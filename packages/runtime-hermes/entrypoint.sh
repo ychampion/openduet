@@ -1,0 +1,166 @@
+#!/bin/sh
+# What the image cannot bake in, done at boot because the container is one
+# attempt and these values belong to that attempt.
+#
+# 1. HERMES_HOME has to be writable. The API server's run-idempotency
+#    reservations are a SQLite file under it; without a writable path the store
+#    falls back to process memory, /v1/capabilities reports
+#    runs_idempotency.durable=false, and the OpenDuet adapter refuses to start. A
+#    retried POST /v1/runs on a non-durable store is a second run, and a second
+#    run is a second set of effects. The image's copy of the config and the
+#    plugin is the source of truth and is synced in on every boot, so an
+#    upgraded image wins over whatever an older container left behind.
+#
+# 2. The model gateway meters per attempt, so every inference request has to
+#    carry the attempt capability as well as the surrogate. Hermes sends a
+#    provider's `extra_headers` on each request, and that is a config value, so
+#    the capability is written into the config here rather than shipped in it.
+#    It goes into the model section as well, because the auxiliary client that
+#    makes the compaction summary call reads only that one: with the provider
+#    copy alone the summary request arrives unauthenticated and the compaction
+#    aborts.
+#
+# 3. The window and the compaction trigger follow the model the attempt was
+#    granted, which the image cannot know. Whatever starts the container works
+#    them out from the one configuration renderer and passes them in.
+#
+# 4. A space with a sandbox runs the engine's terminal there. Whatever starts
+#    the container pins TERMINAL_ENV to the sandbox backend, from the same
+#    renderer, and this writes the terminal section and toolset that go with
+#    it. No other backend is accepted: a cell never runs a local terminal.
+#
+#    An attempt whose budget can carry the engine's helpers is started with
+#    OPENDUET_ENGINE_DELEGATION=1, from the same renderer, and this adds their
+#    toolset. Without it they are off.
+#
+# Everything else the engine is configured to do is in the image's own copy of
+# the rendered configuration. This script adds the attempt to it and nothing more.
+#
+# 5. A spare (OPENDUET_RUNTIME_SPARE=1) is started before its attempt exists. It
+#    is configured here without the capability and handed to the launcher,
+#    which loads the engine, takes the attempt over its port, and runs this same
+#    program again before the engine serves (see process_launcher.py).
+#
+# 6. What the engine and the code it runs make under /work keeps the group's
+#    write bit. The job's workspace belongs to the service, which shares this
+#    group and has to move and remove what is in it. A folder made under the
+#    usual umask 022 (mode 755) cannot be moved to another directory by the
+#    service, nor its files removed. Every process the engine starts inherits
+#    this umask.
+set -eu
+umask 002
+
+: "${HERMES_HOME:?HERMES_HOME must be set}"
+SPARE="${OPENDUET_RUNTIME_SPARE:-}"
+if [ "$SPARE" != 1 ]; then
+  : "${OPENDUET_ATTEMPT_TOKEN:?OPENDUET_ATTEMPT_TOKEN must be set}"
+  : "${OPENDUET_JOB_ID:?OPENDUET_JOB_ID must be set}"
+fi
+
+mkdir -p "$HERMES_HOME/plugins"
+rm -rf "$HERMES_HOME/plugins/openduet"
+# Timestamps kept, so the bytecode compiled into the image still matches.
+cp -R --preserve=timestamps /opt/openduet-runtime/openduet_plugin "$HERMES_HOME/plugins/openduet"
+# OpenDuet's identity is the engine's identity slot. Written on every start, so
+# the engine never seeds its own stock persona into a fresh home. The service
+# passes the installation's own (its assistant's name, or its identity file)
+# as OPENDUET_ENGINE_SOUL, base64; without it the release's copy is used.
+if [ -n "${OPENDUET_ENGINE_SOUL:-}" ]; then
+  python -c 'import base64, os, sys; open(sys.argv[1], "wb").write(base64.b64decode(os.environ["OPENDUET_ENGINE_SOUL"], validate=True))' "$HERMES_HOME/SOUL.md"
+else
+  cp /opt/openduet-runtime/SOUL.md "$HERMES_HOME/SOUL.md"
+fi
+unset OPENDUET_ENGINE_SOUL
+
+BOOT_CONFIG=$(cat <<'PY'
+import os, sys, yaml
+
+config = yaml.safe_load(open("/opt/openduet-runtime/config.yaml", encoding="utf-8"))
+provider = config.setdefault("providers", {}).setdefault("openduet-gateway", {})
+name = os.environ.get("OPENDUET_MODEL_PROVIDER", "fireworks")
+model = os.environ.get("OPENDUET_MODEL_NAME", "accounts/fireworks/models/deepseek-v4p1-flash")
+if not name or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in name):
+    raise SystemExit("Invalid model provider name")
+
+
+def whole(variable):
+    """A positive whole number the caller stated, or nothing. A malformed value
+    is refused rather than silently ignored: it would leave the engine running
+    on the image's default window while the attempt is metered on another."""
+    raw = os.environ.get(variable)
+    if raw is None or raw == "":
+        return None
+    if not raw.isdigit() or int(raw) <= 0:
+        raise SystemExit(variable + " must be a positive whole number")
+    return int(raw)
+
+
+model_config = config.get("model")
+model_section = {**(model_config if isinstance(model_config, dict) else {}), "provider": "openduet-gateway", "default": model}
+context_length = whole("OPENDUET_ENGINE_CONTEXT_LENGTH")
+if context_length:
+    model_section["context_length"] = context_length
+threshold = whole("OPENDUET_ENGINE_COMPACTION_THRESHOLD")
+if threshold:
+    config.setdefault("compression", {})["threshold_tokens"] = threshold
+# Whether the model is shown screenshots as pictures. Only the two spellings
+# the renderer writes are read; anything else stops the boot rather than leave
+# the image's default in place while the plugin acts on another answer.
+vision = os.environ.get("OPENDUET_ENGINE_SUPPORTS_VISION", "")
+if vision not in ("", "0", "1"):
+    raise SystemExit("OPENDUET_ENGINE_SUPPORTS_VISION must be 0 or 1")
+if vision:
+    model_section["supports_vision"] = vision == "1"
+max_turns = whole("OPENDUET_ENGINE_MAX_TURNS")
+if max_turns:
+    config.setdefault("agent", {})["max_turns"] = max_turns
+config["model"] = model_section
+# The engine's helpers, for an attempt whose budget can carry them. Only the
+# value the renderer writes is read; anything else stops the boot.
+delegation = os.environ.get("OPENDUET_ENGINE_DELEGATION", "")
+if delegation not in ("", "1"):
+    raise SystemExit("OPENDUET_ENGINE_DELEGATION must be 1 or unset")
+toolsets = config.setdefault("platform_toolsets", {}).setdefault("api_server", [])
+if "delegation" in toolsets:
+    toolsets.remove("delegation")
+if delegation:
+    toolsets.append("delegation")
+terminal = os.environ.get("TERMINAL_ENV", "")
+config.pop("terminal", None)
+if terminal:
+    if terminal != "openduet_sandbox":
+        raise SystemExit("TERMINAL_ENV may only name the sandbox backend")
+    toolsets = config.setdefault("platform_toolsets", {}).setdefault("api_server", [])
+    # The terminal alone: the `terminal` toolset would add process_manage,
+    # and background processes in a remote sandbox are not offered.
+    if "terminal_tools" not in toolsets:
+        toolsets.append("terminal_tools")
+    config["terminal"] = {"backend": terminal, "cwd": "/work"}
+provider["default_model"] = model
+provider["base_url"] = os.environ["OPENDUET_BROKER_URL"].rstrip("/") + "/providers/" + name + "/v1"
+api_mode = os.environ.get("OPENDUET_MODEL_API_MODE")
+if api_mode:
+    provider["api_mode"] = api_mode
+# The capability is a per-attempt secret and is never written into the image.
+# The main agent reads the provider entry; the auxiliary client that makes the
+# compaction summary call reads the model section. Both get a copy. A spare has
+# none until its attempt is handed over, and this program then runs again.
+capability = os.environ.get("OPENDUET_ATTEMPT_TOKEN")
+if capability:
+    provider.setdefault("extra_headers", {})["x-openduet-capability"] = capability
+    model_section.setdefault("extra_headers", {})["x-openduet-capability"] = capability
+elif os.environ.get("OPENDUET_RUNTIME_SPARE") != "1":
+    raise SystemExit("OPENDUET_ATTEMPT_TOKEN must be set")
+with open(sys.argv[1], "w", encoding="utf-8") as out:
+    yaml.safe_dump(config, out, sort_keys=False)
+PY
+)
+
+python -c "$BOOT_CONFIG" "$HERMES_HOME/config.yaml"
+
+if [ "$SPARE" = 1 ]; then
+  export OPENDUET_BOOT_CONFIG="$BOOT_CONFIG" OPENDUET_RUNTIME_HANDOFF=http
+  exec python /opt/openduet-runtime/process_launcher.py
+fi
+
+exec "$@"

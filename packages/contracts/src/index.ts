@@ -1,0 +1,82 @@
+/**
+ * @openduet/contracts is the shared vocabulary of the system. The service, the
+ * runtime adapter, the knowledge package, the conformance suite, and any client
+ * all import their types from here, so a change to a boundary is one edit that
+ * breaks every caller that needs to know about it.
+ */
+
+export * from './agent-library.ts';
+export * from './api.ts';
+export * from './apps.ts';
+export * from './artifacts.ts';
+export * from './attachments.ts';
+export * from './audit.ts';
+export * from './beliefs.ts';
+export * from './broker.ts';
+export * from './browser.ts';
+export * from './browser-live.ts';
+export * from './capabilities.ts';
+export * from './common.ts';
+export * from './companies.ts';
+export * from './connection-pages.ts';
+export * from './connections.ts';
+export * from './connector.ts';
+export * from './context-budget.ts';
+export * from './cron-words.ts';
+export * from './delta.ts';
+export * from './devices.ts';
+export * from './effects.ts';
+export * from './entities.ts';
+export * from './events.ts';
+export * from './execution.ts';
+export * from './execution-admission.ts';
+export * from './experience.ts';
+export * from './feedback.ts';
+export * from './handoffs.ts';
+export * from './hooks.ts';
+export * from './human-text.ts';
+export * from './instance-name.ts';
+export * from './intents.ts';
+export * from './job-state.ts';
+export * from './knowledge.ts';
+export * from './learning.ts';
+export * from './mcp.ts';
+export * from './mcp-catalog.ts';
+export * from './mcp-server.ts';
+export * from './memory.ts';
+export * from './mention.ts';
+export * from './model-budget.ts';
+export * from './model-search.ts';
+export * from './model-settings.ts';
+export * from './model-vision.ts';
+export * from './morning-brief.ts';
+export { buildOpenApiDocument, OPENAPI_VERSION, openApiJson } from './openapi.ts';
+export * from './paths.ts';
+export * from './plugins.ts';
+export * from './principals.ts';
+export * from './privacy.ts';
+export * from './process-preview.ts';
+export * from './provenance.ts';
+export * from './provider-signin.ts';
+export * from './push.ts';
+export * from './reach.ts';
+export * from './reactions.ts';
+export * from './recurrence.ts';
+export * from './redact.ts';
+export * from './repair.ts';
+export * from './reply-voice.ts';
+export * from './responsibility.ts';
+export * from './rooms.ts';
+export * from './runs.ts';
+export * from './runtime.ts';
+export * from './sandbox-computer.ts';
+export * from './signals.ts';
+export * from './situations.ts';
+export * from './skills.ts';
+export * from './spaces.ts';
+export * from './style.ts';
+export * from './triage.ts';
+export * from './usage.ts';
+export * from './voice.ts';
+export * from './waiting.ts';
+export * from './watch.ts';

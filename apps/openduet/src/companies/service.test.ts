@@ -1,0 +1,283 @@
+/**
+ * Whose budget a live scan spends.
+ *
+ * The extractor's gateway admits a fixed number of calls. If that number
+ * belonged to the process, one person scanning often enough would use it up
+ * and every later scan, anyone's, would quietly find nothing. Each scan gets a
+ * gateway and a budget of its own instead, and these tests hold that.
+ */
+
+import { describe, expect, test } from 'bun:test';
+import { loadEnv } from '../env.ts';
+import type { ModelSettingsService } from '../gateway/model-settings.ts';
+import type { GatewayProvider } from '../gateway/types.ts';
+import { defaultPrivacyRouter } from '../privacy/index.ts';
+import { FIXTURE_REFERENCE, fixtureMessages } from './fixtures.ts';
+import { DEFAULT_EXTRACTION_MODEL } from './gateway.ts';
+import { fixtureMailbox } from './mailbox.ts';
+import { MemoryCompanyStore, type Owner } from './repository.ts';
+import { runScan } from './scan.ts';
+import {
+  companiesExtraction,
+  configuredDailyCalls,
+  configuredExtractor,
+  gatewayExtractor,
+  SCAN_CALL_CEILING,
+} from './service.ts';
+
+const provider: GatewayProvider = {
+  name: 'openai',
+  baseUrl: 'https://api.openai.com/v1/',
+  apiKey: 'a-key-that-stays-inside-the-gateway',
+  protocols: ['chat/completions', 'responses'],
+};
+
+/** Stands in for the provider at the socket, and counts what reached it. */
+function upstream() {
+  const seen = { calls: 0 };
+  const fetch = async (_request: Request): Promise<Response> => {
+    seen.calls += 1;
+    return Response.json({
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      model: DEFAULT_EXTRACTION_MODEL,
+      output: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: JSON.stringify({ items: [] }) }],
+        },
+      ],
+      usage: { input_tokens: 400, output_tokens: 10, total_tokens: 410 },
+    });
+  };
+  return { seen, fetch };
+}
+
+const now = new Date(FIXTURE_REFERENCE);
+const first: Owner = {
+  spaceId: 'sp_01J000000000000000000000AA',
+  principalId: 'own_01J00000000000000000000AA',
+};
+const second: Owner = {
+  spaceId: 'sp_01J000000000000000000000BB',
+  principalId: 'own_01J00000000000000000000BB',
+};
+
+describe('the live extractor’s budget', () => {
+  test('belongs to one scan, so one person’s scans cannot spend another’s', async () => {
+    const { seen, fetch } = upstream();
+    const extractor = gatewayExtractor({
+      privacy: defaultPrivacyRouter(),
+      provider: 'openai',
+      model: DEFAULT_EXTRACTION_MODEL,
+      providers: [provider],
+      fetch,
+    });
+    const store = new MemoryCompanyStore();
+    const scan = (owner: Owner) =>
+      runScan({
+        store,
+        mailbox: fixtureMailbox(fixtureMessages()),
+        extractor,
+        owner,
+        now,
+      });
+
+    // The first person scans until they have asked for more than any one scan may.
+    // Each round is another of their spaces: a mailbox already read is not asked
+    // about twice, so rescanning one space would spend nothing.
+    let scans = 0;
+    while (seen.calls <= SCAN_CALL_CEILING && scans < 20) {
+      const before = seen.calls;
+      expect((await scan({ ...first, spaceId: `${first.spaceId}${scans}` })).status).toBe('done');
+      expect(seen.calls - before).toBeGreaterThan(0);
+      scans += 1;
+    }
+    expect(seen.calls).toBeGreaterThan(SCAN_CALL_CEILING);
+
+    // The second person's scan still reaches the model, message by message.
+    const before = seen.calls;
+    expect((await scan(second)).status).toBe('done');
+    expect(seen.calls - before).toBeGreaterThan(0);
+  }, 60_000);
+
+  test('closes the gateway a scan opened when that scan ends', async () => {
+    const { seen, fetch } = upstream();
+    const live = gatewayExtractor({
+      privacy: defaultPrivacyRouter(),
+      provider: 'openai',
+      model: DEFAULT_EXTRACTION_MODEL,
+      providers: [provider],
+      fetch,
+    });
+    let session: Awaited<ReturnType<NonNullable<typeof live.forScan>>> | undefined;
+    await runScan({
+      store: new MemoryCompanyStore(),
+      mailbox: fixtureMailbox(fixtureMessages()),
+      extractor: {
+        extract: live.extract,
+        async forScan() {
+          session = await live.forScan?.(first.spaceId);
+          if (!session) throw new Error('the live extractor has no scan session');
+          return session;
+        },
+      },
+      owner: first,
+      now,
+    });
+    expect(session).toBeDefined();
+    // Closed with its scan: the gateway it held forwards nothing further.
+    const before = seen.calls;
+    await session?.extract({
+      spaceId: 'sp_01J0000000000000000000000A',
+      messageId: '<1@example.test>',
+      companyName: 'Example',
+      domain: 'example.test',
+      from: 'Example <billing@example.test>',
+      subject: 'Receipt',
+      receivedAt: now.toISOString(),
+      text: 'Subject: Receipt\n\nThank you for your payment.',
+    });
+    expect(seen.calls).toBe(before);
+  });
+});
+
+describe('a space whose rules allow no usable model', () => {
+  test('has its mail read by the scripted reader, and nothing reaches a model', async () => {
+    const saved = process.env.OPENDUET_COMPANIES_MODEL;
+    delete process.env.OPENDUET_COMPANIES_MODEL;
+    try {
+      const { seen, fetch } = upstream();
+      const env = loadEnv({
+        OPENDUET_DEFAULT_PROVIDER: 'openai',
+        OPENDUET_DEFAULT_MODEL: DEFAULT_EXTRACTION_MODEL,
+        OPENAI_API_KEY: 'a-key-that-stays-inside-the-gateway',
+      });
+      const asked: string[] = [];
+      // The space `second` has rules that allow only a model nothing connects.
+      const settings = {
+        activeChoice: async () => ({ provider: 'openai', model: DEFAULT_EXTRACTION_MODEL }),
+        servesLocally: async () => false,
+        isConnected: async () => true,
+        providers: async (configured: GatewayProvider[]) => configured,
+        allowedModelFor: async (spaceId: string, picked: { provider: string; model: string }) => {
+          asked.push(spaceId);
+          return spaceId === second.spaceId
+            ? { ...picked, refused: "This space's rules let its work run only on another model." }
+            : picked;
+        },
+      } as unknown as ModelSettingsService;
+      const extractor = configuredExtractor(
+        env,
+        defaultPrivacyRouter(),
+        undefined,
+        settings,
+        fetch,
+      );
+      const scan = (owner: Owner) =>
+        runScan({
+          store: new MemoryCompanyStore(),
+          mailbox: fixtureMailbox(fixtureMessages()),
+          extractor,
+          owner,
+          now,
+        });
+
+      expect((await scan(second)).status).toBe('done');
+      expect(seen.calls).toBe(0);
+      expect(asked).toContain(second.spaceId);
+      // Another space, with no such rules, is read by the model as before.
+      expect((await scan(first)).status).toBe('done');
+      expect(seen.calls).toBeGreaterThan(0);
+    } finally {
+      if (saved === undefined) delete process.env.OPENDUET_COMPANIES_MODEL;
+      else process.env.OPENDUET_COMPANIES_MODEL = saved;
+    }
+  }, 60_000);
+});
+
+describe('the daily allowance setting', () => {
+  const read = (settings: Record<string, string | undefined>) => {
+    const saved = {
+      model: process.env.OPENDUET_COMPANIES_MODEL,
+      calls: process.env.OPENDUET_COMPANIES_DAILY_CALLS,
+    };
+    const assign = (name: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    try {
+      assign('OPENDUET_COMPANIES_MODEL', settings.model);
+      assign('OPENDUET_COMPANIES_DAILY_CALLS', settings.calls);
+      return configuredDailyCalls(loadEnv({}));
+    } finally {
+      assign('OPENDUET_COMPANIES_MODEL', saved.model);
+      assign('OPENDUET_COMPANIES_DAILY_CALLS', saved.calls);
+    }
+  };
+
+  test('unset or empty is no limit', () => {
+    expect(read({ model: 'default', calls: '' })).toBeUndefined();
+    expect(read({ model: 'default', calls: '  ' })).toBeUndefined();
+    expect(read({ model: 'default', calls: undefined })).toBeUndefined();
+  });
+
+  test('a number is taken as written, including zero', () => {
+    expect(read({ model: 'default', calls: '25' })).toBe(25);
+    expect(read({ model: 'default', calls: '0' })).toBe(0);
+  });
+
+  test('a scripted scan spends nothing and has no allowance', () => {
+    expect(read({ model: undefined, calls: '25' })).toBeUndefined();
+  });
+});
+
+describe('which extractor a scan runs', () => {
+  const none = {};
+  test('a real provider with its key reads mail with the model the installation serves', () => {
+    const env = loadEnv({
+      OPENDUET_DEFAULT_PROVIDER: 'anthropic',
+      OPENDUET_DEFAULT_MODEL: 'claude-sonnet-5',
+      ANTHROPIC_API_KEY: 'a-key',
+    });
+    expect(companiesExtraction(env, none)).toEqual({
+      provider: 'anthropic',
+      model: 'claude-sonnet-5',
+    });
+    // No daily limit unless the operator sets OPENDUET_COMPANIES_DAILY_CALLS.
+    expect(configuredDailyCalls(env)).toBeUndefined();
+  });
+
+  test('the demonstration, and a provider without its key, stay scripted', () => {
+    expect(
+      companiesExtraction(
+        loadEnv({
+          OPENDUET_DEFAULT_PROVIDER: 'fake',
+          OPENDUET_ENABLE_FAKE_PROVIDER: 'true',
+          ANTHROPIC_API_KEY: 'a-key',
+        }),
+        none,
+      ),
+    ).toBeNull();
+    expect(
+      companiesExtraction(loadEnv({ OPENDUET_DEFAULT_PROVIDER: 'anthropic' }), none),
+    ).toBeNull();
+    expect(companiesExtraction(loadEnv({ ANTHROPIC_API_KEY: 'a-key' }), none)).toBeNull();
+  });
+
+  test('a named model still wins, and default is the measured extraction model', () => {
+    const env = loadEnv({ OPENDUET_DEFAULT_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'a-key' });
+    expect(companiesExtraction(env, { OPENDUET_COMPANIES_MODEL: 'default' })).toEqual({
+      provider: 'anthropic',
+      model: DEFAULT_EXTRACTION_MODEL,
+    });
+    expect(
+      companiesExtraction(env, {
+        OPENDUET_COMPANIES_MODEL: 'gpt-6',
+        OPENDUET_COMPANIES_PROVIDER: 'openai',
+      }),
+    ).toEqual({ provider: 'openai', model: 'gpt-6' });
+  });
+});

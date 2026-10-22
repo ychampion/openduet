@@ -1,0 +1,1195 @@
+import { createHash } from 'node:crypto';
+import {
+  type CapabilityClaims,
+  CONTEXT_LIMITS,
+  type ConnectionHealth,
+  INTENT_CAPTURE_TOOL,
+  INTENT_TOOL_NAMES,
+  type JsonObject,
+  MEMORY_SEARCH_TOOL_NAME,
+  REACT_TOOL_NAME,
+  RUN_TOOL_NAMES,
+  RUN_TOOLS,
+  SKILL_READ_TOOL_NAME,
+  type Skill,
+  type ToolSpec,
+} from '@openduet/contracts';
+import { estimateTokens } from '@openduet/skills';
+import type { Sql } from 'postgres';
+import { z } from 'zod';
+import { supersededExecution } from '../connectors/catalog.ts';
+import { MAX_TOOL_SCHEMA_BYTES, toolSchemaFits } from '../connectors/schema-budget.ts';
+import { type Connector, connectorAllowsAudience } from '../connectors/types.ts';
+import { offersPersonsBrowser, routedDescription } from '../devices/routing.ts';
+import { isEgressTool } from '../egress/adapters/types.ts';
+import {
+  type AgentAccess,
+  agentAccess,
+  connectionOffered,
+  toolOffered,
+} from '../experience/access.ts';
+import { appendToolTrace } from '../experience/tools.ts';
+import { stillGiven } from '../gateway/given-skills.ts';
+import { attemptContextBudget } from '../jobs/context-budget.ts';
+import { connectionServesJob, jobConnectionAudience } from '../jobs/scopes.ts';
+import { plainSkillTitle } from '../jobs/skill-trace.ts';
+import { spaceStanding } from '../principals/authority.ts';
+import { audienceVisible } from '../principals/context.ts';
+import { connectorDenied, spaceRulesFor, toolAllowedHere } from '../spaces/policy.ts';
+import { ASK_PERSON_TOOL } from './ask-person.ts';
+import {
+  keepSaidLevels,
+  levelsFor,
+  personOf,
+  roomWork,
+  sendsFromChat,
+  type TaskKind,
+  type TaskLevel,
+} from './autonomy.ts';
+import { CHASE_FOLLOW_UP_TOOL } from './chase.ts';
+import { grantsConnectionScopes } from './connection-scopes.ts';
+import { BrokerFault } from './errors.ts';
+import { gist, relevance, terms, words } from './lexical.ts';
+import { appendEvent, checkAttempt, type LockedJob, lockJob, type Query } from './records.ts';
+import { hasResumableAction, RESUME_ACTION_TOOL } from './resume.ts';
+import { RUNTIME_WAIT_TOOL } from './runtime-wait.ts';
+import { toldToSend } from './told.ts';
+import { steerWebTools, webScores } from './web-steer.ts';
+
+export type CatalogSource = 'connector' | 'capability' | 'skill' | 'mcp';
+/** A skill with where it came from: a built-in is readable by anyone the space admits. */
+export type SourcedSkill = Skill & { source?: 'builtin' | 'space' };
+
+/** Supplied by trusted service code or operator configuration, never by a tool result. */
+export type CatalogMetadata = {
+  source?: CatalogSource;
+  examples?: Record<string, readonly string[]>;
+  core?: readonly string[];
+  audience?: 'owner';
+};
+
+export type CatalogEntry = {
+  name: string;
+  description: string;
+  schema_fingerprint: string;
+  examples: string[];
+  effect_class: ToolSpec['effect_class'];
+  required_scopes: string[];
+  source: CatalogSource;
+  health: ConnectionHealth;
+  connection_id: string | null;
+};
+
+export type CatalogItem = { entry: CatalogEntry; tool: ToolSpec; core: boolean; uses: number };
+type ScopedCatalogItem = CatalogItem & { original: string };
+export type CatalogContext = { core: ToolSpec[]; loaded: ToolSpec[] };
+export type CatalogSearch = {
+  tools: CatalogEntry[];
+  /** Present only when nothing matched: what `load_tool` can still fetch, by name. */
+  index?: { name: string; gist: string }[];
+  hint?: string;
+};
+
+/**
+ * The first catalog's budget at the baseline window. An attempt on a model with
+ * a larger window is given its model's share (`contextBudget`), so a long-context
+ * model sees most of what it is granted without searching for it.
+ */
+export const CORE_CATALOG_TOKENS: number = CONTEXT_LIMITS.core_catalog_tokens;
+export const SEARCH_RESULT_TOKENS = 1_000;
+const SEARCH_TERMS = 24;
+/** The names-only index of unloaded tools has its own fixed allowance beside the schemas. */
+export const CATALOG_INDEX_TOKENS: number = CONTEXT_LIMITS.catalog_index_tokens;
+const compare = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .sort(([a], [b]) => compare(a, b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** The longest a connector may ask one dispatch to take. */
+export const MAX_DISPATCH_BUDGET_MS = 15 * 60_000;
+
+/**
+ * How long one call of a tool may take, where its connector asks for longer
+ * than the broker's default, read for a call that names nothing else. A call
+ * that names its own timeout may take longer; the runtime adds that itself.
+ */
+export function toolDeadline(connector: Connector, name: string): number | undefined {
+  try {
+    const asked = connector.dispatchBudgetMs?.({ kind: name, canonical_payload: {} });
+    return typeof asked === 'number' && Number.isFinite(asked) && asked > 0
+      ? Math.min(Math.ceil(asked), MAX_DISPATCH_BUDGET_MS)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const schemaFingerprint = (schema: ToolSpec['input_schema']): string =>
+  createHash('sha256').update(stable(schema)).digest('hex');
+
+/** A stable function name for two granted accounts offering the same verb. */
+export const accountToolName = (name: string, connectionId: string): string =>
+  `${name}__${createHash('sha256').update(connectionId).digest('hex').slice(0, 12)}`;
+
+export function resolveToolAlias(connector: Connector, connectionId: string, name: string) {
+  return (
+    connector.manifest.tools.find((tool) => tool.name === name) ??
+    connector.manifest.tools.find((tool) => accountToolName(tool.name, connectionId) === name)
+  );
+}
+
+export const META_TOOLS: ToolSpec[] = [
+  {
+    name: 'search_tools',
+    description:
+      'Find available tools by keywords. Results contain names; use load_tool for schemas.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', minLength: 1, maxLength: 500 } },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    effect_class: 'read',
+    connection_id: null,
+  },
+  {
+    name: 'load_tool',
+    description: 'Load an available tool by its exact search result name for this attempt.',
+    input_schema: {
+      type: 'object',
+      properties: { name: { type: 'string', minLength: 1, maxLength: 300 } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    effect_class: 'read',
+    connection_id: null,
+  },
+];
+
+/** A chat's narration tool: what the assistant will do next, in the person's words, at no action cost. */
+export const SAY_TOOL: ToolSpec = {
+  name: 'say',
+  description:
+    'Tell the person in one or two first-person sentences what you will do next, or what you just found. Do not include reasoning, internal names, or technical details. This narration has no action cost and needs no approval.',
+  input_schema: {
+    type: 'object',
+    properties: { text: { type: 'string', minLength: 1, maxLength: 600 } },
+    required: ['text'],
+    additionalProperties: false,
+  },
+  effect_class: 'read',
+  connection_id: null,
+};
+
+/**
+ * Reads the body of a skill the attempt's index names. One broker-owned tool
+ * serves every skill, so reading one needs no schema load and no new run.
+ */
+export const SKILL_READ_TOOL: ToolSpec = {
+  name: SKILL_READ_TOOL_NAME,
+  description:
+    'Read the full instructions of a skill listed under "Other skills you can read", by its exact name, before doing the kind of work it describes. It only returns text and does no work. Skills given in full in your instructions are already there: never read those.',
+  input_schema: {
+    type: 'object',
+    properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
+    required: ['name'],
+    additionalProperties: false,
+  },
+  effect_class: 'read',
+  connection_id: null,
+};
+
+export const toolTokens = (tools: readonly ToolSpec[]): number =>
+  estimateTokens(
+    JSON.stringify(
+      tools.map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.input_schema,
+        },
+      })),
+    ),
+  );
+
+/** What the broker knows about the turn before any model has spoken. */
+export type CoreSelectionContext = {
+  /** The objective and the most recent owner message, as written. */
+  text?: string;
+  /** The job has an enabled trigger, so the lifecycle wait must be on offer. */
+  waitable?: boolean;
+  /** The attempt answers a person directly, so a reaction may be the whole reply. */
+  conversational?: boolean;
+  /** An approved action is waiting to be carried out, so resuming it comes first. */
+  resumable?: boolean;
+  /** A chase's scope covers a follow-up, so its tool comes first beside resuming. */
+  followable?: boolean;
+  /** The attempt may read skills it was not given in full, so the reader must be on offer. */
+  readable?: boolean;
+  /** The tools the job's previous attempt was offered, kept where the message gives no reason to swap them. */
+  kept?: ReadonlySet<string>;
+};
+
+const namespace = (name: string) => (name.includes('.') ? name.slice(0, name.indexOf('.')) : null);
+const writesOutside = (item: CatalogItem) =>
+  item.entry.effect_class === 'write_external' || item.entry.effect_class === 'spend';
+/** Web tools every agent has in its first catalog whenever a web connection grants them. */
+export const ALWAYS_OFFERED_WEB_TOOLS = ['web.search', 'web.fetch'] as const;
+/** The agent's own computer's terminal, which the engine builds its terminal from. */
+const OWN_TERMINAL_TOOL = 'terminal.run';
+/** Whether the installation vouches for this entry's own words. An MCP server writes its own. */
+const granted = (item: CatalogItem) => (item.entry.source === 'mcp' ? 0 : 1);
+
+/**
+ * How firmly a tool holds a place in the core list, ahead of relevance. The
+ * agent's own terminal always has one: ranked by the job's words it can lose
+ * to a paired computer's tools ("my computer"), and without it the engine is
+ * built with no terminal at all, so the agent believes it has none.
+ */
+function pinOf(tool: ToolSpec, context: CoreSelectionContext): number {
+  if (tool.connection_id !== null) return tool.name === OWN_TERMINAL_TOOL ? 1 : 0;
+  if (
+    RUN_TOOL_NAMES.includes(tool.name) ||
+    INTENT_TOOL_NAMES.includes(tool.name) ||
+    (context.resumable === true && tool.name === RESUME_ACTION_TOOL.name) ||
+    (context.followable === true && tool.name === CHASE_FOLLOW_UP_TOOL.name)
+  )
+    return 2;
+  if (
+    (context.waitable === true && tool.name === RUNTIME_WAIT_TOOL.name) ||
+    (context.conversational === true && tool.name === REACT_TOOL_NAME) ||
+    (context.readable === true && tool.name === SKILL_READ_TOOL.name) ||
+    // Answering a person, the agent searches memory before it says it doesn't know.
+    (context.conversational === true && tool.name === MEMORY_SEARCH_TOOL_NAME)
+  )
+    return 1;
+  return 0;
+}
+
+/**
+ * Budget the serialized provider schemas, including the two always-on meta-tools.
+ *
+ * Order: tools the turn cannot do without, then everything the owner granted
+ * ahead of anything a remote server described to us, then lexical relevance to
+ * the job's own words, then the local core, then usage, then name. Relevance is
+ * read off a tool's own description, and an MCP server writes its own: ranking
+ * it against granted verbs would let that server take the first catalog's room
+ * by echoing the job. It may have the room nothing granted wanted, and no more.
+ * A reversible tool is
+ * only offered beside an external-write sibling from the same connection and
+ * namespace, because a draft shown alone reads as the only way to act. Whatever
+ * stays outside is named in a bounded index on `load_tool`, so the model knows
+ * what it can fetch without paying for the schemas.
+ */
+export function selectCore(
+  items: readonly CatalogItem[],
+  budget = CORE_CATALOG_TOKENS,
+  context: CoreSelectionContext = {},
+  indexBudget = CATALOG_INDEX_TOKENS,
+  /** Named in the index but never offered: the skills this attempt was given in full. */
+  indexedOnly: readonly CatalogItem[] = [],
+): ToolSpec[] {
+  if (!Number.isSafeInteger(budget) || budget < toolTokens(META_TOOLS))
+    throw new Error('Core catalog budget cannot hold discovery tools');
+  const tools = structuredClone(META_TOOLS);
+  // The tools long work runs on are how its shifts work, not entries
+  // competing for the catalog: they get room of their own on top of it.
+  const harness = items.filter(
+    (item) => item.tool.connection_id === null && RUN_TOOL_NAMES.includes(item.tool.name),
+  );
+  if (harness.length) budget += toolTokens(harness.map((item) => item.tool));
+  const query = terms(context.text ?? '');
+  const healthy = items
+    .filter((item) => item.entry.health !== 'failing')
+    .map((item) => ({ item, score: relevance(query, item.entry) }));
+  // A browser tool ranks at least as high as the computer's best, and ahead of it.
+  const lifted = webScores(healthy.map(({ item, score }) => ({ name: item.tool.name, score })));
+  // The tools lead a Claude request's cached prefix, so a first catalog that
+  // differs from the last attempt's writes the whole prompt to the cache
+  // again. A tool the message points at still takes its place; the room it
+  // leaves goes to what the last attempt had before anything else.
+  const kept = (item: CatalogItem) => Number(context.kept?.has(item.tool.name) === true);
+  const scored = healthy
+    .map(({ item, score }) => ({
+      item,
+      score: lifted.get(item.tool.name) ?? score,
+      pinned: pinOf(item.tool, context),
+    }))
+    .sort(
+      (a, b) =>
+        b.pinned - a.pinned ||
+        granted(b.item) - granted(a.item) ||
+        b.score - a.score ||
+        Number(lifted.has(b.item.tool.name)) - Number(lifted.has(a.item.tool.name)) ||
+        kept(b.item) - kept(a.item) ||
+        Number(b.item.core) - Number(a.item.core) ||
+        b.item.uses - a.item.uses ||
+        compare(a.item.entry.name, b.item.entry.name),
+    );
+  // A connector verb is always a candidate; an MCP tool only when the job's own
+  // words point at it; capabilities and skills stay behind discovery.
+  const eligible = scored.filter(
+    ({ item, score }) =>
+      item.core || item.entry.source === 'connector' || (item.entry.source === 'mcp' && score > 0),
+  );
+  const chosen = new Set<CatalogItem>();
+  // Asking the person is always on offer and rides beside the budget like the
+  // discovery tools: it takes no room a job's own tools would have had.
+  let room = budget;
+  const asking = scored.find(({ item }) => item.tool.name === ASK_PERSON_TOOL.name)?.item;
+  if (asking) {
+    room += toolTokens([...tools, asking.tool]) - toolTokens(tools);
+    chosen.add(asking);
+    tools.push(asking.tool);
+  }
+  // Searching and reading the web are always on offer too, beside the budget,
+  // so a job's own tools never push them out and they never push those out.
+  // The Public web reads setting still refuses the calls themselves.
+  for (const name of ALWAYS_OFFERED_WEB_TOOLS) {
+    const web = scored.find(
+      ({ item }) =>
+        item.entry.source === 'connector' &&
+        item.tool.connection_id !== null &&
+        !chosen.has(item) &&
+        (item.tool.name === name || item.tool.name.startsWith(`${name}__`)),
+    )?.item;
+    if (!web) continue;
+    room += toolTokens([...tools, web.tool]) - toolTokens(tools);
+    chosen.add(web);
+    tools.push(web.tool);
+  }
+  // The discovery tools, the question and the web lead in a fixed order; what
+  // relevance chooses after them is listed in a canonical one below.
+  const head = tools.length;
+  const add = (...group: CatalogItem[]) => {
+    const fresh = group.filter((item) => !chosen.has(item));
+    if (toolTokens([...tools, ...fresh.map((item) => item.tool)]) > room) return false;
+    for (const item of fresh) {
+      chosen.add(item);
+      tools.push(item.tool);
+    }
+    return true;
+  };
+  for (const { item } of eligible) {
+    if (chosen.has(item)) continue;
+    const siblings =
+      item.entry.effect_class === 'write_reversible' && item.tool.connection_id !== null
+        ? eligible
+            .map((entry) => entry.item)
+            .filter(
+              (other) =>
+                writesOutside(other) &&
+                other.tool.connection_id === item.tool.connection_id &&
+                namespace(other.entry.name) !== null &&
+                namespace(other.entry.name) === namespace(item.entry.name),
+            )
+        : [];
+    if (siblings.length === 0 || siblings.some((other) => chosen.has(other))) add(item);
+    else siblings.some((other) => add(item, other));
+  }
+  // Relevance decides which tools make the cut, never where they stand. The
+  // tool definitions are in the provider's cached prefix (ahead of the system
+  // prompt on Claude), so the same tools are listed in the same order on every
+  // turn whatever the latest message says: pinned first, granted ahead of a
+  // server's own, then by name, which also keeps `browser.*` ahead of
+  // `computer.*` (`web-steer.ts`).
+  const rank = new Map(scored.map((entry) => [entry.item.tool, entry]));
+  const placed = (tool: ToolSpec) => {
+    const entry = rank.get(tool);
+    return { pinned: entry?.pinned ?? 0, granted: entry ? granted(entry.item) : 1 };
+  };
+  tools.splice(
+    head,
+    tools.length - head,
+    ...tools.slice(head).sort((a, b) => {
+      const left = placed(a);
+      const right = placed(b);
+      return right.pinned - left.pinned || right.granted - left.granted || compare(a.name, b.name);
+    }),
+  );
+  const loader = tools.find((tool) => tool.name === 'load_tool');
+  // When the index cannot name them all, which ones it keeps never depends on
+  // the latest message, and the ones kept are named in a fixed order: the
+  // index is part of a tool definition, and a Claude request's cached prefix
+  // starts with the tools, so an index that followed the message made every
+  // turn write the whole prompt to the cache again, system prompt included.
+  // What the person granted comes first, then the local core, then by name.
+  // A skill given in full this turn is named too, so the turn's choice of
+  // skills leaves the index as it was.
+  const rest = [
+    ...scored.map((entry) => entry.item).filter((item) => !chosen.has(item)),
+    ...indexedOnly,
+  ].sort(
+    (a, b) =>
+      granted(b) - granted(a) ||
+      Number(b.core) - Number(a.core) ||
+      compare(a.entry.name, b.entry.name),
+  );
+  if (loader && rest.length > 0 && indexBudget > 0) {
+    const listing = (shown: number) => {
+      const named = rest
+        .slice(0, shown)
+        .sort((a, b) => compare(a.entry.name, b.entry.name))
+        .map((item) => `${item.entry.name} (${gist(item.entry.description)})`);
+      const more = rest.length - shown;
+      return ` Not loaded yet: ${named.join('; ')}${
+        more > 0 ? `${shown > 0 ? '; ' : ''}+${more} more through search_tools` : ''
+      }.`;
+    };
+    let shown = rest.length;
+    while (shown > 0 && estimateTokens(listing(shown)) > indexBudget) shown--;
+    if (estimateTokens(listing(shown)) <= indexBudget) loader.description += listing(shown);
+  }
+  return tools;
+}
+
+export function manifestEntry(
+  tool: ToolSpec,
+  scopes: readonly string[],
+  source: CatalogSource = 'connector',
+  health: ConnectionHealth = 'unknown',
+  examples: readonly string[] = [],
+): CatalogEntry {
+  return {
+    name: tool.name,
+    description: tool.description.replace(/\s+/g, ' ').trim().slice(0, 400),
+    schema_fingerprint: schemaFingerprint(tool.input_schema),
+    examples: examples.slice(0, 2).map((text) => text.replace(/\s+/g, ' ').trim().slice(0, 200)),
+    effect_class: tool.effect_class,
+    required_scopes: [...new Set(scopes)].sort(compare),
+    source,
+    health,
+    connection_id: tool.connection_id,
+  };
+}
+
+type ConnectorResolver = { get(connectionId: string): Connector | undefined };
+export type CatalogOptions = {
+  sql: Sql;
+  connectors: ConnectorResolver;
+  coreTokenBudget?: number;
+  /** This loader is service-owned and already selects the job's space. */
+  skills?: (spaceId: string) => Promise<readonly SourcedSkill[]>;
+  nativeTools?: readonly ToolSpec[];
+  /** Whether a chase's scope still covers a follow-up, so its tool is offered. */
+  followable?: (tx: Query, job: LockedJob) => Promise<boolean>;
+  /** The job's person's level for each kind of task, with the operator's defaults. */
+  taskLevels?: (tx: Query, jobId: string) => Promise<ReadonlyMap<TaskKind, TaskLevel>>;
+};
+
+/**
+ * The skills an attempt may read: every tool one names is within its scopes,
+ * and a space skill's audience admits the reader. A built-in is readable by
+ * anyone the space admits; a space skill with no audience is its owner's alone.
+ */
+export function readableSkills(
+  skills: readonly SourcedSkill[],
+  reader: { spaceId: string; scopes: readonly string[]; owner: boolean },
+): SourcedSkill[] {
+  return skills.filter(
+    (skill) =>
+      skill.frontmatter.tools.every((scope) => reader.scopes.includes(scope)) &&
+      (skill.source === 'builtin' ||
+        audienceVisible(skill.frontmatter.audience, reader.spaceId, reader.owner)),
+  );
+}
+
+/** The context is durable, but possession of a schema never becomes authority. */
+export class ToolCatalog {
+  constructor(private readonly options: CatalogOptions) {}
+
+  private followable(tx: Query, job: LockedJob): Promise<boolean> {
+    return this.options.followable?.(tx, job) ?? Promise.resolve(false);
+  }
+
+  /**
+   * The skills this attempt may read: its granted scopes cover every tool one
+   * names, and a space skill's audience admits the attempt's principal. A skill
+   * with no audience is private to the space's owner.
+   */
+  private async skills(
+    tx: Query,
+    job: LockedJob,
+    claims: CapabilityClaims,
+  ): Promise<readonly SourcedSkill[]> {
+    if (job.constraints.public_compartment) return [];
+    const skills = (await this.options.skills?.(job.space_id)) ?? [];
+    // The rule the skills a run is given use: a private skill is the space's
+    // own owner's (a room's maker, not an owner they added), and a space from
+    // before principals belongs to the installation's owner. A principal the
+    // space does not admit reads nothing.
+    const standing = await spaceStanding(tx, job.space_id, claims.principal_id ?? null);
+    if (!standing) return [];
+    return readableSkills(skills, {
+      spaceId: job.space_id,
+      scopes: claims.scopes,
+      owner: standing.owns,
+    });
+  }
+
+  private async scoped(
+    tx: Query,
+    job: LockedJob,
+    claims: CapabilityClaims,
+    access: AgentAccess,
+  ): Promise<ScopedCatalogItem[]> {
+    // A job bound to a persona that no longer resolves fails closed: nothing is offered.
+    if (access.missingAgent) return [];
+    // Only the connections this job may use: a member's job in a shared space
+    // is offered none of the connections its owner installed there.
+    const audience = await jobConnectionAudience(tx, job.id);
+    const connections = (
+      await tx`select c.id, c.provider, c.scopes, c.health, c.shared_use, s.audience
+      from connection c join space s on s.id = c.space_id
+      where c.space_id = ${job.space_id} and c.status = 'active' order by c.id`
+    ).filter((row) => audience && connectionServesJob(audience, String(row.shared_use)));
+    const usage = await tx`select a.connection_id, a.kind, count(*)::int as uses from action a
+      join job j on j.id = a.job_id where j.space_id = ${job.space_id} and a.status = 'succeeded'
+      group by a.connection_id, a.kind`;
+    const items: ScopedCatalogItem[] = [];
+    // An agent that keeps no memory is not offered a skill that promises to.
+    const skills = (await this.skills(tx, job, claims)).filter(
+      (skill) => access.writesMemory || !skill.frontmatter.keeps_memory,
+    );
+    const nativeNames = new Set(
+      [...META_TOOLS, ...(this.options.nativeTools ?? [])].map((tool) => tool.name),
+    );
+    const reserved = new Set([
+      ...nativeNames,
+      ...skills.map((skill) => `skills.${skill.frontmatter.name.replaceAll('-', '_')}`),
+    ]);
+    const accept = async (name: string, connectionId: string | null, validate: () => void) => {
+      try {
+        validate();
+        return true;
+      } catch (error) {
+        if (!(error instanceof BrokerFault)) throw error;
+        // Isolate configuration faults to their entry; retain a durable diagnostic.
+        await appendEvent(
+          tx,
+          claims.job_id,
+          claims.attempt_id,
+          'notice',
+          {
+            phase: 'catalog_rejected',
+            name,
+            connection_id: connectionId,
+            code: error.code,
+            message: error.message,
+          },
+          `catalog:reject:${claims.attempt_id}:${connectionId ?? 'native'}:${name}`,
+        );
+        return false;
+      }
+    };
+    const providers = connections.map((row) => String(row.provider));
+    // What the space's rules leave out is not offered, whatever else grants it.
+    const rules = await spaceRulesFor(tx, job.space_id);
+    // The person's own browser takes sign-in work from the cloud browser; see devices/routing.ts.
+    const personsBrowser = offersPersonsBrowser(
+      connections
+        .filter((row) => !(access.allowed && !access.allowed.includes(row.id)))
+        .map((row) => ({ provider: String(row.provider), scopes: row.scopes })),
+    );
+    // A level the person set in the message being answered counts from the start.
+    await keepSaidLevels(tx, claims.attempt_id);
+    // A send the person asked for in this turn is offered, and so is one whose
+    // kind of task they let go on its own sometimes; otherwise it is drafted.
+    const told = access.chat && (await toldToSend(tx, claims.attempt_id));
+    // A room's work keeps its own rule: only what the person said to send.
+    const levels =
+      access.chat && !told && !(await roomWork(tx, job.id))
+        ? await (this.options.taskLevels?.(tx, job.id) ?? levelsFor(tx, await personOf(tx, job.id)))
+        : null;
+    const sends = (name: string) => told || (levels !== null && sendsFromChat(name, false, levels));
+    for (const row of connections) {
+      // A conversation's persona bounds which connections and verbs are offered.
+      if (!connectionOffered(access, row.id)) continue;
+      if (supersededExecution(row.provider, providers)) continue;
+      const connector = this.options.connectors.get(row.id);
+      if (!connector || connector.manifest.provider !== row.provider) continue;
+      // A capability whose provider is not configured has nothing to offer yet.
+      if (connector.capability?.available === false) continue;
+      if (!connectorAllowsAudience(connector, job.constraints, row.audience)) continue;
+      for (const declared of connector.manifest.tools) {
+        if (!toolOffered(access, declared.name, sends(declared.name))) continue;
+        if (!toolAllowedHere(rules, String(row.provider), declared.name)) continue;
+        // Made by commands in the computer through the egress relay, never offered as a tool.
+        if (isEgressTool(declared.name)) continue;
+        const scopes = [declared.name, ...declared.required_scopes];
+        if (!grantsConnectionScopes(claims, row.scopes, scopes)) continue;
+        if (
+          !(await accept(declared.name, row.id, () => {
+            if (reserved.has(declared.name))
+              throw new BrokerFault(
+                'unknown_tool',
+                'Connector name is reserved by a broker tool or skill',
+              );
+          }))
+        )
+          continue;
+        const source = connector.catalog?.source ?? 'connector';
+        const deadline = toolDeadline(connector, declared.name);
+        const tool: ToolSpec = {
+          name: declared.name,
+          description: routedDescription(declared.name, declared.description, personsBrowser),
+          input_schema: declared.input_schema,
+          effect_class: declared.effect_class,
+          connection_id: row.id,
+          ...(deadline ? { deadline_ms: deadline } : {}),
+          // The cell needs to know which tools it carries out itself, and
+          // the shape of the record it owes the ledger afterwards.
+          execution: declared.execution,
+          record_schema: declared.record_schema,
+        };
+        items.push({
+          original: tool.name,
+          tool,
+          entry: manifestEntry(
+            tool,
+            scopes,
+            source,
+            row.health,
+            connector.catalog?.examples?.[tool.name],
+          ),
+          core:
+            /^(files\.|knowledge\.|react(?:\.|$))/.test(tool.name) ||
+            Boolean(connector.catalog?.core?.includes(tool.name)),
+          uses: Number(
+            usage.find((item) => item.connection_id === row.id && item.kind === tool.name)?.uses ??
+              0,
+          ),
+        });
+      }
+    }
+    // A skill this attempt was given in full is already in its instructions.
+    // Offering its own tool as well had the model call it to read the same
+    // words again: a round trip before the work began, with nothing new in it.
+    const given = await givenInFull(tx, claims.attempt_id);
+    for (const skill of skills) {
+      if (given.has(skill.frontmatter.name)) continue;
+      const { tool, entry } = skillItem(skill);
+      if (
+        !(await accept(tool.name, null, () => {
+          if (
+            nativeNames.has(tool.name) ||
+            items.some((item) => item.original === tool.name && item.tool.connection_id === null)
+          )
+            throw new BrokerFault('unknown_tool', 'Duplicate scoped skill or reserved native name');
+        }))
+      )
+        continue;
+      items.push({ original: tool.name, tool, entry, core: false, uses: 0 });
+    }
+    const resumable = await hasResumableAction(tx, job);
+    for (const tool of [...(this.options.nativeTools ?? []), ...(access.chat ? [SAY_TOOL] : [])]) {
+      if (tool.name === RUNTIME_WAIT_TOOL.name && !claims.scopes.includes(tool.name)) continue;
+      // Long work's tools belong to the kinds of job its scopes were given to.
+      if (RUN_TOOL_NAMES.includes(tool.name) && !claims.scopes.includes(tool.name)) continue;
+      // Keeping hold of what the person wants belongs to their conversations.
+      if (INTENT_TOOL_NAMES.includes(tool.name) && !claims.scopes.includes(tool.name)) continue;
+      // Offered only while there is a skill this attempt may read.
+      if (tool.name === SKILL_READ_TOOL.name && skills.length === 0) continue;
+      // Offered only where memory may be read: never to an agent set not to read
+      // it, and never in public research, which loads no private knowledge.
+      if (
+        tool.name === MEMORY_SEARCH_TOOL_NAME &&
+        (!access.readsMemory || job.constraints.public_compartment === true)
+      )
+        continue;
+      // Offered only while the owner's approval is waiting to be carried out.
+      if (tool.name === RESUME_ACTION_TOOL.name && !resumable) continue;
+      // Offered only while a chase's scope still covers a follow-up.
+      if (tool.name === CHASE_FOLLOW_UP_TOOL.name && !(await this.followable(tx, job))) continue;
+      if (
+        !(await accept(tool.name, tool.connection_id, () => {
+          const lifecycle = [
+            RUNTIME_WAIT_TOOL,
+            ASK_PERSON_TOOL,
+            RESUME_ACTION_TOOL,
+            CHASE_FOLLOW_UP_TOOL,
+            INTENT_CAPTURE_TOOL,
+            ...RUN_TOOLS,
+          ].some(
+            (typed) =>
+              tool.name === typed.name &&
+              schemaFingerprint(tool.input_schema) === schemaFingerprint(typed.input_schema) &&
+              tool.effect_class === typed.effect_class,
+          );
+          if (tool.connection_id !== null || (tool.effect_class !== 'read' && !lifecycle))
+            throw new BrokerFault(
+              'unknown_tool',
+              'Native catalog tools must be broker-owned reads or a typed lifecycle operation',
+            );
+          if (
+            META_TOOLS.some((meta) => meta.name === tool.name) ||
+            items.some((item) => item.original === tool.name && item.tool.connection_id === null)
+          )
+            throw new BrokerFault('unknown_tool', 'Duplicate native tool name');
+        }))
+      )
+        continue;
+      items.push({
+        original: tool.name,
+        tool,
+        entry: manifestEntry(tool, [], 'capability', 'ok'),
+        core: true,
+        uses: 0,
+      });
+    }
+    const counts = new Map(META_TOOLS.map((tool) => [tool.name, 1]));
+    for (const item of items) counts.set(item.original, (counts.get(item.original) ?? 0) + 1);
+    for (const item of items) {
+      if ((counts.get(item.original) ?? 0) > 1 && item.tool.connection_id) {
+        item.tool.name = accountToolName(item.original, item.tool.connection_id);
+        item.entry.name = item.tool.name;
+      }
+    }
+    // Web pages go to the browser tools first wherever the desktop is offered beside them.
+    return steerWebTools(items).sort((a, b) => compare(a.entry.name, b.entry.name));
+  }
+
+  /**
+   * What the turn is about, read from durable rows before any model speaks: the
+   * objective, the latest owner message, whether a trigger is registered, and
+   * whether this attempt answers a person directly (a chat, a first attempt, or
+   * a wake that carries a new owner message).
+   */
+  private async turn(
+    tx: Query,
+    job: LockedJob,
+    claims: CapabilityClaims,
+    access: AgentAccess,
+  ): Promise<CoreSelectionContext> {
+    const [row] = await tx`select
+      (select e.payload->>'text' from event e where e.job_id = ${job.id} and e.type = 'notice'
+        and e.payload->>'kind' = 'user_message' order by e.seq desc limit 1) as message,
+      (select max(e.seq) from event e where e.job_id = ${job.id} and e.type = 'notice'
+        and e.payload->>'kind' = 'user_message') as message_seq,
+      (select a.input_cursor from attempt a where a.job_id = ${job.id}
+        and a.id <> ${claims.attempt_id} order by a.epoch desc limit 1) as prior_cursor,
+      exists (select 1 from trigger t where t.job_id = ${job.id} and t.enabled) as waitable`;
+    const first = row?.prior_cursor === null || row?.prior_cursor === undefined;
+    return {
+      text: [job.objective, row?.message].filter(Boolean).join(' '),
+      waitable: row?.waitable === true,
+      resumable: await hasResumableAction(tx, job),
+      followable: await this.followable(tx, job),
+      readable: (await this.skills(tx, job, claims)).length > 0,
+      conversational:
+        access.chat || first || Number(row?.message_seq ?? 0) > Number(row?.prior_cursor ?? 0),
+    };
+  }
+
+  private async context(
+    tx: Query,
+    job: LockedJob,
+    claims: CapabilityClaims,
+    items: CatalogItem[],
+    access: AgentAccess,
+  ): Promise<CatalogContext> {
+    const [row] =
+      await tx`select core, loaded from attempt_tool_context where attempt_id = ${claims.attempt_id}`;
+    if (row) return { core: row.core, loaded: row.loaded };
+    const [attempt] = await tx`select model from attempt where id = ${claims.attempt_id}`;
+    const budget = attemptContextBudget(
+      typeof attempt?.model === 'string' ? attempt.model : '',
+      job.budget,
+    );
+    const given = await givenInFull(tx, claims.attempt_id);
+    const indexedOnly = given.size
+      ? (await this.skills(tx, job, claims))
+          .filter((skill) => given.has(skill.frontmatter.name))
+          .map((skill) => ({ ...skillItem(skill), core: false, uses: 0 }))
+      : [];
+    const [last] = await tx`select c.core from attempt a
+      join attempt_tool_context c on c.attempt_id = a.id
+      where a.job_id = ${claims.job_id} and a.id <> ${claims.attempt_id}
+      order by a.epoch desc limit 1`;
+    const kept = Array.isArray(last?.core)
+      ? new Set((last.core as ToolSpec[]).map((tool) => tool.name))
+      : undefined;
+    const core = selectCore(
+      items,
+      this.options.coreTokenBudget ?? budget.core_catalog_tokens,
+      { ...(await this.turn(tx, job, claims, access)), kept },
+      budget.catalog_index_tokens,
+      indexedOnly,
+    );
+    await tx`insert into attempt_tool_context (attempt_id, job_id, core, loaded)
+      values (${claims.attempt_id}, ${claims.job_id}, ${JSON.stringify(core)}::jsonb, '[]'::jsonb)`;
+    await appendEvent(tx, claims.job_id, claims.attempt_id, 'notice', {
+      phase: 'catalog_context',
+      core: core.map((tool) => ({
+        name: tool.name,
+        schema_fingerprint: schemaFingerprint(tool.input_schema),
+      })),
+      estimated_tokens: toolTokens(core),
+    });
+    return { core, loaded: [] };
+  }
+
+  private current(context: CatalogContext, items: CatalogItem[]): ToolSpec[] {
+    return [...context.core, ...context.loaded].filter(
+      (tool) =>
+        META_TOOLS.some((meta) => meta.name === tool.name && tool.connection_id === null) ||
+        items.some(
+          (item) =>
+            item.entry.name === tool.name &&
+            item.tool.connection_id === tool.connection_id &&
+            item.entry.schema_fingerprint === schemaFingerprint(tool.input_schema) &&
+            item.entry.effect_class === tool.effect_class &&
+            item.entry.health !== 'failing',
+        ),
+    );
+  }
+
+  /** Names already shown in this attempt remain bound even after an account is revoked. */
+  private bindNames(items: ScopedCatalogItem[], context: CatalogContext): CatalogItem[] {
+    const saved = [...context.core, ...context.loaded];
+    const reserved = new Set(saved.map((tool) => tool.name));
+    const claimed = new Set<string>();
+    for (const item of items) {
+      const connectionId = item.tool.connection_id;
+      const prior = saved.find(
+        (tool) =>
+          tool.connection_id === connectionId &&
+          (tool.name === item.original ||
+            (connectionId !== null && tool.name === accountToolName(item.original, connectionId))),
+      );
+      if (prior) item.tool.name = prior.name;
+      else if (reserved.has(item.tool.name)) {
+        if (!connectionId) throw new BrokerFault('unknown_tool', 'Duplicate native tool name');
+        item.tool.name = accountToolName(item.original, connectionId);
+      }
+      if ((!prior && reserved.has(item.tool.name)) || claimed.has(item.tool.name))
+        throw new BrokerFault('unknown_tool', 'Ambiguous tool name');
+      claimed.add(item.tool.name);
+      item.entry.name = item.tool.name;
+    }
+    return items.sort((a, b) => compare(a.entry.name, b.entry.name));
+  }
+
+  private async within<T>(
+    claims: CapabilityClaims,
+    use: (
+      tx: Query,
+      job: LockedJob,
+      items: CatalogItem[],
+      context: CatalogContext,
+      access: AgentAccess,
+    ) => Promise<T>,
+  ): Promise<T> {
+    return this.options.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+      const access = await agentAccess(tx, job.id);
+      const items = await this.scoped(tx, job, claims, access);
+      const context = await this.context(tx, job, claims, items, access);
+      return use(tx, job, this.bindNames(items, context), context, access);
+    }) as Promise<T>;
+  }
+
+  catalog(claims: CapabilityClaims): Promise<ToolSpec[]> {
+    return this.within(claims, async (_tx, _job, items, context, access) =>
+      access.missingAgent ? [] : this.current(context, items),
+    );
+  }
+
+  /** Used by trusted broker composition; does not load schemas or create a grant. */
+  available(claims: CapabilityClaims): Promise<ToolSpec[]> {
+    return this.within(claims, async (_tx, _job, items) =>
+      items.filter((item) => item.entry.health !== 'failing').map((item) => item.tool),
+    );
+  }
+
+  async search(claims: CapabilityClaims, query: string): Promise<CatalogEntry[]> {
+    return (await this.find(claims, query)).tools;
+  }
+
+  /**
+   * Ranked discovery. Any term may match: the terms are ORed, stemmed with the
+   * `english` configuration and also kept whole under `simple`, so an identifier
+   * segment such as `restart` in `server.restart` answers "restarting services".
+   * A query that matches nothing returns the names of what can be loaded, with
+   * one line saying so, because an empty list reads as "no such tool exists".
+   */
+  find(claims: CapabilityClaims, query: string): Promise<CatalogSearch> {
+    const parsed = z.string().trim().min(1).max(500).parse(query);
+    return this.within(claims, async (tx, job, items, context, access) => {
+      const loaded = new Set(this.current(context, items).map((tool) => tool.name));
+      const rest = items.filter((item) => !loaded.has(item.entry.name)).map((item) => item.entry);
+      // An account the computer's command line reaches has no tool to match, so
+      // a search that names one is told how it is reached instead.
+      const accounts = await commandLineAccounts(tx, job, claims, access);
+      const asked = new Set(words(parsed));
+      const named = accounts.filter((account) => account.words.some((word) => asked.has(word)));
+      const reached = named.length
+        ? `Connected through the computer's command line, with no tool of their own: ${named
+            .map(
+              (account) =>
+                `${account.label} (run ${account.commands} with terminal.run; the account is added for you)`,
+            )
+            .join('; ')}.`
+        : null;
+      // Only letters and digits reach the query text, so it cannot carry an operator.
+      const lexemes = words(parsed).slice(0, SEARCH_TERMS).join(' | ');
+      // The input contains only already-authorized entries. Even the ranking engine
+      // cannot reveal another space's names, schemas, examples or result counts.
+      const ranked = lexemes
+        ? await tx`with entries as (
+        select value as entry, regexp_replace(value->>'name', '[._-]', ' ', 'g') as segments
+        from jsonb_array_elements(${JSON.stringify(rest)}::jsonb)
+      ), documents as (
+        select entry,
+          setweight(to_tsvector('english', segments), 'A') ||
+          setweight(to_tsvector('simple', segments), 'A') ||
+          setweight(to_tsvector('english', entry->>'description'), 'B') ||
+          setweight(to_tsvector('english', (entry->'examples')::text), 'C') as document
+        from entries
+      ), query as (
+        select to_tsquery('english', ${lexemes}) || to_tsquery('simple', ${lexemes}) as terms
+      )
+      select entry from documents, query where document @@ terms
+      order by ts_rank(document, terms) desc, entry->>'name' collate "C"`
+        : [];
+      const result: CatalogEntry[] = [];
+      for (const row of ranked) {
+        // A long, valid scope list must not make the best match undiscoverable.
+        if (
+          result.length === 0 ||
+          estimateTokens(JSON.stringify([...result, row.entry])) <= SEARCH_RESULT_TOKENS
+        )
+          result.push(row.entry);
+      }
+      await appendEvent(tx, claims.job_id, claims.attempt_id, 'notice', {
+        phase: 'search_tools',
+        query: parsed,
+        names: result.map((item) => item.name),
+        effect_class: 'read',
+      });
+      if (result.length > 0) return { tools: result, ...(reached ? { hint: reached } : {}) };
+      const index: CatalogSearch['index'] = [];
+      for (const entry of rest) {
+        if (entry.health === 'failing') continue;
+        const next = { name: entry.name, gist: gist(entry.description) };
+        if (estimateTokens(JSON.stringify([...index, next])) > SEARCH_RESULT_TOKENS) break;
+        index.push(next);
+      }
+      return {
+        tools: [],
+        index,
+        hint: [
+          reached,
+          index.length
+            ? `No tool matched ${JSON.stringify(parsed)}. These are the tools load_tool can fetch by exact name.`
+            : `No tool matched ${JSON.stringify(parsed)}, and nothing further can be loaded in this attempt.`,
+        ]
+          .filter(Boolean)
+          .join(' '),
+      };
+    });
+  }
+
+  load(
+    claims: CapabilityClaims,
+    name: string,
+  ): Promise<{ tool: ToolSpec; schema_fingerprint: string }> {
+    z.string().min(1).max(300).parse(name);
+    return this.within(claims, async (tx, _job, items, context) => {
+      const item = items.find((entry) => entry.entry.name === name);
+      if (!item) {
+        // The index names the skills given in full too; there is nothing to load
+        // for one. A long turn's compaction can drop it from the instructions,
+        // and the reader still has it then.
+        const given = await givenInFull(tx, claims.attempt_id);
+        if ([...given].some((skill) => `skills.${skill.replaceAll('-', '_')}` === name))
+          throw new BrokerFault(
+            'unknown_tool',
+            `This skill was given in full in this turn's instructions, under "How to do this kind of work": follow it there. If it is no longer there, read it with ${SKILL_READ_TOOL_NAME}.`,
+          );
+        throw new BrokerFault('unknown_tool');
+      }
+      if (item.entry.health === 'failing') throw new BrokerFault('connector_unavailable');
+      if (!toolSchemaFits(item.tool.input_schema))
+        throw new BrokerFault(
+          'connector_unavailable',
+          `Tool schema exceeds ${MAX_TOOL_SCHEMA_BYTES} UTF-8 bytes`,
+        );
+      const prior = [...context.core, ...context.loaded].find((tool) => tool.name === name);
+      if (
+        prior &&
+        (prior.connection_id !== item.tool.connection_id ||
+          schemaFingerprint(prior.input_schema) !== item.entry.schema_fingerprint ||
+          prior.effect_class !== item.entry.effect_class)
+      )
+        throw new BrokerFault('unknown_tool', 'The tool changed during this attempt');
+      if (!prior) {
+        await tx`update attempt_tool_context set loaded = loaded || ${JSON.stringify([item.tool])}::jsonb, updated_at = now()
+          where attempt_id = ${claims.attempt_id}`;
+        await appendEvent(
+          tx,
+          claims.job_id,
+          claims.attempt_id,
+          'notice',
+          { phase: 'load_tool', ...item.entry },
+          `catalog:load:${claims.attempt_id}:${name}`,
+        );
+      }
+      return { tool: item.tool, schema_fingerprint: item.entry.schema_fingerprint };
+    });
+  }
+
+  async callSkill(claims: CapabilityClaims, name: string, args: JsonObject): Promise<JsonObject> {
+    const reading = name === SKILL_READ_TOOL.name;
+    // A skill's own tool takes no arguments; the reader takes the name to read.
+    const asked = reading
+      ? z.strictObject({ name: z.string().min(1).max(80) }).parse(args).name
+      : null;
+    if (!reading) z.object({}).strict().parse(args);
+    return this.within(claims, async (tx, job, items, context) => {
+      if (
+        !this.current(context, items).some(
+          (tool) => tool.name === name && tool.connection_id === null,
+        )
+      )
+        throw new BrokerFault('unknown_tool');
+      const skill = (await this.skills(tx, job, claims)).find((item) =>
+        reading
+          ? item.frontmatter.name === asked
+          : `skills.${item.frontmatter.name.replaceAll('-', '_')}` === name,
+      );
+      if (!skill) throw new BrokerFault('unknown_tool');
+      // A skill the agent still holds in full, at this version, is in its
+      // instructions already: its words again would cost a long tool result and
+      // say nothing new, and a second "Used the skill" entry would tell the
+      // person nothing. One a compaction left out, or that changed since, is
+      // read in full (gateway/given-skills.ts).
+      if (reading && stillGiven(claims.attempt_id, skill.frontmatter.name, skill.body))
+        return {
+          name: skill.frontmatter.name,
+          body: 'This skill is already in your instructions, in full, under "How to do this kind of work". Follow it from there; there is nothing more to read.',
+        };
+      // The conversation shows the read as a tool entry naming the skill.
+      const at = new Date().toISOString();
+      const title = plainSkillTitle(skill.frontmatter.name);
+      await appendToolTrace(tx, job.id, claims.attempt_id, {
+        id: `skill-read:${claims.attempt_id}:${skill.frontmatter.name}`,
+        kind: 'skill',
+        title: `Used the skill: ${title}`,
+        status: 'done',
+        started_at: at,
+        ended_at: at,
+        input_summary: null,
+        output_summary: { text: title },
+        detail: null,
+        parent: null,
+      });
+      await appendEvent(tx, job.id, claims.attempt_id, 'notice', {
+        phase: 'skill_read',
+        name,
+        effect_class: 'read',
+      });
+      return { name: skill.frontmatter.name, body: skill.body };
+    });
+  }
+}
+
+/** The words that point a search at a command-line account, and the commands that use it. */
+const COMMAND_LINE_WORDS: Record<string, { words: string[]; commands: string }> = {
+  github: {
+    words: ['github', 'gh', 'git', 'repo', 'repository', 'issue', 'issues', 'pull', 'pr', 'commit'],
+    commands: 'git or gh',
+  },
+  gitlab: {
+    words: ['gitlab', 'glab', 'git', 'repo', 'repository', 'issue', 'issues', 'merge', 'mr'],
+    commands: 'git or glab',
+  },
+  aws: { words: ['aws', 'amazon', 's3', 'ec2', 'lambda'], commands: 'aws' },
+  npm: { words: ['npm', 'package', 'registry'], commands: 'npm' },
+};
+
+/** A skill as a catalog entry: its own read tool, named after it. */
+function skillItem(
+  skill: SourcedSkill,
+): Pick<CatalogItem, 'tool' | 'entry'> & { original: string } {
+  const tool: ToolSpec = {
+    name: `skills.${skill.frontmatter.name.replaceAll('-', '_')}`,
+    description: skill.frontmatter.description,
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    effect_class: 'read',
+    connection_id: null,
+  };
+  return {
+    original: tool.name,
+    tool,
+    entry: manifestEntry(tool, skill.frontmatter.tools, 'skill', 'ok', skill.frontmatter.triggers),
+  };
+}
+
+/**
+ * The names of the skills an attempt was given in full, as recorded when it
+ * started. Read through the caller's transaction; an attempt with no record
+ * was given none.
+ */
+async function givenInFull(tx: Query, attemptId: string): Promise<Set<string>> {
+  const [row] = await tx`select versions->'skills' as skills from learning_attempt
+    where attempt_id = ${attemptId}`;
+  const skills = Array.isArray(row?.skills) ? (row.skills as unknown[]) : [];
+  return new Set(
+    skills.flatMap((skill) =>
+      skill && typeof skill === 'object' && typeof (skill as { name?: unknown }).name === 'string'
+        ? [(skill as { name: string }).name]
+        : [],
+    ),
+  );
+}
+
+/**
+ * The command-line accounts (GitHub, for one) this job may use: active in its
+ * space, serving it, offered to its agent and granted for reads, as the egress
+ * relay decides. Read through the caller's transaction.
+ */
+async function commandLineAccounts(
+  tx: Query,
+  job: LockedJob,
+  claims: CapabilityClaims,
+  access: AgentAccess,
+): Promise<{ label: string; words: string[]; commands: string }[]> {
+  const rows = await tx`select id, label, scopes, shared_use, configuration->>'adapter' as adapter
+    from connection where space_id = ${job.space_id} and provider = 'command_line'
+      and status = 'active' and configuration->>'kind' = 'command_line' order by label`;
+  if (!rows.length) return [];
+  if (connectorDenied(await spaceRulesFor(tx, job.space_id), 'command_line')) return [];
+  const audience = await jobConnectionAudience(tx, job.id);
+  if (!audience) return [];
+  return rows.flatMap((row) => {
+    const adapter = String(row.adapter);
+    const known = COMMAND_LINE_WORDS[adapter];
+    const read = `egress.${adapter}_read`;
+    if (
+      !known ||
+      !connectionServesJob(audience, String(row.shared_use)) ||
+      !connectionOffered(access, String(row.id)) ||
+      !((row.scopes ?? []) as string[]).includes(read) ||
+      !claims.scopes.includes(read)
+    )
+      return [];
+    return [
+      {
+        label: String(row.label),
+        words: [...known.words, ...words(String(row.label))],
+        commands: known.commands,
+      },
+    ];
+  });
+}

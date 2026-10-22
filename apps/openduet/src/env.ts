@@ -1,0 +1,1621 @@
+/**
+ * Configuration. Everything the service needs comes from the environment and
+ * is validated once at start-up, so a missing master key is a clear message on
+ * boot rather than a decryption failure three hours into a job.
+ */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ATTACHMENT_LIMITS, displayName, EXEC_LIMITS, PROCESS_LIMITS } from '@openduet/contracts';
+import { DEFAULT_COMPACTION_MAX_TOKENS, DEFAULT_ENGINE_MAX_TURNS } from '@openduet/runtime-hermes';
+import { z } from 'zod';
+import { formatRange, parsePrivateHosts, rangesOverlap } from './connectors/private-hosts.ts';
+import { REASONING_EFFORTS } from './gateway/effort.ts';
+import { parseModelPrices } from './gateway/prices.ts';
+import { parseModelChoice } from './gateway/routing.ts';
+import { DEFAULT_NETWORK_POOL, parseNetworkPool } from './runtime/network-pool.ts';
+
+const root = fileURLToPath(new URL('../../../', import.meta.url));
+
+/** How long a sandbox command's workspace may take to sync in and out, around the command. */
+export const SANDBOX_SYNC_ALLOWANCE_MS = 120_000;
+
+/**
+ * The shortest lease a sandbox session may have: the longest command it can
+ * be sent and the syncs around it, with a minute to spare, so a lease renewed
+ * as a command is sent cannot run out while that command runs.
+ */
+export const SANDBOX_LEASE_FLOOR_SECONDS =
+  Math.ceil((EXEC_LIMITS.max_timeout_ms + SANDBOX_SYNC_ALLOWANCE_MS) / 1000) + 60;
+
+/** `host:port`, with brackets around an IPv6 host. */
+export function parseBrokerBind(bind: string): { hostname: string; port: number } | null {
+  const match = /^(\[[^\]]+\]|[^:]+):(\d+)$/.exec(bind);
+  if (!match?.[1] || !match[2]) return null;
+  const port = Number(match[2]);
+  if (port < 1 || port > 65535) return null;
+  return { hostname: match[1].replace(/^\[|\]$/g, ''), port };
+}
+
+const WILDCARD_HOSTS: Record<string, string> = { '0.0.0.0': '127.0.0.1', '::': '::1' };
+const isLoopback = (hostname: string) =>
+  hostname === 'localhost' || hostname === '::1' || /^127(\.\d{1,3}){3}$/.test(hostname);
+
+/**
+ * Where this service reaches the broker it bound. A wildcard bind is not a
+ * destination, so it is reached over loopback on the same port.
+ */
+export function brokerUrlForBind(bind: string): string | null {
+  const parsed = parseBrokerBind(bind);
+  if (!parsed) return null;
+  const hostname = WILDCARD_HOSTS[parsed.hostname] ?? parsed.hostname;
+  return `http://${hostname.includes(':') ? `[${hostname}]` : hostname}:${parsed.port}`;
+}
+
+/** Why a configured broker address cannot reach the bound listener, if it cannot. */
+function brokerUrlMismatch(bind: string, url: string): string | null {
+  const bound = parseBrokerBind(bind);
+  if (!bound) return null;
+  const target = new URL(url);
+  const hostname = target.hostname.replace(/^\[|\]$/g, '');
+  const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  if (port !== bound.port)
+    return `OPENDUET_BROKER_URL names port ${port}, but OPENDUET_BROKER_BIND listens on ${bound.port}`;
+  if (bound.hostname in WILDCARD_HOSTS) return null;
+  if (isLoopback(bound.hostname) !== isLoopback(hostname))
+    return `OPENDUET_BROKER_URL host ${hostname} cannot reach a broker bound to ${bound.hostname} (OPENDUET_BROKER_BIND)`;
+  return null;
+}
+
+/**
+ * Compose writes `${NAME:-}` as an empty string, so an optional setting left
+ * blank in deploy/.env arrives as '' and means the same as leaving it out.
+ */
+const unsetWhenBlank = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === '' ? undefined : value), schema);
+
+/** One of the installation's names (instance-name.ts): trimmed, one line, OpenDuet when unset. */
+const nameSetting = (setting: string) =>
+  z
+    .string()
+    .optional()
+    .transform((value, context) => {
+      try {
+        return displayName(value, setting);
+      } catch (error) {
+        context.addIssue({ code: 'custom', message: (error as Error).message });
+        return z.NEVER;
+      }
+    });
+
+/** One `OPENDUET_FEATURE_<NAME>` switch: `on`, `off`, or left out for the feature's default. */
+const featureSwitch = unsetWhenBlank(
+  z.enum(['on', 'off'], { message: 'Write on or off' }).optional(),
+);
+
+/**
+ * Whether the Postgres client can read this address. It is judged here, the
+ * way the client reads it (only the first of several hosts goes through the URL
+ * parser), because the client's own parse error quotes the whole address,
+ * password included, and does not say which setting it came from.
+ *
+ * The client ignores the scheme name, so any `scheme://` address it can parse
+ * is kept, in any case and after leading whitespace. The one exception is an
+ * address that names another database, which cannot be what was meant.
+ */
+const OTHER_DATABASE =
+  /^\s*(?:mysql|mariadb|mssql|sqlserver|sqlite|mongodb(?:\+srv)?|rediss?):\/\//i;
+
+export function isPostgresUrl(value: string): boolean {
+  if (!/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(value) || OTHER_DATABASE.test(value)) return false;
+  const authority = value.slice(value.indexOf('://') + 3).split(/[?/]/)[0] ?? '';
+  try {
+    const hosts = decodeURIComponent(authority.slice(authority.indexOf('@') + 1));
+    const url = new URL(value.replace(hosts, hosts.split(',')[0] ?? ''));
+    decodeURIComponent(url.username);
+    decodeURIComponent(url.password);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const variables = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().positive().default(8787),
+  /** Compose resolves an alias assigned only to edge; local development uses loopback. */
+  OPENDUET_API_BIND: z.string().min(1).default('127.0.0.1'),
+  /**
+   * The web proxy on the edge network, by service name or address. Only a
+   * connection from it may state a browser's address; unset, no peer is believed.
+   */
+  OPENDUET_TRUSTED_PROXY: z.string().min(1).optional(),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+  /**
+   * Seals connection secrets and provider keys at rest. The operator holds it;
+   * losing it means re-entering every credential, which is the intended trade.
+   */
+  OPENDUET_MASTER_KEY: z.string().min(32).optional(),
+
+  DATABASE_URL: z
+    .string()
+    .refine(
+      isPostgresUrl,
+      'must be a postgres:// address, for example postgres://openduet:password@postgres:5432/openduet',
+    )
+    .optional(),
+  /**
+   * The database role the code that dispatches effects uses: the one role that
+   * may read the `secret` table. Set, DATABASE_URL is the service's own role, which
+   * cannot; the database's setup step creates both and runs the migrations, so
+   * the service checks the roles and the journal instead of migrating
+   * (docs/DEPLOYMENT.md, "Database roles"). Left unset, one role does all of it.
+   */
+  OPENDUET_EFFECTS_DATABASE_URL: z
+    .string()
+    .refine(isPostgresUrl, 'must be a postgres:// address')
+    .optional(),
+  /**
+   * Web Push: this installation's VAPID key pair, base64url, written once by
+   * configure.ts. Unset, the web app does not offer push.
+   */
+  OPENDUET_VAPID_PUBLIC_KEY: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{86,88}$/)
+      .optional(),
+  ),
+  OPENDUET_VAPID_PRIVATE_KEY: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{42,44}$/)
+      .optional(),
+  ),
+  /** Who push services contact about this installation; defaults to mailto: the owner. */
+  OPENDUET_VAPID_SUBJECT: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^(mailto:|https:\/\/)/)
+      .optional(),
+  ),
+  /**
+   * Push endpoints on origins other than the browser push services, comma separated:
+   * a self-hosted push server, or a test's stand-in.
+   */
+  OPENDUET_PUSH_EXTRA_ORIGINS: unsetWhenBlank(z.string().optional()),
+  /**
+   * What a person is told when a connection's tool requires an entitlement
+   * their account does not hold. Operators grant entitlements, so the default
+   * points the person at them.
+   */
+  OPENDUET_GATE_MESSAGE: unsetWhenBlank(
+    z.string().trim().min(1).max(300).default('Contact support to get your account verified.'),
+  ),
+  /**
+   * What the installation calls itself: page titles, account mail, the setup
+   * status. Defaults to OpenDuet. docs/DEPLOYMENT.md, "Names and look".
+   */
+  OPENDUET_INSTANCE_NAME: nameSetting('OPENDUET_INSTANCE_NAME'),
+  /**
+   * What the assistant calls itself in its identity. Defaults to
+   * OPENDUET_INSTANCE_NAME, and so to OpenDuet when neither is set.
+   */
+  OPENDUET_ASSISTANT_NAME: z
+    .string()
+    .optional()
+    .transform((value, context) => {
+      try {
+        return value?.trim() ? displayName(value, 'OPENDUET_ASSISTANT_NAME') : undefined;
+      } catch (error) {
+        context.addIssue({ code: 'custom', message: (error as Error).message });
+        return z.NEVER;
+      }
+    }),
+  /**
+   * A file that replaces the built-in identity, read once at start and held to
+   * the same token cap (packages/skills, loadIdentity).
+   */
+  OPENDUET_IDENTITY_FILE: unsetWhenBlank(z.string().max(4096).optional()),
+  OPENDUET_PUBLIC_URL: unsetWhenBlank(
+    z
+      .url()
+      .refine((value) => {
+        const address = new URL(value);
+        return (
+          ['http:', 'https:'].includes(address.protocol) && !address.username && !address.password
+        );
+      }, 'Use your public web address.')
+      .optional(),
+  ),
+  /**
+   * Whether an https:// OPENDUET_PUBLIC_URL publishes this service's OAuth Client
+   * ID Metadata Document. Turn it off when that address is reachable only on a
+   * private network, so authorization servers are offered dynamic registration.
+   */
+  OPENDUET_OAUTH_CLIENT_METADATA: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .default('true')
+      .transform((v) => v === 'true'),
+  ),
+  /**
+   * The operator's Google OAuth client, for signing in to Gmail and Google
+   * Calendar (docs/mail-calendar.md). Both, or neither.
+   */
+  GOOGLE_OAUTH_CLIENT_ID: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  GOOGLE_OAUTH_CLIENT_SECRET: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  /**
+   * The operator's GitHub OAuth app, for connecting GitHub's MCP server from the
+   * app catalog: GitHub's sign-in accepts only a client registered ahead of time
+   * (docs/CONNECTORS.md). Both, or neither.
+   */
+  GITHUB_MCP_CLIENT_ID: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  GITHUB_MCP_CLIENT_SECRET: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  /**
+   * A Composio project key. Set, the Google card on the connect screen signs
+   * in through Composio's own Google app, so no Google OAuth client of the
+   * operator's is needed (docs/mail-calendar.md). Microsoft stays on its own
+   * sign-in either way.
+   */
+  COMPOSIO_API_KEY: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  /** Composio's API address. Only a test, or a private Composio region, replaces it. */
+  COMPOSIO_BASE_URL: unsetWhenBlank(
+    z.url({ protocol: /^https?$/ }).default('https://backend.composio.dev'),
+  ),
+  /**
+   * The Composio auth config each toolkit signs in with. Left out, OpenDuet uses
+   * the project's Composio-managed config for that toolkit, and makes one when
+   * there is none. Set one to sign in with a Google client of your own inside
+   * Composio.
+   */
+  COMPOSIO_AUTH_CONFIG_GMAIL: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,128}$/)
+      .optional(),
+  ),
+  COMPOSIO_AUTH_CONFIG_GOOGLECALENDAR: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,128}$/)
+      .optional(),
+  ),
+  COMPOSIO_AUTH_CONFIG_GOOGLEDRIVE: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,128}$/)
+      .optional(),
+  ),
+  /**
+   * Auth configs of the operator's own for other apps, as
+   * `toolkit=ac_id,toolkit=ac_id` (for example `slack=ac_123`). An app left out
+   * signs in with the project's Composio-managed config.
+   */
+  COMPOSIO_AUTH_CONFIGS: unsetWhenBlank(
+    z
+      .string()
+      .regex(
+        /^[a-z0-9_]{1,64}=[A-Za-z0-9_-]{1,128}(,[a-z0-9_]{1,64}=[A-Za-z0-9_-]{1,128})*$/,
+        'Write toolkit=auth_config_id pairs separated by commas',
+      )
+      .optional(),
+  ),
+  /**
+   * A secret for Composio's webhook signatures. Set, the mail and calendar
+   * accounts signed in through Composio are watched by Composio's triggers,
+   * which call `POST /composio/events`, and read on a slow schedule otherwise;
+   * unset, they are read on a schedule only.
+   */
+  COMPOSIO_WEBHOOK_SECRET: unsetWhenBlank(z.string().min(16).max(512).optional()),
+  /**
+   * The most tool calls through Composio this installation makes in a billing
+   * month. Close to it, watched accounts are read less often; past it, every
+   * call is refused before it reaches Composio, an approved send included,
+   * until the month resets. Unset, there is no limit.
+   * `OPENDUET_MANAGED_CALLS_MONTHLY_CAP` is the older name for it.
+   */
+  OPENDUET_COMPOSIO_TOOL_CALLS_MONTHLY_CAP: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(1_000_000_000).optional(),
+  ),
+  OPENDUET_MANAGED_CALLS_MONTHLY_CAP: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(1_000_000_000).optional(),
+  ),
+  /**
+   * The most trigger events from Composio this installation takes in a billing
+   * month. Past it, its triggers are switched off at Composio until the month
+   * resets, and accounts are read on a schedule. Unset, there is no limit.
+   */
+  OPENDUET_COMPOSIO_TRIGGER_EVENTS_MONTHLY_CAP: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(1_000_000_000).optional(),
+  ),
+  /** The most accounts connected through Composio at once. Unset, there is no limit. */
+  OPENDUET_COMPOSIO_ACCOUNTS_CAP: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(10_000_000).optional(),
+  ),
+  /**
+   * A monthly credit in US dollars that use past a monthly limit may spend, at
+   * the rates below. Unset, every limit is hard.
+   */
+  OPENDUET_COMPOSIO_MONTHLY_CREDIT_USD: unsetWhenBlank(
+    z.coerce.number().min(0).max(1_000_000).optional(),
+  ),
+  /** What one tool call past the free allowance costs, in US dollars. */
+  OPENDUET_COMPOSIO_TOOL_CALL_USD: unsetWhenBlank(z.coerce.number().min(0).max(1).default(0.0005)),
+  /** What one trigger event past the free allowance costs, in US dollars. */
+  OPENDUET_COMPOSIO_TRIGGER_EVENT_USD: unsetWhenBlank(
+    z.coerce.number().min(0).max(1).default(0.005),
+  ),
+  /** The day of the month (1-28, UTC) Composio's billing month starts on. */
+  OPENDUET_COMPOSIO_BILLING_DAY: unsetWhenBlank(z.coerce.number().int().min(1).max(28).default(1)),
+  /**
+   * The operator's Microsoft Entra app, for signing in to Outlook mail and
+   * calendar (docs/mail-calendar.md). Both, or neither. The tenant is `common`,
+   * for personal and work accounts, unless a tenant id or domain is named.
+   */
+  MICROSOFT_OAUTH_CLIENT_ID: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  MICROSOFT_OAUTH_CLIENT_SECRET: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  MICROSOFT_OAUTH_TENANT: unsetWhenBlank(
+    z
+      .string()
+      .regex(
+        /^[A-Za-z0-9.-]{1,253}$/,
+        'use common, organizations, consumers, a tenant id or a domain',
+      )
+      .default('common'),
+  ),
+  /** Signs bounded attempt capabilities; this key never enters an AttemptBundle. */
+  OPENDUET_CAPABILITY_KEY: z.string().min(32).optional(),
+  /**
+   * `hermes` starts one pinned engine per attempt through the selected supervisor;
+   * `docker` is the deployment's supervised container path; `external` expects an
+   * injected RuntimeAdapter; `stub` is an explicit scripted development choice.
+   */
+  OPENDUET_RUNTIME_ADAPTER: z.enum(['hermes', 'stub', 'external', 'docker']).default('hermes'),
+  OPENDUET_RUNTIME_SUPERVISOR: z.enum(['process', 'docker']).default('process'),
+  /**
+   * How many engines are kept loaded ahead of the next attempts, so a reply does
+   * not wait for an engine to start: `true` is one, `false` or `0` none. Each
+   * holds an idle engine's memory while nothing runs. The process supervisor
+   * keeps at most one; the Docker runtime keeps this many containers.
+   */
+  OPENDUET_ENGINE_PREWARM: unsetWhenBlank(
+    z
+      .union([z.enum(['true', 'false']), z.coerce.number().int().min(0).max(8)])
+      .default('true')
+      .transform((v) => (v === 'true' ? 1 : v === 'false' ? 0 : v)),
+  ),
+  /**
+   * How many attempts run at once. Each runs its own engine; a further one
+   * waits for a free slot, and its conversation says so.
+   */
+  OPENDUET_ATTEMPT_CONCURRENCY: unsetWhenBlank(z.coerce.number().int().min(1).max(32).default(4)),
+  OPENDUET_HERMES_ROOT: z.string().default(join(root, '.hermes-src')),
+  OPENDUET_HERMES_PYTHON: z
+    .string()
+    .default(
+      join(
+        root,
+        '.hermes-venv',
+        process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
+      ),
+    ),
+  OPENDUET_RUNTIME_PACKAGE: z.string().default(join(root, 'packages/runtime-hermes')),
+  OPENDUET_RUNTIME_NETWORK: z.string().default('openduet_internal'),
+  OPENDUET_RUNTIME_WORK_VOLUME: z.string().default('openduet_work'),
+
+  /** Where space git repositories and workspace files live. */
+  OPENDUET_SPACES_DIR: z.string().default('/data/spaces'),
+  /** The root of the local blob store, which keeps write-once files by their sha256. */
+  OPENDUET_ARTIFACTS_DIR: z.string().default('/data/artifacts'),
+  OPENDUET_RESTRICTIONS_DIR: z.string().default('/data/restrictions'),
+  /**
+   * Where blobs are kept: `local` is OPENDUET_ARTIFACTS_DIR, `s3` an
+   * S3-compatible bucket named by the OPENDUET_BLOB_S3_* settings.
+   */
+  OPENDUET_BLOB_STORE: unsetWhenBlank(z.enum(['local', 's3']).default('local')),
+  /** Left out, the AWS endpoint for the region. */
+  OPENDUET_BLOB_S3_ENDPOINT: unsetWhenBlank(z.string().url().optional()),
+  OPENDUET_BLOB_S3_BUCKET: unsetWhenBlank(z.string().min(3).max(63).optional()),
+  OPENDUET_BLOB_S3_REGION: unsetWhenBlank(z.string().default('us-east-1')),
+  /** Every key is written under this prefix, so one bucket can serve more than one installation. */
+  OPENDUET_BLOB_S3_PREFIX: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/, 'letters, digits, ".", "_", "-" and "/" only')
+      .optional(),
+  ),
+  OPENDUET_BLOB_S3_ACCESS_KEY_ID: unsetWhenBlank(z.string().min(1).optional()),
+  OPENDUET_BLOB_S3_SECRET_ACCESS_KEY: unsetWhenBlank(z.string().min(1).optional()),
+
+  /** The address the runtime container reaches the broker on, internal network only. */
+  OPENDUET_BROKER_BIND: z
+    .string()
+    .default('127.0.0.1:3112')
+    .refine((bind) => parseBrokerBind(bind) !== null, 'must be hostname:port'),
+  /**
+   * Where the service reads its own tool catalog, and the address process-mode
+   * attempts are handed. Left out, it follows OPENDUET_BROKER_BIND.
+   */
+  OPENDUET_BROKER_URL: z.string().url().optional(),
+  OPENDUET_APPROVAL_KEY: z.string().min(32).optional(),
+  OPENDUET_WORK_DIR: z.string().default('/work'),
+  OPENDUET_CONNECTIONS_FILE: z.string().optional(),
+  OPENDUET_GATEWAY_TLS_DIR: z.string().optional(),
+  OPENDUET_ENABLE_TEST_CONNECTOR: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  /**
+   * OpenDuet's built-in detectors: meetings that move or overlap, deadlines at
+   * risk, messages still waiting on an answer. On by default; `false` turns
+   * them off for the installation, and connected calendars are then read only
+   * when some work listens to them.
+   */
+  OPENDUET_DETECTORS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  /**
+   * Texts and calls to a person's own verified number when a deadline they set
+   * is about to be missed (docs/SITUATIONAL-AWARENESS.md, "Reaching your
+   * phone"): the Twilio account, its auth token and the number they come from.
+   * All three, with an https OPENDUET_PUBLIC_URL, or the ladder stops at push.
+   */
+  OPENDUET_TWILIO_ACCOUNT_SID: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^AC[0-9a-fA-F]{32}$/, 'An account SID starts with AC')
+      .optional(),
+  ),
+  OPENDUET_TWILIO_AUTH_TOKEN: unsetWhenBlank(z.string().min(16).max(128).optional()),
+  OPENDUET_TWILIO_FROM_NUMBER: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^\+[1-9]\d{6,14}$/, 'Write the number with + and the country code')
+      .optional(),
+  ),
+  /** What one text and one started minute of a call cost, counted toward the person's spend. */
+  OPENDUET_REACH_TEXT_USD: unsetWhenBlank(z.coerce.number().min(0).max(1).default(0.0083)),
+  OPENDUET_REACH_CALL_USD_PER_MINUTE: unsetWhenBlank(
+    z.coerce.number().min(0).max(1).default(0.014),
+  ),
+  /**
+   * Calling-code prefixes a verification code may be texted to, comma
+   * separated. `+1` covers the US and Canada; a Caribbean area code under it
+   * needs its own entry, such as `+1876`.
+   */
+  OPENDUET_REACH_CODE_PREFIXES: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^\+\d{1,6}(,\s*\+\d{1,6})*$/, 'Prefixes such as +1,+44')
+      .default('+1'),
+  ),
+  /** Verification codes the whole installation may text in an hour. */
+  OPENDUET_REACH_CODES_PER_HOUR: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(10_000).default(30),
+  ),
+  /**
+   * Rooms, shared spaces, guests, hand-offs and linked chat platform accounts.
+   * Off, their routes answer 404 `not_available`, their tools are not offered
+   * and new spaces are not given them; what was stored stays as it is.
+   */
+  OPENDUET_PREVIEW_MULTIPLAYER: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  /**
+   * Whole features an operator turns on or off (features.ts). Left out, each
+   * keeps its default: multiplayer follows OPENDUET_PREVIEW_MULTIPLAYER, and
+   * every other feature is on. Off, its routes answer 404 `not_available`
+   * with a plain sentence and the web leaves it out.
+   */
+  OPENDUET_FEATURE_MULTIPLAYER: featureSwitch,
+  OPENDUET_FEATURE_VOICE: featureSwitch,
+  OPENDUET_FEATURE_PHONE: featureSwitch,
+  OPENDUET_FEATURE_SMS: featureSwitch,
+  OPENDUET_FEATURE_BROWSER: featureSwitch,
+  OPENDUET_FEATURE_COMPUTER: featureSwitch,
+  OPENDUET_FEATURE_COMPANIES: featureSwitch,
+  OPENDUET_ENABLE_FAKE_PROVIDER: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  OPENDUET_RUNTIME_URL: z.string().default('http://runtime:8790'),
+  OPENDUET_RUNTIME_KEY: z.string().min(32).optional(),
+  OPENDUET_RUNTIME_IMAGE: z.string().default('openduet-runtime:local'),
+  OPENDUET_DOCKER_SOCKET: z.string().default('/var/run/docker.sock'),
+  /**
+   * The cell service that holds the Docker socket, when the service does not
+   * (`http://openduet-cells:8791` in Compose), and the key it was given. Set, the
+   * service reaches the engine only through it.
+   */
+  OPENDUET_CELLS_URL: z.string().url().optional(),
+  OPENDUET_CELLS_KEY: z.string().min(32).optional(),
+  OPENDUET_COMPOSE_PROJECT: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]*$/)
+    .default('openduet'),
+  /**
+   * This service instance's name among several on one database. Left out, the
+   * container's host name. Each instance labels the containers it starts with
+   * it, so one instance's start never removes another's running cells.
+   */
+  OPENDUET_INSTANCE_ID: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
+      .optional(),
+  ),
+  OPENDUET_WORK_VOLUME: z
+    .string()
+    .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/)
+    .default('openduet_work'),
+  OPENDUET_RUNTIME_START_TIMEOUT_MS: unsetWhenBlank(
+    z.coerce.number().int().positive().default(120_000),
+  ),
+  /**
+   * The range the networks of attempts, computers and plugins take a /28 of
+   * each, or `off` for the engine's own address pools.
+   */
+  OPENDUET_NETWORK_POOL: unsetWhenBlank(
+    z
+      .string()
+      .default(DEFAULT_NETWORK_POOL)
+      .superRefine((value, context) => {
+        try {
+          parseNetworkPool(value);
+        } catch (error) {
+          context.addIssue({ code: 'custom', message: (error as Error).message });
+        }
+      }),
+  ),
+  /** Stdio MCP servers run in containers beside the attempts; these are the runners' images. */
+  OPENDUET_MCP_NODE_IMAGE: unsetWhenBlank(
+    z
+      .string()
+      .min(1)
+      .default(
+        'node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85',
+      ),
+  ),
+  OPENDUET_MCP_PYTHON_IMAGE: unsetWhenBlank(
+    z
+      .string()
+      .min(1)
+      .default(
+        'ghcr.io/astral-sh/uv:0.12.17-python3.12-alpine@sha256:4c7eb663267624fa1f5b0316b3a51b427578bcb1d93459e1b6dfb5e9875beb0f',
+      ),
+  ),
+  /** The port a server with named destinations uses as its proxy, inside the service container. */
+  OPENDUET_MCP_EGRESS_PORT: unsetWhenBlank(z.coerce.number().int().min(1).max(65535).default(8789)),
+  OPENDUET_MCP_IDLE_MS: unsetWhenBlank(z.coerce.number().int().positive().default(600_000)),
+  /** Browser credentials and endpoint are service-owned; neither is sent to the runtime cell. */
+  OPENDUET_BROWSER_URL: z.url().optional(),
+  OPENDUET_BROWSER_SPACE: z
+    .string()
+    .regex(/^sp_[A-Za-z0-9_-]+$/)
+    .optional(),
+  OPENDUET_BROWSER_TOKEN: z.string().min(32).optional(),
+  OPENDUET_BROWSER_IDLE_MS: z.coerce.number().int().positive().default(300_000),
+
+  /** Provider keys. The gateway injects these; the runtime never sees them. */
+  FIREWORKS_API_KEY: z.string().optional(),
+  ANTHROPIC_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  GOOGLE_API_KEY: z.string().optional(),
+  OPENAI_COMPAT_BASE_URL: z.string().optional(),
+  OPENAI_COMPAT_API_KEY: z.string().optional(),
+  /**
+   * A model server on this machine or network (OpenAI-compatible, for example
+   * Ollama at http://127.0.0.1:11434/v1) that private conversations use until
+   * the installation's owner sets one in Settings → Privacy. It is the only
+   * local model anyone else's private conversations use.
+   */
+  OPENDUET_LOCAL_MODEL_URL: unsetWhenBlank(z.string().url().optional()),
+  OPENDUET_LOCAL_MODEL: unsetWhenBlank(z.string().max(200).optional()),
+  OPENDUET_LOCAL_MODEL_KEY: unsetWhenBlank(z.string().max(500).optional()),
+  /**
+   * An address set in the app never reaches a cloud metadata service
+   * (169.254.169.254 and the like), the owner's included. `true` opens those
+   * addresses to the installation owner's own settings, for a model that really
+   * runs there; everyone else stays held to public addresses.
+   */
+  OPENDUET_ALLOW_CLOUD_METADATA: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  /**
+   * Internal hosts everyone on the installation may reach, not only its owner:
+   * host names, `*.corp.internal` wildcards and address ranges such as
+   * `10.20.0.0/16`, comma-separated. Empty (the default) keeps everyone but the
+   * owner to public addresses. Read again where it is used; checked here.
+   */
+  OPENDUET_PRIVATE_HOSTS: unsetWhenBlank(
+    z
+      .string()
+      .default('')
+      .superRefine((value, context) => {
+        try {
+          parsePrivateHosts(value);
+        } catch (error) {
+          context.addIssue({ code: 'custom', message: (error as Error).message });
+        }
+      }),
+  ),
+  /**
+   * The OAuth client ChatGPT sign-in presents. Left empty, the Codex CLI's
+   * public client, the only one OpenAI has registered for this sign-in.
+   */
+  OPENDUET_CHATGPT_CLIENT_ID: unsetWhenBlank(z.string().max(200).optional()),
+  /**
+   * OAuth for the OpenAI-compatible endpoint, for a provider that issues access
+   * tokens instead of keys. The owner signs in once; the gateway refreshes.
+   */
+  OPENAI_COMPAT_OAUTH_ISSUER: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_AUTHORIZE_URL: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_TOKEN_URL: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_REVOKE_URL: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_CLIENT_ID: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_CLIENT_SECRET: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_SCOPES: unsetWhenBlank(z.string().optional()),
+  OPENAI_COMPAT_OAUTH_REDIRECT_URL: unsetWhenBlank(z.string().optional()),
+  /** The provider's name on the sign-in button, for example "Acme Models". */
+  OPENAI_COMPAT_OAUTH_LABEL: unsetWhenBlank(z.string().max(60).optional()),
+
+  OPENDUET_DEFAULT_PROVIDER: z.string().default('fireworks'),
+  /** The identifier the provider serves, which for Fireworks is the full account path. */
+  OPENDUET_DEFAULT_MODEL: z.string().default('accounts/fireworks/models/deepseek-v4p1-flash'),
+  /**
+   * Whether the server's default model reads images: `true` or `false`. Left
+   * blank, OpenDuet's model catalog decides. A model chosen in the app carries the
+   * owner's own answer instead.
+   */
+  OPENDUET_DEFAULT_MODEL_VISION: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v === 'true')),
+  ),
+  /**
+   * Whether the server's default model searches the web through its provider's
+   * own search tool: `true` or `false`. Left blank, OpenDuet's model catalog
+   * decides. `false` sends its searches to OpenDuet's own search instead.
+   */
+  OPENDUET_DEFAULT_MODEL_NATIVE_SEARCH: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v === 'true')),
+  ),
+  /** A Brave Search API key. When set, `web.search` uses it after a Tavily key. */
+  BRAVE_SEARCH_API_KEY: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  /**
+   * A Tavily API key. When set, `web.search` uses Tavily before anything else,
+   * and `web.fetch` reads a page through Tavily Extract when the direct read
+   * gets no text from it.
+   */
+  TAVILY_API_KEY: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  /**
+   * The output limit the gateway gives a model request that names none. The
+   * engine names none by default, so this is the usual ceiling on one reply.
+   */
+  OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(4096),
+  OPENDUET_SPEECH_MODEL: unsetWhenBlank(z.string().optional()),
+  /**
+   * ElevenLabs, for everything voice (docs/VOICE.md). The key alone turns on
+   * speech, transcription, push-to-talk and voice mode, and speech prefers it
+   * over an OpenAI key. Each model and voice left empty uses the default there.
+   */
+  ELEVENLABS_API_KEY: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  ELEVENLABS_VOICE_ID: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9]{1,64}$/, 'use a voice id from your ElevenLabs voice library')
+      .optional(),
+  ),
+  ELEVENLABS_SECOND_VOICE_ID: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[A-Za-z0-9]{1,64}$/, 'use a voice id from your ElevenLabs voice library')
+      .optional(),
+  ),
+  ELEVENLABS_SPEECH_MODEL: unsetWhenBlank(z.string().min(1).max(120).optional()),
+  ELEVENLABS_STREAMING_MODEL: unsetWhenBlank(z.string().min(1).max(120).optional()),
+  ELEVENLABS_TRANSCRIPTION_MODEL: unsetWhenBlank(z.string().min(1).max(120).optional()),
+  /** Seconds of push-to-talk recording one person may have transcribed in a day. Unset, no cap. */
+  OPENDUET_VOICE_DAILY_SECONDS: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /** Characters of replies one person may have read aloud in a day. Unset, no cap. */
+  OPENDUET_VOICE_DAILY_CHARACTERS: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /** Voice mode sessions one person may start in a day. Unset, no cap. */
+  OPENDUET_VOICE_DAILY_SESSIONS: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /**
+   * Minutes of calls one person may have in a month (the last 30 days). Unset,
+   * calls are not capped.
+   */
+  OPENDUET_CALL_MONTHLY_MINUTES: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /**
+   * The ElevenLabs Speech Engine calls use. Unset, the service makes one for
+   * itself at the first call, pointed at OPENDUET_PUBLIC_URL, and keeps it in
+   * step. Set, that engine is used exactly as it is configured in ElevenLabs.
+   */
+  ELEVENLABS_SPEECH_ENGINE_ID: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^seng_[A-Za-z0-9]{1,64}$/, 'use a speech engine id, seng_…')
+      .optional(),
+  ),
+  /**
+   * Asides (short words with the agent while it works in voice mode) one
+   * person may have in a day. Unset or blank: no daily limit; asides are
+   * still counted, so a limit set later holds from the first day.
+   */
+  OPENDUET_VOICE_DAILY_ASIDES: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /**
+   * Automatic memory reads what a person says in chat with this model, through
+   * the model gateway. Unset, it uses the default provider and model; `off`
+   * keeps structured observations only and makes no model call.
+   */
+  OPENDUET_MEMORY_MODEL: z.string().optional(),
+  OPENDUET_MEMORY_PROVIDER: z.string().optional(),
+  /** Extraction calls one person's memory may make in a day. Unset or blank: no daily limit. */
+  OPENDUET_MEMORY_DAILY_CALLS: unsetWhenBlank(z.coerce.number().int().nonnegative().optional()),
+  /**
+   * Semantic recall embeds memory with this model. Unset, the default
+   * provider's embedding model when it has one (Fireworks, OpenAI, Google),
+   * else the first such provider with a key; with none, recall stays lexical.
+   * `off` turns it off. `local` as the provider embeds on the local model
+   * server, which then needs the model and its dimensions named.
+   */
+  OPENDUET_EMBEDDING_PROVIDER: unsetWhenBlank(z.string().max(100).optional()),
+  OPENDUET_EMBEDDING_MODEL: unsetWhenBlank(z.string().max(200).optional()),
+  OPENDUET_EMBEDDING_DIMENSIONS: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(4096).optional(),
+  ),
+  /**
+   * Auto-review asks this model whether a reversible action may go ahead
+   * without the person. Unset, it uses the default provider and model; `off`
+   * runs no reviewer, and every action it would have reviewed asks the person.
+   */
+  OPENDUET_REVIEW_MODEL: z.string().optional(),
+  OPENDUET_REVIEW_PROVIDER: z.string().optional(),
+  /** How long one review may take before the action goes to the person. */
+  OPENDUET_REVIEW_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(20_000).default(12_000),
+  /**
+   * How long a conversation turn may stay silent before the person gets a
+   * one-line acknowledgement from the fast model, in milliseconds. `0` turns
+   * it off, which is the default for now.
+   */
+  OPENDUET_ACK_AFTER_MS: z.coerce.number().int().min(0).max(30_000).default(0),
+  /** Reviews one space may ask for in an hour; past it, the person is asked. */
+  OPENDUET_REVIEW_HOURLY_LIMIT: z.coerce.number().int().nonnegative().default(60),
+  /**
+   * Undo send: how many seconds a message waits after it is cleared to go,
+   * while the person can still cancel it. 0 sends at once.
+   */
+  OPENDUET_SEND_HOLD_SECONDS: z.coerce.number().int().min(0).max(120).default(20),
+  /**
+   * Work nobody is waiting on (a schedule, a timer, an event) that would reach
+   * someone outside OpenDuet goes ahead on its own from this confidence, built
+   * from what the person said before, and is otherwise left as a suggestion.
+   */
+  OPENDUET_PROACTIVE_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.6),
+  /**
+   * The level a chat app's message to others starts at, until the person
+   * chooses one: `when_confident` (also `confidence`, the default), `draft`,
+   * `draft_only` (a draft that proactive work never sends, as before) or
+   * `always`. A level the person chose wins.
+   */
+  OPENDUET_MESSAGES_TO_OTHERS: z
+    .enum(['confidence', 'draft_only', 'draft', 'when_confident', 'always'])
+    .default('confidence'),
+
+  /**
+   * Spending caps on model calls, in US dollars (estimated from the price
+   * table) and in tokens, for the whole installation and for each person, per
+   * UTC day and month. Unset is no limit. docs/DEPLOYMENT.md, "Spending caps".
+   */
+  OPENDUET_SPEND_MONTHLY_USD: unsetWhenBlank(z.coerce.number().positive().optional()),
+  OPENDUET_SPEND_DAILY_USD: unsetWhenBlank(z.coerce.number().positive().optional()),
+  OPENDUET_SPEND_PERSON_MONTHLY_USD: unsetWhenBlank(z.coerce.number().positive().optional()),
+  OPENDUET_SPEND_PERSON_DAILY_USD: unsetWhenBlank(z.coerce.number().positive().optional()),
+  OPENDUET_SPEND_MONTHLY_TOKENS: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+  OPENDUET_SPEND_DAILY_TOKENS: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+  OPENDUET_SPEND_PERSON_MONTHLY_TOKENS: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  OPENDUET_SPEND_PERSON_DAILY_TOKENS: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+  /**
+   * Each person's background model calls alone (watches, standing runs,
+   * routines, memory and learning), beside the limits above. A person's own
+   * messages never count here and are never held back by them. Unset is no
+   * limit. docs/BACKGROUND-COMPUTE.md.
+   */
+  OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_USD: unsetWhenBlank(
+    z.coerce.number().positive().optional(),
+  ),
+  OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_USD: unsetWhenBlank(
+    z.coerce.number().positive().optional(),
+  ),
+  OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_TOKENS: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_TOKENS: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  /**
+   * Days a person may go unseen (no sign-in, no use of the app or of a
+   * channel) before their routines, watches and other standing work rest.
+   * They come back on the next time the person is seen, without running the
+   * times they missed. Unset or blank: standing work never rests.
+   */
+  OPENDUET_REST_ROUTINES_AFTER_DAYS: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(3650).optional(),
+  ),
+  /**
+   * How many routines and pieces of repeating work one person may keep at
+   * once. Unset or blank: no limit.
+   */
+  OPENDUET_ROUTINES_PER_PERSON_MAX: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(100_000).optional(),
+  ),
+  /**
+   * How many pieces of long work (runs) one space may have going at once.
+   * Unset or blank: no limit.
+   */
+  OPENDUET_RUNS_ACTIVE_PER_SPACE_MAX: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(100_000).optional(),
+  ),
+  /**
+   * When true, a job's model calls count against its dollar limit
+   * (`max_usd_est`) as well as its actions do. Off, only actions and search
+   * fees count there.
+   */
+  OPENDUET_JOB_USD_COUNTS_MODELS: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
+  ),
+  /**
+   * Operator alerts on spending, through the same webhook and email as the
+   * health alerts. Each is off unless set: the last hour's model spending
+   * above this many times the installation's usual hour (the median hour of
+   * the week before), or one person above this percent of today's spending.
+   * Neither fires below OPENDUET_ALERT_SPEND_MIN_USD. docs/DEPLOYMENT.md, "Alerts".
+   */
+  OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE: unsetWhenBlank(z.coerce.number().min(1).optional()),
+  OPENDUET_ALERT_SPEND_PERSON_PERCENT: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(100).optional(),
+  ),
+  OPENDUET_ALERT_SPEND_MIN_USD: unsetWhenBlank(z.coerce.number().nonnegative().default(1)),
+  /**
+   * Files sent in chat: the largest file in MB and the most files in one
+   * message, and, unset by default (no limit), how many uploads one person may
+   * have under way at once and may start in a window of minutes. A hosted
+   * install sets the last two. docs/DEPLOYMENT.md, "Attachments".
+   */
+  OPENDUET_ATTACHMENT_MAX_MB: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(ATTACHMENT_LIMITS.file_bytes_ceiling / (1024 * 1024))
+      .default(ATTACHMENT_LIMITS.file_bytes / (1024 * 1024)),
+  ),
+  OPENDUET_ATTACHMENTS_PER_MESSAGE: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(ATTACHMENT_LIMITS.per_message_ceiling)
+      .default(ATTACHMENT_LIMITS.per_message),
+  ),
+  OPENDUET_ATTACHMENT_UPLOADS_AT_ONCE: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  OPENDUET_ATTACHMENT_UPLOADS_PER_WINDOW: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  OPENDUET_ATTACHMENT_UPLOAD_WINDOW_MINUTES: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(1440).default(10),
+  ),
+  /**
+   * Always on, for the service's own sake: uploads it holds in flight at once
+   * from everyone, and the MB they may hold between them (never less than one
+   * file at the largest size).
+   */
+  OPENDUET_ATTACHMENT_SERVER_UPLOADS: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(256).default(16),
+  ),
+  OPENDUET_ATTACHMENT_SERVER_UPLOAD_MB: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(8192).default(384),
+  ),
+  /** Percent of a limit at which the person is told it is close. */
+  OPENDUET_SPEND_NOTICE_PERCENT: unsetWhenBlank(z.coerce.number().int().min(1).max(99).default(80)),
+  /** Per-million-token prices that replace the built-in estimates, as JSON. */
+  OPENDUET_MODEL_PRICES: unsetWhenBlank(
+    z
+      .string()
+      .optional()
+      .superRefine((value, context) => {
+        try {
+          parseModelPrices(value);
+        } catch (error) {
+          context.addIssue({ code: 'custom', message: (error as Error).message });
+        }
+      }),
+  ),
+  /**
+   * Model routing, each `provider/model`: a fast model for the service's short
+   * calls, a vision model for agent requests that carry pictures, and
+   * fallbacks (comma-separated) for a provider that limits or fails.
+   */
+  OPENDUET_MODEL_FAST: unsetWhenBlank(z.string().max(400).optional()),
+  OPENDUET_MODEL_VISION: unsetWhenBlank(z.string().max(400).optional()),
+  OPENDUET_MODEL_FALLBACK: unsetWhenBlank(z.string().max(2000).optional()),
+  /**
+   * The model that sorts new mail and calendar changes into needs you, for
+   * your information, or ignore, written `provider/model`, or `off` to turn
+   * sorting off. Unset, sorting uses the owner's secondary model for scheduled
+   * work, else OPENDUET_MODEL_FAST, else the default model. Its calls are
+   * background calls, held to the OPENDUET_SPEND_PERSON_BACKGROUND_* limits.
+   */
+  OPENDUET_MODEL_TRIAGE: unsetWhenBlank(z.string().max(400).optional()),
+  /** How often waiting items are sorted, in seconds. */
+  OPENDUET_TRIAGE_INTERVAL_SECONDS: unsetWhenBlank(
+    z.coerce.number().int().min(10).max(86_400).default(120),
+  ),
+  /** Reasoning effort for the agent's turns and for the service's side calls. */
+  OPENDUET_REASONING_EFFORT_AGENT: unsetWhenBlank(z.enum(REASONING_EFFORTS).default('medium')),
+  OPENDUET_REASONING_EFFORT_SIDE: unsetWhenBlank(z.enum(REASONING_EFFORTS).default('low')),
+
+  /**
+   * Operator alerts when the service is unhealthy: a webhook that receives a
+   * JSON POST, and/or email through an SMTP server. docs/DEPLOYMENT.md, "Alerts".
+   */
+  OPENDUET_ALERT_WEBHOOK_URL: unsetWhenBlank(z.url({ protocol: /^https?$/ }).optional()),
+  OPENDUET_ALERT_EMAIL_TO: unsetWhenBlank(z.string().max(500).optional()),
+  OPENDUET_ALERT_EMAIL_FROM: unsetWhenBlank(z.string().max(320).optional()),
+  /** smtp:// or smtps://user:password@host:port, for alert email. */
+  OPENDUET_ALERT_SMTP_URL: unsetWhenBlank(z.string().max(2000).optional()),
+  /** How often the service checks its own health, in seconds. */
+  OPENDUET_ALERT_INTERVAL_SECONDS: unsetWhenBlank(
+    z.coerce.number().int().min(10).max(3600).default(60),
+  ),
+  /** While unhealthy, how often the alert is repeated, in minutes. */
+  OPENDUET_ALERT_REPEAT_MINUTES: unsetWhenBlank(
+    z.coerce.number().int().min(5).max(10_080).default(60),
+  ),
+  /**
+   * The free space, in MB, below which the disk check fails, measured under the
+   * spaces, artifacts and work directories; 0 turns the check off.
+   */
+  OPENDUET_ALERT_DISK_MIN_FREE_MB: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(10_000_000).default(2048),
+  ),
+  /** A bearer token that opens GET /health/detail to the operator. */
+  OPENDUET_OPERATOR_TOKEN: unsetWhenBlank(z.string().min(24).max(512).optional()),
+  /**
+   * Where each problem report is also sent, as a JSON POST, for the people
+   * running the installation. docs/FEEDBACK.md.
+   */
+  OPENDUET_FEEDBACK_WEBHOOK_URL: unsetWhenBlank(z.url({ protocol: /^https?$/ }).optional()),
+
+  /**
+   * The installation's own mail sender, for sign-in and password reset links
+   * to every account: smtp:// or smtps://user:password@host:port, and the From
+   * address. Unset, account mail goes only to the owner, from their own
+   * connected mailbox. docs/DEPLOYMENT.md, "Account mail".
+   */
+  OPENDUET_SMTP_URL: unsetWhenBlank(z.string().max(2000).optional()),
+  OPENDUET_MAIL_FROM: unsetWhenBlank(z.string().max(320).optional()),
+  /**
+   * The SHA-256, in hex, of the one-time setup code `openduet init` printed.
+   * Set, creating the first account needs that code. docs/DEPLOYMENT.md,
+   * "Claiming a new installation".
+   */
+  OPENDUET_SETUP_CODE_HASH: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[0-9a-fA-F]{64}$/, 'the SHA-256 of the setup code, in hex')
+      .optional(),
+  ),
+  /**
+   * Lets the first visitor create the owner without a setup code even when
+   * OPENDUET_PUBLIC_URL or OPENDUET_WEB_ORIGIN names another machine. Off, such an
+   * installation with no code refuses its first account until the operator
+   * runs `openduet account setup-code`. A blank or missing code never turns this on.
+   */
+  OPENDUET_SETUP_OPEN: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
+  ),
+  /**
+   * The web app's own origin when it sits behind a proxy (the web server reads
+   * it too). Here it only says whether the sign-in page is reachable from
+   * other machines, for the setup code.
+   */
+  OPENDUET_WEB_ORIGIN: unsetWhenBlank(z.string().max(2000).optional()),
+  /**
+   * Sign-in through an OpenID Connect identity provider (Google, Microsoft,
+   * Okta, Authentik, Keycloak, or any other issuer): its issuer URL and the
+   * client registered there, whose redirect is
+   * <OPENDUET_PUBLIC_URL>/api/signin/oidc/callback. All three, or none.
+   * docs/DEPLOYMENT.md, "Sign-in with your identity provider".
+   */
+  OPENDUET_OIDC_ISSUER: unsetWhenBlank(
+    z
+      .url()
+      .max(2000)
+      .refine((value) => {
+        const url = new URL(value);
+        const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+        return (
+          !url.username &&
+          !url.password &&
+          !url.hash &&
+          !url.search &&
+          (url.protocol === 'https:' || (url.protocol === 'http:' && local))
+        );
+      }, 'an https:// issuer URL with no query (plain http only on this machine)')
+      .optional(),
+  ),
+  OPENDUET_OIDC_CLIENT_ID: unsetWhenBlank(z.string().min(1).max(512).optional()),
+  OPENDUET_OIDC_CLIENT_SECRET: unsetWhenBlank(z.string().min(1).max(2048).optional()),
+  /** What the sign-in button says after "Continue with", for example `Google`. */
+  OPENDUET_OIDC_LABEL: unsetWhenBlank(z.string().min(1).max(60).default('single sign-on')),
+  /** The scopes asked for; `openid` is always among them. */
+  OPENDUET_OIDC_SCOPES: unsetWhenBlank(
+    z
+      .string()
+      .max(1000)
+      .regex(
+        /^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/,
+        'scopes separated by spaces',
+      )
+      .default('openid email profile')
+      .transform((value) => {
+        const scopes = value.split(' ');
+        return (scopes.includes('openid') ? scopes : ['openid', ...scopes]).join(' ');
+      }),
+  ),
+  /**
+   * `existing` signs in only accounts that already exist here, matched by
+   * verified email or by a provider account linked before. `create` also
+   * makes a person account at a first sign-in.
+   */
+  OPENDUET_OIDC_ACCOUNTS: unsetWhenBlank(z.enum(['existing', 'create']).default('existing')),
+  /**
+   * Which existing accounts a verified email from the provider may claim the
+   * first time. `any`: every person account with that email. `no-password`:
+   * only accounts with no password (made with `openduet account create`, or by
+   * a sign-in), plus an account with a password that the operator opened with
+   * `openduet account link <email>`. Use `no-password` with a public provider,
+   * where an address it once verified may no longer belong to the same person.
+   */
+  OPENDUET_OIDC_EMAIL_LINK: unsetWhenBlank(z.enum(['any', 'no-password']).default('any')),
+  /**
+   * `name=value`: a claim the provider must put in the ID token for the person
+   * to get in, such as `openduet_access=true` or a group in `groups=openduet`.
+   * A list claim needs to contain the value.
+   */
+  OPENDUET_OIDC_REQUIRE_CLAIM: unsetWhenBlank(
+    z
+      .string()
+      .max(500)
+      .regex(/^[A-Za-z0-9_.:/-]+=.+$/, 'name=value')
+      .transform((value) => {
+        const at = value.indexOf('=');
+        return { name: value.slice(0, at), value: value.slice(at + 1) };
+      })
+      .optional(),
+  ),
+  /**
+   * `off` leaves the identity provider as the only way in: passwords, emailed
+   * sign-in links and password resets are refused. It needs OPENDUET_OIDC_ISSUER.
+   */
+  OPENDUET_PASSWORD_SIGNIN: unsetWhenBlank(
+    z
+      .enum(['on', 'off'])
+      .default('on')
+      .transform((value) => value === 'on'),
+  ),
+
+  /**
+   * What the engine in an attempt's cell is bounded by. Each is read again from
+   * the environment when an attempt starts, which is where it is applied, but it
+   * is checked here so a malformed value stops the service on boot rather than
+   * failing every attempt one at a time afterwards. `docs/DEPLOYMENT.md` says
+   * what each of them buys.
+   */
+  OPENDUET_ENGINE_MAX_TURNS: unsetWhenBlank(
+    z.coerce.number().int().positive().default(DEFAULT_ENGINE_MAX_TURNS),
+  ),
+  OPENDUET_COMPACTION_MAX_TOKENS: unsetWhenBlank(
+    z.coerce.number().int().positive().default(DEFAULT_COMPACTION_MAX_TOKENS),
+  ),
+  OPENDUET_MODEL_CONTEXT_WINDOW: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+
+  /**
+   * Which sandboxes at a provider belong to this installation. It is the
+   * `openduet.project` label, and reconciliation destroys only sandboxes that
+   * carry it, so two installations sharing one provider account never touch
+   * each other's. Pick something random once and keep it: changing it orphans
+   * whatever the old value labelled.
+   */
+  OPENDUET_SANDBOX_PROJECT: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9-]{2,40}$/)
+      .optional(),
+  ),
+  /** How long a sandbox session may go unrenewed before the sweep ends it. */
+  OPENDUET_SANDBOX_LEASE_SECONDS: unsetWhenBlank(
+    z.coerce.number().int().min(SANDBOX_LEASE_FLOOR_SECONDS).default(900),
+  ),
+  /** The most sandboxes this installation may have running at once, over every connection. */
+  OPENDUET_SANDBOX_MAX_CONCURRENT: unsetWhenBlank(z.coerce.number().int().positive().default(4)),
+  /**
+   * The most any one connection may have running. A provider quota belongs to
+   * an account, and a connection is an account here, so this keeps one busy
+   * space from spending another's. Left unset it is the ceiling above, and it
+   * is never allowed past it.
+   */
+  OPENDUET_SANDBOX_MAX_CONCURRENT_PER_CONNECTION: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  /**
+   * How many displays one agent's computer runs at once: each chat and each
+   * background run works on its own, with its own browser. A chat past this
+   * is told the computer is full.
+   */
+  OPENDUET_SANDBOX_MAX_DISPLAYS: unsetWhenBlank(z.coerce.number().int().min(1).max(64).default(6)),
+  /** How many background processes one agent's computer may run at once. */
+  OPENDUET_PROCESS_MAX_PER_COMPUTER: unsetWhenBlank(
+    z.coerce.number().int().positive().default(PROCESS_LIMITS.max_per_computer),
+  ),
+  /** How many background processes one space may run at once, over all its computers. */
+  OPENDUET_PROCESS_MAX_PER_SPACE: unsetWhenBlank(
+    z.coerce.number().int().positive().default(PROCESS_LIMITS.max_per_space),
+  ),
+  /** How long a background process runs when it is given no time limit. */
+  OPENDUET_PROCESS_DEFAULT_TTL_MINUTES: unsetWhenBlank(
+    z.coerce.number().int().positive().default(PROCESS_LIMITS.default_ttl_minutes),
+  ),
+  /** The longest time limit a background process may have. */
+  OPENDUET_PROCESS_MAX_TTL_MINUTES: unsetWhenBlank(
+    z.coerce.number().int().positive().default(PROCESS_LIMITS.max_ttl_minutes),
+  ),
+  /** The output a process keeps inside the computer, as a ring of two halves. */
+  OPENDUET_PROCESS_OUTPUT_MAX_BYTES: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .min(64 * 1024)
+      .default(PROCESS_LIMITS.output_max_bytes),
+  ),
+  /**
+   * How long a space's background processes may keep its computers running
+   * in one day (UTC), after the turns that used them ended, added up over its
+   * computers. Past it they are stopped and new ones refused until the next
+   * day. Unset or blank: no daily limit; awake time is still counted.
+   */
+  OPENDUET_SANDBOX_AWAKE_SECONDS_PER_DAY: unsetWhenBlank(
+    z.coerce.number().int().positive().optional(),
+  ),
+  /** How long a suspended workspace is kept while nobody resumes it. */
+  OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(7 * 24 * 3600),
+  ),
+  /**
+   * How long Modal keeps a workspace snapshot, and Daytona a stopped
+   * workspace, that this service never deletes. It
+   * must outlast the retention period, or a workspace would be offered a
+   * snapshot the provider has already collected. A snapshot deletion the
+   * provider acknowledged is not re-checked; anything it missed expires with
+   * the snapshot TTL (OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS).
+   */
+  OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(30 * 24 * 3600),
+  ),
+  /**
+   * The most computers this installation keeps at Maritime, asleep or awake.
+   * Past it a new computer is refused with a sentence the agent passes on.
+   * Unset, there is no cap.
+   */
+  OPENDUET_MARITIME_MAX_COMPUTERS: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+  /**
+   * The most of those computers awake at once. A computer that would wake past
+   * it waits a little, then is refused with a sentence the agent passes on.
+   * Unset, there is no cap.
+   */
+  OPENDUET_MARITIME_MAX_AWAKE: unsetWhenBlank(z.coerce.number().int().positive().optional()),
+  /** E2B's maximum continuous runtime follows the account's plan. */
+  OPENDUET_E2B_PLAN: unsetWhenBlank(z.enum(['hobby', 'pro']).default('hobby')),
+  /**
+   * Modal's SDK speaks gRPC, and its transport honours `grpc_proxy`,
+   * `https_proxy`, `http_proxy` and `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` from
+   * this process's own environment. Where one of those is set, the Modal
+   * adapter is refused unless the operator says here that the proxy and its
+   * trust anchors are theirs.
+   */
+  OPENDUET_SANDBOX_ALLOW_PROXY_ENVIRONMENT: unsetWhenBlank(
+    z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
+  ),
+  /**
+   * The sandbox every space gets without anyone installing one. `docker` runs
+   * one container per agent on this service's own Docker engine, reached through
+   * OPENDUET_DOCKER_SOCKET; it needs OPENDUET_SANDBOX_PROJECT. Left unset, a space
+   * has a sandbox only when a person installs a connection for one.
+   */
+  OPENDUET_SANDBOX_PROVIDER: unsetWhenBlank(z.enum(['docker']).optional()),
+  /** The image a docker sandbox starts from; it must already be on the engine. */
+  OPENDUET_SANDBOX_DOCKER_IMAGE: unsetWhenBlank(
+    z.string().min(1).max(200).default('openduet-sandbox:local'),
+  ),
+  OPENDUET_SANDBOX_DOCKER_CPUS: unsetWhenBlank(z.coerce.number().positive().max(64).default(1)),
+  OPENDUET_SANDBOX_DOCKER_MEMORY_MB: unsetWhenBlank(
+    z.coerce.number().int().min(512).max(262_144).default(2048),
+  ),
+  OPENDUET_SANDBOX_DOCKER_PIDS: unsetWhenBlank(
+    z.coerce.number().int().min(64).max(65_536).default(512),
+  ),
+  /** What the agent's two volumes may hold together, and the largest one file may grow. */
+  OPENDUET_SANDBOX_DOCKER_DISK_MB: unsetWhenBlank(
+    z.coerce.number().int().min(256).max(1_048_576).default(4096),
+  ),
+  /**
+   * What the default sandbox may reach: `open` is public HTTPS sites through the
+   * service's egress guard, `connected_hosts_only` the hosts listed below,
+   * `deny_all` is nothing at all.
+   */
+  OPENDUET_SANDBOX_DOCKER_EGRESS: unsetWhenBlank(
+    z.enum(['open', 'connected_hosts_only', 'deny_all']).default('open'),
+  ),
+  /** A container nothing has used for this long is stopped; it starts again when it is used. */
+  OPENDUET_SANDBOX_DOCKER_IDLE_SECONDS: unsetWhenBlank(
+    z.coerce.number().int().min(60).max(86_400).default(900),
+  ),
+  /** The port the egress guard listens on inside the service's container. */
+  OPENDUET_SANDBOX_EGRESS_PORT: unsetWhenBlank(
+    z.coerce.number().int().min(1024).max(65_535).default(8791),
+  ),
+  /**
+   * The hosts a `connected_hosts_only` computer may reach, such as a package
+   * registry: comma-separated names, or `.example.com` for every name below
+   * one. A suffix needs two labels at least, so `.com` alone is refused.
+   */
+  OPENDUET_SANDBOX_EGRESS_EXTRA_HOSTS: unsetWhenBlank(
+    z
+      .string()
+      .default('')
+      .transform((value) =>
+        value
+          .split(',')
+          .map((item) => item.trim().toLowerCase())
+          .filter(Boolean),
+      )
+      .pipe(
+        z
+          .array(
+            z
+              .string()
+              .max(253)
+              .regex(
+                /^\.?(?=[a-z0-9.-]*[a-z])[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/,
+                'each extra host is a DNS name, or .name for the names below it',
+              )
+              .refine(
+                (host) => !host.startsWith('.') || host.slice(1).includes('.'),
+                'a suffix covers too much with one label; name at least two, as in .example.com',
+              ),
+          )
+          .max(64),
+      ),
+  ),
+  /** How many days a deleted file stays in the trash, where it can be restored. */
+  OPENDUET_TRASH_DAYS: unsetWhenBlank(z.coerce.number().int().min(1).max(365).default(7)),
+  /** The most one conversation's trash holds, in MiB; older trash makes room first. */
+  OPENDUET_TRASH_MAX_MB: unsetWhenBlank(z.coerce.number().int().min(1).max(1048576).default(1024)),
+  /**
+   * The most one person may keep, in MiB, across their spaces: their Files,
+   * what their chats saved and what they sent in chat. Unset, nobody is limited.
+   */
+  OPENDUET_STORAGE_PER_PERSON_MB: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(1073741824).optional(),
+  ),
+  /**
+   * How many days an observation read from a connected mailbox or calendar is
+   * kept when no job, situation or listening trigger holds it.
+   */
+  OPENDUET_OBSERVATION_RETENTION_DAYS: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(3650).default(14),
+  ),
+  /**
+   * How many days the delivery key of an expired observation is kept, so the
+   * same message read again is not delivered twice. It holds no content.
+   */
+  OPENDUET_OBSERVATION_TOMBSTONE_DAYS: unsetWhenBlank(
+    z.coerce.number().int().min(1).max(3650).default(180),
+  ),
+  /**
+   * How many days the record of each model call, and what connected accounts
+   * reported that no job took in, is kept. Unset keeps both; each day's calls
+   * are summed into the daily usage roll-up before they go. At least 35, so
+   * this month's spending and the roll-up still read whole days.
+   */
+  OPENDUET_RETENTION_DAYS: unsetWhenBlank(z.coerce.number().int().min(35).max(3650).optional()),
+  /** How many days the record of where each computer connected is kept. */
+  OPENDUET_EGRESS_RECORD_DAYS: unsetWhenBlank(z.coerce.number().int().min(1).max(3650).default(30)),
+  /**
+   * The largest change from the command line the egress relay holds while it
+   * asks for approval. A larger one is refused with a plain message.
+   */
+  OPENDUET_EGRESS_HOLD_MAX_BYTES: unsetWhenBlank(
+    z.coerce
+      .number()
+      .int()
+      .min(1024 * 1024)
+      .max(512 * 1024 * 1024)
+      .default(64 * 1024 * 1024),
+  ),
+  /**
+   * How long a change from the command line waits inside its command for an
+   * answer, always ending at least ten seconds before the command's own time.
+   */
+  OPENDUET_EGRESS_APPROVAL_HOLD_SECONDS: unsetWhenBlank(
+    z.coerce.number().int().min(0).max(600).default(90),
+  ),
+});
+
+/**
+ * A catalog address that misses the bound broker fails every attempt before its
+ * first model call, so the pair is settled here rather than at the first job.
+ */
+export const envSchema = variables.transform((value, context) => {
+  const derived = brokerUrlForBind(value.OPENDUET_BROKER_BIND);
+  const mismatch =
+    value.OPENDUET_BROKER_URL === undefined
+      ? null
+      : brokerUrlMismatch(value.OPENDUET_BROKER_BIND, value.OPENDUET_BROKER_URL);
+  if (mismatch)
+    context.addIssue({ code: 'custom', path: ['OPENDUET_BROKER_URL'], message: mismatch });
+  if (
+    value.OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS < value.OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS
+  )
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS'],
+      message: `a workspace snapshot must outlast the retention period: ${value.OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS}s is shorter than OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS=${value.OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS}s`,
+    });
+  if (value.OPENDUET_PROCESS_DEFAULT_TTL_MINUTES > value.OPENDUET_PROCESS_MAX_TTL_MINUTES)
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_PROCESS_DEFAULT_TTL_MINUTES'],
+      message: `a process's default time limit cannot exceed the longest one: ${value.OPENDUET_PROCESS_DEFAULT_TTL_MINUTES} is more than OPENDUET_PROCESS_MAX_TTL_MINUTES=${value.OPENDUET_PROCESS_MAX_TTL_MINUTES}`,
+    });
+  if (Boolean(value.MICROSOFT_OAUTH_CLIENT_ID) !== Boolean(value.MICROSOFT_OAUTH_CLIENT_SECRET))
+    context.addIssue({
+      code: 'custom',
+      path: [
+        value.MICROSOFT_OAUTH_CLIENT_ID
+          ? 'MICROSOFT_OAUTH_CLIENT_SECRET'
+          : 'MICROSOFT_OAUTH_CLIENT_ID',
+      ],
+      message: 'set both MICROSOFT_OAUTH_CLIENT_ID and MICROSOFT_OAUTH_CLIENT_SECRET, or neither',
+    });
+  if (value.OPENDUET_SANDBOX_PROVIDER && !value.OPENDUET_SANDBOX_PROJECT)
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_SANDBOX_PROJECT'],
+      message: `OPENDUET_SANDBOX_PROVIDER=${value.OPENDUET_SANDBOX_PROVIDER} needs OPENDUET_SANDBOX_PROJECT, the label that says which sandboxes are this installation's`,
+    });
+  if (value.OPENDUET_BLOB_STORE === 's3')
+    for (const name of [
+      'OPENDUET_BLOB_S3_BUCKET',
+      'OPENDUET_BLOB_S3_ACCESS_KEY_ID',
+      'OPENDUET_BLOB_S3_SECRET_ACCESS_KEY',
+    ] as const)
+      if (!value[name])
+        context.addIssue({
+          code: 'custom',
+          path: [name],
+          message: `OPENDUET_BLOB_STORE=s3 needs ${name}`,
+        });
+  for (const name of [
+    'OPENDUET_MODEL_FAST',
+    'OPENDUET_MODEL_VISION',
+    'OPENDUET_MODEL_FALLBACK',
+  ] as const)
+    for (const entry of (value[name] ?? '').split(',').filter((part) => part.trim()))
+      try {
+        parseModelChoice(entry, name);
+      } catch (error) {
+        context.addIssue({ code: 'custom', path: [name], message: (error as Error).message });
+      }
+  if (value.OPENDUET_MODEL_TRIAGE && value.OPENDUET_MODEL_TRIAGE.trim() !== 'off')
+    try {
+      parseModelChoice(value.OPENDUET_MODEL_TRIAGE, 'OPENDUET_MODEL_TRIAGE');
+    } catch (error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['OPENDUET_MODEL_TRIAGE'],
+        message: (error as Error).message,
+      });
+    }
+  // OpenDuet's own networks (attempts, computers, plugins) are never anyone's
+  // internal host: a listed range that overlaps them would open one computer
+  // to another.
+  try {
+    const pool = parseNetworkPool(value.OPENDUET_NETWORK_POOL);
+    const overlap =
+      pool &&
+      rangesOverlap(parsePrivateHosts(value.OPENDUET_PRIVATE_HOSTS), {
+        family: 4,
+        base: BigInt(pool.start),
+        prefix: pool.prefix,
+      });
+    if (overlap)
+      context.addIssue({
+        code: 'custom',
+        path: ['OPENDUET_PRIVATE_HOSTS'],
+        message: `${formatRange(overlap)} overlaps OPENDUET_NETWORK_POOL (${value.OPENDUET_NETWORK_POOL}), the range OpenDuet's own computers take; list a range outside it, or move the pool`,
+      });
+  } catch {
+    // Either setting is already refused on its own.
+  }
+  if (Boolean(value.OPENDUET_SMTP_URL) !== Boolean(value.OPENDUET_MAIL_FROM))
+    context.addIssue({
+      code: 'custom',
+      path: [value.OPENDUET_SMTP_URL ? 'OPENDUET_MAIL_FROM' : 'OPENDUET_SMTP_URL'],
+      message: 'set both OPENDUET_SMTP_URL and OPENDUET_MAIL_FROM, or neither',
+    });
+  if (value.OPENDUET_ALERT_EMAIL_TO && !value.OPENDUET_ALERT_SMTP_URL)
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_ALERT_SMTP_URL'],
+      message: 'OPENDUET_ALERT_EMAIL_TO needs OPENDUET_ALERT_SMTP_URL to send through',
+    });
+  if (Boolean(value.GOOGLE_OAUTH_CLIENT_ID) !== Boolean(value.GOOGLE_OAUTH_CLIENT_SECRET))
+    context.addIssue({
+      code: 'custom',
+      path: [
+        value.GOOGLE_OAUTH_CLIENT_ID ? 'GOOGLE_OAUTH_CLIENT_SECRET' : 'GOOGLE_OAUTH_CLIENT_ID',
+      ],
+      message:
+        'set both GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET, or neither (a Google OAuth client whose redirect is <OPENDUET_PUBLIC_URL>/api/oauth/google/callback; see docs/mail-calendar.md)',
+    });
+  if (Boolean(value.GITHUB_MCP_CLIENT_ID) !== Boolean(value.GITHUB_MCP_CLIENT_SECRET))
+    context.addIssue({
+      code: 'custom',
+      path: [value.GITHUB_MCP_CLIENT_ID ? 'GITHUB_MCP_CLIENT_SECRET' : 'GITHUB_MCP_CLIENT_ID'],
+      message:
+        'set both GITHUB_MCP_CLIENT_ID and GITHUB_MCP_CLIENT_SECRET, or neither (a GitHub OAuth app whose callback is <OPENDUET_PUBLIC_URL>/api/oauth/callback; see docs/CONNECTORS.md)',
+    });
+  const oidc = [
+    value.OPENDUET_OIDC_ISSUER,
+    value.OPENDUET_OIDC_CLIENT_ID,
+    value.OPENDUET_OIDC_CLIENT_SECRET,
+  ];
+  if (oidc.some(Boolean) && !oidc.every(Boolean))
+    context.addIssue({
+      code: 'custom',
+      path: [
+        !value.OPENDUET_OIDC_ISSUER
+          ? 'OPENDUET_OIDC_ISSUER'
+          : !value.OPENDUET_OIDC_CLIENT_ID
+            ? 'OPENDUET_OIDC_CLIENT_ID'
+            : 'OPENDUET_OIDC_CLIENT_SECRET',
+      ],
+      message:
+        'set OPENDUET_OIDC_ISSUER, OPENDUET_OIDC_CLIENT_ID and OPENDUET_OIDC_CLIENT_SECRET together, or none of them (a client whose redirect is <OPENDUET_PUBLIC_URL>/api/signin/oidc/callback; see docs/DEPLOYMENT.md)',
+    });
+  if (value.OPENDUET_OIDC_ISSUER && !value.OPENDUET_PUBLIC_URL)
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_PUBLIC_URL'],
+      message:
+        'OPENDUET_OIDC_ISSUER needs OPENDUET_PUBLIC_URL, the address the identity provider sends people back to',
+    });
+  if (!value.OPENDUET_PASSWORD_SIGNIN && !value.OPENDUET_OIDC_ISSUER)
+    context.addIssue({
+      code: 'custom',
+      path: ['OPENDUET_PASSWORD_SIGNIN'],
+      message: 'OPENDUET_PASSWORD_SIGNIN=off needs OPENDUET_OIDC_ISSUER, or nobody could sign in',
+    });
+  return {
+    ...value,
+    OPENDUET_BROKER_URL: value.OPENDUET_BROKER_URL ?? derived ?? '',
+    OPENDUET_ASSISTANT_NAME: value.OPENDUET_ASSISTANT_NAME ?? value.OPENDUET_INSTANCE_NAME,
+  };
+});
+
+export type Env = z.infer<typeof envSchema>;
+
+export type EnvResult = { ok: true; env: Env } | { ok: false; issues: string[] };
+
+/** Parse without throwing, so the caller decides how loudly to fail. */
+/**
+ * Settings that may be given as a file instead (`NAME_FILE`), for values a
+ * setup step writes into a volume rather than an operator into deploy/.env.
+ */
+export const FILE_SETTINGS = [
+  'DATABASE_URL',
+  'OPENDUET_EFFECTS_DATABASE_URL',
+  'OPENDUET_CELLS_KEY',
+] as const;
+
+/** The source with each `NAME_FILE` read into `NAME`, where `NAME` itself is unset. */
+export function withFileSettings(
+  source: Record<string, string | undefined>,
+  read: (path: string) => string = (path) => readFileSync(path, 'utf8'),
+): Record<string, string | undefined> {
+  const out = { ...source };
+  for (const name of FILE_SETTINGS) {
+    const path = source[`${name}_FILE`]?.trim();
+    if (!path || source[name]?.trim()) continue;
+    try {
+      out[name] = read(path).trim();
+    } catch (error) {
+      const code = error instanceof Error && 'code' in error ? String(error.code) : 'unreadable';
+      throw new Error(`${name}_FILE names ${path}, which could not be read (${code})`);
+    }
+  }
+  return out;
+}
+
+export function readEnv(source: Record<string, string | undefined> = process.env): EnvResult {
+  const parsed = envSchema.safeParse(source);
+  if (parsed.success) return { ok: true, env: parsed.data };
+  return {
+    ok: false,
+    issues: parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`),
+  };
+}
+
+/** Start-up path: a bad environment stops the process before it accepts traffic. */
+export function loadEnv(source: Record<string, string | undefined> = process.env): Env {
+  // Only the process that starts reads the files; a check of the settings does not.
+  const result = readEnv(withFileSettings(source));
+  if (!result.ok) {
+    throw new Error(`invalid environment:\n  ${result.issues.join('\n  ')}`);
+  }
+  return result.env;
+}
+
+/**
+ * Settings that belong to the scripted demonstration, left on beside a real
+ * model provider. The test connector accepts sends to a fixture destination,
+ * and the scripted provider answers without a model, so on a production
+ * installation either is a way for work to look done when nothing was.
+ */
+export function demonstrationWarnings(env: Env): string[] {
+  if (env.OPENDUET_DEFAULT_PROVIDER === 'fake') return [];
+  const provider = env.OPENDUET_DEFAULT_PROVIDER;
+  return [
+    ...(env.OPENDUET_ENABLE_TEST_CONNECTOR
+      ? [
+          `OPENDUET_ENABLE_TEST_CONNECTOR=true is set beside the real provider ${provider}. The test connector is for the scripted demonstration; set it to false in deploy/.env unless you mean to keep a test destination.`,
+        ]
+      : []),
+    ...(env.OPENDUET_ENABLE_FAKE_PROVIDER
+      ? [
+          `OPENDUET_ENABLE_FAKE_PROVIDER=true is set beside the real provider ${provider}. The scripted provider is for the demonstration; set it to false in deploy/.env so no job can be served by it.`,
+        ]
+      : []),
+  ];
+}

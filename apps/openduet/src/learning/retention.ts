@@ -1,0 +1,63 @@
+import type { MemorySql, MemoryTx } from '../memory/db.ts';
+import type { RestrictionRecord } from '../memory/restore.ts';
+
+/** Invoked inside the memory restriction transaction, including journal replay after restore. */
+export async function restrictEpisodes(
+  tx: MemoryTx,
+  record: RestrictionRecord,
+  affectedClaims: string[],
+) {
+  const ids = [...affectedClaims, ...record.targets.map((target) => target.source_id)];
+  const removed =
+    await tx`update episode set restricted = true, intervention = null, versions = '[]',
+    artifacts = '[]', receipts = '[]', input_refs = '[]', prior_output = null,
+    corrected_output = null, generation_state = 'restricted'
+    where space_id = ${record.space_id} and (
+      (${record.all} and exists (select 1 from job j where j.id = episode.job_id
+        and j.created_at <= ${record.recorded_at})) or exists (
+        select 1 from jsonb_array_elements_text(input_refs) ref where split_part(ref, '@', 1) = any(${ids})
+      )) returning id`;
+  await tx`delete from procedure_candidate where episode_id = any(${removed.map((row) => row.id)})`;
+  // A skill the engine wrote reaches back to what its job read. Forgetting any of
+  // that restricts the skill and erases its bytes, replay after a restore included.
+  await tx`update procedure_candidate set state = 'reverted', rejection_reason = 'inputs_forgotten',
+    body = '', description = '', hold_reason = null, paused_at = null, input_refs = '[]',
+    version = version + 1
+    where origin = 'engine_staged' and space_id = ${record.space_id} and rejection_reason is null and (
+      (${record.all} and exists (select 1 from job j where j.id = procedure_candidate.source_job_id
+        and j.created_at <= ${record.recorded_at})) or exists (
+        select 1 from jsonb_array_elements_text(input_refs) ref where split_part(ref, '@', 1) = any(${ids})
+      ))`;
+}
+
+/** Retention erases private bytes and keeps only a tombstone so retries cannot recreate evidence. */
+export async function expireEpisodes(sql: MemorySql, now = new Date()) {
+  return sql.begin(async (tx) => {
+    const rows =
+      await tx`update episode set restricted = true, intervention = null, versions = '[]',
+      artifacts = '[]', receipts = '[]', input_refs = '[]', prior_output = null,
+      corrected_output = null, generation_state = 'restricted'
+      where expires_at <= ${now.toISOString()} and not restricted returning id`;
+    await tx`delete from procedure_candidate where episode_id = any(${rows.map((row) => row.id)})`;
+    return rows.length;
+  });
+}
+
+/**
+ * Expires episodes every minute on the instance that leads retention; the
+ * others skip the pass. Answers how to stop it.
+ */
+export function startEpisodeRetention(
+  sql: MemorySql,
+  leads: () => boolean | Promise<boolean> = () => true,
+  everyMs = 60_000,
+  say: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): () => void {
+  const timer = setInterval(() => {
+    void Promise.resolve(leads())
+      .then((leading) => (leading ? expireEpisodes(sql) : undefined))
+      .catch(() => say('episode retention failed'));
+  }, everyMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}

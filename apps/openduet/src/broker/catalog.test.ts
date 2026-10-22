@@ -1,0 +1,510 @@
+import { expect, test } from 'bun:test';
+import type { ToolSpec } from '@openduet/contracts';
+import type { Connector } from '../connectors/types.ts';
+import {
+  CATALOG_INDEX_TOKENS,
+  type CatalogItem,
+  MAX_DISPATCH_BUDGET_MS,
+  META_TOOLS,
+  manifestEntry,
+  readableSkills,
+  type SourcedSkill,
+  schemaFingerprint,
+  selectCore,
+  toolDeadline,
+  toolTokens,
+} from './catalog.ts';
+import { relevance, terms } from './lexical.ts';
+import { BROWSER_FIRST_NOTE, COMPUTER_WEB_NOTE, steerWebTools } from './web-steer.ts';
+
+function item(name: string, options: Partial<CatalogItem> = {}): CatalogItem {
+  const tool: ToolSpec = {
+    name,
+    description: `Read ${name}`,
+    input_schema: { type: 'object' },
+    effect_class: 'read',
+    connection_id: null,
+  };
+  return { tool, entry: manifestEntry(tool, [name]), core: false, uses: 0, ...options };
+}
+
+const withoutIndex = (tools: readonly ToolSpec[]): ToolSpec[] =>
+  tools.map((tool) => META_TOOLS.find((meta) => meta.name === tool.name) ?? tool);
+
+test('core uses a serialized token budget, never a count cap, with stable ordering', () => {
+  const many = Array.from({ length: 22 }, (_, i) =>
+    item(`files.t${String(i).padStart(2, '0')}`, { core: true }),
+  );
+  const budget = toolTokens([...META_TOOLS, ...many.map((entry) => entry.tool)]);
+  const selected = selectCore(many, budget);
+  expect(selected).toHaveLength(24);
+  expect(selectCore([...many].reverse(), budget)).toEqual(selected);
+  // The schemas answer to their budget; the names-only index answers to its own.
+  const tight = selectCore(many, 500);
+  expect(toolTokens(withoutIndex(tight))).toBeLessThanOrEqual(500);
+  expect(toolTokens(tight)).toBeLessThanOrEqual(500 + CATALOG_INDEX_TOKENS);
+  expect(toolTokens(selectCore(many, 500, {}, 0))).toBeLessThanOrEqual(500);
+  expect(() => selectCore(many, 1)).toThrow('cannot hold discovery tools');
+});
+
+test('core prioritizes local tools then most-used granted connector verbs', () => {
+  const local = item('files.read', { core: true });
+  const popular = item('mail.search', { uses: 100 });
+  const other = item('mail.archive');
+  const budget = toolTokens([...META_TOOLS, local.tool, popular.tool]);
+  expect(selectCore([other, popular, local], budget).map((tool) => tool.name)).toEqual([
+    'search_tools',
+    'load_tool',
+    'files.read',
+    'mail.search',
+  ]);
+});
+
+test('capabilities and failing tools stay discoverable without inflating the core', () => {
+  const capability = item('images.draw');
+  capability.entry.source = 'capability';
+  const failing = item('mail.search');
+  failing.entry.health = 'failing';
+  const selected = selectCore([capability, failing]);
+  expect(withoutIndex(selected)).toEqual(META_TOOLS);
+  const loader = selected.find((tool) => tool.name === 'load_tool');
+  expect(loader?.description).toContain('images.draw (Read images.draw)');
+  expect(loader?.description).not.toContain('mail.search');
+});
+
+test('fingerprints ignore schema key order and compact manifests bound examples', () => {
+  expect(schemaFingerprint({ type: 'object', properties: { a: { type: 'string' } } })).toBe(
+    schemaFingerprint({ properties: { a: { type: 'string' } }, type: 'object' }),
+  );
+  expect(schemaFingerprint({ type: 'string' })).not.toBe(schemaFingerprint({ type: 'number' }));
+  const tool = item('files.read').tool;
+  const manifest = manifestEntry(
+    { ...tool, description: 'One\nline' },
+    ['z', 'a', 'z'],
+    'skill',
+    'ok',
+    ['One\nexample', 'two', 'three'],
+  );
+  expect(manifest.description).toBe('One line');
+  expect(manifest.examples).toEqual(['One example', 'two']);
+  expect(manifest.required_scopes).toEqual(['a', 'z']);
+  expect(manifest).not.toHaveProperty('input_schema');
+});
+
+function effect(
+  name: string,
+  effectClass: ToolSpec['effect_class'],
+  description: string,
+  options: Partial<CatalogItem> = {},
+): CatalogItem {
+  const tool: ToolSpec = {
+    name,
+    description,
+    input_schema: { type: 'object', properties: { text: { type: 'string' } } },
+    effect_class: effectClass,
+    connection_id: 'conn_01J8ZP3QWABCDEFGHJKMNPQRST',
+  };
+  return { tool, entry: manifestEntry(tool, [name]), core: false, uses: 0, ...options };
+}
+
+const names = (tools: readonly ToolSpec[]) => tools.map((tool) => tool.name);
+
+test('relevance to the objective and the latest owner message outranks usage', () => {
+  const popular = effect('notes.search', 'read', 'Search saved notes', { uses: 500 });
+  const create = effect('calendar.create', 'write_external', 'Create a calendar event');
+  const restart = effect('server.restart', 'write_external', 'Restart a managed service');
+  const budget = toolTokens([...META_TOOLS, create.tool]);
+  expect(names(selectCore([popular, create, restart], budget, {}, 0))).toContain('notes.search');
+  expect(
+    names(
+      selectCore([popular, create, restart], budget, { text: 'Create the Friday review event' }, 0),
+    ),
+  ).toEqual(['search_tools', 'load_tool', 'calendar.create']);
+  // Stemming and name segments: "restarting" reaches `server.restart`.
+  expect(
+    names(
+      selectCore(
+        [popular, create, restart],
+        toolTokens([...META_TOOLS, restart.tool]),
+        { text: 'Try restarting the billing service' },
+        0,
+      ),
+    ),
+  ).toEqual(['search_tools', 'load_tool', 'server.restart']);
+});
+
+test('a reversible draft is never shown without its external-write sibling', () => {
+  const draft = effect('mail.draft', 'write_reversible', 'Save a local mail draft', { uses: 9 });
+  const send = effect('mail.send', 'write_external', 'Send a mail message');
+  const lonely = effect('notes.draft', 'write_reversible', 'Save a local note draft');
+  const both = toolTokens([...META_TOOLS, draft.tool, send.tool]);
+  const selected = names(selectCore([draft, send], both, { text: 'Draft a mail to Alex' }, 0));
+  expect(selected).toEqual(['search_tools', 'load_tool', 'mail.draft', 'mail.send']);
+  // The pair does not fit: the draft alone would read as the only way to act.
+  const tight = names(selectCore([draft, send], both - 1, { text: 'Draft a mail to Alex' }, 0));
+  expect(tight).not.toContain('mail.draft');
+  // A draft with no external sibling is an ordinary tool.
+  expect(names(selectCore([lonely], toolTokens([...META_TOOLS, lonely.tool]), {}, 0))).toContain(
+    'notes.draft',
+  );
+});
+
+test('the lifecycle wait and the reaction are pinned when the turn needs them', () => {
+  const files = Array.from({ length: 12 }, (_, i) =>
+    item(`files.t${String(i).padStart(2, '0')}`, { core: true }),
+  );
+  const wait = item('job.wait', { core: true });
+  const react = item('react', { core: true });
+  const budget = toolTokens([...META_TOOLS, wait.tool, react.tool]);
+  const plain = names(selectCore([...files, wait, react], budget, {}, 0));
+  expect(plain).not.toContain('job.wait');
+  const pinned = names(
+    selectCore([...files, wait, react], budget, { waitable: true, conversational: true }, 0),
+  );
+  expect(pinned).toEqual(['search_tools', 'load_tool', 'job.wait', 'react']);
+});
+
+test("the agent's own terminal keeps its place beside a paired computer's tools", () => {
+  // A paired computer that can't run commands still offers files and status,
+  // and the person's "my computer" points at those. The agent's own terminal
+  // must not lose its place to them, or the engine is built with no terminal.
+  const status = effect('device.status', 'read', "Check the person's connected laptop");
+  const list = effect('device.list_files', 'read', "List a folder on the person's laptop");
+  const terminal = effect('terminal.run', 'write_reversible', 'Execute a shell line');
+  const budget = toolTokens([...META_TOOLS, terminal.tool, status.tool]);
+  // Ranked by these words alone, the laptop's tools would take the budget.
+  const text = 'Check the folder on my laptop';
+  expect(relevance(terms(text), status.entry)).toBeGreaterThan(
+    relevance(terms(text), terminal.entry),
+  );
+  const chosen = names(selectCore([status, list, terminal], budget, { text }, 0));
+  expect(chosen).toContain('terminal.run');
+  expect(chosen.indexOf('terminal.run')).toBe(META_TOOLS.length);
+});
+
+test('an MCP tool enters the core by relevance and never by default', () => {
+  const mcp = effect('tickets.lookup', 'read', 'Look up a support ticket');
+  mcp.entry.source = 'mcp';
+  expect(names(selectCore([mcp]))).not.toContain('tickets.lookup');
+  expect(names(selectCore([mcp], undefined, { text: 'Find ticket 4411' }))).toContain(
+    'tickets.lookup',
+  );
+});
+
+test('an MCP description cannot take the place of a granted connector verb', () => {
+  // A description written by the server it came from is that server's words,
+  // not the owner's. They may earn room nothing else wanted; they may not
+  // spend the room a granted verb wanted, however closely they echo the job.
+  const granted = effect('mail.send', 'write_external', 'Send a mail message');
+  const text = 'Send the quarterly report to Alex by Friday morning as an email attachment';
+  const echoing = effect('helper.relay', 'write_external', text);
+  echoing.entry.source = 'mcp';
+  const one = toolTokens([...META_TOOLS, echoing.tool]);
+  expect(names(selectCore([granted, echoing], one, { text }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'mail.send',
+  ]);
+  // With room for both, the echoing tool is still offered, after the verb.
+  const two = toolTokens([...META_TOOLS, granted.tool, echoing.tool]);
+  expect(names(selectCore([granted, echoing], two, { text }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'mail.send',
+    'helper.relay',
+  ]);
+});
+
+test('every unloaded tool is named in a bounded index on load_tool', () => {
+  const many = Array.from({ length: 60 }, (_, i) =>
+    effect(
+      `suite${String(i).padStart(2, '0')}.apply`,
+      'read',
+      `Apply change number ${i} to the remote record. This second sentence is never shown.`,
+    ),
+  );
+  const selected = selectCore(many, 400, {}, CATALOG_INDEX_TOKENS);
+  const core = new Set(names(selected));
+  const loader = selected.find((tool) => tool.name === 'load_tool');
+  const base = META_TOOLS.find((tool) => tool.name === 'load_tool');
+  if (!loader || !base) throw new Error('load_tool missing');
+  const index = loader.description.slice(base.description.length);
+  const first = many.find((entry) => !core.has(entry.tool.name));
+  expect(index).toContain(`${first?.tool.name} (Apply change number`);
+  expect(index).not.toContain('second sentence');
+  expect(index).toMatch(/\+\d+ more/);
+  expect(Math.ceil(index.length / 4)).toBeLessThanOrEqual(CATALOG_INDEX_TOKENS);
+  // The schemas keep their own budget; the index has a separate fixed one.
+  expect(toolTokens(selected)).toBeLessThanOrEqual(400 + CATALOG_INDEX_TOKENS);
+  expect(toolTokens(withoutIndex(selected))).toBeLessThanOrEqual(400);
+  // Core tools are not repeated, and a full core leaves the description alone.
+  for (const name of core) expect(index).not.toContain(`${name} (`);
+  const only = many[0] as CatalogItem;
+  expect(selectCore([only])).toEqual([...META_TOOLS, only.tool]);
+});
+
+test('the skill reader is pinned when the attempt has skills to read', () => {
+  const files = Array.from({ length: 12 }, (_, i) =>
+    item(`files.t${String(i).padStart(2, '0')}`, { core: true }),
+  );
+  const reader = item('skills.read', { core: true });
+  const budget = toolTokens([...META_TOOLS, reader.tool]);
+  expect(names(selectCore([...files, reader], budget, {}, 0))).not.toContain('skills.read');
+  expect(names(selectCore([...files, reader], budget, { readable: true }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'skills.read',
+  ]);
+});
+
+test('the memory search is pinned when the turn answers a person', () => {
+  const files = Array.from({ length: 12 }, (_, i) =>
+    item(`files.t${String(i).padStart(2, '0')}`, { core: true }),
+  );
+  const search = item('memory.search', { core: true });
+  const budget = toolTokens([...META_TOOLS, search.tool]);
+  expect(names(selectCore([...files, search], budget, {}, 0))).not.toContain('memory.search');
+  expect(names(selectCore([...files, search], budget, { conversational: true }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'memory.search',
+  ]);
+});
+
+test('a skill is readable only within scope, and a space skill only by its audience', () => {
+  const skill = (
+    name: string,
+    source: 'builtin' | 'space',
+    extra: { tools?: string[]; audience?: string } = {},
+  ): SourcedSkill => ({
+    path: `${name}/SKILL.md`,
+    body: 'Do it.',
+    source,
+    frontmatter: {
+      name,
+      description: name,
+      triggers: [name],
+      tools: extra.tools ?? [],
+      max_tokens: 400,
+      ...(extra.audience ? { audience: extra.audience } : {}),
+    },
+  });
+  const skills = [
+    skill('built-in', 'builtin'),
+    skill('needs-mail', 'builtin', { tools: ['email.send'] }),
+    skill('owners-own', 'space'),
+    skill('for-members', 'space', { audience: 'space' }),
+  ];
+  const read = (owner: boolean) =>
+    readableSkills(skills, { spaceId: 'sp_x', scopes: ['files.read'], owner }).map(
+      (entry) => entry.frontmatter.name,
+    );
+  expect(read(true)).toEqual(['built-in', 'owners-own', 'for-members']);
+  expect(read(false)).toEqual(['built-in', 'for-members']);
+});
+
+test('web search and web fetch are always in the core, never pushed out by the budget', () => {
+  const web = (name: string) => {
+    const entry = item(name);
+    entry.tool.connection_id = 'conn_web';
+    entry.entry.connection_id = 'conn_web';
+    return entry;
+  };
+  // Many granted, relevant, much-used tools that would fill the budget on their own.
+  const crowd = Array.from({ length: 40 }, (_, i) => {
+    const entry = item(`mail.verb${String(i).padStart(2, '0')}`, { core: true, uses: 1_000 });
+    entry.tool.connection_id = 'conn_mail';
+    entry.entry.connection_id = 'conn_mail';
+    entry.tool.description = 'Search and read the person’s mail about invoices';
+    return entry;
+  });
+  const items = [...crowd, web('web.search'), web('web.fetch')];
+  const budget = toolTokens(META_TOOLS) + 200;
+  const names = selectCore(items, budget, { text: 'find my invoices in mail' }).map(
+    (tool) => tool.name,
+  );
+  expect(names).toContain('web.search');
+  expect(names).toContain('web.fetch');
+  // They ride beside the budget: the room the job's own tools had is unchanged.
+  const without = selectCore(crowd, budget, { text: 'find my invoices in mail' }).map(
+    (tool) => tool.name,
+  );
+  expect(names.filter((name) => !name.startsWith('web.'))).toEqual(without);
+  // An account alias of a second web connection is still recognised.
+  const alias = web('web.search__0123456789ab');
+  expect(selectCore([...crowd, alias], budget).map((tool) => tool.name)).toContain(
+    'web.search__0123456789ab',
+  );
+  // A failing connection is not offered, and an ungranted one is not there to offer.
+  const failing = web('web.search');
+  failing.entry.health = 'failing';
+  expect(selectCore([failing], budget).map((tool) => tool.name)).not.toContain('web.search');
+});
+
+test('a web task is steered to the browser tools ahead of the desktop, by description and by order', () => {
+  const connected = (name: string, description: string): CatalogItem => {
+    const tool: ToolSpec = {
+      name,
+      description,
+      input_schema: { type: 'object' },
+      effect_class:
+        name.endsWith('.observe') || name.endsWith('screenshot') ? 'read' : 'write_reversible',
+      connection_id: name.startsWith('browser.') ? 'con_browser' : 'con_computer',
+    };
+    return { tool, entry: manifestEntry(tool, [name]), core: false, uses: 0 };
+  };
+  const desktop = () => [
+    connected('computer.open', 'Open an address in the sandbox browser on the desktop.'),
+    connected('computer.click', 'Click at a point on the sandbox desktop.'),
+    connected('computer.screenshot', 'Capture the sandbox desktop.'),
+  ];
+  const items = steerWebTools([
+    ...desktop(),
+    connected('browser.open', 'Open an allowed URL in this job’s browser.'),
+    connected('browser.observe', 'Look at the current page in this job’s browser.'),
+    connected('browser.click', 'Click one control by role and name.'),
+  ]);
+  const described = new Map(items.map((each) => [each.tool.name, each.tool.description]));
+  expect(described.get('computer.open')).toEndWith(COMPUTER_WEB_NOTE);
+  expect(described.get('computer.click')).toEndWith(COMPUTER_WEB_NOTE);
+  expect(described.get('browser.open')).toEndWith(BROWSER_FIRST_NOTE);
+  expect(described.get('computer.screenshot')).toBe('Capture the sandbox desktop.');
+  // Search reads the entry's words, so it is told the same.
+  expect(items.find((each) => each.tool.name === 'computer.open')?.entry.description).toEndWith(
+    COMPUTER_WEB_NOTE,
+  );
+  // Steering twice says it once.
+  expect(steerWebTools(items).map((each) => each.tool.description)).toEqual(
+    items.map((each) => each.tool.description),
+  );
+  // The task's words point at the desktop; the browser still comes first.
+  const order = names(
+    selectCore(items, 100_000, { text: 'Open the sandbox desktop browser and click the time' }, 0),
+  ).filter((name) => name.startsWith('browser.') || name.startsWith('computer.'));
+  expect(order.indexOf('browser.open')).toBeLessThan(order.indexOf('computer.open'));
+  expect(order.indexOf('browser.click')).toBeLessThan(order.indexOf('computer.click'));
+  expect(order.slice(0, 3).every((name) => name.startsWith('browser.'))).toBe(true);
+  // Without the browser, the desktop is offered as it was.
+  const alone = steerWebTools(desktop());
+  expect(alone.map((each) => each.tool.description).join(' ')).not.toContain('browser tools');
+});
+
+test('the core lists the same tools in the same order whatever the latest message says', () => {
+  // The tool definitions sit in the provider's cached prefix: a turn that
+  // reorders them reprocesses everything cached after them.
+  const tools = [
+    effect('mail.search', 'read', 'Search the mailbox for messages'),
+    effect('calendar.list', 'read', 'List calendar events in a range'),
+    effect('notes.write', 'write_reversible', 'Write a note in the notes folder'),
+    effect('files.read', 'read', 'Read a file from the workspace'),
+    effect('weather.today', 'read', "Today's weather where the person is"),
+    effect('archive.old', 'read', 'Old records nobody reads'),
+  ];
+  const budget = toolTokens([...META_TOOLS, ...tools.slice(0, 5).map((entry) => entry.tool)]);
+  const asked = [
+    'What is on my calendar tomorrow?',
+    'Find the email from Dana about the lease',
+    'Write that down as a note',
+    'hi',
+  ].map((text) => selectCore(tools, budget, { text }));
+  for (const each of asked) expect(each).toEqual(asked[0] as ToolSpec[]);
+  const listed = names(asked[0] as ToolSpec[]);
+  expect(listed.slice(0, META_TOOLS.length)).toEqual(names(META_TOOLS));
+  const rest = listed.slice(META_TOOLS.length);
+  expect(rest).toEqual([...rest].sort());
+  // What relevance leaves out is still named on load_tool, the same way every turn.
+  const loader = (asked[0] as ToolSpec[]).find((tool) => tool.name === 'load_tool');
+  const left = tools.filter((entry) => !listed.includes(entry.tool.name));
+  expect(left.length).toBeGreaterThan(0);
+  for (const entry of left) expect(loader?.description).toContain(entry.tool.name);
+});
+
+test('an index too long to name every unloaded tool names the same ones whatever the message', () => {
+  // Tools lead a Claude request's cached prefix, ahead of the system prompt:
+  // an index that followed each message wrote the whole prompt again every turn.
+  const topics = ['invoice', 'flight', 'recipe', 'lease', 'garden', 'tax', 'piano', 'visa'];
+  const tools = topics.flatMap((topic) =>
+    ['find', 'list', 'export'].map((verb) =>
+      effect(`${topic}.${verb}`, 'read', `${verb} ${topic} records kept for the person`),
+    ),
+  );
+  // Room for the discovery tools alone, so every one of these waits on the index.
+  const budget = toolTokens(META_TOOLS);
+  const index = (text: string) =>
+    selectCore(tools, budget, { text }, 60).find((tool) => tool.name === 'load_tool')
+      ?.description ?? '';
+  const first = index('Find the invoice from March');
+  // The index is cut to its budget, so the message could have chosen what it keeps.
+  expect(first).toMatch(/\+\d+ more through search_tools/);
+  for (const text of ['Book a flight to Lisbon', 'Export my visa papers', 'hi', ''])
+    expect(index(text)).toBe(first);
+});
+
+test('a turn the message gives no reason to change keeps the tools the last attempt had', () => {
+  // A first catalog that differs from the last attempt's rewrites the whole
+  // cached prompt, so the room relevance leaves goes to what was there before.
+  const archive = effect('archive.find', 'read', 'Find archive records');
+  const backup = effect('backup.list', 'read', 'List backup records');
+  const garden = effect('garden.plan', 'read', 'Plan garden records');
+  const piano = effect('piano.log', 'read', 'Log piano records');
+  const tools = [archive, backup, garden, piano];
+  const room = (...picked: CatalogItem[]) =>
+    toolTokens([...META_TOOLS, ...picked.map((entry) => entry.tool)]);
+  const budget = Math.max(room(archive, backup), room(garden, piano));
+  expect(room(archive, garden, piano)).toBeGreaterThan(budget);
+  const offered = (text: string, kept?: ToolSpec[]) =>
+    names(selectCore(tools, budget, { text, kept: kept && new Set(names(kept)) })).slice(
+      META_TOOLS.length,
+    );
+  const last = selectCore(tools, budget, { text: 'Plan the garden and log my piano practice' });
+  expect(names(last).slice(META_TOOLS.length)).toEqual(['garden.plan', 'piano.log']);
+  // Without the last attempt's tools, a word-less turn changes the catalog.
+  expect(offered('thanks!')).toEqual(['archive.find', 'backup.list']);
+  expect(offered('thanks!', last)).toEqual(['garden.plan', 'piano.log']);
+  // A tool the message points at still takes its place.
+  expect(offered('Find the archived invoice', last)).toContain('archive.find');
+});
+
+test('relevance still decides which tools make the cut', () => {
+  const near = effect('calendar.create', 'write_external', 'Create a calendar event');
+  const far = effect('server.restart', 'write_external', 'Restart a managed service');
+  const one = Math.max(
+    toolTokens([...META_TOOLS, near.tool]),
+    toolTokens([...META_TOOLS, far.tool]),
+  );
+  expect(names(selectCore([far, near], one, { text: 'Create the Friday event' }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'calendar.create',
+  ]);
+  expect(names(selectCore([far, near], one, { text: 'Restart the billing service' }, 0))).toEqual([
+    'search_tools',
+    'load_tool',
+    'server.restart',
+  ]);
+});
+
+test('a tool whose connector asks for longer than the default says how long, within the limit', () => {
+  const connector = (budget: (kind: string) => number) =>
+    ({
+      dispatchBudgetMs: (action: { kind: string }) => budget(action.kind),
+    }) as unknown as Connector;
+  const web = connector((kind) => (kind === 'web.search' ? 90_000 : 0));
+  expect(toolDeadline(web, 'web.search')).toBe(90_000);
+  expect(toolDeadline(web, 'web.fetch')).toBeUndefined();
+  expect(
+    toolDeadline(
+      connector(() => 10 ** 9),
+      'egress.upload',
+    ),
+  ).toBe(MAX_DISPATCH_BUDGET_MS);
+  expect(
+    toolDeadline(
+      connector(() => {
+        throw new Error('needs a payload');
+      }),
+      'device.run',
+    ),
+  ).toBeUndefined();
+  expect(toolDeadline({} as Connector, 'files.read')).toBeUndefined();
+});

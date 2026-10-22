@@ -1,0 +1,247 @@
+/**
+ * The openduet command, for the person or program looking after an installation.
+ *
+ *   bun run openduet <command> [--deploy-dir <path>] [--json] [options]
+ *
+ * Exit codes: 0 done or every check passed; 1 a check failed; 2 refused, and
+ * nothing was changed; 3 acted, but did not finish (the output says what next).
+ */
+import { basename, resolve } from 'node:path';
+import { type Context, DEFAULT_DEPLOY_DIR, realContext } from './context.ts';
+import { readHistory, renderHistory } from './history.ts';
+import { EXIT, type ExitCode } from './schema.ts';
+
+export const USAGE = `Usage: bun run openduet <command> [--deploy-dir <path>] [options]
+
+  init [configure options]   Configure a new installation: deploy/.env, then deploy/openduet.deploy.json
+       [--public-url https://your.domain [--hosted]]
+                             The public address and web origin together; --hosted for other people
+  init --adopt               Describe a running installation in deploy/openduet.deploy.json; nothing else changes
+  check [--json]             Judge deploy/openduet.deploy.json, deploy/.env and the Compose files, without Docker
+  doctor [--json] [--offline]  Judge this machine: Docker, its networks, disk in MB, memory, ports, images, registry
+  doctor --remove-leftovers  Also remove the agents' computers and networks no installation here uses
+  status [--json]            The installation's report: services, API, account and the optional parts
+  set NAME=value ...         Change settings in deploy/.env; --from-env NAME for a key, --clear NAME
+                             to empty one; says which services to recreate
+  browser enable [--space <id>]
+                             Turn on the browser worker for the first person's space, or the one named
+  logs [service ...]         The stack's logs: --since, --tail, --follow, --timestamps
+  logs --attempts [id]       Attempt containers, or one's logs; --computers [name] for agents' computers
+  deploy [--tag <tag>]       Update to published images: plan, back up, pull one at a time, switch, verify
+         [--dry-run] [--checkout | --allow-compose-mismatch] [--skip-backup | --backup-to ssh://host:/path]
+  rollback [--dry-run]       Back to the images before the last deploy, or the restore steps if migrations ran
+  backup [--estimate]        Back up the database, journal, settings, files and agents' computers to backup.dir
+         [--database-only | --offline] [--dir <path>] [--to ssh://host:/path]
+         [--encrypt | --encrypt-to <age recipient>]
+  restore <backup> [--plan]  Check a backup and print the steps that restore it
+          [--verify]         Read every archive in it through, changing nothing
+          [--yes]            Restore it: stop the stack, put every part back, start it
+          [--keep-database]  Leave an external database that already holds the data as it is
+          [--replace-files]  With --keep-database, put back the files even where this machine has some
+  upgrade <version>          Upgrade an installation that builds its images, with the release's own script
+  history [--json]           The deploys, rollbacks and upgrades this installation has run
+  account list|setup-code    The accounts, or a new one-time code for creating the first one
+  account create|reset|disable|enable <email>
+                             Add an account (the owner, on a new installation), print a password
+                             link, or stop and restore an account's access; --json for a program
+  feedback [list|show <id>]  The problem reports people sent from the app
+  remote <ssh-target> [--path <dir>] <command> [args]
+                             Run one of these commands on another machine over SSH, in its checkout
+  remote <ssh-target> [--path <dir>] push [--replace] [--dry-run]
+                             Copy deploy/.env, deploy/openduet.deploy.json and deploy/config/ there
+
+--deploy-dir names the deployment directory of another checkout; the default is this checkout's deploy/.
+Without Bun on the host, check, doctor and status run in the service container:
+  docker compose -f deploy/docker-compose.yml exec openduet bun run openduet doctor --offline
+Exit codes: 0 done, 1 a check failed, 2 refused with nothing changed, 3 acted but did not finish.
+`;
+
+export type Parsed = {
+  command: string;
+  rest: string[];
+  deployDir: string;
+  json: boolean;
+  offline: boolean;
+};
+
+export function parseArguments(argv: readonly string[]): Parsed {
+  const rest: string[] = [];
+  let deployDir = DEFAULT_DEPLOY_DIR;
+  let json = false;
+  let offline = false;
+  let command = '';
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index] ?? '';
+    if (arg === '--deploy-dir') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('--deploy-dir needs a path.');
+      deployDir = resolve(value);
+      index += 1;
+    } else if (arg.startsWith('--deploy-dir='))
+      deployDir = resolve(arg.slice('--deploy-dir='.length));
+    else if (arg === '--json') json = true;
+    else if (arg === '--offline') offline = true;
+    else if (!command && !arg.startsWith('-')) command = arg;
+    else rest.push(arg);
+  }
+  return { command, rest, deployDir, json, offline };
+}
+
+/** The commands that only read: Ctrl-C stops them with nothing changed. */
+const READ_ONLY = new Set(['', 'help', 'check', 'status', 'logs', 'history']);
+
+/** What Ctrl-C may leave behind, by command, when the command registered nothing closer. */
+const LEFT_BEHIND: Record<string, string> = {
+  backup:
+    'The backup it was making is not whole, and a restore refuses it (it has no SHA256SUMS yet). An offline backup stops the writers while it runs: see bun run openduet status, then run the backup again.',
+  restore:
+    'Without --yes it changes nothing. With --yes it changes nothing until its steps start: see bun run openduet status, then run the same restore again.',
+};
+
+/**
+ * The handler for Ctrl-C (SIGINT) and SIGTERM: one line naming the command it
+ * stopped and what may have changed, then exit 130 or 143, as a shell reports a
+ * command a signal stopped. A command that changes things in steps registers,
+ * through `hint`, what to say where it stands.
+ */
+export function interruption(
+  command: string,
+  write: (text: string) => void,
+  exit: (code: number) => void,
+) {
+  let registered: string | null = null;
+  return {
+    hint: (text: string | null) => {
+      registered = text;
+    },
+    handle: (signal: 'SIGINT' | 'SIGTERM') => {
+      const left =
+        registered ??
+        (READ_ONLY.has(command)
+          ? 'It changes nothing.'
+          : (LEFT_BEHIND[command] ??
+            'It may have stopped partway: see bun run openduet status before running it again.'));
+      write(
+        `\n${signal === 'SIGINT' ? 'Ctrl-C' : 'SIGTERM'} stopped openduet ${command || 'help'}. ${left}\n`,
+      );
+      exit(signal === 'SIGINT' ? 130 : 143);
+    },
+  };
+}
+
+export async function main(
+  argv: readonly string[],
+  make = realContext,
+  options: { signals?: boolean } = {},
+): Promise<ExitCode> {
+  let parsed: Parsed;
+  try {
+    parsed = parseArguments(argv);
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : error}\n${USAGE}`);
+    return EXIT.refused;
+  }
+  const context: Context = make(parsed.deployDir, { quiet: parsed.json });
+  if (options.signals) {
+    const stop = interruption(parsed.command, context.err, (code) => process.exit(code));
+    context.interruptHint = stop.hint;
+    process.on('SIGINT', () => stop.handle('SIGINT'));
+    process.on('SIGTERM', () => stop.handle('SIGTERM'));
+  }
+  const refuse = (message: string): ExitCode => {
+    context.err(`${message}\n`);
+    return EXIT.refused;
+  };
+  // The deployment directory sits in a checkout as deploy/: status.ts and configure.ts read it there.
+  if (basename(context.deployDir) !== 'deploy')
+    return refuse(`${context.deployDir} is not a checkout's deploy directory.`);
+  const noExtra = (allowed: string) =>
+    parsed.rest.length > 0
+      ? refuse(`${parsed.command} takes no ${parsed.rest.join(' ')}. ${allowed}`)
+      : null;
+  // Each command is loaded when it runs, so check, doctor and status need only the
+  // files the service image ships (deploy/Dockerfile.openduet) and run inside it.
+  switch (parsed.command) {
+    case 'check':
+      return (
+        noExtra('Usage: bun run openduet check [--json]') ??
+        (await import('./commands/check.ts')).runCheck(context, parsed.json)
+      );
+    case 'doctor': {
+      const remove = parsed.rest.length === 1 && parsed.rest[0] === '--remove-leftovers';
+      return (
+        (remove
+          ? null
+          : noExtra('Usage: bun run openduet doctor [--json] [--offline] [--remove-leftovers]')) ??
+        (await (
+          await import('./commands/doctor.ts')
+        ).runDoctor(context, parsed.json, parsed.offline, remove))
+      );
+    }
+    case 'status':
+      return (
+        noExtra('Usage: bun run openduet status [--json]') ??
+        (await (await import('./commands/status.ts')).runStatus(context, parsed.json))
+      );
+    case 'set':
+      return (await import('./commands/set.ts')).runSet(context, parsed.rest);
+    case 'browser':
+      // `files` is the one-line installer's half, run inside the service image.
+      return parsed.rest[0] === 'files'
+        ? (await import('./commands/browser-files.ts')).runBrowserFiles(context, parsed.rest)
+        : (await import('./commands/browser.ts')).runBrowser(context, parsed.rest);
+    case 'logs':
+      return (await import('./commands/logs.ts')).runLogs(context, parsed.rest);
+    case 'init':
+      return (await import('./commands/init.ts')).runInit(context, parsed.rest);
+    case 'deploy':
+      return (await import('./commands/deploy.ts')).runDeploy(context, parsed.rest, parsed.json);
+    case 'rollback':
+      return (await import('./commands/rollback.ts')).runRollback(
+        context,
+        parsed.rest,
+        parsed.json,
+      );
+    case 'backup':
+      return (await import('./commands/backup.ts')).runBackup(context, parsed.rest, parsed.json);
+    case 'restore':
+      return (await import('./commands/restore.ts')).runRestore(context, parsed.rest, parsed.json);
+    case 'upgrade':
+      return (await import('./commands/upgrade.ts')).runUpgrade(context, parsed.rest);
+    case 'remote':
+      return (await import('./commands/remote.ts')).runRemote(context, parsed.rest, {
+        json: parsed.json,
+        offline: parsed.offline,
+      });
+    case 'account':
+      return (await import('./commands/account.ts')).runAccount(context, parsed.rest, parsed.json);
+    case 'feedback':
+      return (await import('./commands/account.ts')).runFeedback(context, parsed.rest);
+    case 'history': {
+      const refused = noExtra('Usage: bun run openduet history [--json]');
+      if (refused !== null) return refused;
+      const entries = readHistory(context.deployDir);
+      context.out(json(parsed.json, entries));
+      return EXIT.ok;
+    }
+    case '':
+    case 'help':
+      context.out(USAGE);
+      return parsed.command === 'help' ? EXIT.ok : EXIT.refused;
+    default:
+      return refuse(`${parsed.command} is not a openduet command.\n${USAGE}`);
+  }
+}
+
+const json = (asJson: boolean, entries: ReturnType<typeof readHistory>) =>
+  asJson
+    ? `${JSON.stringify(entries, null, 2)}
+`
+    : renderHistory(entries);
+
+if (import.meta.main) {
+  const code = await main(process.argv.slice(2), realContext, { signals: true });
+  // A Ctrl-C that came while the last step ran is handled here, before the exit.
+  await new Promise((settle) => setImmediate(settle));
+  process.exit(code);
+}

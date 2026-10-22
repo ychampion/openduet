@@ -1,0 +1,254 @@
+/**
+ * The model auto-review asks. It is the service's own model gateway, as the
+ * memory extractor's is: the provider key never leaves the gateway, a call is
+ * one request of a bounded size, and a call token is good for that call only.
+ * How often a person's actions may be reviewed is the broker's limit, counted
+ * from its own review records, so this gateway keeps no ledger of its own.
+ *
+ * The model and the keys are read for each review, so a model the owner
+ * connects in the app reviews the next action without a restart. Each call's
+ * principal names the space whose action it carries.
+ */
+import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
+import type { Env } from '../env.ts';
+import { configuredProviders } from '../gateway/configured.ts';
+import type { ProviderSignIn } from '../gateway/credentials.ts';
+import { createModelGateway, type GatewayOptions, gatewayLog } from '../gateway/index.ts';
+import {
+  type ModelSettingsService,
+  type ServiceModel,
+  type ServiceModelSource,
+  sideCallSource,
+} from '../gateway/model-settings.ts';
+import { modelApiMode, protocolForApiMode } from '../gateway/providers.ts';
+import {
+  type ModelRouting,
+  NO_ROUTING,
+  routingFromEnv,
+  serviceFallback,
+} from '../gateway/routing.ts';
+import { replyOf, withStructuredOutput } from '../gateway/structured.ts';
+import { GatewayError, type GatewayPrincipal } from '../gateway/types.ts';
+import {
+  createModelReviewer,
+  ReviewCallFailed,
+  type ReviewChat,
+  type Reviewer,
+  type ReviewScope,
+} from './reviewer.ts';
+
+const INPUT_TOKENS = 8_000;
+const OUTPUT_TOKENS = 300;
+
+export type ReviewGatewayOptions = {
+  /** The model every review uses when no `source` is given. */
+  provider: string;
+  model: string;
+  providers: NonNullable<GatewayOptions['providers']>;
+  /** The service's privacy router: the reviewed job's space and conversation privacy apply. */
+  privacy: GatewayOptions['privacy'];
+  /** The model and keys each review uses, read per review. */
+  source?: ServiceModelSource;
+  fake?: GatewayOptions['fake'];
+  fetch?: GatewayOptions['fetch'];
+  timeoutMs: number;
+  /** The installation's spending caps. */
+  spending?: GatewayOptions['spending'];
+  /** The operator's fallbacks for a provider that limits or fails. */
+  routing?: ModelRouting;
+  /** How hard a reasoning model thinks on a review. */
+  reasoningEffort?: GatewayOptions['reasoningEffort'];
+};
+
+/**
+ * Whose data a review call carries: the space the reviewed action belongs to
+ * and the job that proposed it. It has the shape of a service call's privacy
+ * scope, so a router that applies per-space privacy settings reads it as such.
+ */
+export type ReviewPrivacyScope = {
+  kind: 'service';
+  purpose: 'action_review';
+  spaceId: string;
+  sourceJobId: string;
+};
+export type ReviewPrincipal = GatewayPrincipal & { privacy: ReviewPrivacyScope };
+
+/** The principal of one review call: one request, one model, one space. */
+export function reviewPrincipal(
+  token: string,
+  scope: ReviewScope,
+  target: ServiceModel,
+  routing: ModelRouting = NO_ROUTING,
+): ReviewPrincipal {
+  const fallback = serviceFallback(routing, target);
+  return {
+    jobId: `review:${scope.spaceId}`,
+    attemptId: `review:${token}`,
+    privacy: {
+      kind: 'service',
+      purpose: 'action_review',
+      spaceId: scope.spaceId,
+      sourceJobId: scope.jobId,
+    },
+    epoch: 0,
+    revision: 0,
+    maxRequests: 1,
+    maxTokens: INPUT_TOKENS + OUTPUT_TOKENS,
+    allowedModels: [{ provider: target.provider, model: target.model }, ...fallback],
+    ...(fallback.length ? { routes: { fallback } } : {}),
+  };
+}
+
+export async function openReviewGateway(options: ReviewGatewayOptions) {
+  type Call = { scope: ReviewScope; target: ServiceModel };
+  const live = new Map<string, Call>();
+  const server = createModelGateway({
+    budget: {
+      async reserve(request) {
+        if (
+          !request.principal.allowedModels.some(
+            (allowed) => request.provider === allowed.provider && request.model === allowed.model,
+          )
+        )
+          throw new GatewayError(403, 'review_principal_denied');
+        if (
+          request.estimatedTokens > INPUT_TOKENS + OUTPUT_TOKENS ||
+          request.maxOutputTokens > OUTPUT_TOKENS
+        )
+          throw new GatewayError(429, 'review_call_too_large');
+        return { id: randomUUID() };
+      },
+      async settle() {},
+    },
+    providers: options.providers,
+    ...(options.source ? { currentProviders: options.source.providers } : {}),
+    fake: options.fake,
+    fetch: options.fetch,
+    privacy: options.privacy,
+    defaultProvider: options.provider,
+    timeoutMs: options.timeoutMs,
+    spending: options.spending,
+    reasoningEffort: options.reasoningEffort,
+    maxRequestBytes: 128 * 1024,
+    maxResponseBytes: 32 * 1024,
+    onError: gatewayLog('review'),
+    async authenticate(token) {
+      // One token, one call: it is spent the moment the gateway accepts it.
+      const call = live.get(token);
+      live.delete(token);
+      if (!call) throw new GatewayError(401, 'review_principal_denied');
+      return reviewPrincipal(token, call.scope, call.target, options.routing);
+    },
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+  const chat: ReviewChat = async (messages, signal, scope, format) => {
+    // The model is read for each review, so one connected in the app applies at once.
+    // It is a safety check: no person's secondary model ever takes it. It reads
+    // the action, so it keeps to the models the space's rules allow; with none
+    // of them usable the review is unavailable, and the action waits for a person.
+    const target = options.source
+      ? await options.source.current({ spaceId: scope.spaceId })
+      : { provider: options.provider, model: options.model };
+    const model = `${target.provider}/${target.model}`;
+    const protocol = protocolForApiMode(modelApiMode(target.provider, target.model));
+    const token = randomUUID();
+    live.set(token, { scope, target });
+    const system = messages.find((message) => message.role === 'system')?.content ?? '';
+    const plain: Record<string, unknown> =
+      protocol === 'responses'
+        ? { model: target.model, input: messages, max_output_tokens: OUTPUT_TOKENS }
+        : protocol === 'messages'
+          ? {
+              model: target.model,
+              system,
+              messages: messages.filter((message) => message.role !== 'system'),
+              max_tokens: OUTPUT_TOKENS,
+            }
+          : { model: target.model, messages, max_tokens: OUTPUT_TOKENS };
+    const body = format ? withStructuredOutput(plain, target, protocol, format) : plain;
+    try {
+      const response = await fetch(`${base}/providers/${target.provider}/v1/${protocol}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-openduet-capability': token,
+          ...(protocol === 'messages'
+            ? { 'x-api-key': 'openduet-surrogate-review' }
+            : { authorization: 'Bearer openduet-surrogate-review' }),
+        },
+        body: JSON.stringify(body),
+        redirect: 'error',
+        signal,
+      });
+      if (!response.ok) throw new Error(`review gateway ${response.status}`);
+      const { text, end } = replyOf(protocol, await response.json());
+      return { text, model, end };
+    } catch (error) {
+      throw new ReviewCallFailed(model, { cause: error });
+    } finally {
+      live.delete(token);
+    }
+  };
+  return {
+    reviewer: createModelReviewer({ model: `${options.provider}/${options.model}`, chat }),
+    async close() {
+      live.clear();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    },
+  };
+}
+
+/**
+ * The reviewer this deployment runs, or none when the operator turned it off.
+ * Without one, every action that would be reviewed goes to the person.
+ *
+ * OPENDUET_REVIEW_PROVIDER and OPENDUET_REVIEW_MODEL, when set, name the model
+ * outright. Otherwise reviews use the model new chats use, the one chosen in
+ * the app included, and the keys connected there.
+ */
+export async function configuredReviewGateway(
+  env: Env,
+  privacy: GatewayOptions['privacy'],
+  signIn?: ProviderSignIn,
+  fake?: GatewayOptions['fake'],
+  connected: {
+    settings?: ModelSettingsService;
+    /** The upstream transport; tests pass a stand-in provider. */
+    fetch?: GatewayOptions['fetch'];
+    spending?: GatewayOptions['spending'];
+  } = {},
+): Promise<Awaited<ReturnType<typeof openReviewGateway>> | null> {
+  const setting = env.OPENDUET_REVIEW_MODEL?.trim();
+  if (setting === 'off') return null;
+  const pinned = { provider: env.OPENDUET_REVIEW_PROVIDER?.trim(), model: setting };
+  return openReviewGateway({
+    provider: pinned.provider || env.OPENDUET_DEFAULT_PROVIDER,
+    model: pinned.model || env.OPENDUET_DEFAULT_MODEL,
+    providers: configuredProviders(env, () => {}, signIn),
+    privacy,
+    // A review is a short classification: the fast model, unless one is pinned.
+    // It decides whether a risky action runs, so no person's secondary takes it.
+    source: sideCallSource('review', {
+      env,
+      settings: connected.settings,
+      pinned,
+      routing: routingFromEnv(env),
+    }),
+    fake,
+    ...(connected.fetch ? { fetch: connected.fetch } : {}),
+    timeoutMs: env.OPENDUET_REVIEW_TIMEOUT_MS,
+    spending: connected.spending,
+    routing: routingFromEnv(env),
+    reasoningEffort: env.OPENDUET_REASONING_EFFORT_SIDE,
+  });
+}
+
+export type { Reviewer };

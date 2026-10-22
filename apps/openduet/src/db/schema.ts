@@ -1,0 +1,1762 @@
+/**
+ * The Postgres schema. One table per entity in the contracts package; the
+ * migration SQL under apps/openduet/drizzle is generated from this file and
+ * committed, so a fresh install applies exactly the schema that was reviewed.
+ */
+import type { DeferredQuestion, RepairTraceEntry } from '@openduet/contracts';
+import { sql } from 'drizzle-orm';
+import {
+  bigint,
+  bigserial,
+  boolean,
+  check,
+  doublePrecision,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
+
+const created = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
+
+export const owner = pgTable(
+  'owner',
+  {
+    id: text('id').primaryKey(),
+    email: text('email').notNull().unique(),
+    passwordHash: text('password_hash'),
+    passkey: jsonb('passkey'),
+    createdAt: created(),
+  },
+  () => [uniqueIndex('owner_singleton_idx').on(sql`(true)`)],
+);
+
+/** Login identities are independent of the installation's singleton setup guard. */
+export const principal = pgTable(
+  'principal',
+  {
+    id: text('id').primaryKey(),
+    email: text('email').notNull().unique(),
+    passwordHash: text('password_hash'),
+    passkey: jsonb('passkey'),
+    /**
+     * `person` signs in. `room` is the identity a room's agent acts as: it has
+     * no password, never signs in and is never listed among people. `guest` is
+     * an account made from a room invite: it signs in, and uses only the rooms
+     * it was invited to.
+     */
+    kind: text('kind').notNull().default('person'),
+    /** The name other people in a room see. Null shows the part of the email before the @. */
+    displayName: text('display_name'),
+    createdAt: created(),
+    /**
+     * Set by the person who runs the installation (`openduet account disable`):
+     * the account cannot sign in, and nothing it had signed in still works.
+     */
+    disabledAt: timestamp('disabled_at', { withTimezone: true }),
+    /**
+     * Granted by the account that set OpenDuet up: an admin provisions accounts
+     * and chooses the installation's model, as the setup owner does. Only a
+     * person holds it, and only the setup owner grants or takes it away.
+     */
+    admin: boolean('admin').notNull().default(false),
+    /**
+     * The last time the person signed in, used the app or reached their
+     * assistant through a channel, to within a few minutes. When the operator
+     * sets OPENDUET_REST_ROUTINES_AFTER_DAYS, standing work rests once this is
+     * older than that.
+     */
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    /** When the person's routines last came back on after resting while they were away. */
+    routinesResumedAt: timestamp('routines_resumed_at', { withTimezone: true }),
+    /**
+     * The id a system outside OpenDuet knows this person by, such as a directory
+     * or customer number. OpenDuet never reads it; whoever runs the installation
+     * sets it.
+     */
+    externalId: text('external_id').unique(),
+    /**
+     * Until when a sign-in through the identity provider may claim this account
+     * by its verified email although it has a password, under
+     * OPENDUET_OIDC_EMAIL_LINK=no-password. The operator sets it with
+     * `openduet account link`; the link it allows clears it.
+     */
+    oidcLinkUntil: timestamp('oidc_link_until', { withTimezone: true }),
+  },
+  (t) => [check('principal_kind', sql`${t.kind} in ('person', 'guest', 'room')`)],
+);
+
+/**
+ * A person's account at the installation's OpenID Connect identity provider:
+ * the provider's issuer and its subject for them, which stays the same when
+ * their email changes. Made at their first sign-in through the provider.
+ */
+export const oidcIdentity = pgTable(
+  'oidc_identity',
+  {
+    issuer: text('issuer').notNull(),
+    subject: text('subject').notNull(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    createdAt: created(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.issuer, t.subject] }),
+    // One account at a provider per person: a second subject never takes over the first's account.
+    uniqueIndex('oidc_identity_principal_issuer_idx').on(t.principalId, t.issuer),
+    check('oidc_identity_subject', sql`length(${t.subject}) between 1 and 255`),
+  ],
+);
+
+/**
+ * Sign-ins through the identity provider that have come back, by a digest of
+ * their state, and back-channel logout tokens received, by a digest of their
+ * id, so neither is ever used twice. Rows past their expiry are removed as new
+ * ones arrive.
+ */
+export const oidcSpentState = pgTable('oidc_spent_state', {
+  stateHash: text('state_hash').primaryKey(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+});
+
+export const space = pgTable('space', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  policyGeneration: integer('policy_generation').notNull().default(0),
+  kind: text('kind').notNull().default('personal'),
+  ownerPrincipalId: text('owner_principal_id').references(() => principal.id),
+  audience: text('audience').notNull().default('owner'),
+  gitPath: text('git_path').notNull(),
+  /** Stamped by the fence that begins a removal. A stamped space serves nothing. */
+  removedAt: timestamp('removed_at', { withTimezone: true }),
+  /**
+   * How many removals this space has been through, counting from the one the
+   * fence starts. A backup from before a removal carries a smaller number,
+   * which is how the startup replay tells the state a removal record is about
+   * from state made after it.
+   */
+  removalEpoch: integer('removal_epoch').notNull().default(0),
+  /** What a room is for, in its owner's words. Null for personal spaces. */
+  purpose: text('purpose'),
+  createdAt: created(),
+});
+
+/** Revocations retain their row so a regrant never resurrects an old capability. */
+export const spaceMembership = pgTable(
+  'space_membership',
+  {
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    role: text('role').notNull(),
+    generation: integer('generation').notNull().default(0),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    /**
+     * When a guest's place in a room ends. Null for everyone else. From this
+     * moment the guest reads nothing, and the expiry sweep ends the membership
+     * as a removal does.
+     */
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.principalId, t.spaceId] }),
+    // `agent` is the room's own principal: its generation is the room's roster generation.
+    check('membership_role', sql`${t.role} in ('owner', 'member', 'guest', 'agent')`),
+    check('membership_generation', sql`${t.generation} >= 0`),
+  ],
+);
+
+/** The sites a space's browser is signed in to: a name and a time, never a cookie. */
+export const browserSiteProfile = pgTable(
+  'browser_site_profile',
+  {
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    domain: text('domain').notNull(),
+    label: text('label').notNull(),
+    firstSeen: timestamp('first_seen', { withTimezone: true }).notNull().defaultNow(),
+    lastUsed: timestamp('last_used', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.spaceId, t.domain] }),
+    check('browser_site_domain_lower', sql`${t.domain} = lower(${t.domain})`),
+  ],
+);
+
+/**
+ * Sealed with OPENDUET_MASTER_KEY. Nothing outside the connectors module reads
+ * this table, and no API response carries a row from it.
+ */
+export const secret = pgTable('secret', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id')
+    .notNull()
+    .references(() => space.id, { onDelete: 'cascade' }),
+  ciphertext: text('ciphertext').notNull(),
+  createdAt: created(),
+  rotatedAt: timestamp('rotated_at', { withTimezone: true }),
+});
+
+/**
+ * A model provider the owner signed in to, one row per provider for the whole
+ * installation. The tokens are one sealed box bound to the provider name and
+ * the row's generation. The generation moves on every rotation, so a refresh
+ * that read an older generation cannot overwrite a newer one.
+ */
+export const providerCredential = pgTable('provider_credential', {
+  provider: text('provider').primaryKey(),
+  ownerId: text('owner_id')
+    .notNull()
+    .references(() => owner.id, { onDelete: 'cascade' }),
+  /** The sealed record's own id, which the box binds alongside the provider and generation. */
+  secretId: text('secret_id'),
+  /** Empty once a refresh was refused for good; the row then only says why. */
+  ciphertext: text('ciphertext'),
+  generation: integer('generation').notNull().default(0),
+  /** `active`, or `sign_in_required` after the provider refused a refresh. */
+  status: text('status').notNull().default('active'),
+  reason: text('reason'),
+  account: text('account'),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  refreshedAt: timestamp('refreshed_at', { withTimezone: true }),
+  createdAt: created(),
+});
+
+/**
+ * A model provider's API key the owner entered in the app, one row per
+ * provider for the whole installation. The key is one sealed box bound to the
+ * provider name; only its last four characters are kept in the clear, for the
+ * screen that says which key is set. A key the operator put in the
+ * environment is never stored here and always wins.
+ */
+export const modelProviderKey = pgTable('model_provider_key', {
+  provider: text('provider').primaryKey(),
+  ownerId: text('owner_id')
+    .notNull()
+    .references(() => owner.id, { onDelete: 'cascade' }),
+  secretId: text('secret_id').notNull(),
+  ciphertext: text('ciphertext').notNull(),
+  lastFour: text('last_four').notNull(),
+  /** Only for the OpenAI-compatible endpoint: its version prefix, ending in a slash. */
+  baseUrl: text('base_url'),
+  createdAt: created(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * The model the owner chose in the app for new attempts. One row at most; with
+ * none, OPENDUET_DEFAULT_PROVIDER and OPENDUET_DEFAULT_MODEL decide.
+ */
+export const modelDefault = pgTable(
+  'model_default',
+  {
+    id: text('id').primaryKey().default('installation'),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    /** The owner's word on whether this model reads images; null leaves it to the catalog. */
+    supportsVision: boolean('supports_vision'),
+    ownerId: text('owner_id')
+      .notNull()
+      .references(() => owner.id, { onDelete: 'cascade' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [check('model_default_single_row', sql`${table.id} = 'installation'`)],
+);
+
+/**
+ * The owner's word on whether a model reads images, apart from which model is
+ * chosen: saying so for the server's default model leaves it the server's.
+ * One row per model; none leaves it to the model chosen in the app, the
+ * operator's setting or the catalog.
+ */
+export const modelVision = pgTable(
+  'model_vision',
+  {
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    supportsVision: boolean('supports_vision').notNull(),
+    ownerId: text('owner_id')
+      .notNull()
+      .references(() => owner.id, { onDelete: 'cascade' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.provider, table.model] })],
+);
+
+/**
+ * A person's secondary model, beside the installation's primary, and which of
+ * their work runs on it. One row per person at most; with none, or with no
+ * model in it, all their work runs on the primary.
+ */
+export const modelSecondary = pgTable(
+  'model_secondary',
+  {
+    principalId: text('principal_id')
+      .primaryKey()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    provider: text('provider'),
+    model: text('model'),
+    /** Short side calls: memory reads and voice asides. */
+    sideTasks: text('side_tasks').notNull().default('secondary'),
+    /** Routines and work that wakes on a trigger. */
+    scheduled: text('scheduled').notNull().default('primary'),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check('model_secondary_pair', sql`(${t.provider} is null) = (${t.model} is null)`),
+    check('model_secondary_side_tasks', sql`${t.sideTasks} in ('primary', 'secondary')`),
+    check('model_secondary_scheduled', sql`${t.scheduled} in ('primary', 'secondary')`),
+  ],
+);
+
+/**
+ * What a provider's own model list said about which of its models read
+ * images, kept from the last time the list was fetched. A provider's rows are
+ * replaced whenever its list is fetched again. Shown to the owner; it never
+ * decides whether a model is shown pictures.
+ */
+export const modelVisionReport = pgTable(
+  'model_vision_report',
+  {
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    supportsVision: boolean('supports_vision').notNull(),
+    reportedAt: timestamp('reported_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.provider, table.model] })],
+);
+
+export const connection = pgTable(
+  'connection',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    provider: text('provider').notNull(),
+    label: text('label').notNull(),
+    secretRef: text('secret_ref').references(() => secret.id, { onDelete: 'set null' }),
+    scopes: jsonb('scopes').$type<string[]>().notNull().default([]),
+    configuration: jsonb('configuration').$type<Record<string, unknown>>().notNull().default({}),
+    setupState: text('setup_state').notNull().default('connected'),
+    status: text('status').notNull().default('active'),
+    /**
+     * Set while a revocation ('revoke') or key switch ('switch') has paused
+     * this connection to undo what its old key did; cleared when the change
+     * commits or is given up. A restart reads it to finish or undo the pause.
+     */
+    keyChange: text('key_change'),
+    generation: integer('generation').notNull().default(0),
+    health: text('health').notNull().default('unknown'),
+    lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
+    /**
+     * Whose work a connection in a shared space serves: `owner` is the space
+     * owner's own jobs, `room` is work the room asks for. A personal space's
+     * connections serve its owner whatever this says.
+     */
+    sharedUse: text('shared_use').notNull().default('owner'),
+    /**
+     * Whether the service watches this mailbox or calendar for changes when no
+     * trigger asks it to. Null is the default: on in a person's own space, off
+     * in a room's until its owners turn it on.
+     */
+    watchChanges: boolean('watch_changes'),
+    createdAt: created(),
+  },
+  (t) => [
+    index('connection_space_idx').on(t.spaceId),
+    check('connection_shared_use', sql`${t.sharedUse} in ('owner', 'room')`),
+  ],
+);
+
+export const agent = pgTable(
+  'agent',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    role: text('role').notNull(),
+    colour: text('colour').notNull(),
+    surface: text('surface').notNull(),
+    eyeColour: text('eye_colour').notNull(),
+    tone: text('tone').notNull(),
+    standingInstruction: text('standing_instruction').notNull(),
+    /** Null reaches every connection in the space, including ones added later; a list narrows it. */
+    allowedConnectionIds: jsonb('allowed_connection_ids').$type<string[] | null>(),
+    asksBeforeActing: boolean('asks_before_acting').notNull().default(true),
+    /** The browser, the terminal and code in the workspace. */
+    usesComputer: boolean('uses_computer').notNull().default(true),
+    readsMemory: boolean('reads_memory').notNull().default(true),
+    writesMemory: boolean('writes_memory').notNull().default(true),
+    /** OpenDuet, the agent every space has: one per space, never removed. */
+    isDefault: boolean('is_default').notNull().default(false),
+    faceImage: text('face_image'),
+    /**
+     * Set when the person deleted it. The row stays so the turns it answered
+     * keep naming it; it is no longer listed, picked or mentioned.
+     */
+    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [uniqueIndex('agent_default_space_idx').on(t.spaceId).where(sql`is_default`)],
+);
+
+export const job = pgTable(
+  'job',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    principalId: text('principal_id').references(() => principal.id),
+    objective: text('objective').notNull(),
+    /**
+     * Whose words the objective is, decided where it was written down rather than
+     * inferred later from `kind`: a corrective job and an evaluation arm both carry
+     * the origin of the text they were given. Null on rows written before this.
+     */
+    objectiveOrigin: text('objective_origin'),
+    kind: text('kind').notNull().default('responsibility'),
+    agentId: text('agent_id').references(() => agent.id, { onDelete: 'restrict' }),
+    currentTurnId: text('current_turn_id'),
+    planId: text('plan_id'),
+    experienceParentId: text('experience_parent_id'),
+    experienceCommandKey: text('experience_command_key').unique(),
+    experienceCategory: text('experience_category'),
+    pauseRequested: boolean('pause_requested').notNull().default(false),
+    paused: boolean('paused').notNull().default(false),
+    experienceCursor: bigint('experience_cursor', { mode: 'number' }).notNull().default(0),
+    experienceGroup: jsonb('experience_group').$type<string[]>().notNull().default([]),
+    constraints: jsonb('constraints').notNull().default({}),
+    state: text('state').notNull().default('queued'),
+    revision: integer('revision').notNull().default(0),
+    // The fence. Every attempt start bumps it; the broker refuses a stale epoch.
+    leaseEpoch: integer('lease_epoch').notNull().default(0),
+    // Due time lives here, not only in the queue, so a lost timer is recoverable.
+    nextWakeAt: timestamp('next_wake_at', { withTimezone: true }),
+    wait: jsonb('wait').notNull().default({ kind: 'none' }),
+    substrateDisposition: text('substrate_disposition').notNull().default('timer_or_event'),
+    schedulingClass: text('scheduling_class').notNull().default('interactive'),
+    importance: text('importance').notNull().default('routine'),
+    unreadResults: integer('unread_results').notNull().default(0),
+    unreadThreshold: integer('unread_threshold').notNull().default(3),
+    cadenceMultiplier: integer('cadence_multiplier').notNull().default(1),
+    attentionStatus: text('attention_status').notNull().default('normal'),
+    attentionBaseWakeAt: timestamp('attention_base_wake_at', { withTimezone: true }),
+    scheduleSkipRemaining: integer('schedule_skip_remaining').notNull().default(0),
+    lastResultHash: text('last_result_hash'),
+    lastAttentionAttemptId: text('last_attention_attempt_id'),
+    // Questions this job wanted to ask but did not, because a wake asks one.
+    deferredQuestions: jsonb('deferred_questions')
+      .$type<DeferredQuestion[]>()
+      .notNull()
+      .default([]),
+    budget: jsonb('budget').notNull().default({}),
+    createdBy: text('created_by').notNull().default('owner'),
+    /**
+     * `principal` is the job's own principal's work. `room` is a request someone
+     * made of a room's agent: the job's principal is the room, and it is read
+     * and steered only through the room's routes.
+     */
+    audience: text('audience').notNull().default('principal'),
+    /** For a room request, the member who asked. */
+    requestedByPrincipalId: text('requested_by_principal_id').references(() => principal.id),
+    /** For a room request, the thread it was asked in. */
+    roomThreadId: text('room_thread_id'),
+    createdAt: created(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    stateVersion: integer('state_version').notNull().default(0),
+  },
+  (t) => [
+    index('job_space_state_idx').on(t.spaceId, t.state),
+    // The recovery scan reads this every 60 seconds.
+    index('job_next_wake_idx').on(t.nextWakeAt),
+    index('job_room_thread_idx').on(t.roomThreadId),
+    check('job_audience', sql`${t.audience} in ('principal', 'room')`),
+  ],
+);
+
+export const attempt = pgTable(
+  'attempt',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    epoch: integer('epoch').notNull(),
+    principalId: text('principal_id').references(() => principal.id),
+    /**
+     * For a request made of a room's agent, the member who asked, copied from
+     * the job when the attempt starts. `principal_id` is the room's own
+     * principal then, so this is what says whose request the work was.
+     */
+    requestedByPrincipalId: text('requested_by_principal_id').references(() => principal.id),
+    membershipGeneration: integer('membership_generation'),
+    turnId: text('turn_id'),
+    runtimeVersion: text('runtime_version').notNull(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    modelActual: text('model_actual'),
+    usage: jsonb('usage').notNull().default({}),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    outcome: text('outcome'),
+    outcomeDetail: jsonb('outcome_detail'),
+    contextSnapshotRef: text('context_snapshot_ref'),
+    policyGeneration: integer('policy_generation').notNull().default(0),
+    connectionGenerations: jsonb('connection_generations')
+      .$type<Record<string, number>>()
+      .notNull()
+      .default({}),
+    revision: integer('revision').notNull().default(0),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    leaseStatus: text('lease_status').notNull().default('active'),
+    substrateDisposition: text('substrate_disposition')
+      .notNull()
+      .default('local_process_interrupted'),
+    runtimeCursor: integer('runtime_cursor').notNull().default(-1),
+    inputCursor: bigint('input_cursor', { mode: 'number' }).notNull().default(0),
+    /**
+     * `interactive` when a person is waiting on this attempt (their message,
+     * their answer or decision, or the turn they started); `background` when a
+     * trigger, schedule or timer woke it. Its model calls are counted under it.
+     */
+    usageClass: text('class').notNull().default('interactive'),
+    /** The trigger whose event woke this attempt, when one did. */
+    triggerId: text('trigger_id'),
+    /** The situation that woke this attempt, when one did (see situations/service.ts). */
+    situationId: text('situation_id'),
+  },
+  (t) => [
+    uniqueIndex('attempt_job_epoch_idx').on(t.jobId, t.epoch),
+    check('attempt_class', sql`${t.usageClass} in ('interactive', 'background')`),
+  ],
+);
+
+export const action = pgTable(
+  'action',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    attemptId: text('attempt_id')
+      .notNull()
+      .references(() => attempt.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    effectClass: text('effect_class').notNull(),
+    canonicalPayload: jsonb('canonical_payload').notNull(),
+    // The identity of the effect. Approval binds to it; a retry reuses it.
+    payloadHash: text('payload_hash').notNull(),
+    // sha256(job, revision, connection, kind, payload hash). One action per
+    // key: a re-proposal after a crash finds this row instead of making a
+    // second one. Null only on rows written before the column existed.
+    intentKey: text('intent_key'),
+    status: text('status').notNull().default('proposed'),
+    authorizationRef: text('authorization_ref'),
+    budgetReservation: text('budget_reservation'),
+    idempotencyKey: text('idempotency_key').notNull(),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
+    receipt: jsonb('receipt'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    reconciliation: jsonb('reconciliation'),
+    // What the repair policy did, in order, with the hash of the bytes each
+    // attempt put on the wire. Empty for an action that never met a fault.
+    repairTrace: jsonb('repair_trace').$type<RepairTraceEntry[]>().notNull().default([]),
+    // One counter per fault class met, so a class that keeps recurring is
+    // visible without reading a log.
+    repairCounters: jsonb('repair_counters').$type<Record<string, number>>().notNull().default({}),
+    // Where the last dispatch came to rest. `completed` is the only value that
+    // means the effect happened; every other one is a safe stop.
+    repairDisposition: text('repair_disposition'),
+    // Set when a destination asked to be left alone. The job then waits on a
+    // timer rather than on a worker, so nothing spins against a rate limit.
+    retryAfterAt: timestamp('retry_after_at', { withTimezone: true }),
+    // Which way it reached its service (`api` or `browser`) and which service
+    // that is (`google:mail`, `opentable.com`), set by the path policy at
+    // proposal. Null for an effect on no outside service, and on rows written
+    // before the columns existed.
+    path: text('path'),
+    serviceKey: text('service_key'),
+    // Which action at the service it is (`paths/operations.ts`): a form's
+    // address, or an app request's own key. An unconfirmed effect holds back
+    // the same action only, or anything for the same intent.
+    operationKey: text('operation_key'),
+    // The one open intent the work is for, when there is exactly one.
+    operationIntent: text('operation_intent'),
+    // For a browser submit doing what a connected app has a tool for, after
+    // the app could not: the app tools it stands in for, shown on its receipt.
+    standsInFor: text('stands_in_for'),
+    createdAt: created(),
+  },
+  (t) => [
+    index('action_job_status_idx').on(t.jobId, t.status),
+    uniqueIndex('action_idempotency_idx').on(t.idempotencyKey),
+    // Postgres lets a unique index hold many nulls, so pre-existing rows are
+    // untouched while every new proposal is one effect exactly once.
+    uniqueIndex('action_intent_key_idx').on(t.intentKey),
+  ],
+);
+
+/**
+ * A drift mapping is a proposal, never a live change.
+ *
+ * When a destination renames a field under a working call, re-discovery writes
+ * a row here with the mapping it would use and the test that mapping must pass.
+ * A candidate becomes `applied` only after its test passes and only for the
+ * action that raised it; anything ambiguous becomes `rejected` and the action
+ * stops instead. Nothing reads this table to change behaviour on its own.
+ */
+export const repairCandidate = pgTable(
+  'repair_candidate',
+  {
+    id: text('id').primaryKey(),
+    actionId: text('action_id')
+      .notNull()
+      .references(() => action.id, { onDelete: 'cascade' }),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id').notNull(),
+    kind: text('kind').notNull(),
+    faultKind: text('fault_kind').notNull(),
+    state: text('state').notNull().default('candidate'),
+    observedSchema: jsonb('observed_schema'),
+    /** Old field name to new field name. Nothing else is expressible. */
+    proposedMapping: jsonb('proposed_mapping')
+      .$type<Record<string, string>>()
+      .notNull()
+      .default({}),
+    test: jsonb('test').notNull(),
+    evaluation: jsonb('evaluation'),
+    /** True only for a rename whose every value survives unchanged. */
+    safe: boolean('safe').notNull().default(false),
+    createdAt: created(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('repair_candidate_action_idx').on(t.actionId, t.state),
+    index('repair_candidate_job_idx').on(t.jobId),
+    // One candidate per action and mapping: re-running discovery updates the
+    // proposal it already made instead of stacking near-identical guesses.
+    uniqueIndex('repair_candidate_mapping_idx').on(t.actionId, t.proposedMapping),
+  ],
+);
+
+export const approval = pgTable(
+  'approval',
+  {
+    id: text('id').primaryKey(),
+    actionId: text('action_id')
+      .notNull()
+      .references(() => action.id, { onDelete: 'cascade' }),
+    jobRevision: integer('job_revision').notNull(),
+    payloadHash: text('payload_hash').notNull(),
+    requestedAt: timestamp('requested_at', { withTimezone: true }).notNull().defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    decision: text('decision'),
+    substrateDisposition: text('substrate_disposition').notNull().default('timer_or_event'),
+    decidedBy: text('decided_by'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    // The doubts the person was shown. A decision is bound to this set, so an
+    // approval given before an origin was known cannot be spent after.
+    originWarnings: jsonb('origin_warnings').notNull().default([]),
+    /**
+     * The action moves money, so an Allow counts only with the person's own
+     * confirmation given for it (`step_up`), at the moment they answered.
+     */
+    stepUpRequired: boolean('step_up_required').notNull().default(false),
+    /** The confirmation an Allow of a money move was given with. */
+    stepUpId: text('step_up_id'),
+  },
+  // One live approval per action and payload: re-asking for the same bytes
+  // reuses the record instead of stacking duplicates in the inbox.
+  (t) => [uniqueIndex('approval_action_hash_idx').on(t.actionId, t.payloadHash)],
+);
+
+/**
+ * The person confirming it is them, with their own password, for one money
+ * move: one approval, one action, one exact payload. Its token is kept only
+ * as a hash, lasts two minutes and is spent by the one Allow it was made for.
+ */
+export const stepUp = pgTable(
+  'step_up',
+  {
+    id: text('id').primaryKey(),
+    tokenHash: text('token_hash').notNull().unique(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    approvalId: text('approval_id')
+      .notNull()
+      .references(() => approval.id, { onDelete: 'cascade' }),
+    actionId: text('action_id')
+      .notNull()
+      .references(() => action.id, { onDelete: 'cascade' }),
+    payloadHash: text('payload_hash').notNull(),
+    /** How the person confirmed: `password` now; a passkey later. */
+    method: text('method').notNull(),
+    createdAt: created(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('step_up_approval_idx').on(t.approvalId),
+    check('step_up_method', sql`${t.method} in ('password', 'passkey', 'oidc')`),
+  ],
+);
+
+/**
+ * How much the agent does on its own for one kind of task, as one person chose
+ * (`broker/autonomy.ts`). A row with no level was asked about once, in the
+ * conversation named here, and not answered yet: the default applies and it is
+ * not asked again. The person is a principal, or the owner of a single-person
+ * install, so there is no reference to either table.
+ */
+export const taskAutonomy = pgTable(
+  'task_autonomy',
+  {
+    principalId: text('principal_id').notNull(),
+    kind: text('kind').notNull(),
+    level: text('level'),
+    /** Where it was chosen: Settings, the card that asked, or the person's own message. */
+    setBy: text('set_by'),
+    /** The message that set it, when it was said in one. */
+    turnId: text('turn_id'),
+    askId: text('ask_id'),
+    askedJobId: text('asked_job_id'),
+    askedAt: timestamp('asked_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.principalId, t.kind] }),
+    check(
+      'task_autonomy_kind',
+      sql`${t.kind} in ('email', 'chat_message', 'calendar_invite', 'public_post', 'other_send')`,
+    ),
+    check(
+      'task_autonomy_level',
+      sql`${t.level} is null or ${t.level} in ('draft', 'when_confident', 'always')`,
+    ),
+    check(
+      'task_autonomy_set_by',
+      sql`${t.setBy} is null or ${t.setBy} in ('settings', 'card', 'chat')`,
+    ),
+  ],
+);
+
+export const event = pgTable(
+  'event',
+  {
+    seq: bigserial('seq', { mode: 'number' }).primaryKey(),
+    jobId: text('job_id').references(() => job.id, { onDelete: 'cascade' }),
+    attemptId: text('attempt_id').references(() => attempt.id, { onDelete: 'cascade' }),
+    type: text('type').notNull(),
+    // Null on pre-protocol events: migration must not invent a historical lease.
+    epoch: integer('epoch'),
+    payload: jsonb('payload').notNull().default({}),
+    // Duplicate delivery of the same runtime event writes one row, not two.
+    dedupKey: text('dedup_key').notNull(),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('event_dedup_idx').on(t.dedupKey),
+    index('event_job_seq_idx').on(t.jobId, t.seq),
+    // A page of a chat's messages reads the events of its turns alone.
+    index('event_experience_turn_idx')
+      .on(t.jobId, sql`(${t.payload}->>'turn_id')`, t.seq)
+      .where(sql`${t.payload}->>'kind' = 'experience'`),
+    // What a connection reported and no job owns, found by its connection when
+    // the connection is revoked or its space removed.
+    index('event_connector_observation_idx')
+      .on(sql`(${t.payload}->>'connection_id')`)
+      .where(sql`${t.jobId} is null and ${t.payload}->>'kind' = 'connector_event'`),
+  ],
+);
+
+export const artifact = pgTable(
+  'artifact',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    jobId: text('job_id').references(() => job.id, { onDelete: 'set null' }),
+    /**
+     * The job whose work this is. `job_id` is nulled when a job row goes away;
+     * this one is not a foreign key precisely so it survives that, because it is
+     * what "update this with the latest data" resolves against.
+     */
+    sourceJobId: text('source_job_id'),
+    /** `work` is the job's own workspace; `artifacts` is the space directory. */
+    area: text('area').notNull().default('work'),
+    path: text('path').notNull(),
+    kind: text('kind').notNull().default('binary'),
+    contentHash: text('content_hash').notNull(),
+    mime: text('mime').notNull(),
+    size: integer('size').notNull(),
+    audience: text('audience').notNull().default('owner'),
+    /** The template this was produced from, when one was declared. */
+    template: text('template'),
+    /** The declared expectation, verbatim. Null for a file nobody promised anything about. */
+    expectation: jsonb('expectation'),
+    /** Handles the content was derived from: action ids, claim handles, artifact ids. */
+    evidence: jsonb('evidence').notNull().default([]),
+    createdAt: created(),
+  },
+  (t) => [
+    index('artifact_space_idx').on(t.spaceId),
+    // The gate reads the latest row per path, so this is the index it walks.
+    index('artifact_job_path_idx').on(t.jobId, t.area, t.path, t.createdAt),
+  ],
+);
+
+/**
+ * One validation result, bound to the artifact row and therefore to the exact
+ * bytes it was computed over. Re-writing a file makes a new artifact row with
+ * its own results rather than editing these, so the history of what was wrong
+ * survives the fix.
+ */
+export const artifactValidation = pgTable(
+  'artifact_validation',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    artifactId: text('artifact_id')
+      .notNull()
+      .references(() => artifact.id, { onDelete: 'cascade' }),
+    class: text('class').notNull(),
+    name: text('name').notNull(),
+    status: text('status').notNull(),
+    detail: text('detail').notNull().default(''),
+    evidence: jsonb('evidence').notNull().default({}),
+    /** Advisory results are recorded and shown; they never block a completion. */
+    advisory: boolean('advisory').notNull().default(false),
+    checkedAt: timestamp('checked_at', { withTimezone: true }).notNull().defaultNow(),
+    validatedContentHash: text('validated_content_hash'),
+  },
+  (t) => [
+    index('artifact_validation_artifact_idx').on(t.artifactId),
+    // One live result per named check per artifact: a human acceptance replaces
+    // the pending row it answers rather than sitting beside it.
+    uniqueIndex('artifact_validation_name_idx').on(t.artifactId, t.name),
+  ],
+);
+
+/** Where an artifact went, and what the destination called it when it got there. */
+export const artifactPublication = pgTable(
+  'artifact_publication',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    artifactId: text('artifact_id')
+      .notNull()
+      .references(() => artifact.id, { onDelete: 'cascade' }),
+    actionId: text('action_id').notNull(),
+    destination: text('destination').notNull(),
+    externalRef: text('external_ref'),
+    contentHash: text('content_hash').notNull(),
+    detail: jsonb('detail').notNull().default({}),
+    publishedAt: timestamp('published_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('artifact_publication_artifact_idx').on(t.artifactId),
+    uniqueIndex('artifact_publication_action_idx').on(t.actionId),
+  ],
+);
+
+/**
+ * A catalog, not the record. The Markdown file in the space git repository is
+ * the source of truth and the FTS index is derived from it.
+ */
+export const knowledgeRecord = pgTable(
+  'knowledge_record',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    path: text('path').notNull(),
+    frontmatter: jsonb('frontmatter').notNull(),
+    contentHash: text('content_hash').notNull(),
+    status: text('status').notNull().default('active'),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('knowledge_space_path_idx').on(t.spaceId, t.path)],
+);
+
+export const trigger = pgTable(
+  'trigger',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    kind: text('kind').notNull(),
+    spec: jsonb('spec').notNull(),
+    cursor: text('cursor'),
+    enabled: boolean('enabled').notNull().default(true),
+    substrateDisposition: text('substrate_disposition').notNull().default('timer_or_event'),
+    // The last observation this trigger looked at, so a `changed` clause has
+    // something to compare against. Null until the first one arrives, which is
+    // why `changed` is false on a feed's first observation: there is no
+    // evidence of a change, only evidence of a first sighting.
+    lastObservation: jsonb('last_observation'),
+    createdAt: created(),
+  },
+  (t) => [index('trigger_job_idx').on(t.jobId)],
+);
+
+/** Reserve before the call, settle after it. Concurrent attempts cannot double-spend. */
+export const budgetLedger = pgTable(
+  'budget_ledger',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    attemptId: text('attempt_id').references(() => attempt.id, { onDelete: 'set null' }),
+    actionId: text('action_id').references(() => action.id, { onDelete: 'set null' }),
+    kind: text('kind').notNull(),
+    reserved: doublePrecision('reserved').notNull(),
+    settled: doublePrecision('settled'),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('budget_job_idx').on(t.jobId)],
+);
+
+export const skill = pgTable(
+  'skill',
+  {
+    id: text('id').primaryKey(),
+    // Null for the skills that ship with the release.
+    spaceId: text('space_id').references(() => space.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    path: text('path').notNull(),
+    frontmatter: jsonb('frontmatter').notNull(),
+    enabled: boolean('enabled').notNull().default(true),
+  },
+  (t) => [uniqueIndex('skill_space_name_idx').on(t.spaceId, t.name)],
+);
+
+export const submission = pgTable('submission', {
+  submissionId: text('submission_id').primaryKey(),
+  inputDigest: text('input_digest').notNull(),
+  principalId: text('principal_id').references(() => principal.id),
+  jobId: text('job_id').references(() => job.id, { onDelete: 'set null' }),
+  jobRevision: integer('job_revision'),
+  eventCursor: bigint('event_cursor', { mode: 'number' }),
+  state: text('state').notNull(),
+  httpStatus: integer('http_status').notNull(),
+  errorCode: text('error_code'),
+  errorMessage: text('error_message'),
+  createdAt: created(),
+});
+
+/** Independent of the receipt row and retained beyond event-stream pruning. */
+export const acceptanceJournal = pgTable('acceptance_journal', {
+  submissionId: text('submission_id').primaryKey(),
+  principalId: text('principal_id').references(() => principal.id),
+  jobId: text('job_id').references(() => job.id, { onDelete: 'set null' }),
+  receipt: jsonb('receipt').notNull(),
+  receiptHash: text('receipt_hash').notNull(),
+  createdAt: created(),
+});
+
+export const replyObligation = pgTable(
+  'reply_obligation',
+  {
+    id: text('id').primaryKey(),
+    submissionId: text('submission_id').notNull().unique(),
+    jobId: text('job_id').references(() => job.id, { onDelete: 'set null' }),
+    kind: text('kind').notNull(),
+    state: text('state').notNull().default('owed'),
+    substrateDisposition: text('substrate_disposition').notNull().default('timer_or_event'),
+    coalesceKey: text('coalesce_key').notNull(),
+    eventCursor: bigint('event_cursor', { mode: 'number' }).notNull(),
+    content: jsonb('content'),
+    contentHash: text('content_hash'),
+    acknowledgedAt: timestamp('acknowledged_at', { withTimezone: true }),
+    fulfilledAt: timestamp('fulfilled_at', { withTimezone: true }),
+    message: text('message'),
+    createdAt: created(),
+  },
+  (t) => [index('reply_owed_idx').on(t.state, t.jobId)],
+);
+
+export const notification = pgTable(
+  'notification',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id').references(() => job.id, { onDelete: 'set null' }),
+    coalesceKey: text('coalesce_key').notNull(),
+    deliveryKey: text('delivery_key').notNull(),
+    obligationIds: jsonb('obligation_ids').notNull(),
+    content: jsonb('content'),
+    contentHash: text('content_hash').notNull(),
+    // Why this had to be sent, and what happens if it is ignored. Both required:
+    // a notification nobody can trace back to a record is noise with authority.
+    because: jsonb('because').$type<string[]>().notNull().default([]),
+    ifIgnored: text('if_ignored').notNull().default('This message has not been delivered yet.'),
+    deliveryAttempt: integer('delivery_attempt').notNull(),
+    state: text('state').notNull().default('pending'),
+    substrateDisposition: text('substrate_disposition').notNull().default('external_uncertain'),
+    attemptedAt: timestamp('attempted_at', { withTimezone: true }),
+    deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('notification_attempt_idx').on(t.deliveryKey, t.deliveryAttempt),
+    index('notification_pending_idx').on(t.state),
+    check('notification_because_not_empty', sql`jsonb_array_length(${t.because}) > 0`),
+  ],
+);
+
+/**
+ * A browser that receives pushes for one person. The endpoint and keys stay in
+ * the service: the person sees a device name and when it was last used.
+ */
+export const pushSubscription = pgTable(
+  'push_subscription',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull().unique(),
+    p256dh: text('p256dh').notNull(),
+    auth: text('auth').notNull(),
+    deviceLabel: text('device_label').notNull().default(''),
+    createdAt: created(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  },
+  (t) => [index('push_subscription_principal_idx').on(t.principalId)],
+);
+
+/** What a person wants pushed, and how often. No row means the defaults. */
+export const pushSetting = pgTable('push_setting', {
+  principalId: text('principal_id')
+    .primaryKey()
+    .references(() => principal.id, { onDelete: 'cascade' }),
+  decisions: boolean('decisions').notNull().default(true),
+  settled: boolean('settled').notNull().default(true),
+  weeklySummary: boolean('weekly_summary').notNull().default(true),
+  dailyCap: integer('daily_cap').notNull().default(4),
+  batchMinutes: integer('batch_minutes').notNull().default(10),
+});
+
+/**
+ * When a person last had OpenDuet open in front of them, on any device. A
+ * conversation that finishes while they are looking needs no push.
+ */
+export const clientFocus = pgTable('client_focus', {
+  principalId: text('principal_id')
+    .primaryKey()
+    .references(() => principal.id, { onDelete: 'cascade' }),
+  focusedAt: timestamp('focused_at', { withTimezone: true }).notNull(),
+});
+
+/**
+ * One thing worth saying, recorded once by its dedup key. It goes out alone or
+ * folded into a batch, and it cannot exist without saying why.
+ */
+export const pushIntent = pgTable(
+  'push_intent',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    /** `decision`, `settled`, `weekly`, `progress` or `situation`. */
+    kind: text('kind').notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull(),
+    because: text('because').notNull(),
+    url: text('url').notNull(),
+    dedupKey: text('dedup_key').notNull().unique(),
+    createdAt: created(),
+    /** The batch it went out in; null while it waits. */
+    batchId: text('batch_id'),
+    sentAt: timestamp('sent_at', { withTimezone: true }),
+    /** Set instead of sending when it stopped being true: the decision was made. */
+    droppedAt: timestamp('dropped_at', { withTimezone: true }),
+    /** `normal`, `soon` or `urgent`: how it is paced (see push/policy.ts). */
+    urgency: text('urgency').notNull().default('normal'),
+    /** An urgent push about a deadline the person set or accepted may break quiet hours. */
+    personSet: boolean('person_set').notNull().default(false),
+    /** The situation it tells of, when it does. */
+    situationId: text('situation_id'),
+    /** The lane it went out in, which may be below the one it asked for; its day's count is that lane's. */
+    sentLane: text('sent_lane'),
+  },
+  (t) => [
+    index('push_intent_waiting_idx')
+      .on(t.principalId)
+      .where(sql`sent_at is null and dropped_at is null`),
+    check('push_intent_because_not_empty', sql`length(${t.because}) > 0`),
+    check('push_intent_urgency', sql`${t.urgency} in ('normal', 'soon', 'urgent')`),
+    // Only a deadline the person set or accepted may break their quiet.
+    check('push_intent_urgent_is_person_set', sql`${t.urgency} <> 'urgent' or ${t.personSet}`),
+    index('push_intent_situation_idx').on(t.situationId).where(sql`${t.situationId} is not null`),
+  ],
+);
+
+/**
+ * The owner's question queue. One open row per job, enforced in the database, so
+ * a talkative responsibility cannot turn one queue into its own inbox.
+ */
+export const question = pgTable(
+  'question',
+  {
+    id: text('id').primaryKey(),
+    /** `job` or `memory`. One queue, two things that can put an entry in it. */
+    source: text('source').notNull().default('job'),
+    /** Null for a memory question: a disputed key belongs to a space, not a job. */
+    jobId: text('job_id').references(() => job.id, { onDelete: 'cascade' }),
+    attemptId: text('attempt_id').references(() => attempt.id, { onDelete: 'set null' }),
+    /** Set together, and only for a memory question: which key is in dispute. */
+    spaceId: text('space_id').references(() => space.id, { onDelete: 'cascade' }),
+    key: text('key'),
+    text: text('text').notNull(),
+    because: jsonb('because').$type<string[]>().notNull(),
+    /** Why the agent asked, in its own words, when it said. */
+    why: text('why'),
+    ifIgnored: text('if_ignored').notNull(),
+    blocksExternalEffect: boolean('blocks_external_effect').notNull().default(false),
+    deadlineAt: timestamp('deadline_at', { withTimezone: true }),
+    state: text('state').notNull().default('open'),
+    answer: text('answer'),
+    options: jsonb('options').$type<Array<{ id: string; label: string }>>().notNull().default([]),
+    answerSubmissionId: text('answer_submission_id'),
+    answeredAt: timestamp('answered_at', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('question_open_job_idx').on(t.jobId).where(sql`state = 'open'`),
+    // One open question per disputed key, however many conflicting proposals arrive.
+    uniqueIndex('question_open_memory_idx')
+      .on(t.spaceId, t.key)
+      .where(sql`state = 'open' and source = 'memory'`),
+    index('question_queue_idx').on(t.state, t.blocksExternalEffect, t.deadlineAt, t.createdAt),
+    check('question_because_not_empty', sql`jsonb_array_length(${t.because}) > 0`),
+  ],
+);
+
+/** Durable registrations are the recovery source; queue messages are disposable hints. */
+export const backgroundOperation = pgTable(
+  'background_operation',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    operationKey: text('operation_key').notNull(),
+    inputDigest: text('input_digest').notNull(),
+    policyGeneration: integer('policy_generation').notNull().default(0),
+    kind: text('kind').notNull(),
+    substrateDisposition: text('substrate_disposition').notNull(),
+    state: text('state').notNull().default('registered'),
+    version: integer('version').notNull().default(0),
+    ownerInstance: text('owner_instance'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    dueAt: timestamp('due_at', { withTimezone: true }).notNull().defaultNow(),
+    remoteRef: text('remote_ref'),
+    triggerId: text('trigger_id').references(() => trigger.id, { onDelete: 'set null' }),
+    result: jsonb('result'),
+    createdAt: created(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('operation_job_key_idx').on(t.jobId, t.operationKey),
+    index('operation_ready_idx').on(t.state, t.dueAt),
+  ],
+);
+
+/** Transport retention is separate from the durable event/transcript ledger. */
+export const eventRetention = pgTable('event_retention', {
+  id: text('id').primaryKey(),
+  retainedAfter: bigint('retained_after', { mode: 'number' }).notNull().default(0),
+});
+
+export const experienceTurn = pgTable(
+  'experience_turn',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    agentId: text('agent_id')
+      .notNull()
+      .references(() => agent.id),
+    submissionId: text('submission_id').notNull().unique(),
+    /** Who said this turn's words. Null on turns recorded before authors were. */
+    authorPrincipalId: text('author_principal_id').references(() => principal.id),
+    text: text('text').notNull(),
+    answer: text('answer').notNull().default(''),
+    status: text('status').notNull().default('queued'),
+    createdAt: created(),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+  },
+  // A chat's turns, newest first, a page at a time.
+  (t) => [index('experience_turn_job_created_idx').on(t.jobId, t.createdAt, t.id)],
+);
+
+export const experienceProfile = pgTable('experience_profile', {
+  spaceId: text('space_id')
+    .primaryKey()
+    .references(() => space.id, { onDelete: 'cascade' }),
+  name: text('name').notNull().default(''),
+  timeZone: text('time_zone').notNull().default('UTC'),
+  dayStart: text('day_start').notNull().default('08:00'),
+  dayEnd: text('day_end').notNull().default('22:00'),
+  /** When the person finished or skipped setup. Kept here so no browser has to remember it. */
+  onboardedAt: timestamp('onboarded_at', { withTimezone: true }),
+  /** When the person chose or confirmed their time zone; until then it is only a default. */
+  timeZoneConfirmedAt: timestamp('time_zone_confirmed_at', { withTimezone: true }),
+  /** How the agent sounds in replies and drafts: `teammate` or `professional`. */
+  voice: text('voice').notNull().default('teammate'),
+});
+
+export const task = pgTable('task', {
+  id: text('id').primaryKey(),
+  spaceId: text('space_id')
+    .notNull()
+    .references(() => space.id, { onDelete: 'cascade' }),
+  title: text('title').notNull(),
+  dueAt: timestamp('due_at', { withTimezone: true }),
+  done: boolean('done').notNull().default(false),
+  createdAt: created(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const planMilestone = pgTable('plan_milestone', {
+  id: text('id').primaryKey(),
+  planId: text('plan_id')
+    .notNull()
+    .references(() => job.id, { onDelete: 'cascade' }),
+  title: text('title').notNull(),
+  ordinal: integer('ordinal').notNull(),
+  agentId: text('agent_id').references(() => agent.id),
+  childJobId: text('child_job_id').references(() => job.id),
+  done: boolean('done').notNull().default(false),
+  scheduleAt: timestamp('schedule_at', { withTimezone: true }),
+});
+
+/**
+ * A run: long work an assistant keeps at across shifts. One row per run job
+ * and per helper step; a step names the run it belongs to. The job row holds
+ * the state machine; this row holds what the loop between shifts decides on.
+ */
+export const runState = pgTable(
+  'run_state',
+  {
+    jobId: text('job_id')
+      .primaryKey()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    /** The run a helper step works for; null on a run itself. */
+    parentRunId: text('parent_run_id').references(() => job.id, { onDelete: 'cascade' }),
+    /** The conversation it was started from, when it was. */
+    conversationId: text('conversation_id').references(() => job.id, { onDelete: 'set null' }),
+    goal: text('goal').notNull(),
+    doneWhen: text('done_when'),
+    metric: jsonb('metric').$type<{ name: string; direction: 'higher' | 'lower' } | null>(),
+    /** An overall limit the person chose; null is none. */
+    limit: jsonb('limit').$type<Record<string, number> | null>(),
+    shifts: integer('shifts').notNull().default(0),
+    idleShifts: integer('idle_shifts').notNull().default(0),
+    /** The run sleeps until its helpers are done (or a fallback time). */
+    waitingOnSteps: boolean('waiting_on_steps').notNull().default(false),
+    lastReportAt: timestamp('last_report_at', { withTimezone: true }),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+    /** A result is confirmed by a separate check before the run is called done. */
+    checkResult: boolean('check_result').notNull().default(true),
+    /** On a helper that checks a result: the proposed result entry it checks. */
+    checking: text('checking'),
+    createdAt: created(),
+  },
+  (t) => [
+    index('run_state_parent_idx').on(t.parentRunId),
+    index('run_state_conversation_idx').on(t.conversationId),
+    index('run_state_space_idx').on(t.spaceId),
+  ],
+);
+
+/**
+ * The record a run keeps: append-only, ordered by `seq`. Entries written by a
+ * helper are filed under the run it works for, with `stepJobId` naming it.
+ */
+export const runEntry = pgTable(
+  'run_entry',
+  {
+    id: text('id').primaryKey(),
+    seq: bigserial('seq', { mode: 'number' }).notNull(),
+    runJobId: text('run_job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    stepJobId: text('step_job_id').references(() => job.id, { onDelete: 'set null' }),
+    attemptId: text('attempt_id'),
+    kind: text('kind').notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull().default(''),
+    data: jsonb('data').$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: created(),
+  },
+  (t) => [
+    index('run_entry_run_seq_idx').on(t.runJobId, t.seq),
+    index('run_entry_attempt_idx').on(t.attemptId),
+  ],
+);
+
+export const experienceRule = pgTable(
+  'experience_rule',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id),
+    toolKind: text('tool_kind').notNull(),
+    recipient: jsonb('recipient').notNull(),
+    recipientClass: text('recipient_class').notNull(),
+    originTrust: text('origin_trust').notNull(),
+    countCap: integer('count_cap').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    reconsentAfterDays: integer('reconsent_after_days').notNull(),
+    used: integer('used').notNull().default(0),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: created(),
+    /**
+     * A rule scoped to one job: a chase's follow-ups, covered by the person's
+     * approval of its first message, which `sourceActionId` names.
+     */
+    jobId: text('job_id').references(() => job.id, { onDelete: 'cascade' }),
+    sourceActionId: text('source_action_id').references(() => action.id, { onDelete: 'cascade' }),
+  },
+  (t) => [
+    check(
+      'experience_rule_bounds',
+      sql`${t.countCap} between 1 and 100 and ${t.reconsentAfterDays} between 1 and 30 and ${t.used} between 0 and ${t.countCap}`,
+    ),
+    check(
+      'experience_rule_job_scope',
+      sql`${t.originTrust} <> 'person_approved' or (${t.jobId} is not null and ${t.sourceActionId} is not null)`,
+    ),
+    uniqueIndex('experience_rule_job_idx').on(t.jobId).where(sql`${t.jobId} is not null`),
+  ],
+);
+
+export const experienceRuleUse = pgTable('experience_rule_use', {
+  actionId: text('action_id')
+    .primaryKey()
+    .references(() => action.id, { onDelete: 'cascade' }),
+  ruleId: text('rule_id')
+    .notNull()
+    .references(() => experienceRule.id),
+});
+
+export const experienceUndo = pgTable('experience_undo', {
+  actionId: text('action_id')
+    .primaryKey()
+    .references(() => action.id, { onDelete: 'cascade' }),
+  handle: text('handle').notNull().unique(),
+  validUntil: timestamp('valid_until', { withTimezone: true }).notNull(),
+  reversalActionId: text('reversal_action_id').references(() => action.id),
+});
+
+export const experienceDraftSend = pgTable('experience_draft_send', {
+  draftActionId: text('draft_action_id')
+    .primaryKey()
+    .references(() => action.id, { onDelete: 'cascade' }),
+  sendActionId: text('send_action_id').references(() => action.id),
+  requestedAt: timestamp('requested_at', { withTimezone: true }).notNull().defaultNow(),
+  discardedAt: timestamp('discarded_at', { withTimezone: true }),
+});
+
+/**
+ * What each person has used of their daily voice allowance: seconds
+ * transcribed, characters read aloud, voice sessions opened, words with the
+ * agent while it works. Keyed by person
+ * and nothing else, because the allowance follows the person across spaces.
+ * No audio or text is kept here, only the amount.
+ */
+export const voiceUsage = pgTable(
+  'voice_usage',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id').notNull(),
+    kind: text('kind').notNull(),
+    amount: integer('amount').notNull(),
+    createdAt: created(),
+  },
+  (t) => [
+    index('voice_usage_principal').on(t.principalId, t.kind, t.createdAt),
+    check('voice_usage_kind', sql`${t.kind} in ('transcribe', 'speech', 'session', 'aside')`),
+    check('voice_usage_amount', sql`${t.amount} > 0`),
+  ],
+);
+
+/**
+ * One row per call: who was on it and for how long, so an operator's monthly
+ * cap on call minutes can hold. No words and no audio are kept here; what was
+ * said is in the conversation. Rows older than the month are cleared as new
+ * calls start.
+ */
+export const callUsage = pgTable(
+  'call_usage',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    /** Seconds on the call, written as it goes on and when it ends. */
+    seconds: integer('seconds').notNull().default(0),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('call_usage_principal').on(t.principalId, t.startedAt),
+    check('call_usage_seconds', sql`${t.seconds} >= 0`),
+  ],
+);
+
+/**
+ * How a person's space lets auto-review stand in for them. No row is the
+ * default: auto-review for work inside the agent's own sandbox, and the
+ * person asked for everything else.
+ */
+export const approvalReviewPolicy = pgTable(
+  'approval_review_policy',
+  {
+    spaceId: text('space_id')
+      .primaryKey()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    mode: text('mode').notNull().default('auto_review'),
+    classes: jsonb('classes').notNull().default({}),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [check('approval_review_policy_mode', sql`${t.mode} in ('ask', 'auto_review')`)],
+);
+
+/**
+ * One row per action that auto-review decided instead of asking the person,
+ * or sent to the person with its reason. It is the audit trail, and the rate
+ * limits count from it.
+ */
+export const actionReview = pgTable(
+  'action_review',
+  {
+    id: text('id').primaryKey(),
+    actionId: text('action_id')
+      .notNull()
+      .references(() => action.id, { onDelete: 'cascade' }),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    /** `sandbox`, `reviewable` or `person`. */
+    tier: text('tier').notNull(),
+    actionClass: text('action_class'),
+    /** `policy` (a fixed rule) or `reviewer` (the model review). */
+    decidedBy: text('decided_by').notNull(),
+    /** `approved` or `escalated`. */
+    outcome: text('outcome').notNull(),
+    risk: text('risk'),
+    reason: text('reason').notNull(),
+    model: text('model'),
+    latencyMs: integer('latency_ms'),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('action_review_action_idx').on(t.actionId),
+    index('action_review_space_idx').on(t.spaceId, t.createdAt),
+    index('action_review_job_idx').on(t.jobId, t.createdAt),
+    check('action_review_outcome', sql`${t.outcome} in ('approved', 'escalated')`),
+    check('action_review_decided_by', sql`${t.decidedBy} in ('policy', 'reviewer')`),
+  ],
+);
+
+/**
+ * What was done in the person's name, kept after the chat or plan that did it
+ * is deleted. One row per succeeded action whose effect reached outside
+ * OpenDuet. It names the effect and where it went, never what it said: no
+ * subject, body or file contents.
+ */
+export const activityRecord = pgTable(
+  'activity_record',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    /** Whose work it was; null on work from before principals. */
+    principalId: text('principal_id'),
+    /** The action this was, kept as a plain value: the action row is gone. */
+    actionId: text('action_id').notNull(),
+    kind: text('kind').notNull(),
+    effectClass: text('effect_class').notNull(),
+    connectionId: text('connection_id'),
+    connectionLabel: text('connection_label').notNull(),
+    provider: text('provider').notNull(),
+    /** The recipient or place it went, where the effect has one. */
+    destination: text('destination'),
+    /** The destination's own reference for it, from the receipt. */
+    externalRef: text('external_ref'),
+    outcome: text('outcome').notNull(),
+    /** The title of the chat or plan it came from. */
+    source: text('source').notNull(),
+    happenedAt: timestamp('happened_at', { withTimezone: true }).notNull(),
+    recordedAt: timestamp('recorded_at', { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * How to take it back, kept from the reversal registry when the chat was
+     * deleted: the tool, its payload and the connection it runs on. Null when
+     * it has none.
+     */
+    reversal: jsonb('reversal'),
+    /** Until when Undo is offered. */
+    undoUntil: timestamp('undo_until', { withTimezone: true }),
+    /** When it was taken back, and by which action. */
+    undoneAt: timestamp('undone_at', { withTimezone: true }),
+    undoneBy: text('undone_by'),
+  },
+  (t) => [
+    uniqueIndex('activity_record_action_idx').on(t.actionId),
+    index('activity_record_space_idx').on(t.spaceId, t.happenedAt),
+  ],
+);
+
+export const schema = {
+  owner,
+  principal,
+  spaceMembership,
+  space,
+  secret,
+  connection,
+  job,
+  attempt,
+  action,
+  repairCandidate,
+  approval,
+  event,
+  artifact,
+  artifactValidation,
+  artifactPublication,
+  knowledgeRecord,
+  trigger,
+  budgetLedger,
+  skill,
+  submission,
+  acceptanceJournal,
+  replyObligation,
+  notification,
+  question,
+  backgroundOperation,
+  eventRetention,
+  agent,
+  experienceTurn,
+  experienceProfile,
+  task,
+  planMilestone,
+  experienceRule,
+  experienceRuleUse,
+  experienceUndo,
+  experienceDraftSend,
+  approvalReviewPolicy,
+  actionReview,
+  activityRecord,
+};
+
+/**
+ * Threads that routines deleted before a deleted routine took its thread with
+ * it left behind, listed once by a migration. The service removes each the way
+ * a deleted chat goes and takes it off this list; once empty it stays empty.
+ */
+export const orphanedRoutineThread = pgTable('orphaned_routine_thread', {
+  jobId: text('job_id').primaryKey(),
+});
+
+/**
+ * Every model call any of the service's gateways settled: who it counts
+ * against, which model served it and why, the tokens it used and what that
+ * is estimated to have cost. Spending caps and Settings' usage read it.
+ */
+export const modelUsage = pgTable(
+  'model_usage',
+  {
+    id: text('id').primaryKey(),
+    createdAt: created(),
+    spaceId: text('space_id'),
+    principalId: text('principal_id'),
+    jobId: text('job_id'),
+    /** `agent` for an agent turn, otherwise the service call's purpose (memory, voice, ...). */
+    purpose: text('purpose').notNull(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    modelActual: text('model_actual'),
+    /** `vision` or `fallback` when the call went to another model than the one it named. */
+    route: text('route'),
+    routedFrom: text('routed_from'),
+    status: text('status').notNull(),
+    inputTokens: integer('input_tokens').notNull().default(0),
+    outputTokens: integer('output_tokens').notNull().default(0),
+    cachedInputTokens: integer('cached_input_tokens').notNull().default(0),
+    costUsd: doublePrecision('cost_usd').notNull().default(0),
+    usageEstimated: boolean('usage_estimated').notNull().default(false),
+    /** `interactive` when a person was waiting on the call, else `background`. */
+    usageClass: text('class').notNull().default('interactive'),
+    /**
+     * Which step made the call: `interactive` (an agent turn a person waits
+     * on), `t2` (an agent turn something else woke), `service` (one of the
+     * service's own side calls), or `t1` (a batched look at what came in).
+     */
+    tier: text('tier').notNull().default('interactive'),
+    /** The trigger whose event woke the work that made the call, when one did. */
+    triggerId: text('trigger_id'),
+    /** The situation behind the call, when one is. */
+    situationId: text('situation_id'),
+    /** Input at full-price-equivalent tokens: cached reads and cache writes at their own prices. */
+    chargedInputTokens: integer('charged_input_tokens').notNull().default(0),
+    /** The part of the input the provider wrote to its prompt cache. */
+    cacheWriteTokens: integer('cache_write_tokens').notNull().default(0),
+  },
+  (t) => [
+    index('model_usage_created_idx').on(t.createdAt),
+    index('model_usage_principal_idx').on(t.principalId, t.createdAt),
+    index('model_usage_space_idx').on(t.spaceId, t.createdAt),
+    check('model_usage_class', sql`${t.usageClass} in ('interactive', 'background')`),
+  ],
+);
+
+/**
+ * One day of `model_usage`, summed per person, space, class, tier and
+ * purpose. Written for each finished UTC day, and recomputable from
+ * `model_usage` at any time; an empty person or space is ''.
+ */
+export const usageDay = pgTable(
+  'usage_day',
+  {
+    day: text('day').notNull(),
+    principalId: text('principal_id').notNull(),
+    spaceId: text('space_id').notNull(),
+    usageClass: text('class').notNull(),
+    tier: text('tier').notNull(),
+    purpose: text('purpose').notNull(),
+    calls: integer('calls').notNull(),
+    inputTokens: bigint('input_tokens', { mode: 'number' }).notNull(),
+    cachedInputTokens: bigint('cached_input_tokens', { mode: 'number' }).notNull(),
+    cacheWriteTokens: bigint('cache_write_tokens', { mode: 'number' }).notNull(),
+    chargedInputTokens: bigint('charged_input_tokens', { mode: 'number' }).notNull(),
+    outputTokens: bigint('output_tokens', { mode: 'number' }).notNull(),
+    costUsd: doublePrecision('cost_usd').notNull(),
+    computedAt: created(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.day, t.principalId, t.spaceId, t.usageClass, t.tier, t.purpose] }),
+    index('usage_day_principal_idx').on(t.principalId, t.day),
+  ],
+);
+
+/** A spending notice already given for a period, so each is given once. */
+export const spendingNotice = pgTable(
+  'spending_notice',
+  {
+    scope: text('scope').notNull(),
+    period: text('period').notNull(),
+    level: text('level').notNull(),
+    createdAt: created(),
+  },
+  (t) => [primaryKey({ columns: [t.scope, t.period, t.level] })],
+);
+
+/**
+ * A page a connection's server showed in a conversation (MCP Apps), and what
+ * its server reported about it. The document is kept as the server gave it,
+ * and served only framed, with the policy in `csp`. The report key is never
+ * kept: it is derived from the installation's key and the page's id.
+ */
+export const connectionPage = pgTable(
+  'connection_page',
+  {
+    id: text('id').primaryKey(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    actionId: text('action_id')
+      .notNull()
+      .references(() => action.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'cascade' }),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    /** The person the page is for: the job's person, or who asked a room. */
+    principalId: text('principal_id'),
+    triggerId: text('trigger_id'),
+    resourceUri: text('resource_uri').notNull(),
+    html: text('html').notNull(),
+    /** Domains the page may use, after the connection's allow-list: connect, resource, frame. */
+    domains: jsonb('domains').$type<Record<string, string[]>>().notNull().default({}),
+    /** Origins the page may ask to open in a new tab. */
+    openOrigins: jsonb('open_origins').$type<string[]>().notNull().default([]),
+    serverOrigin: text('server_origin').notNull(),
+    toolInput: jsonb('tool_input').$type<Record<string, unknown>>().notNull().default({}),
+    toolResult: jsonb('tool_result').$type<Record<string, unknown>>().notNull().default({}),
+    state: text('state').notNull().default('open'),
+    summary: text('summary'),
+    reportData: jsonb('report_data').$type<Record<string, unknown>>(),
+    reportId: text('report_id'),
+    createdAt: created(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    settledAt: timestamp('settled_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('connection_page_job_idx').on(t.jobId),
+    uniqueIndex('connection_page_action_idx').on(t.actionId),
+    check(
+      'connection_page_state_check',
+      sql`${t.state} in ('open', 'completed', 'failed', 'cancelled', 'expired')`,
+    ),
+  ],
+);
+
+/**
+ * What an operator granted a person's account, by name (`verified`). Written
+ * only by the operator's routes and the host's command line; no route a person
+ * or an agent reaches writes it. A connection's tool can require one, and the
+ * person's identity assertion carries those they hold. A grant past
+ * `expires_at` counts for nothing.
+ */
+export const personEntitlement = pgTable(
+  'person_entitlement',
+  {
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    key: text('key').notNull(),
+    /** What the operator recorded with it (`method`, `level`); opaque to OpenDuet. */
+    value: jsonb('value').$type<Record<string, string>>().notNull().default({}),
+    grantedBy: text('granted_by').notNull(),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.principalId, t.key] })],
+);

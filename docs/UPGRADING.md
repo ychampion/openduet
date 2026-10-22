@@ -1,0 +1,306 @@
+# Upgrading between releases
+
+An upgrade moves a running Compose installation from one tagged release to a
+later one. The target release's `deploy/scripts/upgrade.ts` carries out the
+procedure on this page; `--dry-run` prints every command it would run, and the
+rollback, without executing any of them.
+
+From a checkout that has the openduet command, `bun run openduet upgrade <tag>`
+does the steps below for you: it fetches the tag if this clone lacks it, takes
+the release's own `upgrade.ts` out of the tag with `git archive`, and runs that
+copy with every overlay file and profile named in `deploy/openduet.deploy.json`
+(the browser and tailnet files, the sandbox profile, an external database and
+an S3 blob store, then the installation's own `compose_files`), under the
+deployment lock. It records the run in
+`deploy/.openduet/history.jsonl` and removes the copy afterwards. An installation that runs the published images
+updates with `bun run openduet deploy` ([DEPLOYMENT.md](DEPLOYMENT.md#update)).
+
+Read the target release's [changelog](../CHANGELOG.md) entry first. Releases are
+upgraded in order of their tags; moving to an older tag is a
+[rollback](#rolling-back), not an upgrade.
+
+## What an upgrade changes
+
+- **The source tree** is checked out at the tag.
+- **The images** are rebuilt from it. Each is tagged with the release version
+  as well as `:local`, which is the name Compose starts. The images that were
+  running are kept under the previous version's name. With `--browser`, the
+  browser worker's image, `<project>-browser:latest`, is kept and tagged the
+  same way.
+- **The database schema** is migrated by the `database-roles` step, which runs
+  before the service at every start. It takes a Postgres advisory lock and
+  applies, as the schema's owner, whatever the migration journal has that the
+  database has not recorded. A second start, or the slower of two starting at
+  once, finds nothing to do. The service starts only after it has finished, and
+  checks that every migration of its release is recorded before the API
+  listens, so a health check cannot pass ahead of the migrations.
+- **The database roles** are set up by the same step: the first start of a
+  release that has them creates `openduet_migrate`, `openduet_api` and
+  `openduet_effects` and hands the existing tables, with their data, to
+  `openduet_migrate` ([Database roles](DEPLOYMENT.md#database-roles)).
+  `deploy/.env` gains nothing; the service's addresses are written into the
+  `database-access` volume.
+- **The Docker socket** moves from the `openduet` service to `openduet-cells`, a
+  new service from the same image ([Isolation and image
+  provenance](DEPLOYMENT.md#isolation-and-image-provenance)).
+
+Migrations only go forward. There is no down migration: returning to the
+previous release means restoring the database backup taken before the upgrade.
+That is why the backup comes first and is never skipped.
+
+The volumes (`spaces`, `artifacts`, `work`, `runtime-home`, `restrictions`) and
+`deploy/.env` are not changed by an upgrade. No step removes a volume.
+`database-access` and `cells-key` are written by the stack itself and hold nothing
+a backup needs.
+
+An installation running the tailnet override also has `tailscale-state`, which
+holds the node's key. Keeping it is optional: nothing you have written is in it,
+and an installation that loses it authenticates the node again with a fresh auth
+key and comes back at the same address. Keep it if you would rather not repeat
+that step.
+
+### Folders an engine made before the upgrade
+
+Engines keep the group's write bit on what they make under `/work`, so the
+service, which shares their group, can move and remove it. Folders an engine
+made before an upgrade that brought this keep mode 755. When the service finds
+one in a job workspace it has to put back, it starts without that folder and
+logs `workspace_restore_failed job=<id> directory=<name> error=EACCES`, and it
+does not hand that job's workspace to a spare engine. To give every such folder
+the group's write bit, run this as the runtime's user, which owns them, then
+restart the service:
+
+```sh
+docker compose -f deploy/docker-compose.yml run --rm --no-deps --user 10001:10001 \
+  --entrypoint find openduet /work -user 10001 -type d -exec chmod g+w {} +
+```
+
+The next start puts the folder back. A line with `error=EEXIST` means the job
+has written a newer entry of the same name since: the older one stays in the
+set-aside directory the line names, in the `work` volume, for you to move back
+by hand.
+
+### Agents and their connections
+
+From the release after v0.2.0, an agent can reach every connection in its space,
+including ones connected later, and ticking connections in the agent's settings
+narrows it. The upgrade applies this to the agents already there:
+
+- Agents in personal spaces that had no connections now use every connection in
+  their space; untick them in the agent's settings to narrow it.
+- Agents in shared spaces keep no connections until you tick them.
+
+## Before you start
+
+You need what the [install](DEPLOYMENT.md#install-on-a-linux-docker-host) needs:
+Docker Engine 28.0 or newer, Docker Compose 2.33.1 or newer, Bun, and an account
+that can use the Docker socket. The stack must be running and healthy, because
+the database is dumped from the running `postgres` service.
+
+The script that runs is always the target release's own, taken out of its tag
+into a temporary directory, so the same steps work from every
+release, `v0.1.0` included, whose tree has no upgrade script of its own. The
+copy needs no `bun install`, and it leaves the installation's tree untouched.
+`--repository` names the installation it acts on.
+
+```bash
+cd openduet
+git fetch --tags origin
+tag="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+mkdir -p -m 700 ~/openduet-backups
+release="$(mktemp -d)"
+git archive "$tag" | tar -x -C "$release"
+bun run "$release/deploy/scripts/upgrade.ts" "$tag" --repository "$PWD" --dry-run
+```
+
+The `tag=` line picks the newest release; `git tag --list 'v*'` shows every
+one, and to upgrade to another, set `tag` to its name instead.
+
+The backup parent must exist before the first run; the `mkdir` creates the
+default one, `~/openduet-backups`, private to you. A second installation on the
+machine (a `COMPOSE_PROJECT_NAME` other than `openduet` in `deploy/.env`) keeps
+its backups in a folder of its own, `~/openduet-backups/<project>`, as `openduet
+backup` does; make that one instead (`mkdir -p -m 700
+~/openduet-backups/<project>`). Its upgrades from before this default left their
+backups in `~/openduet-backups`. `bun run openduet upgrade` makes the deploy file's
+`backup.dir` itself when it is missing, private to you. Run the same command without
+`--dry-run` to upgrade, and remove the copy afterwards with `rm -rf "$release"`.
+Take the copy from the tag you are upgrading to, and give that same tag to the
+script.
+
+The dry run performs the read-only preflight and prints the plan. It exits
+non-zero when the preflight found a problem; the plan is printed either way.
+
+| Option | Meaning |
+| --- | --- |
+| `--dry-run` | Print the preflight result, the plan and the rollback. Execute nothing. |
+| `--backup-dir /absolute/parent` | Parent directory for this run's backup. Default: `~/openduet-backups` for the project `openduet`, `~/openduet-backups/<project>` for any other; `openduet upgrade` names the deploy file's `backup.dir`, and makes it if it is missing. A folder given here must exist. |
+| `--browser` | Include `deploy/docker-compose.browser.yml` in every Compose command and stop the browser worker with the other writers. Use it if you start the stack with that override. |
+| `--tailscale` | Include `deploy/docker-compose.tailscale.yml` in every Compose command and stop the Tailscale node with the other writers. Use it if you start the stack with that override. |
+| `--tailscale-kernel` | Also include `deploy/docker-compose.tailscale-kernel.yml`, read on top of the Tailscale file. Needs `--tailscale`. |
+| `--external-db` | Include `deploy/docker-compose.external-db.yml`. The database is dumped, sized and checked through the `database-client` service rather than a bundled `postgres`, and the rollback loads the dump into a new, empty database on that server, which you create and point `DATABASE_URL` at (with roles an administrator made, their three addresses too); the database the release used is left as it is. |
+| `--blobs-s3` | Include `deploy/docker-compose.blobs-s3.yml`, read last, so the service keeps its blobs in the bucket. |
+| `--profile sandbox` | Run every Compose command with the sandbox profile, so the agents' computer image is rebuilt with the release and its running image is kept for a rollback. |
+| `--wait-timeout seconds` | How long `up --wait` may take. Default 300. Image builds are not bounded by it. |
+| `--repository /absolute/path` | The installation to upgrade: the top of the checkout it was cloned into. Default: the checkout the script itself is in. |
+
+Name the overrides the installation actually runs with. An upgrade that leaves
+one out rebuilds and starts the stack without that service, and the address it
+answered on stops answering.
+
+## Preflight
+
+Nothing is stopped or written until every check passes:
+
+- **The installation.** `--repository` is the top of a git checkout, so every
+  command runs from the directory its Compose files are named relative to.
+- **The copy's release.** `git archive` writes the commit it archived into
+  `deploy/scripts/release-commit.txt`, and that commit must be the tag's. A copy
+  taken from another tag is refused, naming both commits.
+- **A clean working tree.** Local edits are refused, except under
+  `deploy/config/`, which holds your connection configuration. Edits there are
+  refused only when the target release also changes that directory; merge the
+  release's version by hand and run the upgrade again. `deploy/.env` is ignored
+  by git and is never touched.
+- **The tag exists** in this clone, is not the commit already running, and
+  descends from it.
+- **Docker Engine and Compose versions**, judged the same way the service and
+  the configuration generator judge them.
+- **The stack**: the `postgres` service is running (unless the database is
+  external) and the `openduet` service has a container to archive from.
+- **The browser worker image**, with `--browser`: `<project>-browser:latest`
+  exists, so the backup can keep it for a rollback.
+- **Disk space**: at least 8 GiB free on Docker's data filesystem for the
+  rebuild, and room in the backup directory for the measured size of the
+  database, `/data` and `/work` plus a fifth. The archives are not compressed.
+  The sizes are read from the running `postgres` and `openduet` services; if
+  either cannot be measured, the upgrade does not start.
+
+## What the script does
+
+1. Creates a private directory, `upgrade-<tag>-<UTC time>`, under the backup
+   parent.
+2. Stops `openduet`, `runtime` and `web`, so the database and the volumes describe
+   the same moment. Postgres keeps running.
+3. Takes the backup described [below](#the-backup), checks that the dump is a
+   readable archive, records checksums, and makes every file private.
+4. Tags the running images with the version being left, so a rollback does not
+   need a rebuild.
+5. Checks out the tag, installs its locked dependencies, and runs its own
+   `bun run compose:check`.
+6. Builds the images and tags each with the release version as well as `:local`.
+7. Starts the stack with `up -d --wait`, which waits for every health check. The
+   `openduet` health check requires a reachable database, and the API it asks does
+   not listen until the migrations have been applied.
+8. Reads the migration count from the database until it equals the number of
+   entries in the release's journal, and fails if it does not get there.
+9. Prints the rollback for this run, with this run's paths and versions.
+
+## The backup
+
+| File | Contents |
+| --- | --- |
+| `database.dump` | `pg_dump --format=custom` of the whole database, including the queue schema |
+| `database.contents` | The archive's table of contents; it exists only if the dump is readable |
+| `deploy.env` | `deploy/.env`. It holds the master key: without it the sealed credentials in the database cannot be opened |
+| `config/` | `deploy/config/` |
+| `data.tar` | `/data`: spaces, artifacts and the restriction journal as it was. Each space's search index (`.index/`) and staged writes (`.proposed/`) are left out, as `openduet backup` leaves them out; the service rebuilds the index |
+| `work.tar` | `/work`: job workspaces |
+| `restrictions.tar` | The restriction journal alone |
+| `SHA256SUMS` | Checksums of the files above |
+
+The restriction journal is archived on its own because it has a different
+lifetime from the database snapshot. It is the append-only record of what was
+forgotten. Keep the newest copy you have independently of any database backup:
+an old database is always paired with the newest journal, never with the journal
+of its own age, or restoring it would bring back what was removed since. See
+[backup and restore](DEPLOYMENT.md#backup-and-restore).
+
+Backup files are created exclusively and are never overwritten; a second run
+uses a new directory. The directory contains secrets. Keep it private, and keep
+it until the release has run to your satisfaction.
+
+## If the upgrade fails
+
+**Before the checkout** (a failed stop, dump, archive, image tag, or the checkout
+itself): the tree,
+the `:local` images and the database are untouched. The script starts the
+previous release again and says so. Any partial backup stays in its directory.
+
+**After the checkout** (dependencies, the Compose check, the build, startup or
+the migration wait): the script changes nothing further. It prints the commands
+that were not completed, then the rollback. It does not start the previous
+release by itself, because the new release may already have migrated the
+database and the old code must not run against a newer schema. Fix the cause and
+run the remaining commands yourself, each of which is safe to run again, or roll
+back.
+
+## Rolling back
+
+The script prints these steps with the real paths and names; this is their
+shape. `<project>` is `COMPOSE_PROJECT_NAME`, `openduet` unless you changed it.
+
+```bash
+cd openduet
+# Stop the release. Never add --volumes: the volumes are the installation.
+docker compose -f deploy/docker-compose.yml down
+# Return the tree, its dependencies and the preserved images to the old release.
+git checkout <branch or commit you upgraded from>
+bun install --frozen-lockfile
+docker tag openduet-service:<old version> openduet-service:local
+docker tag openduet-web:<old version> openduet-web:local
+docker tag openduet-runtime:<old version> openduet-runtime:local
+# With the browser override:
+docker tag <project>-browser:<old version> <project>-browser:latest
+cp -p <backup>/deploy.env deploy/.env
+# Replace only the database volume.
+docker volume rm <project>_pgdata
+docker compose -f deploy/docker-compose.yml up -d --wait postgres
+docker compose -f deploy/docker-compose.yml exec -T postgres sh -c \
+  'exec pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-owner --no-privileges --exit-on-error' \
+  < <backup>/database.dump
+# Start only after the restore has finished.
+docker compose -f deploy/docker-compose.yml up -d --wait --wait-timeout 300
+docker compose -f deploy/docker-compose.yml ps
+```
+
+Three rules make this safe:
+
+- **Restore into an empty database volume.** Do not use `pg_restore --clean`
+  over the live schema; the queue's partition foreign keys make that a
+  different, unsupported path.
+- **Keep the `restrictions` volume as it is now.** It is newer than the dump.
+  At startup the service replays the retained journal into the restored
+  database before it serves memory or starts job workers, so nothing forgotten
+  after the backup comes back. Do not unpack `restrictions.tar`, or the
+  `restrictions` directory of `data.tar`, over it.
+- **Keep every other volume too.** `data.tar` and `work.tar` are for a damaged
+  volume, not for an ordinary rollback. If you do restore `/data` from the
+  archive, exclude its `restrictions` directory.
+
+After a rollback, check health, then look at any job that was waiting for an
+approval before deciding it. Work done by the new release after the backup is
+not in the restored database.
+
+## How the procedure is tested
+
+- The plan's order, the preflight judgement, the rollback text, the behaviour on
+  failure before and after the checkout, the bounded migration wait and the
+  redaction of secrets are unit-tested with an injected command runner
+  (`deploy/scripts/upgrade.test.ts`). The real runner is tested for binary
+  output, file input and refusing to overwrite.
+- A database migrated with exactly the journal the `v0.1.0` tag shipped is
+  upgraded to the current journal, and a second boot changes nothing; two
+  services booting at once apply a newer journal exactly once; and no migration
+  released in `v0.1.0` has been edited since
+  (`apps/openduet/test/integration/migration-upgrade.test.ts`).
+- The restore boundary itself, an old database with the newer journal, is the
+  [restore proof](DEPLOYMENT.md#backup-and-restore).
+- A copy of the script holding only the files it imports runs with no
+  dependencies installed, reads the installation's `deploy/.env` rather than its
+  own, and runs every command there. A copy archived from one tag is refused
+  when it is given another, and a run from a checkout has nothing to compare
+  (`deploy/scripts/upgrade-copy.test.ts`).
+- The script as a whole has run against the injected runner, not against a
+  live Docker host. Its commands are the ones the deployment guide documents,
+  so run it with `--dry-run` first and read the plan it prints.

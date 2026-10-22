@@ -1,0 +1,205 @@
+/**
+ * What the service keeps to notice change in a connected account.
+ *
+ * `source_cursor` is where each account's change feed was last read: one row
+ * per connection and stream (its mail, its calendar, its Drive), with when to
+ * read next and how the last reads went. A change is read once however often it is
+ * announced, because the cursor moves past it.
+ *
+ * `subject_state` is the latest few fields known about each thing a source
+ * reports on, one calendar occurrence per row: its start, end, place and
+ * status. That is what lets the service say what changed rather than only
+ * that something did. A Drive file a deadline follows keeps when it last
+ * changed and whether its own person changed it, without its name. It never
+ * holds a message body, an event description or a file's contents.
+ */
+import { sql } from 'drizzle-orm';
+import {
+  bigint,
+  check,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  text,
+  timestamp,
+} from 'drizzle-orm/pg-core';
+import { connection, space } from '../db/schema.ts';
+
+const created = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
+
+export const sourceCursor = pgTable(
+  'source_cursor',
+  {
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'cascade' }),
+    stream: text('stream').notNull(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    /** Opaque to everything but the source that wrote it. Null until the first read. */
+    cursor: jsonb('cursor'),
+    nextPollAt: timestamp('next_poll_at', { withTimezone: true }).notNull().defaultNow(),
+    intervalSeconds: integer('interval_s').notNull().default(300),
+    lastOkAt: timestamp('last_ok_at', { withTimezone: true }),
+    failures: integer('failures').notNull().default(0),
+    /** Why the last read failed, in words a person can read; null after a read that worked. */
+    lastError: text('last_error'),
+    /** Provider push subscriptions, once a source has them. */
+    pushState: jsonb('push_state'),
+    createdAt: created(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.connectionId, table.stream] }),
+    index('source_cursor_due_idx').on(table.nextPollAt),
+    index('source_cursor_space_idx').on(table.spaceId),
+    check('source_cursor_stream_check', sql`${table.stream} in ('mail', 'calendar', 'documents')`),
+    check('source_cursor_interval_check', sql`${table.intervalSeconds} > 0`),
+  ],
+);
+
+/**
+ * What was delivered once, kept after the observation itself is gone: the
+ * delivery key alone (a hash of a provider's id and state, never a word of
+ * what it said) and when it was seen. A mailbox that hands an old message back
+ * after its observation expired is recognised, and nothing is delivered twice.
+ */
+export const observationTombstone = pgTable(
+  'observation_tombstone',
+  {
+    dedupKey: text('dedup_key').primaryKey(),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'cascade' }),
+    seenAt: timestamp('seen_at', { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    index('observation_tombstone_seen_idx').on(table.seenAt),
+    index('observation_tombstone_connection_idx').on(table.connectionId),
+  ],
+);
+
+export const subjectState = pgTable(
+  'subject_state',
+  {
+    /** Names the connection and the thing: `calendar:<connection>:<uid>:<occurrence>`. */
+    subjectKey: text('subject_key').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'cascade' }),
+    type: text('type').notNull(),
+    /** Small typed fields only. */
+    fields: jsonb('fields').notNull(),
+    /** A hash of `fields`: the same version is the same state. */
+    version: text('version').notNull(),
+    origin: text('origin').notNull(),
+    lastChangedAt: timestamp('last_changed_at', { withTimezone: true }).notNull(),
+    createdAt: created(),
+  },
+  (table) => [
+    index('subject_state_connection_idx').on(table.connectionId, table.type),
+    index('subject_state_space_idx').on(table.spaceId),
+  ],
+);
+
+/**
+ * Calls made through a managed sign-in provider (Composio), counted per
+ * person and calendar month: a watched account's reads and the agent's own
+ * calls alike. The installation's monthly limit is read against the sum of a
+ * month's rows. Only counts are kept, never what a call asked or answered.
+ */
+export const managedCall = pgTable(
+  'managed_call',
+  {
+    /** The person whose space the connection is in. */
+    principalId: text('principal_id').notNull(),
+    /** The calendar month in UTC, `YYYY-MM`. */
+    month: text('month').notNull(),
+    calls: integer('calls').notNull().default(0),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.principalId, table.month] }),
+    index('managed_call_month_idx').on(table.month),
+    check('managed_call_month_check', sql`${table.month} ~ '^[0-9]{4}-[0-9]{2}$'`),
+    check('managed_call_calls_check', sql`${table.calls} >= 0`),
+  ],
+);
+
+/**
+ * What this installation has spent at Composio in each billing period, by
+ * billable dimension (tool calls, trigger events). A call is counted here
+ * before it is sent, under a lock, so concurrent calls cannot pass a limit
+ * together; one that was definitely never sent is taken back. `reported` is
+ * the count Composio's own usage numbers gave for the period, when read; the
+ * larger of the two is what a limit is checked against. Only counts are kept.
+ */
+export const composioUsage = pgTable(
+  'composio_usage',
+  {
+    /** The first day of the billing period, `YYYY-MM-DD` in UTC. */
+    period: text('period').notNull(),
+    dimension: text('dimension').notNull(),
+    used: bigint('used', { mode: 'number' }).notNull().default(0),
+    /** Composio's own count for the period, as last read. */
+    reported: bigint('reported', { mode: 'number' }),
+    /** OpenDuet's own count when Composio's was read, so calls since then are added to it. */
+    usedAtReport: bigint('used_at_report', { mode: 'number' }).notNull().default(0),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.period, table.dimension] }),
+    check('composio_usage_period_check', sql`${table.period} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'`),
+    check('composio_usage_dimension_check', sql`${table.dimension} ~ '^[a-z_]{1,40}$'`),
+    check('composio_usage_used_check', sql`${table.used} >= 0`),
+  ],
+);
+
+/**
+ * Each trigger delivery from Composio that was taken, by its `webhook-id`, so
+ * a delivery sent again (a retry, or a replay within the signature's
+ * tolerance) is counted and acted on once. Rows older than a day are removed.
+ */
+export const composioDelivery = pgTable(
+  'composio_delivery',
+  {
+    id: text('id').primaryKey(),
+    receivedAt: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('composio_delivery_received_idx').on(table.receivedAt),
+    check('composio_delivery_id_check', sql`${table.id} ~ '^[A-Za-z0-9_.:-]{1,128}$'`),
+  ],
+);
+
+/**
+ * Composio accounts waiting to be revoked and deleted there: one whose space
+ * was removed, one whose disconnection could not reach Composio, and one made
+ * for a sign-in that was never finished, due once that sign-in has expired.
+ * A row stays until Composio confirms the account is gone, or until a live
+ * connection is found acting for it, so nothing is dropped on a failure. Only
+ * the account id is kept, never the key or anything the account holds. A row
+ * whose id starts `slot_` is a place held for a sign-in under way, counted
+ * against the account limit and never sent to Composio.
+ */
+export const managedAccountRemoval = pgTable(
+  'managed_account_removal',
+  {
+    connectedAccountId: text('connected_account_id').primaryKey(),
+    /** Not tried before this. */
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    /** The last failure's fixed code, never a message from Composio. */
+    lastError: text('last_error'),
+    createdAt: created(),
+  },
+  (table) => [
+    index('managed_account_removal_due_idx').on(table.nextAttemptAt),
+    check('managed_account_removal_attempts_check', sql`${table.attempts} >= 0`),
+  ],
+);

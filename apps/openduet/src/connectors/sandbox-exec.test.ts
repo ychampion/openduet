@@ -1,0 +1,1158 @@
+/**
+ * The brokered `terminal.run` connector, against the in-memory fake provider
+ * and a real session table. Nothing here reaches a provider.
+ */
+import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { SandboxConnectionConfig } from '@openduet/contracts';
+import {
+  type Action,
+  canonicalizePayload,
+  connectorManifest,
+  EXEC_LIMITS,
+} from '@openduet/contracts';
+import { testDatabase } from '../../test/helpers/database.ts';
+import type { AttributedCommand, EgressAttribution, EgressHostSummary } from '../egress/tokens.ts';
+import { SANDBOX_SYNC_ALLOWANCE_MS } from '../env.ts';
+import { sandboxSpecFor } from '../sandbox/connection.ts';
+import { FakeSandboxEngine, FakeSandboxProvider } from '../sandbox/fake.ts';
+import { seedSessionScope } from '../sandbox/session-fixtures.ts';
+import { SandboxSessions, type SessionRow, sessionHandle } from '../sandbox/sessions.ts';
+import { type ResumeOptions, SandboxGone, type SandboxHandle } from '../sandbox/types.ts';
+import { ConnectorRegistry } from './registry.ts';
+import {
+  createSandboxExecConnector,
+  INTERRUPTED,
+  INTERRUPTED_WITH_NETWORK,
+  outputText,
+  sandboxDispatchBudgetMs,
+  sandboxExecManifest,
+  WORKSPACE_WAIT_MS,
+} from './sandbox-exec.ts';
+import type { ConnectorContext } from './types.ts';
+
+const handle = await testDatabase();
+const withDb = handle ? describe : describe.skip;
+const digest = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
+const PROJECT = 'sandbox-exec-test';
+
+let workRoot = '';
+beforeEach(async () => {
+  if (handle) await handle.sql`truncate space cascade`;
+  workRoot = await mkdtemp(path.join(tmpdir(), 'openduet-sandbox-exec-'));
+});
+afterAll(async () => {
+  await handle?.close();
+}, 30_000);
+
+const config: SandboxConnectionConfig = {
+  adapter: 'e2b',
+  image: 'base',
+  egress: 'deny_all',
+  persistence: 'ephemeral',
+  lifetime_seconds: 600,
+};
+
+test('the terminal manifest parses, is brokered, and registers', () => {
+  connectorManifest.parse(sandboxExecManifest);
+  const [tool] = sandboxExecManifest.tools;
+  // Brokered: the service runs the command, so there is no record to validate.
+  expect(tool?.execution).toBeUndefined();
+  expect(tool?.record_schema).toBeNull();
+  expect(tool).toMatchObject({
+    name: 'terminal.run',
+    effect_class: 'write_reversible',
+    requires_approval: false,
+    verify: true,
+    required_scopes: ['terminal.run'],
+  });
+  const registry = new ConnectorRegistry();
+  const provider = new FakeSandboxProvider();
+  expect(() =>
+    registry.register(
+      'conn_01J0SANDBOXEXEC0000000000',
+      createSandboxExecConnector({
+        sessions: new SandboxSessions({} as never, {
+          leaseSeconds: 300,
+          workspaceRetentionSeconds: 3_600,
+        }),
+        provider,
+        config,
+        connectionId: 'conn_01J0SANDBOXEXEC0000000000',
+        spaceId: 'sp_01',
+        project: PROJECT,
+        workRoot: 'unused',
+        sql: {} as never,
+      }),
+    ),
+  ).not.toThrow();
+});
+
+test('a dispatch may take the command timeout, the wait for the computer and the session margin', () => {
+  expect(
+    sandboxDispatchBudgetMs({ canonical_payload: { command: 'true', timeout_ms: 90_000 } }),
+  ).toBe(90_000 + SANDBOX_SYNC_ALLOWANCE_MS + WORKSPACE_WAIT_MS);
+  expect(sandboxDispatchBudgetMs({ canonical_payload: { command: 'true' } })).toBe(
+    EXEC_LIMITS.default_timeout_ms + SANDBOX_SYNC_ALLOWANCE_MS + WORKSPACE_WAIT_MS,
+  );
+  // A payload the connector refuses still gets a bounded budget.
+  expect(sandboxDispatchBudgetMs({ canonical_payload: { command: 'true', timeout_ms: -1 } })).toBe(
+    EXEC_LIMITS.default_timeout_ms + SANDBOX_SYNC_ALLOWANCE_MS + WORKSPACE_WAIT_MS,
+  );
+});
+
+test('a run name is a short token', () => {
+  const schema = sandboxExecManifest.tools[0]?.input_schema as {
+    properties: { run: { pattern: string } };
+  };
+  const pattern = new RegExp(schema.properties.run.pattern);
+  expect(pattern.test('0123456789abcdef')).toBe(true);
+  expect(pattern.test('short')).toBe(false);
+  expect(pattern.test('has a space in it')).toBe(false);
+});
+
+test('output text keeps a character the cap cut, and marks what is not text', () => {
+  const bytes = new TextEncoder().encode('ok é');
+  expect(outputText(bytes, false)).toEqual({ text: 'ok é', binary: false });
+  // The cap fell inside the last character: not binary.
+  expect(outputText(bytes.slice(0, -1), true)).toEqual({ text: 'ok ', binary: false });
+  // The command itself ended inside one: that is not text.
+  expect(outputText(bytes.slice(0, -1), false).binary).toBe(true);
+  expect(outputText(new Uint8Array([0x61, 0x00]), false)).toEqual({
+    text: 'a�',
+    binary: true,
+  });
+});
+
+withDb('a command in a remote sandbox', () => {
+  const setup = async (
+    over: {
+      persistence?: SandboxConnectionConfig['persistence'];
+      maxConcurrent?: number;
+      maxPerConnection?: number;
+      /** Shared where two connections run side by side, so their sandbox ids differ. */
+      engine?: FakeSandboxEngine;
+      workspaceWaitMs?: number;
+      egress?: SandboxConnectionConfig['egress'];
+      provider?: FakeSandboxProvider;
+    } = {},
+  ) => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const scope = await seedSessionScope(handle.sql);
+    const provider =
+      over.provider ?? new FakeSandboxProvider(over.engine ? { engine: over.engine } : {});
+    const sessions = new SandboxSessions(handle.sql, {
+      leaseSeconds: 300,
+      workspaceRetentionSeconds: 3_600,
+    });
+    const connector = createSandboxExecConnector({
+      sessions,
+      provider,
+      config: {
+        ...config,
+        ...(over.persistence ? { persistence: over.persistence } : {}),
+        ...(over.egress ? { egress: over.egress } : {}),
+      },
+      connectionId: scope.connectionId,
+      spaceId: scope.spaceId,
+      project: PROJECT,
+      workRoot,
+      sql: handle.sql,
+      ...(over.maxConcurrent === undefined ? {} : { maxConcurrent: over.maxConcurrent }),
+      ...(over.maxPerConnection === undefined ? {} : { maxPerConnection: over.maxPerConnection }),
+      ...(over.workspaceWaitMs === undefined ? {} : { workspaceWaitMs: over.workspaceWaitMs }),
+    });
+    const attemptId = await scope.attempt();
+    await mkdir(path.join(workRoot, scope.jobId), { recursive: true });
+    const action = async (
+      payload: Record<string, unknown>,
+      attempt = attemptId,
+    ): Promise<Action> => {
+      const id = await scope.action(attempt);
+      const canonical = canonicalizePayload(payload);
+      return {
+        id,
+        job_id: scope.jobId,
+        attempt_id: attempt,
+        connection_id: scope.connectionId,
+        kind: 'terminal.run',
+        effect_class: 'write_reversible',
+        canonical_payload: canonical.canonical,
+        payload_hash: canonical.hash,
+        intent_key: null,
+        status: 'dispatched',
+        authorization_ref: null,
+        budget_reservation: null,
+        idempotency_key: id,
+        dispatched_at: new Date().toISOString(),
+        receipt: null,
+        resolved_at: null,
+        reconciliation: null,
+        repair_trace: [],
+        repair_counters: {},
+        repair_disposition: null,
+        retry_after_at: null,
+        created_at: new Date().toISOString(),
+      };
+    };
+    const context = (action: Action): ConnectorContext => ({
+      job_id: action.job_id,
+      space_id: scope.spaceId,
+      idempotency_key: action.id,
+      constraints: {
+        deliverable: { kind: 'none' },
+        allowed_domains: [],
+        public_compartment: false,
+      },
+    });
+    const run = async (payload: Record<string, unknown>, attempt = attemptId) => {
+      const target = await action(payload, attempt);
+      return { action: target, result: await connector.execute(target, context(target)) };
+    };
+    return { scope, provider, sessions, connector, attemptId, action, context, run };
+  };
+
+  test('an ordinary command is recorded with what ran, where, and in which sandbox', async () => {
+    const { provider, run, sessions } = await setup();
+    const { result } = await run({ command: "printf 'from the sandbox'" });
+    if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+    expect(result.receipt.detail).toMatchObject({
+      language: 'shell',
+      command: "printf 'from the sandbox'",
+      cwd: '.',
+      exit_code: 0,
+      timed_out: false,
+      truncated: false,
+      output_digest: digest('from the sandbox'),
+      output_bytes: 16,
+      digest_verified: true,
+      adapter: 'fake',
+      image_ref: 'base',
+      egress: 'deny_all',
+      persistence: 'ephemeral',
+    });
+    expect(result.receipt.external_ref).toBe(digest('from the sandbox'));
+    expect(String(result.receipt.detail.sandbox_id)).toStartWith('fake-sbx-');
+    expect(provider.calls.create).toBe(1);
+    // The session is recorded, leased and still running.
+    const session = await sessions.get(String(result.receipt.detail.session_id));
+    expect(session).toMatchObject({ status: 'ready', adapter: 'fake' });
+  }, 60_000);
+
+  test("a remote command's digest is verified because the service wrote the file", async () => {
+    const { scope, run } = await setup();
+    const slow = await run({ command: 'printf started; sleep 5; printf never', timeout_ms: 1_000 });
+    if (slow.result.outcome !== 'succeeded') throw new Error(JSON.stringify(slow.result));
+    expect(slow.result.receipt.detail).toMatchObject({ timed_out: true, output: 'started' });
+    const size = 70_000;
+    const { action, result } = await run({ command: `head -c ${size} /dev/zero` });
+    if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+    const detail = result.receipt.detail as Record<string, unknown>;
+    // The service read the output out of the sandbox, wrote it here and hashed
+    // these bytes, so it says so rather than repeating a claim.
+    expect(detail.digest_verified).toBe(true);
+    expect(detail.truncated).toBe(true);
+    expect(detail.output_path).toBe(`.openduet/exec/${action.id}.out`);
+    const stored = await readFile(path.join(workRoot, scope.jobId, String(detail.output_path)));
+    expect(stored.byteLength).toBe(size);
+    expect(digest(stored)).toBe(String(detail.output_digest));
+    expect(detail.artifact).toMatchObject({
+      area: 'work',
+      path: detail.output_path,
+      kind: 'text',
+      size,
+      content_hash: digest(stored),
+    });
+    const validations = detail.validations as { name: string; status: string }[];
+    expect(validations.map((entry) => entry.name)).toEqual(['text.parses']);
+    // A small output is hashed by the service too, so it is verified as well.
+    const small = await run({ command: 'printf small' });
+    if (small.result.outcome !== 'succeeded') throw new Error('expected a receipt');
+    expect(small.result.receipt.detail).toMatchObject({
+      digest_verified: true,
+      output_path: null,
+    });
+  }, 60_000);
+
+  test('the output travels back on the receipt, as text or marked binary', async () => {
+    const { scope, run } = await setup();
+    const text = await run({ command: "printf 'line one\\nline two'" });
+    if (text.result.outcome !== 'succeeded') throw new Error(JSON.stringify(text.result));
+    expect(text.result.receipt.detail).toMatchObject({
+      output: 'line one\nline two',
+      output_binary: false,
+    });
+
+    // Bytes that are not UTF-8 are marked, and a NUL never reaches the receipt,
+    // since Postgres cannot store one inside a JSON string.
+    const work = path.join(workRoot, scope.jobId);
+    await Bun.write(path.join(work, 'blob.bin'), new Uint8Array([0x41, 0x00, 0xff, 0xfe, 0x42]));
+    const binary = await run({ command: 'cat /work/blob.bin' });
+    if (binary.result.outcome !== 'succeeded') throw new Error(JSON.stringify(binary.result));
+    const detail = binary.result.receipt.detail as Record<string, unknown>;
+    expect(detail.output_binary).toBe(true);
+    expect(String(detail.output)).not.toContain('\0');
+    expect(String(detail.output)).toStartWith('A');
+    // The digest names the real bytes, not the text shown.
+    expect(detail.output_digest).toBe(digest(new Uint8Array([0x41, 0x00, 0xff, 0xfe, 0x42])));
+
+    // A preview cut at the cap inside a character is still text.
+    await Bun.write(path.join(work, 'accents.txt'), `a${'é'.repeat(9_000)}`);
+    const accents = await run({ command: 'cat /work/accents.txt' });
+    if (accents.result.outcome !== 'succeeded') throw new Error(JSON.stringify(accents.result));
+    const cut = accents.result.receipt.detail as Record<string, unknown>;
+    expect(cut.truncated).toBe(true);
+    expect(cut.output_binary).toBe(false);
+    expect(String(cut.output)).toBe(`a${'é'.repeat(8_191)}`);
+  }, 60_000);
+
+  test('a malformed run name is refused before a sandbox opens', async () => {
+    const { provider, run } = await setup();
+    const { result } = await run({ command: 'true', run: 'not a run name' });
+    expect(result).toMatchObject({ outcome: 'failed', retryable: true });
+    expect(provider.calls.create).toBe(0);
+    expect(provider.calls.exec).toBe(0);
+  }, 60_000);
+
+  test('a second command in one attempt reuses the session', async () => {
+    const { provider, run } = await setup();
+    const first = await run({ command: 'printf once > /work/first.txt; printf done' });
+    const second = await run({ command: 'cat /work/first.txt' });
+    if (first.result.outcome !== 'succeeded' || second.result.outcome !== 'succeeded')
+      throw new Error('expected two receipts');
+    // One sandbox, one session, and the second command sees the first's files.
+    expect(provider.calls.create).toBe(1);
+    expect(second.result.receipt.detail.session_id).toBe(first.result.receipt.detail.session_id);
+    expect(second.result.receipt.detail.sandbox_id).toBe(first.result.receipt.detail.sandbox_id);
+    expect(second.result.receipt.detail.output_digest).toBe(digest('once'));
+  }, 60_000);
+
+  test('a reused session is renewed before its command is sent', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { sql } = handle;
+    const { provider, run, sessions } = await setup();
+    const first = await run({ command: 'printf first' });
+    if (first.result.outcome !== 'succeeded') throw new Error(JSON.stringify(first.result));
+    const [session] = await sql`select id from sandbox_session where status = 'ready'`;
+    // A second of lease left: the sweep would take it while the command ran.
+    await sql`update sandbox_session set lease_expires_at = now() + interval '1 second'
+      where id = ${session?.id}`;
+    // The lease as the provider is sent the command.
+    let leaseAtExec = 0;
+    const exec = provider.exec.bind(provider);
+    provider.exec = async (sandbox, spec, signal) => {
+      const row = await sessions.get(String(session?.id));
+      leaseAtExec = row?.leaseExpiresAt.getTime() ?? 0;
+      return exec(sandbox, spec, signal);
+    };
+    const second = await run({ command: 'printf second' });
+    expect(second.result.outcome).toBe('succeeded');
+    expect(leaseAtExec - Date.now()).toBeGreaterThan(60_000);
+  }, 60_000);
+
+  test('an unknown outcome is never re-dispatched', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, run, sessions, connector, context } = await setup();
+    provider.loseNextAcknowledgement('after_start');
+    const lost = await run({ command: 'printf once >> /work/counter; sleep 1; printf done' });
+    expect(lost.result.outcome).toBe('unknown');
+    const [settled] = await handle.sql`select outcome, session_id from sandbox_command
+      where action_id = ${lost.action.id}`;
+    // Recorded as unknown, so the broker cannot send it as a first run again.
+    expect(settled?.outcome).toBe('unknown');
+    expect(
+      await sessions.beginCommand(String(settled?.session_id), lost.action.id, lost.action.id),
+    ).toBe('again');
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    // Asked again, the same action reattaches to the marker instead of running.
+    const again = await connector.execute(lost.action, context(lost.action));
+    if (again.outcome !== 'succeeded') throw new Error(JSON.stringify(again));
+    expect(again.receipt.late).toBe(true);
+    expect(again.receipt.detail.output_digest).toBe(digest('done'));
+    const counter = await provider.getFile(
+      { providerSandboxId: 'fake-sbx-0001', imageDigest: null, region: null },
+      '/work/counter',
+      64,
+      AbortSignal.timeout(5_000),
+    );
+    expect(new TextDecoder().decode(counter)).toBe('once');
+    expect(provider.calls.exec).toBeLessThan(6);
+  }, 60_000);
+
+  test('a verify after an unknown dispatch reads the marker, never the command again', async () => {
+    const { provider, run, connector, context } = await setup();
+    provider.loseNextAcknowledgement('after_start');
+    const lost = await run({ command: 'printf once >> /work/counter; sleep 1; printf done' });
+    expect(lost.result.outcome).toBe('unknown');
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const decision = await connector.verify(lost.action, context(lost.action));
+    if (decision.decision !== 'succeeded') throw new Error(JSON.stringify(decision));
+    expect(decision.evidence).toMatchObject({ output_digest: digest('done') });
+    expect(decision.receipt?.detail.digest_verified).toBe(true);
+    const counter = await provider.getFile(
+      { providerSandboxId: 'fake-sbx-0001', imageDigest: null, region: null },
+      '/work/counter',
+      64,
+      AbortSignal.timeout(5_000),
+    );
+    expect(new TextDecoder().decode(counter)).toBe('once');
+  }, 60_000);
+
+  test('a job that has used its sandbox time is refused, and nothing is dispatched', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { scope, provider, run } = await setup();
+    await handle.sql`update job set budget = jsonb_set(budget, '{max_sandbox_seconds}', '0'::jsonb)
+      where id = ${scope.jobId}`;
+    const refused = await run({ command: 'printf nothing' });
+    if (refused.result.outcome !== 'failed') throw new Error(JSON.stringify(refused.result));
+    expect(refused.result.reason).toContain('sandbox_time_exhausted');
+    // Nothing ran, so the same action may be sent again once the budget allows.
+    expect(refused.result.retryable).toBe(true);
+    expect(provider.calls.create).toBe(0);
+  }, 60_000);
+
+  test('a command for another job or another connection is refused before anything opens', async () => {
+    const { provider, action, context, connector } = await setup();
+    const foreign = await action({ command: 'printf nothing' });
+    await expect(
+      connector.execute({ ...foreign, job_id: 'job_OTHER' }, context(foreign)),
+    ).rejects.toThrow('identity mismatch');
+    await expect(
+      connector.execute(
+        { ...foreign, connection_id: 'conn_01J0OTHER00000000000000000' },
+        context(foreign),
+      ),
+    ).rejects.toThrow('identity mismatch');
+    expect(provider.calls.create).toBe(0);
+  }, 60_000);
+
+  test("a workspace command opens the agent's workspace and resumes it next time", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { scope, provider, sessions, run, connector, context, action } = await setup({
+      persistence: 'pause',
+    });
+    await handle.sql`update job set agent_id = ${scope.agentId} where id = ${scope.jobId}`;
+    const first = await run({ command: 'printf remembered > /work/notes.txt; printf ok' });
+    if (first.result.outcome !== 'succeeded') throw new Error('expected a receipt');
+    const sessionId = String(first.result.receipt.detail.session_id);
+    const session = await sessions.get(sessionId);
+    expect(session).toMatchObject({ persistence: 'pause', agentId: scope.agentId });
+    await sessions.suspendWorkspace(sessionId, provider, AbortSignal.timeout(10_000));
+
+    // A later attempt for the same agent comes back to the same files.
+    const next = await scope.attempt();
+    const resumed = await action({ command: 'cat /work/notes.txt' }, next);
+    const outcome = await connector.execute(resumed, context(resumed));
+    if (outcome.outcome !== 'succeeded') throw new Error(JSON.stringify(outcome));
+    expect(outcome.receipt.detail.output_digest).toBe(digest('remembered'));
+    expect(outcome.receipt.detail.session_id).not.toBe(sessionId);
+    expect(provider.calls.create).toBe(1);
+    expect(provider.calls.resume).toBe(1);
+  }, 60_000);
+
+  test("a computer that went away mid-attempt is marked lost, and the command runs on the agent's computer opened again", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { scope, provider, sessions, run } = await setup({ persistence: 'pause' });
+    await handle.sql`update job set agent_id = ${scope.agentId} where id = ${scope.jobId}`;
+    // The engine says a container it no longer has is gone, as docker does.
+    const gone = (handle: SandboxHandle) => {
+      if (!provider.engine.get(handle.providerSandboxId))
+        throw new SandboxGone(`the engine has no sandbox ${handle.providerSandboxId}`);
+    };
+    for (const name of ['putFiles', 'listFiles', 'getFile', 'exec', 'connect'] as const) {
+      const original = (provider[name] as (...args: unknown[]) => Promise<unknown>).bind(provider);
+      Object.assign(provider, {
+        [name]: async (handle: SandboxHandle, ...rest: unknown[]) => {
+          gone(handle);
+          return original(handle, ...rest);
+        },
+      });
+    }
+    const first = await run({ command: 'printf ok' });
+    if (first.result.outcome !== 'succeeded') throw new Error(JSON.stringify(first.result));
+    const sessionId = String(first.result.receipt.detail.session_id);
+    const before = await sessions.get(sessionId);
+    provider.vanish(before?.providerSandboxId ?? '');
+    // The next command in the same attempt runs on the agent's computer opened again.
+    const next = await run({ command: 'printf back' });
+    if (next.result.outcome !== 'succeeded') throw new Error(JSON.stringify(next.result));
+    expect(next.result.receipt.detail.session_id).not.toBe(sessionId);
+    expect((await sessions.get(sessionId))?.status).toBe('lost');
+  }, 60_000);
+
+  test('a computer whose container went away but whose files are kept is resumed on them, not replaced', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { scope, provider, sessions, run } = await setup({ persistence: 'pause' });
+    await handle.sql`update job set agent_id = ${scope.agentId} where id = ${scope.jobId}`;
+    const first = await run({ command: 'printf kept > /work/notes.txt' });
+    if (first.result.outcome !== 'succeeded') throw new Error(JSON.stringify(first.result));
+    const sessionId = String(first.result.receipt.detail.session_id);
+    // The container is missing and its volumes are not, as after a restore:
+    // the engine says it is gone when connected to, and stopped when asked.
+    const connect = provider.connect.bind(provider);
+    const inspect = provider.inspect.bind(provider);
+    let missing = true;
+    provider.connect = async (handle, signal) => {
+      if (missing) throw new SandboxGone(`the engine has no sandbox ${handle.providerSandboxId}`);
+      return connect(handle, signal);
+    };
+    provider.inspect = async (handle, signal) => (missing ? 'paused' : inspect(handle, signal));
+    const pause = provider.pause.bind(provider);
+    provider.pause = async (handle, signal) => {
+      const paused = await pause(handle, signal);
+      missing = false;
+      return paused;
+    };
+    const next = await run({ command: 'cat /work/notes.txt' });
+    if (next.result.outcome !== 'succeeded') throw new Error(JSON.stringify(next.result));
+    expect(next.result.receipt.detail.output_digest).toBe(digest('kept'));
+    expect(next.result.receipt.detail.session_id).not.toBe(sessionId);
+    expect((await sessions.get(sessionId))?.status).toBe('closed');
+    expect(provider.calls.create).toBe(1);
+    expect(provider.calls.resume).toBe(1);
+  }, 60_000);
+
+  /**
+   * A provider that makes a quiet workspace again from a newer image as it
+   * resumes, as the docker adapter does, and records what it was told.
+   */
+  const updating = (engine?: FakeSandboxEngine) => {
+    const provider = new FakeSandboxProvider(engine ? { engine } : {});
+    const told: (boolean | undefined)[] = [];
+    const resume = provider.resume.bind(provider);
+    provider.resume = async (ref, spec, signal, options?: ResumeOptions) => {
+      told.push(options?.quiet);
+      const resumed = await resume(ref, spec, signal);
+      return options?.quiet ? { ...resumed, recreatedFrom: 'sha256:old' } : resumed;
+    };
+    return { provider, told };
+  };
+
+  /** Runs a first command, suspends the workspace, and returns the next attempt's run. */
+  const suspendedWorkspace = async (s: Awaited<ReturnType<typeof setup>>) => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    await handle.sql`update job set agent_id = ${s.scope.agentId} where id = ${s.scope.jobId}`;
+    const first = await s.run({ command: 'printf kept > /work/notes.txt' });
+    if (first.result.outcome !== 'succeeded') throw new Error(JSON.stringify(first.result));
+    const sessionId = String(first.result.receipt.detail.session_id);
+    await s.sessions.suspendWorkspace(sessionId, s.provider, AbortSignal.timeout(10_000));
+    const session = await s.sessions.get(sessionId);
+    return { sandbox: session?.providerSandboxId ?? '', next: await s.scope.attempt() };
+  };
+
+  test("a quiet workspace made again from a newer image keeps its files, and the job's timeline says so", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, told } = updating();
+    const s = await setup({ persistence: 'pause', provider });
+    const { next } = await suspendedWorkspace(s);
+    const after = await s.run({ command: 'cat /work/notes.txt' }, next);
+    if (after.result.outcome !== 'succeeded') throw new Error(JSON.stringify(after.result));
+    expect(after.result.receipt.detail.output_digest).toBe(digest('kept'));
+    expect(told).toEqual([true]);
+    const notices = await handle.sql`select payload from event
+      where job_id = ${s.scope.jobId} and payload->>'kind' = 'computer_updated'`;
+    expect(notices.map((row) => row.payload)).toEqual([
+      {
+        kind: 'computer_updated',
+        session_id: String(after.result.receipt.detail.session_id),
+        image: null,
+        replaced_image: 'sha256:old',
+      },
+    ]);
+  }, 60_000);
+
+  test('a workspace whose background processes still run is not called quiet, and nothing is recorded', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, told } = updating();
+    const s = await setup({ persistence: 'pause', provider });
+    const { next } = await suspendedWorkspace(s);
+    await handle.sql`insert into sandbox_process (id, space_id, agent_id, connection_id,
+        command_redacted, command_digest, cwd, name, state, expires_at)
+      values ('prc_01J00000000000000000000000', ${s.scope.spaceId}, ${s.scope.agentId},
+        ${s.scope.connectionId}, 'npm run dev', 'd', '/work', 'dev server', 'running',
+        now() + interval '1 hour')`;
+    const after = await s.run({ command: 'printf next' }, next);
+    if (after.result.outcome !== 'succeeded') throw new Error(JSON.stringify(after.result));
+    expect(told).toEqual([false]);
+    const [notice] = await handle.sql`select 1 from event
+      where job_id = ${s.scope.jobId} and payload->>'kind' = 'computer_updated'`;
+    expect(notice).toBeUndefined();
+  }, 60_000);
+
+  test('two openings racing for a workspace being made again make it once', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, told } = updating();
+    const updated = provider.resume.bind(provider);
+    provider.resume = async (ref, spec, signal, options?: ResumeOptions) => {
+      await Bun.sleep(500);
+      return updated(ref, spec, signal, options);
+    };
+    const s = await setup({ persistence: 'pause', provider, workspaceWaitMs: 0 });
+    const { next } = await suspendedWorkspace(s);
+    const other = await s.scope.attempt();
+    const results = await Promise.all([
+      s.run({ command: 'printf one' }, next),
+      s.run({ command: 'printf two' }, other),
+    ]);
+    expect(results.map((each) => each.result.outcome).sort()).toEqual(['failed', 'succeeded']);
+    expect(told).toEqual([true]);
+    const notices = await handle.sql`select 1 from event
+      where job_id = ${s.scope.jobId} and payload->>'kind' = 'computer_updated'`;
+    expect(notices.length).toBe(1);
+  }, 60_000);
+
+  /** A provider resume held at a gate until the test lets it go, on its first call only. */
+  const gated = (provider: FakeSandboxProvider) => {
+    const updated = provider.resume.bind(provider);
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = () => {};
+    const inside = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let calls = 0;
+    provider.resume = async (ref, spec, signal, options?: ResumeOptions) => {
+      calls += 1;
+      if (calls === 1) {
+        entered();
+        await gate;
+      }
+      return updated(ref, spec, signal, options);
+    };
+    return { release, inside };
+  };
+
+  test('no transaction is open while the provider makes a computer again', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const sql = handle.sql;
+    const { provider, told } = updating();
+    const s = await setup({ persistence: 'pause', provider });
+    const { next } = await suspendedWorkspace(s);
+    const updated = provider.resume.bind(provider);
+    const open: number[] = [];
+    provider.resume = async (ref, spec, signal, options?: ResumeOptions) => {
+      const [row] = await sql`select count(*)::int as open from pg_stat_activity
+        where datname = current_database() and state like 'idle in transaction%'`;
+      open.push(Number(row?.open));
+      return updated(ref, spec, signal, options);
+    };
+    const after = await s.run({ command: 'printf next' }, next);
+    expect(after.result.outcome).toBe('succeeded');
+    expect(told).toEqual([true]);
+    expect(open).toEqual([0]);
+  }, 60_000);
+
+  test('a takeover while a computer is being made again is recorded at once, and holds the new computer', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, told } = updating();
+    const s = await setup({ persistence: 'pause', provider });
+    const { sandbox, next } = await suspendedWorkspace(s);
+    const { release, inside } = gated(provider);
+    const run = s.run({ command: 'printf next' }, next);
+    try {
+      await inside;
+      // A person takes the computer over between the check and the replacement.
+      const taken = await Promise.race([
+        s.sessions.controls.change(sandbox, 'human'),
+        Bun.sleep(5_000).then(() => null),
+      ]);
+      expect(taken).toMatchObject({ control: 'human' });
+      release();
+      await run;
+      expect(told).toEqual([true]);
+      // Kept on the computer's id, which the new computer has: the person holds
+      // it, and the finished replacement did not move the epoch past them.
+      expect(await s.sessions.controls.state(sandbox)).toEqual({
+        control: 'human',
+        epoch: (taken as { epoch: number }).epoch,
+      });
+    } finally {
+      release();
+      await run.catch(() => {});
+      await s.sessions.controls.change(sandbox, 'agent');
+    }
+  }, 60_000);
+
+  test("a hung replacement holds up neither another person's computer nor a takeover", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const engine = new FakeSandboxEngine();
+    const { provider } = updating(engine);
+    const s = await setup({ persistence: 'pause', provider });
+    const { sandbox, next } = await suspendedWorkspace(s);
+    const { release, inside } = gated(provider);
+    const hung = s.run({ command: 'printf late' }, next);
+    try {
+      await inside;
+      const b = await setup({ persistence: 'pause', engine });
+      await handle.sql`update job set agent_id = ${b.scope.agentId} where id = ${b.scope.jobId}`;
+      const other = await Promise.race([
+        b.run({ command: 'printf other' }),
+        Bun.sleep(20_000).then(() => null),
+      ]);
+      expect(other?.result.outcome).toBe('succeeded');
+      const taken = await Promise.race([
+        s.sessions.controls.change(sandbox, 'human'),
+        Bun.sleep(5_000).then(() => null),
+      ]);
+      expect(taken).toMatchObject({ control: 'human' });
+    } finally {
+      release();
+      await hung.catch(() => {});
+      await s.sessions.controls.change(sandbox, 'agent');
+    }
+  }, 60_000);
+
+  test('a claim left by a replacement that stopped answering is recovered, and its late answer leaves the computer alone', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider } = updating();
+    const s = await setup({ persistence: 'pause', provider, workspaceWaitMs: 0 });
+    const { sandbox, next } = await suspendedWorkspace(s);
+    const { release, inside } = gated(provider);
+    const hung = s.run({ command: 'printf late' }, next);
+    try {
+      await inside;
+      // The service running it stopped: its attempt is gone, so its claim is stale.
+      await handle.sql`update attempt set ended_at = now() where id = ${next}`;
+      const later = await s.scope.attempt();
+      const after = await s.run({ command: 'cat /work/notes.txt' }, later);
+      if (after.result.outcome !== 'succeeded') throw new Error(JSON.stringify(after.result));
+      expect(after.result.receipt.detail.output_digest).toBe(digest('kept'));
+      release();
+      await hung;
+      // The late answer neither removes nor pauses the computer the later attempt holds.
+      expect(provider.calls.destroy).toBe(0);
+      const row = await s.sessions.get(String(after.result.receipt.detail.session_id));
+      expect(row).toMatchObject({ status: 'ready', providerSandboxId: sandbox });
+      expect(
+        await provider.inspect(sessionHandle(row as SessionRow), AbortSignal.timeout(10_000)),
+      ).toBe('running');
+    } finally {
+      release();
+      await hung.catch(() => {});
+    }
+  }, 60_000);
+
+  test('a late answer from a stale claim leaves alone a computer a later opening is still resuming', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider } = updating();
+    const s = await setup({ persistence: 'pause', provider, workspaceWaitMs: 0 });
+    const { sandbox, next } = await suspendedWorkspace(s);
+    // Both resumes are held: the stale one, then the later attempt's.
+    const updated = provider.resume.bind(provider);
+    const gates: Array<{ release: () => void; entered: Promise<void> }> = [];
+    const waits: Array<{ gate: Promise<void>; enter: () => void }> = [];
+    for (let index = 0; index < 2; index += 1) {
+      let release = () => {};
+      let enter = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      gates.push({ release, entered });
+      waits.push({ gate, enter });
+    }
+    let calls = 0;
+    provider.resume = async (ref, spec, signal, options?: ResumeOptions) => {
+      const wait = waits[calls];
+      calls += 1;
+      if (wait) {
+        wait.enter();
+        await wait.gate;
+      }
+      return updated(ref, spec, signal, options);
+    };
+    const hung = s.run({ command: 'printf late' }, next);
+    let later: ReturnType<typeof s.run> | null = null;
+    try {
+      await gates[0]?.entered;
+      await handle.sql`update attempt set ended_at = now() where id = ${next}`;
+      later = s.run({ command: 'cat /work/notes.txt' }, await s.scope.attempt());
+      await gates[1]?.entered;
+      // The stale resume answers while the later opening still holds the claim.
+      gates[0]?.release();
+      await hung;
+      expect(provider.calls.destroy).toBe(0);
+      gates[1]?.release();
+      const after = await later;
+      if (after.result.outcome !== 'succeeded') throw new Error(JSON.stringify(after.result));
+      expect(after.result.receipt.detail.output_digest).toBe(digest('kept'));
+      const row = await s.sessions.get(String(after.result.receipt.detail.session_id));
+      expect(row).toMatchObject({ status: 'ready', providerSandboxId: sandbox });
+    } finally {
+      for (const gate of gates) gate.release();
+      await hung.catch(() => {});
+      await later?.catch(() => {});
+    }
+  }, 60_000);
+
+  test('a workspace a person holds is not resumed, so never made again under them', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const { provider, told } = updating();
+    const s = await setup({ persistence: 'pause', provider, workspaceWaitMs: 0 });
+    const { sandbox, next } = await suspendedWorkspace(s);
+    await s.sessions.controls.change(sandbox, 'human');
+    try {
+      const after = await s.run({ command: 'printf next' }, next);
+      expect(after.result.outcome).toBe('failed');
+      expect(told).toEqual([]);
+      expect(provider.calls.resume).toBe(0);
+    } finally {
+      // Control is kept by sandbox id, which outlives the space: the next test's fake sandbox may share it.
+      await s.sessions.controls.change(sandbox, 'agent');
+    }
+  }, 60_000);
+
+  test('a sandbox beyond the concurrency limit is refused, and nothing is dispatched', async () => {
+    const { provider, run, scope, action, context, connector } = await setup({ maxConcurrent: 1 });
+    const first = await run({ command: 'printf first' });
+    expect(first.result.outcome).toBe('succeeded');
+    // The limit counts what this installation has running, whatever job it serves.
+    const second = await action({ command: 'printf second' }, await scope.attempt());
+    const refused = await connector.execute(second, context(second));
+    if (refused.outcome !== 'failed') throw new Error(JSON.stringify(refused));
+    expect(refused.reason).toContain('which is its limit');
+    expect(refused.retryable).toBe(true);
+    expect(provider.calls.create).toBe(1);
+  }, 60_000);
+
+  test('concurrent attempts cannot race past the limit', async () => {
+    const { scope, provider, action, context, connector } = await setup({ maxConcurrent: 2 });
+    // Five attempts open at once. Counting before the row is written would let
+    // all five read the same total and pass; counting under the lock that
+    // writes it cannot.
+    const actions = await Promise.all(
+      [0, 1, 2, 3, 4].map(async () => action({ command: 'printf racing' }, await scope.attempt())),
+    );
+    const outcomes = await Promise.all(actions.map((one) => connector.execute(one, context(one))));
+    expect(outcomes.filter((one) => one.outcome === 'succeeded')).toHaveLength(2);
+    const refused = outcomes.filter((one) => one.outcome === 'failed');
+    expect(refused).toHaveLength(3);
+    for (const one of refused)
+      expect(one.outcome === 'failed' && one.reason).toContain('which is its limit');
+    // Exactly two sandboxes were ever created, not five.
+    expect(provider.calls.create).toBe(2);
+  }, 60_000);
+
+  test('two connections each have their own allowance', async () => {
+    // Room in the service for three, and one apiece: a provider quota belongs
+    // to an account, and an account is a connection here.
+    const engine = new FakeSandboxEngine();
+    const first = await setup({ maxConcurrent: 3, maxPerConnection: 1, engine });
+    const second = await setup({ maxConcurrent: 3, maxPerConnection: 1, engine });
+    expect((await first.run({ command: 'printf one' })).result.outcome).toBe('succeeded');
+
+    // The first connection has spent what is its own.
+    const again = await first.action({ command: 'printf two' }, await first.scope.attempt());
+    const refused = await first.connector.execute(again, first.context(again));
+    if (refused.outcome !== 'failed') throw new Error(JSON.stringify(refused));
+    expect(refused.reason).toContain('this connection already has');
+    expect(refused.retryable).toBe(true);
+
+    // The second's allowance is untouched by the first being full.
+    expect((await second.run({ command: 'printf three' })).result.outcome).toBe('succeeded');
+    expect(first.provider.calls.create).toBe(1);
+    expect(second.provider.calls.create).toBe(1);
+  }, 60_000);
+
+  test("a command never runs in another connection's session, even in the same attempt", async () => {
+    const engine = new FakeSandboxEngine();
+    const first = await setup({ engine });
+    const second = await setup({ engine });
+    expect((await first.run({ command: 'printf first' })).result.outcome).toBe('succeeded');
+    const sandboxes = engine.sandboxes.size;
+    // The second connection's command, in the attempt the first one's session serves.
+    const stray = await second.action({ command: 'printf second' }, first.attemptId);
+    const outcome = await second.connector.execute(stray, second.context(stray));
+    if (outcome.outcome !== 'failed') throw new Error(JSON.stringify(outcome));
+    expect(outcome.reason).toContain('session_exists');
+    expect(second.provider.calls.exec).toBe(0);
+    // Nothing ran through the second connection, and nothing new was created.
+    expect(engine.sandboxes.size).toBe(sandboxes);
+  }, 60_000);
+
+  test('the installation ceiling refuses a sandbox a connection still had room for', async () => {
+    // Two apiece, but only two in the whole service.
+    const engine = new FakeSandboxEngine();
+    const first = await setup({ maxConcurrent: 2, maxPerConnection: 2, engine });
+    const second = await setup({ maxConcurrent: 2, maxPerConnection: 2, engine });
+    expect((await first.run({ command: 'printf one' })).result.outcome).toBe('succeeded');
+    expect((await second.run({ command: 'printf two' })).result.outcome).toBe('succeeded');
+
+    // The first connection has one of its two, so only the ceiling can refuse it.
+    const again = await first.action({ command: 'printf three' }, await first.scope.attempt());
+    const refused = await first.connector.execute(again, first.context(again));
+    if (refused.outcome !== 'failed') throw new Error(JSON.stringify(refused));
+    expect(refused.reason).toContain('this installation already has');
+    expect(refused.retryable).toBe(true);
+    expect(first.provider.calls.create).toBe(1);
+  }, 60_000);
+  /** A second conversation of the same agent, holding the agent's computer. */
+  const otherConversation = async (s: Awaited<ReturnType<typeof setup>>, title: string) => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const jobId = `job_OTHER${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const attemptId = `att_OTHER${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    await handle.sql`insert into job (id, space_id, title, objective, agent_id)
+      values (${jobId}, ${s.scope.spaceId}, ${title}, 'Other work', ${s.scope.agentId})`;
+    await handle.sql`insert into attempt (id, job_id, epoch, runtime_version, provider, model,
+        lease_expires_at)
+      values (${attemptId}, ${jobId}, 1, 'fake', 'fake', 'scripted', now() + interval '10 minutes')`;
+    const row = await s.sessions.openWorkspace(
+      {
+        connectionId: s.scope.connectionId,
+        spaceId: s.scope.spaceId,
+        jobId,
+        attemptId,
+        agentId: s.scope.agentId,
+        persistence: 'pause',
+      },
+      s.provider,
+      (session) =>
+        sandboxSpecFor(config, {
+          project: PROJECT,
+          connectionId: s.scope.connectionId,
+          spaceId: s.scope.spaceId,
+          jobId,
+          attemptId,
+          session,
+        }),
+      AbortSignal.timeout(10_000),
+    );
+    return { jobId, attemptId, row };
+  };
+
+  test("after a restart, the agent's computer is free for the next attempt at once", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup({ persistence: 'pause', workspaceWaitMs: 0 });
+    await handle.sql`update job set agent_id = ${s.scope.agentId} where id = ${s.scope.jobId}`;
+    const first = await s.run({ command: 'printf before' });
+    expect(first.result.outcome).toBe('succeeded');
+    // The service stopped: that attempt ended with its workspace still open.
+    await handle.sql`update attempt set ended_at = now() where id = ${s.attemptId}`;
+    const next = await s.scope.attempt();
+    const after = await s.run({ command: 'printf after' }, next);
+    if (after.result.outcome !== 'succeeded') throw new Error(JSON.stringify(after.result));
+    expect(s.provider.calls.resume).toBe(1);
+  }, 60_000);
+
+  test('a conversation waits for the computer another conversation holds, then uses it', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const sql = handle.sql;
+    const s = await setup({ persistence: 'pause', workspaceWaitMs: 10_000 });
+    await sql`update job set agent_id = ${s.scope.agentId} where id = ${s.scope.jobId}`;
+    const other = await otherConversation(s, 'Memory check');
+    // The other conversation finishes a moment later.
+    setTimeout(() => {
+      void sql`update attempt set ended_at = now() where id = ${other.attemptId}`.then(() => {});
+    }, 1_000);
+    const waited = await s.run({ command: 'printf mine' });
+    if (waited.result.outcome !== 'succeeded') throw new Error(JSON.stringify(waited.result));
+    const [notice] = await sql`select payload from event
+      where job_id = ${s.scope.jobId} and payload->>'kind' = 'computer_busy'`;
+    expect(notice?.payload).toMatchObject({ kind: 'computer_busy', held_by: 'Memory check' });
+  }, 60_000);
+
+  test('a conversation that waited too long is told which conversation has the computer', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup({ persistence: 'pause', workspaceWaitMs: 500 });
+    await handle.sql`update job set agent_id = ${s.scope.agentId} where id = ${s.scope.jobId}`;
+    await otherConversation(s, 'Computer CSV');
+    const refused = await s.run({ command: 'printf mine' });
+    if (refused.result.outcome !== 'failed') throw new Error(JSON.stringify(refused.result));
+    expect(refused.result.reason).toContain('another conversation ("Computer CSV")');
+    expect(refused.result.reason).toContain('Nothing ran');
+    expect(refused.result.retryable).toBe(true);
+  }, 60_000);
+
+  test("another person's or a sensitive conversation holding the computer is not named", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const sql = handle.sql;
+    const s = await setup({ persistence: 'pause', workspaceWaitMs: 500 });
+    await sql`update job set agent_id = ${s.scope.agentId} where id = ${s.scope.jobId}`;
+    const someone = `own_SOMEONE${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    await sql`insert into principal (id, email) values (${someone}, ${`${someone}@example.test`})`;
+    const theirs = await otherConversation(s, 'My divorce lawyer');
+    await sql`update job set principal_id = ${someone} where id = ${theirs.jobId}`;
+    const refused = await s.run({ command: 'printf mine' });
+    if (refused.result.outcome !== 'failed') throw new Error(JSON.stringify(refused.result));
+    expect(refused.result.reason).toContain('in use by another conversation, and');
+    expect(refused.result.reason).not.toContain('divorce');
+    const [notice] = await sql`select payload from event
+      where job_id = ${s.scope.jobId} and payload->>'kind' = 'computer_busy'`;
+    expect(notice?.payload).toMatchObject({ kind: 'computer_busy', held_by: null });
+
+    // The person's own conversation, found sensitive, is not named either.
+    await sql`update job set principal_id = null where id = ${theirs.jobId}`;
+    await sql`insert into privacy_conversation (conversation_id, space_id, sensitive)
+      values (${theirs.jobId}, ${s.scope.spaceId}, 'health')`;
+    const again = await s.run({ command: 'printf mine' });
+    if (again.result.outcome !== 'failed') throw new Error(JSON.stringify(again.result));
+    expect(again.result.reason).not.toContain('divorce');
+  }, 60_000);
+
+  test("commands read the person's time zone", async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup();
+    await handle.sql`insert into experience_profile (space_id, time_zone)
+      values (${s.scope.spaceId}, 'Europe/Paris')`;
+    const { result } = await s.run({ command: 'echo $TZ' });
+    if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+    expect(result.receipt.detail.output).toBe('Europe/Paris\n');
+    // The receipt keeps the command as it was asked for.
+    expect(result.receipt.detail.command).toBe('echo $TZ');
+  }, 60_000);
+
+  test('a command cut off by a restart is read back from its marker, or left unknown with the reason', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup();
+    s.provider.loseNextAcknowledgement('after_start');
+    const finished = await s.run({ command: 'sleep 1; printf done' });
+    expect(finished.result.outcome).toBe('unknown');
+    // It finished in the sandbox after the answer was lost.
+    await Bun.sleep(1_500);
+    const read = await s.connector.abandoned?.(finished.action, s.context(finished.action));
+    if (read?.outcome !== 'succeeded') throw new Error(JSON.stringify(read));
+    expect(read.receipt.detail.output).toBe('done');
+
+    s.provider.loseNextAcknowledgement('after_start');
+    const cut = await s.run({ command: 'sleep 20; printf late' });
+    expect(cut.result.outcome).toBe('unknown');
+    const lost = await s.connector.abandoned?.(cut.action, s.context(cut.action));
+    // Still open, not failed: a late answer can still land.
+    expect(lost).toEqual({ outcome: 'unknown', reason: INTERRUPTED });
+  }, 60_000);
+
+  test('a command cut off in a computer with network access is not said to have stayed inside it', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup({ egress: 'open' });
+    s.provider.loseNextAcknowledgement('after_start');
+    const cut = await s.run({ command: 'sleep 20; curl -sd @notes.md https://example.test/' });
+    expect(cut.result.outcome).toBe('unknown');
+    const lost = await s.connector.abandoned?.(cut.action, s.context(cut.action));
+    expect(lost).toEqual({ outcome: 'unknown', reason: INTERRUPTED_WITH_NETWORK });
+    if (lost?.outcome !== 'unknown') throw new Error(JSON.stringify(lost));
+    expect(lost.reason).not.toContain('inside that computer');
+    expect(lost.reason).toContain('may also have reached outside');
+  }, 60_000);
+
+  test('a command in a guarded computer carries its own proxy address, and its receipt lists the hosts it reached', async () => {
+    const provider = new GuardedFake();
+    const s = await setup({ egress: 'open', provider });
+    const first = await s.run({ command: 'printf %s "$HTTPS_PROXY"' });
+    if (first.result.outcome !== 'succeeded') throw new Error(JSON.stringify(first.result));
+    expect(first.result.receipt.detail.output).toBe(
+      `http://cmd:token-${first.action.id}@openduet-egress:8791`,
+    );
+    expect(first.result.receipt.detail.egress_hosts).toEqual(REACHED);
+    expect(provider.attributed).toEqual([
+      {
+        kind: 'command',
+        sessionId: String(first.result.receipt.detail.session_id),
+        jobId: s.scope.jobId,
+        attemptId: s.attemptId,
+        actionId: first.action.id,
+        // When the command runs out of time: a held request is answered before then.
+        deadlineAt: expect.any(Number),
+      },
+    ]);
+    // Ended with the command, so a later command never shares its token.
+    expect(provider.settled).toEqual([first.action.id]);
+    const second = await s.run({ command: 'printf %s "$https_proxy"' });
+    if (second.result.outcome !== 'succeeded') throw new Error(JSON.stringify(second.result));
+    expect(second.result.receipt.detail.output).toBe(
+      `http://cmd:token-${second.action.id}@openduet-egress:8791`,
+    );
+    expect(provider.settled).toEqual([first.action.id, second.action.id]);
+  }, 60_000);
+
+  test('a computer with no network gets no token, and its receipt says it reached nothing', async () => {
+    const provider = new GuardedFake();
+    const s = await setup({ provider });
+    const { result } = await s.run({ command: 'printf "[%s]" "$HTTPS_PROXY"' });
+    if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+    expect(result.receipt.detail.output).toBe('[]');
+    expect(result.receipt.detail).toMatchObject({ egress: 'deny_all', egress_hosts: [] });
+    expect(provider.attributed).toEqual([]);
+  }, 60_000);
+
+  test("where the provider's own network carries a command, its receipt does not claim to know the hosts", async () => {
+    const s = await setup({ egress: 'open' });
+    const { result } = await s.run({ command: 'printf ok' });
+    if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+    expect(result.receipt.detail).toMatchObject({ egress: 'open', egress_hosts: null });
+  }, 60_000);
+
+  // A scheduled run uses the same computer as a conversation: the same network,
+  // whether the agent keeps its computer or each run gets a fresh one.
+  for (const persistence of ['pause', 'ephemeral'] as const)
+    test(`a routine's command reaches the internet exactly as a conversation's does (${persistence})`, async () => {
+      if (!handle) throw new Error('Postgres is unavailable');
+      const reached: Record<string, unknown> = {};
+      const engine = new FakeSandboxEngine();
+      for (const kind of ['chat', 'routine'] as const) {
+        const s = await setup({ egress: 'open', persistence, engine });
+        await handle.sql`update job set kind = ${kind}, agent_id = ${s.scope.agentId}
+          where id = ${s.scope.jobId}`;
+        const { result } = await s.run({
+          command: "curl -s -o /dev/null -w '%{http_code}' https://example.com/",
+        });
+        if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+        expect(result.receipt.detail).toMatchObject({ exit_code: 0, output: '200' });
+        const { egress, egress_hosts, exit_code, output } = result.receipt.detail;
+        reached[kind] = { egress, egress_hosts, exit_code, output };
+      }
+      expect(reached.routine).toEqual(reached.chat);
+      expect(reached.routine).toMatchObject({ egress: 'open' });
+    }, 60_000);
+
+  test('a receipt read back later takes its hosts from the egress records', async () => {
+    if (!handle) throw new Error('Postgres is unavailable');
+    const s = await setup({ egress: 'open', provider: new GuardedFake() });
+    const ran = await s.run({ command: 'printf ok' });
+    if (ran.result.outcome !== 'succeeded') throw new Error(JSON.stringify(ran.result));
+    const session = String(ran.result.receipt.detail.session_id);
+    await handle.sql`insert into egress_record (id, session_id, space_id, action_id, token_kind,
+        host, port, verdict, reason, bytes_up, bytes_down, opened_at, closed_at)
+      values
+        ('egr_one', ${session}, ${s.scope.spaceId}, ${ran.action.id}, 'command', 'github.com',
+          443, 'tunnel', null, 300, 9000, now(), now()),
+        ('egr_two', ${session}, ${s.scope.spaceId}, ${ran.action.id}, 'command', 'github.com',
+          22, 'refused', 'destination_denied', 0, 0, now(), now()),
+        ('egr_three', ${session}, ${s.scope.spaceId}, null, null, 'example.com',
+          443, 'unattributed', null, 5, 5, now(), now())`;
+    const verdict = await s.connector.verify?.(ran.action, s.context(ran.action));
+    if (verdict?.decision !== 'succeeded' || !verdict.receipt)
+      throw new Error(JSON.stringify(verdict));
+    expect(verdict.receipt.detail.egress_hosts).toEqual([
+      { host: 'github.com', tunnels: 1, refused: 1, bytes_up: 300, bytes_down: 9000 },
+    ]);
+  }, 60_000);
+});
+
+const REACHED: EgressHostSummary[] = [
+  { host: 'example.com', tunnels: 2, refused: 0, bytes_up: 120, bytes_down: 4096 },
+];
+
+/** The fake, behind a guard that gives each command its own proxy address. */
+class GuardedFake extends FakeSandboxProvider {
+  readonly attributed: EgressAttribution[] = [];
+  readonly settled: string[] = [];
+
+  attributeCommand(_handle: SandboxHandle, attribution: EgressAttribution): AttributedCommand {
+    this.attributed.push(attribution);
+    const proxy = `http://cmd:token-${attribution.actionId}@openduet-egress:8791`;
+    return {
+      env: { HTTPS_PROXY: proxy, https_proxy: proxy, HTTP_PROXY: proxy, http_proxy: proxy },
+      settle: () => {
+        this.settled.push(attribution.actionId ?? '');
+        return REACHED;
+      },
+    };
+  }
+}

@@ -1,0 +1,549 @@
+/**
+ * The service's view of its own health, and the operator's alerts when it
+ * goes bad.
+ *
+ * `healthDetail` checks the database, the runtime that runs attempts,
+ * openduet-cells and the container engine behind it, the free disk under the
+ * directories the service writes, the job queue (work that is due but has not
+ * been picked up) and the recent error rate (attempts that failed or were lost,
+ * and model calls providers refused), and background work stuck on one space
+ * (a space, account or routine that the same background pass keeps failing
+ * on while the rest go on). Where the operator asks for them, two spending checks join it:
+ * the last hour's model spending against the installation's usual hour, and
+ * one person's share of today's. `GET /health/detail` returns it to the
+ * operator.
+ *
+ * `HealthMonitor` runs those checks on a timer and, when the service turns
+ * unhealthy, sends an alert to the configured webhook and/or email address;
+ * it repeats while the trouble lasts and says when it has cleared. It runs
+ * inside the service, so it cannot report the service being down: pair it
+ * with an external uptime check on `/health` (docs/DEPLOYMENT.md, "Alerts").
+ */
+import { statfsSync } from 'node:fs';
+import nodemailer from 'nodemailer';
+import type { Sql } from 'postgres';
+import type { Env } from '../env.ts';
+import { smtpTransportOptions } from '../experience/account-mail.ts';
+import type { StuckItem } from '../ops/item-failures.ts';
+
+export type HealthCheck = { name: string; ok: boolean; detail: string };
+export type HealthDetail = {
+  status: 'ok' | 'unhealthy';
+  version: string;
+  checks: HealthCheck[];
+  time: string;
+};
+
+export type HealthProbes = {
+  version: string;
+  database: () => Promise<'ok' | 'unreachable' | 'not_configured'>;
+  /** Resolves when the runtime answers; left out, there is no runtime to check. */
+  runtime?: () => Promise<unknown>;
+  sql?: Sql;
+  /** The spending checks to run; each is left out unless set. */
+  spend?: SpendAlerts;
+  /** Free space under the directories the service writes; left out, disk is not checked. */
+  disk?: DiskProbe;
+  /**
+   * Resolves when openduet-cells answers that the container engine does; left
+   * out where the service has no cell service (OPENDUET_CELLS_URL unset).
+   */
+  cells?: () => Promise<unknown>;
+  /** The items background passes keep failing on (ops/item-failures.ts); left out, not checked. */
+  stuck?: () => StuckItem[];
+};
+
+export type DiskProbe = {
+  /** The directories whose filesystems are measured, such as /data/spaces and /work. */
+  paths: string[];
+  /** Below this many free bytes on any of them, the check fails. */
+  minFreeBytes: number;
+  /** Free bytes on the filesystem holding a path; null when it cannot be measured. */
+  free: (path: string) => number | null;
+};
+
+const MB = 1024 ** 2;
+
+/** Free space on the filesystem that holds `path`, as an unprivileged writer sees it. */
+export function statfsFree(path: string): number | null {
+  try {
+    const stats = statfsSync(path);
+    return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null;
+  }
+}
+
+/** The disk check: the fullest of the paths, against the floor. */
+export function diskCheck(probe: DiskProbe): HealthCheck {
+  const measured = [...new Set(probe.paths)].map((path) => ({ path, free: probe.free(path) }));
+  const unknown = measured.filter((entry) => entry.free === null).map((entry) => entry.path);
+  const known = measured.filter((entry): entry is { path: string; free: number } =>
+    Number.isFinite(entry.free),
+  );
+  const fullest = known.sort((a, b) => a.free - b.free)[0];
+  const floor = `${Math.round(probe.minFreeBytes / MB)} MB`;
+  if (fullest && fullest.free < probe.minFreeBytes)
+    return {
+      name: 'disk',
+      ok: false,
+      detail: `${Math.round(fullest.free / MB)} MB free under ${fullest.path}, below the ${floor} floor (OPENDUET_ALERT_DISK_MIN_FREE_MB)`,
+    };
+  if (!fullest)
+    return {
+      name: 'disk',
+      ok: false,
+      detail: `free space could not be measured under ${unknown.join(', ')}`,
+    };
+  return {
+    name: 'disk',
+    ok: true,
+    detail: `${Math.round(fullest.free / MB)} MB free under ${fullest.path} (floor ${floor})`,
+  };
+}
+
+/** openduet-cells' own /health, which answers 503 when the container engine does not. */
+export function cellsProbe(
+  cellsUrl: string,
+  transport: (url: string, init: RequestInit) => Promise<Response> = (url, init) =>
+    fetch(url, init),
+): () => Promise<void> {
+  return async () => {
+    const response = await transport(new URL('/health', cellsUrl).toString(), {
+      signal: AbortSignal.timeout(HEALTH_LIMITS.runtime_timeout_ms),
+    });
+    await response.body?.cancel().catch(() => {});
+    if (!response.ok)
+      throw new Error(
+        response.status === 503
+          ? 'the container engine does not answer'
+          : `openduet-cells answered ${response.status}`,
+      );
+  };
+}
+
+export type SpendAlerts = {
+  /** The last hour above this many times the median hour of the week before. */
+  hourlyMultiple?: number;
+  /** One person above this percent of today's spending, with others spending too. */
+  personPercent?: number;
+  /** Neither check fires below this many dollars. */
+  minUsd: number;
+};
+
+export function spendAlertsFromEnv(env: Env): SpendAlerts | undefined {
+  if (!env.OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE && !env.OPENDUET_ALERT_SPEND_PERSON_PERCENT)
+    return undefined;
+  return {
+    ...(env.OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE
+      ? { hourlyMultiple: env.OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE }
+      : {}),
+    ...(env.OPENDUET_ALERT_SPEND_PERSON_PERCENT
+      ? { personPercent: env.OPENDUET_ALERT_SPEND_PERSON_PERCENT }
+      : {}),
+    minUsd: env.OPENDUET_ALERT_SPEND_MIN_USD,
+  };
+}
+
+const dollars = (value: number) => `$${value.toFixed(2)}`;
+
+/** The last hour's spending against the usual hour. */
+export function spendRateCheck(
+  lastHourUsd: number,
+  usualHourUsd: number,
+  multiple: number,
+  minUsd: number,
+): HealthCheck {
+  const high = lastHourUsd >= minUsd && lastHourUsd > multiple * usualHourUsd;
+  return {
+    name: 'spend_rate',
+    ok: !high,
+    detail: `${dollars(lastHourUsd)} on model calls in the last hour; the usual hour is ${dollars(usualHourUsd)}${high ? `, and the alert is set at ${multiple} times that` : ''}`,
+  };
+}
+
+/** One person's share of today's spending. */
+export function spendShareCheck(
+  top: { personId: string; usd: number } | null,
+  totalUsd: number,
+  people: number,
+  percent: number,
+  minUsd: number,
+): HealthCheck {
+  const share = top && totalUsd > 0 ? (top.usd / totalUsd) * 100 : 0;
+  const high = Boolean(top) && people > 1 && (top?.usd ?? 0) >= minUsd && share > percent;
+  return {
+    name: 'spend_share',
+    ok: !high,
+    detail: top
+      ? `${top.personId} accounts for ${Math.round(share)}% (${dollars(top.usd)}) of today's ${dollars(totalUsd)} across ${people} ${people === 1 ? 'person' : 'people'}`
+      : 'no model spending today',
+  };
+}
+
+export const HEALTH_LIMITS = {
+  /** How long a runtime probe may take. */
+  runtime_timeout_ms: 5_000,
+  /** Work due this long ago and still not started means the queue is stuck. */
+  queue_stuck_minutes: 10,
+  /** The window the error rate is read over. */
+  error_window_minutes: 15,
+  /** Fewer outcomes than this in the window is too few to call a spike. */
+  error_min_samples: 5,
+  /** The share of failures in the window that counts as a spike. */
+  error_rate: 0.5,
+} as const;
+
+async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timed out')), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function healthDetail(
+  probes: HealthProbes,
+  limits: Record<keyof typeof HEALTH_LIMITS, number> = HEALTH_LIMITS,
+): Promise<HealthDetail> {
+  const checks: HealthCheck[] = [];
+  const database = await probes.database().catch(() => 'unreachable' as const);
+  checks.push({
+    name: 'database',
+    ok: database !== 'unreachable',
+    detail: database === 'not_configured' ? 'not configured' : database,
+  });
+  if (probes.runtime) {
+    const runtime = probes.runtime;
+    const answered = await within(Promise.resolve().then(runtime), limits.runtime_timeout_ms)
+      .then(() => null)
+      .catch((error: unknown) => (error instanceof Error ? error.message : 'unreachable'));
+    checks.push({
+      name: 'runtime',
+      ok: answered === null,
+      detail: answered === null ? 'ok' : `not answering (${answered.slice(0, 120)})`,
+    });
+  }
+  if (probes.cells) {
+    const cells = probes.cells;
+    const answered = await within(Promise.resolve().then(cells), limits.runtime_timeout_ms)
+      .then(() => null)
+      .catch((error: unknown) => (error instanceof Error ? error.message : 'unreachable'));
+    checks.push({
+      name: 'cells',
+      ok: answered === null,
+      detail:
+        answered === null
+          ? 'openduet-cells and the container engine answer'
+          : `agents' computers and attempts cannot start: ${answered.slice(0, 120)}`,
+    });
+  }
+  if (probes.disk) checks.push(diskCheck(probes.disk));
+  if (probes.stuck) checks.push(stuckCheck(probes.stuck()));
+  if (probes.sql && database === 'ok') {
+    const sql = probes.sql;
+    try {
+      const [queue] = await sql`select count(*)::int as stuck from job
+        where state = 'queued' and not paused and next_wake_at is not null
+          and next_wake_at < now() - make_interval(mins => ${limits.queue_stuck_minutes})`;
+      const stuck = Number(queue?.stuck ?? 0);
+      checks.push({
+        name: 'job_queue',
+        ok: stuck === 0,
+        detail:
+          stuck === 0
+            ? 'ok'
+            : `${stuck} job${stuck === 1 ? '' : 's'} due more than ${limits.queue_stuck_minutes} minutes ago and not started`,
+      });
+      const [attempts] = await sql`select count(*)::int as ended,
+          count(*) filter (where outcome = 'failed' or lease_status = 'lost')::int as failed
+        from attempt where ended_at > now() - make_interval(mins => ${limits.error_window_minutes})`;
+      const [calls] = await sql`select count(*)::int as total,
+          count(*) filter (where status = 'failed')::int as failed
+        from model_usage where created_at > now() - make_interval(mins => ${limits.error_window_minutes})`;
+      const spike = (failed: number, total: number) =>
+        total >= limits.error_min_samples && failed / total >= limits.error_rate;
+      const attemptSpike = spike(Number(attempts?.failed ?? 0), Number(attempts?.ended ?? 0));
+      const callSpike = spike(Number(calls?.failed ?? 0), Number(calls?.total ?? 0));
+      checks.push({
+        name: 'error_rate',
+        ok: !attemptSpike && !callSpike,
+        detail: `in the last ${limits.error_window_minutes} minutes: ${attempts?.failed ?? 0} of ${attempts?.ended ?? 0} attempts failed or were lost, ${calls?.failed ?? 0} of ${calls?.total ?? 0} model calls were refused by the provider`,
+      });
+    } catch (error) {
+      checks.push({
+        name: 'job_queue',
+        ok: false,
+        detail: `could not be read (${error instanceof Error ? error.message.slice(0, 120) : 'error'})`,
+      });
+    }
+  }
+  if (probes.sql && database === 'ok' && probes.spend) {
+    try {
+      checks.push(...(await spendChecks(probes.sql, probes.spend)));
+    } catch (error) {
+      checks.push({
+        name: 'spend',
+        ok: false,
+        detail: `spending could not be read (${error instanceof Error ? error.message.slice(0, 120) : 'error'})`,
+      });
+    }
+  }
+  return {
+    status: checks.every((check) => check.ok) ? 'ok' : 'unhealthy',
+    version: probes.version,
+    checks,
+    time: new Date().toISOString(),
+  };
+}
+
+/** How many listed in a stuck check's detail; the rest are counted. */
+const STUCK_LISTED = 10;
+
+/**
+ * Background work that keeps failing on one space, account or routine while
+ * the rest go on: each named with its pass, how often it failed and why.
+ */
+export function stuckCheck(stuck: StuckItem[]): HealthCheck {
+  if (!stuck.length) return { name: 'background_work', ok: true, detail: 'ok' };
+  const listed = stuck
+    .slice(0, STUCK_LISTED)
+    .map(
+      (item) =>
+        `${item.pass}: ${item.id} failed ${item.failures} times since ${item.since} (${item.error})`,
+    );
+  const more = stuck.length - listed.length;
+  return {
+    name: 'background_work',
+    ok: false,
+    detail: `${listed.join('; ')}${more > 0 ? `; and ${more} more` : ''}`,
+  };
+}
+
+/** The spending checks the operator asked for, read from `model_usage`. */
+async function spendChecks(sql: Sql, spend: SpendAlerts): Promise<HealthCheck[]> {
+  const checks: HealthCheck[] = [];
+  if (spend.hourlyMultiple !== undefined) {
+    const [rate] = await sql`with hours as (
+        select generate_series(date_trunc('hour', now()) - interval '168 hours',
+          date_trunc('hour', now()) - interval '1 hour', interval '1 hour') as hour),
+      spent as (
+        select date_trunc('hour', created_at) as hour, sum(cost_usd) as usd from model_usage
+        where created_at >= date_trunc('hour', now()) - interval '168 hours'
+          and created_at < date_trunc('hour', now())
+        group by 1)
+      select
+        (select coalesce(sum(cost_usd), 0) from model_usage
+          where created_at > now() - interval '1 hour')::float8 as last_hour,
+        (select percentile_cont(0.5) within group (order by coalesce(spent.usd, 0))
+          from hours left join spent using (hour))::float8 as usual_hour`;
+    checks.push(
+      spendRateCheck(
+        Number(rate?.last_hour ?? 0),
+        Number(rate?.usual_hour ?? 0),
+        spend.hourlyMultiple,
+        spend.minUsd,
+      ),
+    );
+  }
+  if (spend.personPercent !== undefined) {
+    const people = await sql`select principal_id, sum(cost_usd)::float8 as usd from model_usage
+      where created_at >= date_trunc('day', now() at time zone 'UTC') at time zone 'UTC'
+        and principal_id is not null
+      group by principal_id order by usd desc`;
+    const total = people.reduce((sum, row) => sum + Number(row.usd), 0);
+    const [first] = people;
+    checks.push(
+      spendShareCheck(
+        first ? { personId: String(first.principal_id), usd: Number(first.usd) } : null,
+        total,
+        people.length,
+        spend.personPercent,
+        spend.minUsd,
+      ),
+    );
+  }
+  return checks;
+}
+
+export type Alert = {
+  kind: 'unhealthy' | 'recovered';
+  subject: string;
+  text: string;
+  detail: HealthDetail;
+};
+export type AlertSender = (alert: Alert) => Promise<void>;
+
+function alertText(kind: Alert['kind'], detail: HealthDetail): { subject: string; text: string } {
+  const failing = detail.checks.filter((check) => !check.ok);
+  if (kind === 'recovered')
+    return {
+      subject: 'OpenDuet is healthy again',
+      text: `OpenDuet ${detail.version} is healthy again as of ${detail.time}.`,
+    };
+  return {
+    subject: `OpenDuet is unhealthy: ${failing.map((check) => check.name).join(', ')}`,
+    text: [
+      `OpenDuet ${detail.version} is unhealthy as of ${detail.time}.`,
+      ...failing.map((check) => `- ${check.name}: ${check.detail}`),
+    ].join('\n'),
+  };
+}
+
+/** A JSON POST with `text` (which chat webhooks show), `status` and the checks. */
+export function webhookSender(
+  url: string,
+  transport: (request: Request) => Promise<Response> = (request) => fetch(request),
+): AlertSender {
+  return async (alert) => {
+    const response = await transport(
+      new Request(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          text: alert.text,
+          status: alert.kind,
+          service: 'openduet',
+          version: alert.detail.version,
+          checks: alert.detail.checks,
+          time: alert.detail.time,
+        }),
+        redirect: 'error',
+        signal: AbortSignal.timeout(10_000),
+      }),
+    );
+    await response.body?.cancel().catch(() => {});
+    if (!response.ok) throw new Error(`webhook answered ${response.status}`);
+  };
+}
+
+/**
+ * Sends alerts over SMTP with the account mail's connection rules: the
+ * timeouts apply, and a server elsewhere must take TLS (STARTTLS on a plain
+ * `smtp://` URL) unless its URL says `?requireTLS=false`.
+ */
+export function emailSender(options: { smtpUrl: string; to: string; from: string }): AlertSender {
+  return async (alert) => {
+    const smtp = nodemailer.createTransport(smtpTransportOptions(options.smtpUrl));
+    try {
+      await smtp.sendMail({
+        from: options.from,
+        to: options.to,
+        subject: alert.subject,
+        text: alert.text,
+      });
+    } finally {
+      smtp.close();
+    }
+  };
+}
+
+/** The senders the environment configures; empty when alerts are off. */
+export function alertSendersFromEnv(env: Env): AlertSender[] {
+  const senders: AlertSender[] = [];
+  if (env.OPENDUET_ALERT_WEBHOOK_URL) senders.push(webhookSender(env.OPENDUET_ALERT_WEBHOOK_URL));
+  if (env.OPENDUET_ALERT_EMAIL_TO && env.OPENDUET_ALERT_SMTP_URL)
+    senders.push(
+      emailSender({
+        smtpUrl: env.OPENDUET_ALERT_SMTP_URL,
+        to: env.OPENDUET_ALERT_EMAIL_TO,
+        from: env.OPENDUET_ALERT_EMAIL_FROM ?? env.OPENDUET_ALERT_EMAIL_TO,
+      }),
+    );
+  return senders;
+}
+
+export class HealthMonitor {
+  private unhealthySince: number | null = null;
+  /** The checks failing at the last round, so one that starts failing is said at once. */
+  private failing = new Set<string>();
+  private lastSent = 0;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running: Promise<unknown> | undefined;
+
+  constructor(
+    private readonly options: {
+      check: () => Promise<HealthDetail>;
+      senders: AlertSender[];
+      intervalMs: number;
+      repeatMs: number;
+      now?: () => number;
+      onError?: (error: Error) => void;
+      /** Whether this instance sends the alerts now, when several share the database. */
+      leads?: () => Promise<boolean>;
+    },
+  ) {}
+
+  /** One round of checks; returns the alert it sent, if any. */
+  async tick(): Promise<Alert | null> {
+    // One instance alerts for all of them.
+    if (this.options.leads && !(await this.options.leads().catch(() => false))) return null;
+    const now = this.options.now?.() ?? Date.now();
+    let detail: HealthDetail;
+    try {
+      detail = await this.options.check();
+    } catch (error) {
+      detail = {
+        status: 'unhealthy',
+        version: 'unknown',
+        checks: [
+          {
+            name: 'health_check',
+            ok: false,
+            detail: error instanceof Error ? error.message.slice(0, 200) : 'failed',
+          },
+        ],
+        time: new Date(now).toISOString(),
+      };
+    }
+    let kind: Alert['kind'] | null = null;
+    if (detail.status === 'unhealthy') {
+      // A check that starts failing while another already fails is news of its
+      // own and is not held for the repeat: background work stuck on one space
+      // for days never keeps a database or disk failure quiet.
+      const failing = new Set(
+        detail.checks.filter((check) => !check.ok).map((check) => check.name),
+      );
+      const newly = [...failing].some((name) => !this.failing.has(name));
+      if (this.unhealthySince === null || newly || now - this.lastSent >= this.options.repeatMs)
+        kind = 'unhealthy';
+      this.failing = failing;
+      this.unhealthySince ??= now;
+    } else if (this.unhealthySince !== null) {
+      kind = 'recovered';
+      this.unhealthySince = null;
+      this.failing = new Set();
+    }
+    if (!kind) return null;
+    const alert: Alert = { kind, ...alertText(kind, detail), detail };
+    this.lastSent = now;
+    for (const send of this.options.senders)
+      await send(alert).catch((error: unknown) =>
+        this.options.onError?.(error instanceof Error ? error : new Error('alert not sent')),
+      );
+    return alert;
+  }
+
+  start(): void {
+    if (this.timer || !this.options.senders.length) return;
+    this.timer = setInterval(() => {
+      if (this.running) return;
+      this.running = this.tick().finally(() => {
+        this.running = undefined;
+      });
+    }, this.options.intervalMs);
+    this.timer.unref?.();
+  }
+
+  async stop(): Promise<void> {
+    clearInterval(this.timer);
+    this.timer = undefined;
+    await this.running;
+  }
+}

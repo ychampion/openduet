@@ -1,0 +1,347 @@
+import type { IndexManifest } from '@openduet/contracts';
+import { eligibleRevision, sourceExcerpts } from './claims.ts';
+import {
+  generation,
+  lockSpace,
+  MemoryError,
+  type MemoryScope,
+  type MemorySql,
+  type MemoryTx,
+} from './db.ts';
+import { profileCandidates } from './recall.ts';
+
+export const LEXICAL_RECIPE = 'simple-lexical-v1';
+export const MAX_INDEX_ROWS = 2000;
+/** Whose memory an embedding call reads, so its cost is charged to that person. */
+export type EmbeddingCall = {
+  spaceId: string;
+  /** The conversation the text came from, when it came from one. */
+  jobId?: string | null;
+  /** The person who caused the call, when the caller knows them. */
+  actor?: string | null;
+};
+export type EmbeddingProvider = {
+  model: string;
+  version: string;
+  dimensions: number;
+  recipe: string;
+  /**
+   * The model runs on the person's own machine or network. Only such a model
+   * may read what memory learned in a private conversation; a cloud embedder
+   * never sees it, and that memory is recalled lexically.
+   */
+  local?: boolean;
+  /** `purpose` tells a model that embeds questions and passages differently which this is. */
+  embed(
+    text: string[],
+    signal: AbortSignal,
+    options?: { purpose?: 'query' | 'document'; call?: EmbeddingCall },
+  ): Promise<number[][]>;
+  /**
+   * What of each text may be sent for this space: the details the privacy
+   * settings detect swapped for their kind, or null when nothing from the
+   * space may leave (a space the person marked private). Left out, texts are
+   * sent as given, which only a local model should do.
+   */
+  screen?(spaceId: string, texts: string[], jobId?: string | null): Promise<string[] | null>;
+  /** How calls to the provider have gone, for health. */
+  status?(): import('./embedding.ts').EmbeddingStatus;
+};
+/** How many texts one embedding request carries. */
+export const EMBED_BATCH = 64;
+/** How many index rows one statement writes. */
+const INDEX_INSERT_BATCH = 500;
+/**
+ * How many times one pass builds a space's index again when a newer fact was
+ * committed while it was being built. Each try reads the facts afresh.
+ */
+export const STALE_BUILD_TRIES = 3;
+export type IndexableRevision = {
+  claim_id: string;
+  revision: number;
+  text: string;
+  kind: string;
+  status: string;
+  /** Learned from a conversation that was private when it was captured. */
+  private: boolean;
+};
+export function validateVector(vector: number[], dimensions: number) {
+  if (vector.length !== dimensions || !vector.every(Number.isFinite))
+    throw new MemoryError('embedding_space_mismatch');
+}
+const VECTOR_PREFIX = 'f32:';
+/**
+ * A vector as it is stored: float32, base64, about a quarter the size of JSON
+ * numbers and read without parsing each one.
+ */
+export function encodeVector(vector: readonly number[]): string {
+  const floats = Float32Array.from(vector);
+  return `${VECTOR_PREFIX}${Buffer.from(floats.buffer, floats.byteOffset, floats.byteLength).toString('base64')}`;
+}
+/** A stored vector, as `encodeVector` wrote it or as JSON numbers; null when it is neither, or of another size. */
+export function decodeVector(value: unknown, dimensions: number): Float32Array | null {
+  if (typeof value === 'string' && value.startsWith(VECTOR_PREFIX)) {
+    const bytes = Buffer.from(value.slice(VECTOR_PREFIX.length), 'base64');
+    if (bytes.byteLength !== dimensions * 4) return null;
+    const floats = new Float32Array(dimensions);
+    new Uint8Array(floats.buffer).set(bytes);
+    return floats.every(Number.isFinite) ? floats : null;
+  }
+  if (Array.isArray(value) && value.length === dimensions && value.every(Number.isFinite))
+    return Float32Array.from(value as number[]);
+  return null;
+}
+/** The vector scaled to length one, so a dot product is its cosine; null for a zero vector. */
+export function normalized(vector: ArrayLike<number>): Float32Array | null {
+  let length = 0;
+  for (let i = 0; i < vector.length; i++) length += (vector[i] ?? 0) ** 2;
+  if (!length) return null;
+  const scale = 1 / Math.sqrt(length);
+  return Float32Array.from(vector as ArrayLike<number>, (x) => x * scale);
+}
+export function cosine(a: number[], b: number[]) {
+  validateVector(b, a.length);
+  let dot = 0;
+  let aa = 0;
+  let bb = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    dot += x * y;
+    aa += x * x;
+    bb += y * y;
+  }
+  return aa && bb ? dot / Math.sqrt(aa * bb) : 0;
+}
+export async function indexableRows(
+  tx: MemoryTx,
+  scope: MemoryScope,
+): Promise<IndexableRevision[]> {
+  const rows =
+    await tx`select c.id as claim_id, r.revision, c.domain_key, r.kind, r.status, b.content
+    from memory_claims c join memory_revisions r on r.claim_id = c.id join memory_revision_content b on b.claim_id = r.claim_id and b.revision = r.revision
+    where c.space_id = ${scope.spaceId} and not c.hidden and r.status <> 'retracted' order by c.id, r.revision limit ${MAX_INDEX_ROWS + 1}`;
+  if (rows.length > MAX_INDEX_ROWS) throw new MemoryError('index_build_budget');
+  const learnedPrivately = new Set(
+    (
+      await tx`select distinct ref.claim_id, ref.revision from memory_references ref
+        join memory_sources s on s.id = ref.source_id
+        where s.space_id = ${scope.spaceId} and s.private_origin is not null`
+    ).map((row) => `${row.claim_id}:${row.revision}`),
+  );
+  const eligible: IndexableRevision[] = [];
+  for (const row of rows) {
+    if (!(await eligibleRevision(tx, scope, row.claim_id, row.revision))) continue;
+    eligible.push({
+      claim_id: row.claim_id,
+      revision: row.revision,
+      text: `${(row.domain_key as string).replace(/[.:]/g, ' ')} ${row.content} ${(await sourceExcerpts(tx, row.claim_id, row.revision)).join(' ')}`,
+      kind: row.kind,
+      status: row.status,
+      private: learnedPrivately.has(`${row.claim_id}:${row.revision}`),
+    });
+  }
+  return eligible;
+}
+/** The vectors already made for this space under this embedding, by claim revision. */
+async function keptVectors(
+  sql: MemorySql,
+  scope: MemoryScope,
+  embedding: EmbeddingProvider,
+): Promise<Map<string, number[]>> {
+  const rows = await sql`select claim_id, revision, vector from memory_dense_entries
+    where space_id = ${scope.spaceId} and model = ${embedding.model} and version = ${embedding.version}
+      and dimensions = ${embedding.dimensions} and recipe = ${embedding.recipe}`;
+  const kept = new Map<string, number[]>();
+  for (const row of rows) {
+    const vector = decodeVector(row.vector, embedding.dimensions);
+    if (vector) kept.set(`${row.claim_id}:${row.revision}`, Array.from(vector));
+  }
+  return kept;
+}
+/**
+ * Vectors for the revisions this build indexes. A revision embedded by an
+ * earlier build keeps its vector, so each write embeds only what it added and
+ * a space indexed before embeddings were configured is filled in on its next
+ * build. What a cloud embedder may not read (memory learned in a private
+ * conversation, or anything in a space marked private) gets no vector and is
+ * recalled lexically. A provider that fails or refuses leaves the rest for the
+ * next build (`partial`); a vector of the wrong shape fails the build.
+ */
+async function vectorsFor(
+  sql: MemorySql,
+  scope: MemoryScope,
+  rows: IndexableRevision[],
+  embedding: EmbeddingProvider,
+  earlier?: EarlierVectors,
+): Promise<{ vectors: Map<string, number[]>; partial: boolean }> {
+  if (
+    !Number.isInteger(embedding.dimensions) ||
+    embedding.dimensions < 1 ||
+    embedding.dimensions > 4096
+  )
+    throw new MemoryError('embedding_space_mismatch');
+  const kept = await keptVectors(sql, scope, embedding);
+  const vectors = new Map<string, number[]>();
+  const missing: IndexableRevision[] = [];
+  for (const row of rows) {
+    const key = `${row.claim_id}:${row.revision}`;
+    const vector = kept.get(key) ?? earlier?.vectors.get(`${earlier.policy}|${key}`);
+    if (vector) vectors.set(key, vector);
+    else if (embedding.local || !row.private) missing.push(row);
+  }
+  if (!missing.length) return { vectors, partial: false };
+  let texts: string[] | null;
+  try {
+    texts = embedding.screen
+      ? await embedding.screen(
+          scope.spaceId,
+          missing.map((row) => row.text),
+        )
+      : missing.map((row) => row.text);
+  } catch {
+    process.stderr.write('memory: embedding_screen_failed\n');
+    return { vectors, partial: true };
+  }
+  // A space marked private sends nothing, by design: that is not a gap to retry.
+  if (!texts) return { vectors, partial: false };
+  if (texts.length !== missing.length) return { vectors, partial: true };
+  let partial = false;
+  const signal = AbortSignal.timeout(15000);
+  for (let start = 0; start < missing.length; start += EMBED_BATCH) {
+    const batch = missing.slice(start, start + EMBED_BATCH);
+    let made: number[][];
+    try {
+      made = await embedding.embed(texts.slice(start, start + EMBED_BATCH), signal, {
+        purpose: 'document',
+        call: { spaceId: scope.spaceId },
+      });
+    } catch (error) {
+      if (error instanceof MemoryError && error.code === 'embedding_space_mismatch') throw error;
+      // Not this time: the lexical index is still built, and the space is
+      // marked partly embedded so a later build tries again.
+      process.stderr.write(
+        `memory: embedding_build_failed:${error instanceof MemoryError ? error.code : 'unreachable'}\n`,
+      );
+      partial = true;
+      break;
+    }
+    if (made.length !== batch.length) throw new MemoryError('embedding_space_mismatch');
+    batch.forEach((row, i) => {
+      const vector = made[i] ?? [];
+      validateVector(vector, embedding.dimensions);
+      vectors.set(`${row.claim_id}:${row.revision}`, vector);
+      earlier?.vectors.set(`${earlier.policy}|${row.claim_id}:${row.revision}`, vector);
+    });
+  }
+  return { vectors, partial };
+}
+/**
+ * Vectors made by an earlier build that was overtaken before it could keep
+ * them, so the build after it does not send the same facts to be embedded
+ * again. Only reused while the space's privacy and access are as they were.
+ */
+type EarlierVectors = { policy: string; vectors: Map<string, number[]> };
+/** Embedding work is outside the transaction. The manifest moves only after a fresh validation. */
+export async function buildViews(
+  sql: MemorySql,
+  scope: MemoryScope,
+  embedding?: EmbeddingProvider,
+  made?: Map<string, number[]>,
+): Promise<IndexManifest> {
+  const snapshot = await sql.begin(async (tx) => {
+    const space = await lockSpace(tx, scope);
+    return { generation: generation(space), rows: await indexableRows(tx, scope) };
+  });
+  const policy = `${snapshot.generation.policy_generation}:${snapshot.generation.access_generation}`;
+  const { vectors, partial } = embedding
+    ? await vectorsFor(sql, scope, snapshot.rows, embedding, made && { policy, vectors: made })
+    : { vectors: new Map<string, number[]>(), partial: false };
+  return sql.begin(async (tx) => {
+    const space = await lockSpace(tx, scope);
+    if (
+      space.data_revision !== snapshot.generation.data_revision ||
+      space.access_generation !== snapshot.generation.access_generation ||
+      space.policy_generation !== snapshot.generation.policy_generation
+    )
+      throw new MemoryError('stale_index_build');
+    const [old] =
+      await tx`select * from memory_index_manifest where space_id = ${scope.spaceId} for update`;
+    const nextGeneration = (old?.generation ?? 0) + 1;
+    // A few statements per rebuild rather than one or two per claim: the space
+    // stays locked while they run, and a fact is not recalled until they have.
+    for (let start = 0; start < snapshot.rows.length; start += INDEX_INSERT_BATCH) {
+      const rows = snapshot.rows.slice(start, start + INDEX_INSERT_BATCH);
+      await tx`insert into memory_index_entries (space_id, generation, claim_id, revision, tokens)
+        select ${scope.spaceId}, ${nextGeneration}, row.claim_id, row.revision, to_tsvector('simple', row.text)
+        from unnest(${rows.map((row) => row.claim_id)}::text[], ${rows.map((row) => row.revision)}::integer[],
+          ${rows.map((row) => row.text)}::text[]) as row(claim_id, revision, text)`;
+      const dense = embedding
+        ? rows.flatMap((row) => {
+            const vector = vectors.get(`${row.claim_id}:${row.revision}`);
+            return vector ? [{ row, vector: JSON.stringify(encodeVector(vector)) }] : [];
+          })
+        : [];
+      if (embedding && dense.length)
+        await tx`insert into memory_dense_entries (space_id, generation, claim_id, revision, model, version, dimensions, recipe, vector)
+          select ${scope.spaceId}, ${nextGeneration}, entry.claim_id, entry.revision, ${embedding.model}, ${embedding.version},
+            ${embedding.dimensions}, ${embedding.recipe}, entry.vector::jsonb
+          from unnest(${dense.map((entry) => entry.row.claim_id)}::text[], ${dense.map((entry) => entry.row.revision)}::integer[],
+            ${dense.map((entry) => entry.vector)}::text[]) as entry(claim_id, revision, vector)`;
+    }
+    const embeddingInfo = embedding
+      ? { model: embedding.model, version: embedding.version, dimensions: embedding.dimensions }
+      : null;
+    await tx`update memory_index_manifest set generation = ${nextGeneration}, coverage_revision = ${space.data_revision}, method = 'lexical',
+      recipe = ${LEXICAL_RECIPE}, embedding = ${embeddingInfo ? JSON.stringify({ ...embeddingInfo, ...(partial ? { partial: true } : {}) }) : null}::text::jsonb where space_id = ${scope.spaceId}`;
+    // The inspection copy of what recall reads from the claims themselves.
+    const profile = (await profileCandidates(tx, scope, ['private', 'space', 'public'])).map(
+      ({ claim_id, revision }) => ({ claim_id, revision }),
+    );
+    // Drizzle makes JSON serializers transparent on a shared postgres.js handle.
+    // Passing text explicitly works with both a raw pool and that shared handle.
+    await tx`insert into memory_profile (space_id, data_revision, items, stale) values (${scope.spaceId}, ${space.data_revision}, ${JSON.stringify(profile)}::text::jsonb, false)
+      on conflict (space_id) do update set data_revision = excluded.data_revision, items = excluded.items, stale = false`;
+    await tx`delete from memory_index_entries where space_id = ${scope.spaceId} and generation <> ${nextGeneration}`;
+    await tx`delete from memory_dense_entries where space_id = ${scope.spaceId} and generation <> ${nextGeneration}`;
+    await tx`update memory_outbox set completed_at = clock_timestamp() where space_id = ${scope.spaceId} and kind = 'index' and target_id::integer <= ${space.data_revision}`;
+    return {
+      space_id: scope.spaceId,
+      generation: nextGeneration,
+      coverage_revision: space.data_revision as number,
+      method: 'lexical',
+      recipe: LEXICAL_RECIPE,
+      embedding: embeddingInfo,
+    };
+  });
+}
+/** Durable work IDs make retries harmless; failed indexing leaves evidence and claims intact. */
+export async function runViewWork(
+  sql: MemorySql,
+  scope: MemoryScope,
+  embedding?: EmbeddingProvider,
+) {
+  const [pending] =
+    await sql`select id from memory_outbox where space_id = ${scope.spaceId} and kind = 'index' and completed_at is null limit 1`;
+  if (!pending) return false;
+  // A fact committed while the index was built (a chat is often still saying
+  // things) leaves the build behind it. That is not a failure: the build reads
+  // the facts again at once, rather than the space waiting out a failure's
+  // pause before what was just said can be recalled. Still behind after a few
+  // tries, the index stays pending for the next pass, uncounted. What one try
+  // embedded is kept for the next, so only facts new since then are sent.
+  const made = new Map<string, number[]>();
+  for (let tries = 1; ; tries++) {
+    try {
+      await buildViews(sql, scope, embedding, made);
+      return true;
+    } catch (error) {
+      if (error instanceof MemoryError && error.code === 'stale_index_build') {
+        if (tries < STALE_BUILD_TRIES) continue;
+        return true;
+      }
+      await sql`update memory_outbox set failures = failures + 1, error_code = 'index_build_failed' where id = ${pending.id}`;
+      throw error;
+    }
+  }
+}

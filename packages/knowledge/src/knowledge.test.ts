@@ -1,0 +1,561 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { KnowledgeFrontmatter } from '@openduet/contracts';
+import { parseRecord, serializeRecord } from './frontmatter.ts';
+import { query, SpaceIndex, toMatchQuery } from './fts.ts';
+import { recordPath, resolveInSpace, slugify, type spacePaths } from './layout.ts';
+import { renderUnifiedDiff } from './mediation.ts';
+import { buildIndex, ensureSpaceDirs, loadRecords, loadSpace } from './store.ts';
+
+const ID = {
+  bun: 'k_01J8ZP3QWABCDEFGHJKMNPQRST',
+  flights: 'k_01J8ZP3QWABCDEFGHJKMNPQRSV',
+  landlord: 'k_01J8ZP3QWABCDEFGHJKMNPQRSW',
+};
+
+const frontmatter = (over: Partial<KnowledgeFrontmatter>): KnowledgeFrontmatter => ({
+  id: ID.bun,
+  title: 'Prefers bun over npm for all package management',
+  space: 'personal',
+  audience: 'private',
+  type: 'preference',
+  status: 'active',
+  confidence: 'high',
+  asserted_by: 'user',
+  source: {
+    kind: 'statement',
+    ref: 'session:2026-09-10T14:22:31Z',
+    quote: 'always use bun instead of npm',
+    sha256: null,
+  },
+  observed_at: '2026-09-10',
+  valid_from: '2026-07-10',
+  valid_until: null,
+  supersedes: [],
+  superseded_by: null,
+  created: '2026-09-10',
+  updated: '2026-09-10',
+  tags: ['tooling', 'javascript'],
+  links: [],
+  schema_version: 1,
+  ...over,
+});
+
+let root: string;
+let paths: ReturnType<typeof spacePaths>;
+
+beforeAll(() => {
+  root = mkdtempSync(join(tmpdir(), 'openduet-knowledge-'));
+  paths = ensureSpaceDirs(root, 'personal');
+
+  const records: Array<[string, KnowledgeFrontmatter, string]> = [
+    [
+      'prefers-bun.md',
+      frontmatter({}),
+      'Zara uses bun for every package operation, including scratch clones and CI.',
+    ],
+    [
+      'prefers-morning-flights.md',
+      frontmatter({
+        id: ID.flights,
+        title: 'Prefers morning flights',
+        type: 'preference',
+        tags: ['travel'],
+      }),
+      'Books departures before eleven whenever the fare difference is under forty euro.',
+    ],
+    [
+      'landlord-contact.md',
+      frontmatter({
+        id: ID.landlord,
+        title: 'Landlord contact and renewal window',
+        type: 'fact',
+        tags: ['housing'],
+      }),
+      'The lease renews in March. The landlord answers email but never the phone.',
+    ],
+  ];
+
+  for (const [name, fm, body] of records) {
+    writeFileSync(join(paths.knowledge, name), serializeRecord(fm, body), 'utf8');
+  }
+});
+
+afterAll(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+describe('frontmatter round trip', () => {
+  test('a serialized record parses back to the same record', () => {
+    const original = frontmatter({});
+    const text = serializeRecord(original, 'A short body.');
+    const parsed = parseRecord(text);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.record.frontmatter).toEqual(original);
+      expect(parsed.record.body).toBe('A short body.');
+    }
+  });
+
+  test('an unquoted YAML date survives as the string a person typed', () => {
+    const text = `---
+id: ${ID.bun}
+title: Dates
+space: personal
+audience: private
+type: fact
+status: active
+confidence: high
+asserted_by: user
+source:
+  kind: statement
+  ref: "session:1"
+  quote: ""
+  sha256: null
+observed_at: 2026-09-10
+valid_from: 2026-07-10
+valid_until: null
+created: 2026-09-10
+updated: 2026-09-10
+schema_version: 1
+---
+Body.
+`;
+    const parsed = parseRecord(text);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.record.frontmatter.observed_at).toBe('2026-09-10');
+      expect(parsed.record.frontmatter.valid_from).toBe('2026-07-10');
+    }
+  });
+
+  test('a file with no frontmatter is reported, not thrown', () => {
+    const parsed = parseRecord('Just some prose.\n');
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.issues[0]).toContain('frontmatter');
+  });
+
+  test('a record missing a required field names the field', () => {
+    const parsed = parseRecord('---\nid: k_1\n---\nBody\n');
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.issues.join(' ')).toContain('title');
+  });
+
+  test('the content hash tracks the body and ignores frontmatter formatting', () => {
+    const a = parseRecord(serializeRecord(frontmatter({}), 'Same body.'));
+    const b = parseRecord(serializeRecord(frontmatter({ tags: ['different'] }), 'Same body.'));
+    expect(a.ok && b.ok).toBe(true);
+    if (a.ok && b.ok) expect(a.record.contentHash).toBe(b.record.contentHash);
+  });
+});
+
+describe('layout', () => {
+  test('a path that escapes the space root is refused', () => {
+    expect(resolveInSpace(paths, '../other/secret.md')).toBeNull();
+    expect(resolveInSpace(paths, '/etc/passwd')).toBeNull();
+    expect(resolveInSpace(paths, 'knowledge/ok.md')).not.toBeNull();
+  });
+
+  test('slugs stay readable', () => {
+    expect(slugify('Prefers morning flights!')).toBe('prefers-morning-flights');
+    expect(recordPath('Landlord contact')).toBe('knowledge/landlord-contact.md');
+  });
+});
+
+describe('loading a space', () => {
+  test('reads all three sample records', () => {
+    const contents = loadSpace(paths);
+    expect(contents.failures).toEqual([]);
+    expect(contents.records.map((r) => r.frontmatter.id).sort()).toEqual(
+      [ID.bun, ID.flights, ID.landlord].sort(),
+    );
+  });
+
+  test('a malformed file is reported without stopping the rest', () => {
+    const bad = join(paths.knowledge, 'broken.md');
+    writeFileSync(bad, '---\nnot: a record\n---\nbody\n', 'utf8');
+    const contents = loadSpace(paths);
+    expect(contents.records).toHaveLength(3);
+    expect(contents.failures).toHaveLength(1);
+    expect(contents.failures[0]?.path).toBe('knowledge/broken.md');
+    rmSync(bad);
+  });
+
+  test('a search reads only the records it found, as loading the whole space would', () => {
+    const read: string[] = [];
+    const records = loadRecords(
+      paths,
+      [
+        'knowledge/landlord-contact.md',
+        'knowledge/prefers-bun.md',
+        'knowledge/landlord-contact.md',
+        'knowledge/gone.md',
+        '../outside.md',
+        'SCHEMA.md',
+      ],
+      (file) => {
+        read.push(file);
+        return readFileSync(file, 'utf8');
+      },
+    );
+    expect(records.map((record) => record.frontmatter.id)).toEqual([ID.landlord, ID.bun]);
+    expect(read).toHaveLength(2);
+    const whole = loadSpace(paths).records.find((record) => record.frontmatter.id === ID.landlord);
+    expect(records[0]).toEqual(whole as (typeof records)[number]);
+  });
+
+  test('a record that does not validate is left out of a search too', () => {
+    const bad = join(paths.knowledge, 'broken.md');
+    writeFileSync(bad, '---\nnot: a record\n---\nbody\n', 'utf8');
+    expect(loadRecords(paths, ['knowledge/broken.md'])).toEqual([]);
+    rmSync(bad);
+  });
+});
+
+describe('the full-text index', () => {
+  test('finds a record by a word from its body', () => {
+    const { index } = buildIndex(paths);
+    try {
+      const hits = index.search('landlord');
+      expect(hits).toHaveLength(1);
+      expect(hits[0]?.id).toBe(ID.landlord);
+      expect(hits[0]?.path).toBe('knowledge/landlord-contact.md');
+    } finally {
+      index.close();
+    }
+  });
+
+  test('finds a record by a word from its title and one from its tags', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(index.search('flights')[0]?.id).toBe(ID.flights);
+      expect(index.search('javascript')[0]?.id).toBe(ID.bun);
+      expect(index.count()).toBe(3);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('ranks the better match first', () => {
+    const { index } = buildIndex(paths);
+    try {
+      const hits = index.search('bun package management');
+      expect(hits[0]?.id).toBe(ID.bun);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a query with no usable tokens returns nothing rather than everything', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(index.search('   ')).toEqual([]);
+      expect(toMatchQuery('!!!')).toBeNull();
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a query full of FTS5 syntax is searched for, not interpreted', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(() => index.search('landlord AND "unclosed')).not.toThrow();
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a handle knows the one space it can ever see', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(index.space).toBe('personal');
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a type filter narrows the hits', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(query(index, 'flights', { type: 'fact' })).toEqual([]);
+      expect(query(index, 'flights', { type: 'preference' })).toHaveLength(1);
+      expect(query(index, 'flights', { type: ['fact', 'preference'] })).toHaveLength(1);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a tag filter matches whole tags, not substrings', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(query(index, 'bun', { tags: ['tooling'] })).toHaveLength(1);
+      expect(query(index, 'bun', { tags: ['tool'] })).toEqual([]);
+      expect(query(index, 'bun', { tags: ['tooling', 'housing'] })).toEqual([]);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a limit is respected', () => {
+    const { index } = buildIndex(paths);
+    try {
+      expect(query(index, 'the lease renews', { limit: 1 })).toHaveLength(1);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a retracted record never enters the index, before or after a rebuild', () => {
+    const index = SpaceIndex.memory('personal');
+    try {
+      index.rebuild([
+        {
+          id: ID.bun,
+          path: 'a.md',
+          title: 'Bun',
+          tags: [],
+          body: 'bun',
+          status: 'active',
+          type: 'preference',
+        },
+        {
+          id: ID.flights,
+          path: 'b.md',
+          title: 'Flights',
+          tags: [],
+          body: 'flights',
+          status: 'retracted',
+          type: 'preference',
+        },
+      ]);
+      expect(index.search('flights')).toEqual([]);
+      expect(index.search('bun')).toHaveLength(1);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a superseded record is not indexed either', () => {
+    const index = SpaceIndex.memory('personal');
+    try {
+      index.upsert({
+        id: ID.flights,
+        path: 'b.md',
+        title: 'Flights',
+        tags: [],
+        body: 'flights',
+        status: 'superseded',
+        type: 'preference',
+      });
+      expect(index.search('flights')).toEqual([]);
+      expect(index.count()).toBe(0);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('removing a record takes it out of the index immediately', () => {
+    const index = SpaceIndex.memory('personal');
+    try {
+      index.upsert({
+        id: ID.bun,
+        path: 'a.md',
+        title: 'Bun',
+        tags: [],
+        body: 'bun',
+        status: 'active',
+        type: 'preference',
+      });
+      expect(index.search('bun')).toHaveLength(1);
+      index.remove(ID.bun);
+      expect(index.search('bun')).toEqual([]);
+      expect(index.has(ID.bun)).toBe(false);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('an index written to disk survives being reopened', () => {
+    const { index } = buildIndex(paths);
+    index.close();
+    const reopened = SpaceIndex.open(paths);
+    try {
+      expect(reopened.search('landlord')).toHaveLength(1);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+describe('renderUnifiedDiff', () => {
+  test('shows a new file as all additions', () => {
+    const diff = renderUnifiedDiff('', 'one\ntwo\n', 'a.md');
+    expect(diff).toContain('--- /dev/null');
+    expect(diff).toContain('+one');
+    expect(diff).toContain('+two');
+    expect(diff).not.toContain('-one');
+  });
+
+  test('shows a changed line as a removal and an addition', () => {
+    const diff = renderUnifiedDiff('one\ntwo\n', 'one\nthree\n', 'a.md');
+    expect(diff).toContain(' one');
+    expect(diff).toContain('-two');
+    expect(diff).toContain('+three');
+  });
+
+  test('counts the lines on both sides', () => {
+    expect(renderUnifiedDiff('one\n', 'one\ntwo\n', 'a.md')).toContain('@@ -1,1 +1,2 @@');
+  });
+});
+
+describe('the diff a person approves a write from', () => {
+  const body = (diff: string): string[] => diff.trimEnd().split('\n').slice(3);
+
+  test('an inserted line is one insertion, not a rewrite of everything below it', () => {
+    const before = 'alpha\nbeta\ngamma\n';
+    const after = 'alpha\ninserted\nbeta\ngamma\n';
+    expect(body(renderUnifiedDiff(before, after, 'a.md'))).toEqual([
+      ' alpha',
+      '+inserted',
+      ' beta',
+      ' gamma',
+    ]);
+  });
+
+  test('a deleted line is one deletion', () => {
+    expect(body(renderUnifiedDiff('alpha\nbeta\ngamma\n', 'alpha\ngamma\n', 'a.md'))).toEqual([
+      ' alpha',
+      '-beta',
+      ' gamma',
+    ]);
+  });
+
+  test('a moved line reads as a move, not as the whole file changing', () => {
+    const diff = body(renderUnifiedDiff('alpha\nbeta\ngamma\n', 'beta\ngamma\nalpha\n', 'a.md'));
+    expect(diff.filter((line) => line.startsWith(' ')).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('removals come before additions inside one changed run', () => {
+    expect(body(renderUnifiedDiff('a\nb\nc\nd\n', 'a\nx\ny\nd\n', 'a.md'))).toEqual([
+      ' a',
+      '-b',
+      '-c',
+      '+x',
+      '+y',
+      ' d',
+    ]);
+  });
+
+  test('an unchanged file shows no change at all', () => {
+    const same = 'alpha\nbeta\n';
+    expect(body(renderUnifiedDiff(same, same, 'a.md')).every((l) => l.startsWith(' '))).toBe(true);
+  });
+
+  test('everything removed reads as every line removed', () => {
+    expect(body(renderUnifiedDiff('alpha\nbeta\n', '', 'a.md'))).toEqual(['-alpha', '-beta']);
+  });
+
+  test('the counts in the header describe both sides', () => {
+    expect(renderUnifiedDiff('a\nb\nc\n', 'a\n', 'x.md')).toContain('@@ -1,3 +1,1 @@');
+  });
+
+  test('a record edited in the middle shows only the edit', () => {
+    const before = ['---', 'id: k_1', 'title: Old title', '---', '', 'The body.'].join('\n');
+    const after = ['---', 'id: k_1', 'title: New title', '---', '', 'The body.'].join('\n');
+    const changed = body(renderUnifiedDiff(before, after, 'r.md')).filter(
+      (line) => !line.startsWith(' '),
+    );
+    expect(changed).toEqual(['-title: Old title', '+title: New title']);
+  });
+});
+
+// --------------------------------------------------------------------------
+// isolation cannot be decided by looking at the text of a path
+// --------------------------------------------------------------------------
+
+/** Creating a symlink needs a privilege on some Windows setups. Say so rather than passing. */
+const symlinksWork = (() => {
+  const probe = mkdtempSync(join(tmpdir(), 'openduet-symlink-probe-'));
+  try {
+    writeFileSync(join(probe, 'target'), 'x', 'utf8');
+    symlinkSync(join(probe, 'target'), join(probe, 'link'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
+if (!symlinksWork) {
+  process.stdout.write('symlink tests skipped: this machine will not create symlinks\n');
+}
+
+const describeSymlinks = symlinksWork ? describe : describe.skip;
+
+describeSymlinks('a symlink is a path that lies about where it goes', () => {
+  let linkRoot: string;
+  let mine: ReturnType<typeof spacePaths>;
+  let theirs: ReturnType<typeof spacePaths>;
+
+  beforeEach(() => {
+    linkRoot = mkdtempSync(join(tmpdir(), 'openduet-links-'));
+    mine = ensureSpaceDirs(linkRoot, 'personal');
+    theirs = ensureSpaceDirs(linkRoot, 'team-acme');
+    writeFileSync(
+      join(theirs.knowledge, 'private.md'),
+      serializeRecord(
+        frontmatter({ id: ID.landlord, space: 'team-acme', title: 'Their private record' }),
+        'Something the other space keeps to itself.',
+      ),
+      'utf8',
+    );
+  });
+
+  afterEach(() => {
+    rmSync(linkRoot, { recursive: true, force: true });
+  });
+
+  test('a record that is really a link into another space is not read', () => {
+    symlinkSync(join(theirs.knowledge, 'private.md'), join(mine.knowledge, 'borrowed.md'));
+    expect(loadSpace(mine).records).toEqual([]);
+  });
+
+  test('nor read when a search names it', () => {
+    symlinkSync(join(theirs.knowledge, 'private.md'), join(mine.knowledge, 'borrowed.md'));
+    expect(loadRecords(mine, ['knowledge/borrowed.md'])).toEqual([]);
+  });
+
+  test('nor a record reached through a linked directory', () => {
+    symlinkSync(theirs.knowledge, join(mine.knowledge, 'borrowed-dir'));
+    expect(loadRecords(mine, ['knowledge/borrowed-dir/private.md'])).toEqual([]);
+  });
+
+  test('and never reaches the index, so a search cannot find it', () => {
+    symlinkSync(join(theirs.knowledge, 'private.md'), join(mine.knowledge, 'borrowed.md'));
+    const { index } = buildIndex(mine);
+    try {
+      expect(index.search('private')).toEqual([]);
+      expect(index.count()).toBe(0);
+    } finally {
+      index.close();
+    }
+  });
+
+  test('a write through a linked file is refused', () => {
+    symlinkSync(join(theirs.knowledge, 'private.md'), join(mine.knowledge, 'borrowed.md'));
+    expect(resolveInSpace(mine, 'knowledge/borrowed.md')).toBeNull();
+  });
+
+  test('a write through a linked directory is refused too', () => {
+    symlinkSync(theirs.knowledge, join(mine.knowledge, 'borrowed-dir'));
+    expect(resolveInSpace(mine, 'knowledge/borrowed-dir/new.md')).toBeNull();
+  });
+
+  test('an ordinary path in the same space still resolves', () => {
+    expect(resolveInSpace(mine, 'knowledge/ordinary.md')).not.toBeNull();
+    expect(resolveInSpace(mine, 'SCHEMA.md')).not.toBeNull();
+  });
+});

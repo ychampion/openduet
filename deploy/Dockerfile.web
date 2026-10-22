@@ -1,0 +1,65 @@
+# The reference web client.
+#
+# /api is served by the web server's fixed proxy to http://openduet:8787. Browser
+# requests and session cookies therefore stay on the web client's origin.
+# Vite inlines the API address at build time; changing it requires a rebuild.
+
+FROM oven/bun:1.3.13-slim@sha256:7e8ed3961db1cdedf17d516dda87948cfedbd294f53bf16462e5b57ed3fff0f1 AS build
+
+ARG VITE_OPENDUET_API=/api
+ENV VITE_OPENDUET_API=${VITE_OPENDUET_API}
+
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY apps/web/package.json apps/web/
+COPY packages/cli/package.json packages/cli/
+COPY packages/client/package.json packages/client/
+COPY packages/contracts/package.json packages/contracts/
+COPY packages/device/package.json packages/device/
+COPY packages/knowledge/package.json packages/knowledge/
+COPY packages/runtime-hermes/package.json packages/runtime-hermes/
+COPY packages/skills/package.json packages/skills/
+COPY apps/openduet/package.json apps/openduet/
+COPY apps/mock-api/package.json apps/mock-api/
+COPY apps/tryit/package.json apps/tryit/
+COPY conformance/package.json conformance/
+COPY evals/package.json evals/
+# Only the root tooling and the web client's own dependency tree: the other workspaces'
+# development tools, wrangler and its workerd binary among them, play no part in this build.
+# Downloads are kept in a BuildKit cache between builds, and a stalled download is cut off
+# and retried rather than holding the build.
+RUN --mount=type=cache,target=/var/cache/bun \
+    export BUN_INSTALL_CACHE_DIR=/var/cache/bun; \
+    for attempt in 1 2 3; do \
+      timeout 300 bun install --frozen-lockfile --filter ./ --filter @openduet/web && exit 0; \
+      echo "dependency install attempt $attempt of 3 did not finish" >&2; \
+      [ "$attempt" = 3 ] || sleep $((attempt * 10)); \
+    done; \
+    exit 1
+
+COPY . .
+RUN bun run --cwd apps/web build
+
+FROM oven/bun:1.3.13-slim@sha256:7e8ed3961db1cdedf17d516dda87948cfedbd294f53bf16462e5b57ed3fff0f1
+
+WORKDIR /app
+COPY --from=build /app/apps/web/dist ./dist
+# Source files at their repository paths, because the server imports the
+# peer-trust rule, the app isolation check, the call's upstream path and the
+# installation-name rule the API uses rather than keeping a second copy of any.
+COPY deploy/scripts/serve-static.ts ./deploy/scripts/serve-static.ts
+COPY apps/openduet/src/api/trusted-peer.ts ./apps/openduet/src/api/trusted-peer.ts
+COPY apps/openduet/src/viewer/headers.ts ./apps/openduet/src/viewer/headers.ts
+COPY apps/openduet/src/sandbox/preview-path.ts ./apps/openduet/src/sandbox/preview-path.ts
+COPY apps/openduet/src/call/upstream-path.ts ./apps/openduet/src/call/upstream-path.ts
+COPY packages/contracts/src/instance-name.ts ./packages/contracts/src/instance-name.ts
+
+RUN useradd --uid 10003 --create-home --home-dir /home/web web
+USER web
+
+EXPOSE 3000
+
+# A committed file server rather than `bunx serve`, which would reach the
+# registry on every container start. A client that cannot boot without the
+# network is not self-hosted. The bundle is read from ./dist beside it.
+CMD ["bun", "run", "deploy/scripts/serve-static.ts"]

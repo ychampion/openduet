@@ -1,0 +1,420 @@
+/**
+ * The HTTP surface. OpenDuet is API-first: every capability the web client has,
+ * a script has too, and the OpenAPI document is generated from exactly these
+ * schemas so the two can never drift.
+ */
+import { z } from 'zod';
+import { ATTACHMENT_LIMITS } from './attachments.ts';
+import { actionStatus, approvalRequestView, effectClass, payloadHash } from './broker.ts';
+import { ID_PREFIXES, jsonObject, newPasswordInput, prefixedId, timestamp } from './common.ts';
+import { originWarnings } from './effects.ts';
+import { action, attempt, job, jobBudget, jobConstraints, space, trigger } from './entities.ts';
+import { DISPLAY_NAME_MAX } from './instance-name.ts';
+import {
+  knowledgeFrontmatter,
+  knowledgeRecordStatus,
+  knowledgeType,
+  proposedWrite,
+} from './knowledge.ts';
+import { jobLearningScope } from './learning.ts';
+import { MESSAGE_SPAN_LIMIT, messageId, messageSpan } from './reactions.ts';
+import { skillFrontmatter } from './skills.ts';
+
+export const healthResponse = z.object({
+  status: z.enum(['ok', 'degraded']),
+  version: z.string(),
+  /** Present once the service has a database; absent in the skeleton. */
+  database: z.enum(['ok', 'unreachable', 'not_configured']),
+  runtime_adapter: z.string().optional(),
+  runtime_supervisor: z.enum(['process', 'docker']).nullable().optional(),
+  /**
+   * Whether automatic memory is reading what people say. `waiting` counts
+   * messages held back, and `reason` says why: the memory model's provider is
+   * not answering, or people's daily reads are spent. `failed` counts messages
+   * whose reading was given up in the last day, for any reason, and
+   * `failed_reason` says why the latest was: the provider refused the key, the
+   * model's answer could not be read, and so on. Counts only; no content.
+   */
+  memory: z
+    .object({
+      status: z.enum(['ok', 'waiting']),
+      waiting: z.number().int().nonnegative(),
+      failed: z.number().int().nonnegative(),
+      reason: z.enum(['provider_unavailable', 'provider_slow', 'daily_budget']).nullable(),
+      failed_reason: z
+        .enum([
+          'provider_auth',
+          'provider_refused',
+          'provider_unavailable',
+          'provider_slow',
+          'daily_budget',
+          'unreadable_answer',
+          'answer_cut_off',
+          'answer_refused',
+          'too_large',
+          'no_memory_model',
+          'other',
+        ])
+        .nullable(),
+      /**
+       * Semantic recall's embedder: whether one is configured, how its calls
+       * have gone, whether it is paused after failing in a row (recall stays
+       * lexical meanwhile), and how many spaces are not yet fully embedded.
+       */
+      embedding: z
+        .object({
+          configured: z.boolean(),
+          model: z.string().nullable(),
+          local: z.boolean(),
+          last_success_at: timestamp.nullable(),
+          last_error: z.string().nullable(),
+          consecutive_failures: z.number().int().nonnegative(),
+          paused_until: timestamp.nullable(),
+          spaces_not_embedded: z.number().int().nonnegative(),
+        })
+        .optional(),
+    })
+    .optional(),
+  time: timestamp,
+});
+export type HealthResponse = z.infer<typeof healthResponse>;
+
+export const errorResponse = z.object({
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    detail: z.record(z.string(), z.unknown()).optional(),
+  }),
+});
+export type ErrorResponse = z.infer<typeof errorResponse>;
+
+// --------------------------------------------------------------------------
+// the account: setup, sign-in and the signed-in owner
+// --------------------------------------------------------------------------
+
+/** Setup and sign-in take the same body. The email is compared in lower case. */
+export const credentialsRequest = z.object({
+  email: z.email().max(254),
+  password: z.string().min(8).max(1024),
+});
+export const signedInOwner = z.object({
+  id: z.string(),
+  email: z.email(),
+  created_at: timestamp,
+  /** `guest`: an invited account that uses only the rooms it was invited to. */
+  kind: z.enum(['person', 'guest']).optional(),
+});
+export const ownerResponse = z.object({ owner: signedInOwner });
+/**
+ * The first account. `setup_code` is the one-time code the installer printed;
+ * it is needed whenever the installation has one (`code_required` in the setup
+ * status), and a link from the installer carries it.
+ */
+export const setupRequest = z.object({
+  email: z.email().max(254),
+  password: newPasswordInput,
+  setup_code: z.string().min(1).max(200).optional(),
+});
+/** Whether this installation still needs its first account: true until an owner exists. */
+export const setupStatusResponse = z.strictObject({
+  needed: z.boolean(),
+  /** Whether rooms, shared spaces, guests and hand-offs are switched on here. */
+  multiplayer: z.boolean(),
+  /**
+   * Each feature an operator can turn on or off, by name (`voice`, `browser`,
+   * `companies`, …), and whether it is on for whoever is asking. A surface
+   * whose feature is false is left out; its routes are refused anyway.
+   */
+  features: z.record(z.string().regex(/^[a-z][a-z0-9_]*$/), z.boolean()),
+  /** Whether creating the first account needs the installation's one-time setup code. */
+  code_required: z.boolean(),
+  /**
+   * Whether this installation can email a sign-in link and a password reset
+   * link. When it cannot, the sign-in page does not offer email sign-in, and a
+   * forgotten password needs the person who runs the installation.
+   */
+  email_sign_in: z.boolean(),
+  /** What the installation calls itself (`OPENDUET_INSTANCE_NAME`); OpenDuet unless set. */
+  instance_name: z.string().min(1).max(DISPLAY_NAME_MAX),
+  /** What the assistant calls itself (`OPENDUET_ASSISTANT_NAME`); OpenDuet unless set. */
+  assistant_name: z.string().min(1).max(DISPLAY_NAME_MAX),
+  /**
+   * How people sign in here. `password` is false when the operator made the
+   * identity provider the only way in (`OPENDUET_PASSWORD_SIGNIN=off`); `oidc`
+   * names the provider's button (`Continue with <label>`, which opens
+   * `GET /signin/oidc/start`), or is null when none is set up.
+   */
+  signin: z.strictObject({
+    password: z.boolean(),
+    oidc: z.strictObject({ label: z.string().min(1).max(60) }).nullable(),
+  }),
+});
+
+// --------------------------------------------------------------------------
+// triggers
+// --------------------------------------------------------------------------
+
+export const triggerResponse = z.object({ trigger });
+/** One observation from a connection, offered to every event trigger that watches it. */
+export const eventDeliveryRequest = z.object({
+  connection_id: prefixedId(ID_PREFIXES.connection),
+  event_name: z.string().min(1).max(200),
+  cursor: z.string().min(1).max(1000),
+  dedup_key: z.string().min(1).max(1000),
+  payload: jsonObject,
+});
+export const eventDeliveryResponse = z.object({
+  seq: z.number().int().nonnegative(),
+  /** True when this dedup key was delivered before, so nothing new was recorded. */
+  duplicate: z.boolean(),
+});
+
+// --------------------------------------------------------------------------
+// spaces
+// --------------------------------------------------------------------------
+
+export const spaceListResponse = z.object({ spaces: z.array(space) });
+
+// --------------------------------------------------------------------------
+// jobs
+// --------------------------------------------------------------------------
+
+export const createJobRequest = z.object({
+  space_id: prefixedId(ID_PREFIXES.space),
+  title: z.string().min(1).max(200),
+  objective: z.string().min(1),
+  constraints: jobConstraints.partial().optional(),
+  budget: jobBudget.partial().optional(),
+  /** Optional procedure scope is registered atomically before any attempt can claim the job. */
+  learning: jobLearningScope.optional(),
+});
+export type CreateJobRequest = z.infer<typeof createJobRequest>;
+
+export const jobListQuery = z.object({
+  space_id: prefixedId(ID_PREFIXES.space).optional(),
+  state: z.string().optional(),
+  limit: z.coerce.number().int().positive().max(200).default(50),
+});
+
+export const jobListResponse = z.object({ jobs: z.array(job) });
+export const jobResponse = z.object({ job });
+
+export const postMessageRequest = z
+  .object({
+    /** May be empty only when the message carries files. */
+    text: z.string(),
+    /**
+     * The answer this message corrects, by its message id, when the person says so
+     * (a "correct this" reply rather than a new request). Learning reads it only
+     * when it names the latest answer on the same job.
+     */
+    corrects: messageId.optional(),
+    /** Files uploaded for this message, checked as the person's own and unsent when it is accepted. */
+    attachments: z
+      .array(z.string().min(1).max(240))
+      .max(ATTACHMENT_LIMITS.per_message_ceiling)
+      .optional(),
+    /** Stretches of `text` the person pasted rather than typed, when their composer can tell. */
+    pasted: z.array(messageSpan).max(MESSAGE_SPAN_LIMIT).optional(),
+    /** The time zone the sender's device is set to, by name, when it says. */
+    time_zone: z.string().min(1).max(64).optional(),
+  })
+  .refine((value) => value.text.length > 0 || (value.attachments?.length ?? 0) > 0, {
+    message: 'A message needs words or a file.',
+    path: ['text'],
+  });
+
+export const cancelJobRequest = z.object({
+  reason: z.string().max(500).optional(),
+});
+
+// --------------------------------------------------------------------------
+// attempts, actions
+// --------------------------------------------------------------------------
+
+export const attemptListResponse = z.object({ attempts: z.array(attempt) });
+export const attemptResponse = z.object({ attempt });
+
+export const actionListQuery = z.object({
+  job_id: prefixedId(ID_PREFIXES.job).optional(),
+  status: actionStatus.optional(),
+  effect_class: effectClass.optional(),
+  limit: z.coerce.number().int().positive().max(200).default(50),
+  /**
+   * `summary` lists each action by what a person is shown of it: its state,
+   * what it was (who it went to, its title, the file or command) and whether
+   * the person settled it. The full record stays on GET /actions/{actionId}.
+   */
+  view: z.enum(['full', 'summary']).default('full'),
+});
+export const actionListResponse = z.object({ actions: z.array(action) });
+
+/** The payload fields a summary keeps, each clipped: enough to name the effect, never its body. */
+const SUMMARY_PAYLOAD = ['to', 'title', 'summary', 'path', 'command'] as const;
+const SUMMARY_TEXT = 300;
+/** The reconciliation fields a summary keeps: who settled it, and how. */
+const SUMMARY_RECONCILIATION = ['decided_by', 'decision'] as const;
+
+export const actionSummary = z
+  .object({
+    id: prefixedId(ID_PREFIXES.action),
+    job_id: prefixedId(ID_PREFIXES.job),
+    kind: z.string().min(1),
+    effect_class: effectClass,
+    status: actionStatus,
+    /** Only `to`, `title`, `summary`, `path` and `command`, each at most 300 characters. */
+    canonical_payload: jsonObject,
+    /** Only `decided_by` and `decision`. */
+    reconciliation: jsonObject.nullable(),
+    dispatched_at: timestamp.nullable(),
+    resolved_at: timestamp.nullable(),
+    created_at: timestamp,
+  })
+  .meta({ id: 'ActionSummary' });
+export type ActionSummary = z.infer<typeof actionSummary>;
+export const actionSummaryListResponse = z.object({ actions: z.array(actionSummary) });
+
+const clipped = (value: unknown): unknown => {
+  if (typeof value === 'string') return value.slice(0, SUMMARY_TEXT);
+  if (Array.isArray(value))
+    return value
+      .slice(0, 20)
+      .filter((item) => typeof item === 'string')
+      .map((item: string) => item.slice(0, SUMMARY_TEXT));
+  return undefined;
+};
+
+/** An action as the lean list shows it. */
+export function actionSummaryOf(full: z.infer<typeof action>): ActionSummary {
+  const payload: Record<string, unknown> = {};
+  for (const key of SUMMARY_PAYLOAD) {
+    const value = clipped(full.canonical_payload[key]);
+    if (value !== undefined) payload[key] = value;
+  }
+  const reconciliation = full.reconciliation
+    ? Object.fromEntries(
+        SUMMARY_RECONCILIATION.flatMap((key) => {
+          const value = full.reconciliation?.[key];
+          return typeof value === 'string' ? [[key, value]] : [];
+        }),
+      )
+    : null;
+  return actionSummary.parse({
+    id: full.id,
+    job_id: full.job_id,
+    kind: full.kind,
+    effect_class: full.effect_class,
+    status: full.status,
+    canonical_payload: payload,
+    reconciliation,
+    dispatched_at: full.dispatched_at,
+    resolved_at: full.resolved_at,
+    created_at: full.created_at,
+  });
+}
+export const actionResponse = z.object({ action });
+
+/** Used when an action came back `unknown` and a person settles it by hand. */
+export const resolveActionRequest = z.object({
+  resolution: z.enum(['succeeded', 'failed', 'unresolved']),
+  note: z.string().max(2000).optional(),
+});
+
+// --------------------------------------------------------------------------
+// approvals
+// --------------------------------------------------------------------------
+
+/**
+ * The approval request as the client renders it, plus the doubts that made it
+ * worth asking. A screen that shows an address without saying it came from a
+ * web page is asking the person to approve something they cannot see.
+ */
+export const approvalRequestWithOrigin = approvalRequestView.extend({
+  origin_warnings: originWarnings.default([]),
+});
+export type ApprovalRequestWithOrigin = z.infer<typeof approvalRequestWithOrigin>;
+
+export const approvalListResponse = z.object({ approvals: z.array(approvalRequestWithOrigin) });
+export const approvalDecisionResponse = z.object({
+  approval_id: prefixedId(ID_PREFIXES.approval),
+  action_id: prefixedId(ID_PREFIXES.action),
+  decision: z.enum(['approved', 'denied']),
+  payload_hash: payloadHash,
+  decided_at: timestamp,
+});
+
+// --------------------------------------------------------------------------
+// knowledge
+// --------------------------------------------------------------------------
+
+export const knowledgeSearchQuery = z.object({
+  space_id: prefixedId(ID_PREFIXES.space),
+  q: z.string().min(1),
+  limit: z.coerce.number().int().positive().max(50).default(10),
+  include_retracted: z.coerce.boolean().default(false),
+});
+
+export const knowledgeHit = z.object({
+  id: prefixedId(ID_PREFIXES.knowledge),
+  path: z.string(),
+  title: z.string(),
+  excerpt: z.string(),
+  status: knowledgeRecordStatus,
+  score: z.number(),
+});
+export const knowledgeSearchResponse = z.object({ hits: z.array(knowledgeHit) });
+
+/**
+ * The catalog of one space. Search answers a question; nothing else could show a
+ * caller what is actually in the space, which is why listing is its own
+ * operation rather than a search with an empty query.
+ */
+export const knowledgeListEntry = z.object({
+  id: prefixedId(ID_PREFIXES.knowledge),
+  path: z.string(),
+  title: z.string(),
+  type: knowledgeType,
+  status: knowledgeRecordStatus,
+  tags: z.array(z.string()),
+  updated: z.string(),
+});
+export const knowledgeListQuery = z.object({
+  space_id: prefixedId(ID_PREFIXES.space).optional(),
+});
+export const knowledgeListResponse = z.object({ records: z.array(knowledgeListEntry) });
+
+export const knowledgeRecordResponse = z.object({
+  id: prefixedId(ID_PREFIXES.knowledge),
+  path: z.string(),
+  frontmatter: knowledgeFrontmatter,
+  body: z.string(),
+});
+
+export const proposeKnowledgeRequest = proposedWrite;
+export const proposeKnowledgeResponse = z.object({
+  proposal_id: z.string(),
+  path: z.string(),
+  diff: z.string(),
+});
+
+export const retractKnowledgeRequest = z.object({
+  reason: z.string().min(1).max(500),
+  /** Hard delete removes the file and rebuilds the index in the same operation. */
+  hard_delete: z.boolean().default(false),
+});
+
+// --------------------------------------------------------------------------
+// skills
+// --------------------------------------------------------------------------
+
+export const skillListResponse = z.object({
+  skills: z.array(
+    z.object({
+      id: prefixedId(ID_PREFIXES.skill),
+      space_id: prefixedId(ID_PREFIXES.space).nullable(),
+      path: z.string(),
+      enabled: z.boolean(),
+      frontmatter: skillFrontmatter,
+    }),
+  ),
+});

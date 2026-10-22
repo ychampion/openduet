@@ -1,0 +1,283 @@
+import { afterAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { type AddressInfo, createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import {
+  type DoctorFacts,
+  expandPublished,
+  judgeDoctor,
+  publishedByProject,
+  runDoctor,
+} from './commands/doctor.ts';
+import { probePort } from './context.ts';
+import { defaultDeployConfig } from './deploy-config.ts';
+import { reportSchema } from './schema.ts';
+import { changingCalls, ok, temporaryDeployDir, testContext, writeEnv } from './testing.ts';
+
+const MB = 1024 ** 2;
+
+const healthy: DoctorFacts = {
+  config: defaultDeployConfig(),
+  contract: { id: 'deploy.contract', level: 'ok', detail: 'openduet.deploy.json, contract 1' },
+  docker: [],
+  dockerVersions: 'Engine 28.3.0, Compose 2.39.1',
+  dockerNotes: [],
+  remoteEngine: null,
+  freeBytes: 20_000 * MB,
+  memoryBytes: 8192 * MB,
+  ports: [
+    { service: 'openduet', host: '127.0.0.1', port: '3100', probe: 'free' },
+    { service: 'web', host: '127.0.0.1', port: '3101', probe: 'free' },
+  ],
+  images: [{ name: 'ghcr.io/ychampion/openduet-service:main', present: true }],
+  registry: {
+    url: 'https://ghcr.io/v2/',
+    answered: true,
+    detail: 'https://ghcr.io/v2/ answers (401).',
+  },
+  database: null,
+};
+
+const find = (facts: DoctorFacts, id: string) =>
+  judgeDoctor(facts).find((result) => result.id === id);
+const withFloor = (min_free_mb: number) => ({
+  ...healthy.config,
+  disk: { ...healthy.config.disk, min_free_mb },
+});
+
+describe('openduet doctor', () => {
+  test('a healthy host passes, with disk reported in MB', () => {
+    const results = judgeDoctor(healthy);
+    expect(results.filter((result) => result.level !== 'ok')).toEqual([]);
+    expect(results.find((result) => result.id === 'disk.free_mb')?.detail).toBe(
+      '20000 MB free where Docker keeps its images; the floor is 4096 MB.',
+    );
+  });
+
+  test("the disk floor is the contract's, so a small host can pass below 1 GB", () => {
+    const small = { ...healthy, freeBytes: 1000 * MB };
+    expect(find(small, 'disk.free_mb')?.level).toBe('fail');
+    expect(find({ ...small, config: withFloor(600) }, 'disk.free_mb')?.level).toBe('ok');
+    expect(find({ ...small, config: withFloor(1001) }, 'disk.free_mb')?.level).toBe('fail');
+  });
+
+  test("a port another program holds fails; the stack's own port does not", () => {
+    const taken = {
+      ...healthy,
+      ports: [
+        { service: 'openduet', host: '127.0.0.1', port: '3100', probe: 'ours' as const },
+        { service: 'web', host: '127.0.0.1', port: '3101', probe: 'in_use' as const },
+      ],
+    };
+    expect(find(taken, 'ports.3100')?.level).toBe('ok');
+    expect(find(taken, 'ports.3101')).toMatchObject({
+      level: 'fail',
+      fix: expect.stringContaining('WEB_PORT'),
+    });
+  });
+
+  test('an address this machine lacks, an unanswered probe and a wide range are each named', () => {
+    const facts = {
+      ...healthy,
+      ports: [
+        { service: 'openduet', host: '::1', port: '3100', probe: 'no_address' as const },
+        { service: 'web', host: '127.0.0.1', port: '3101', probe: 'unknown' as const },
+        { service: 'web', host: '0.0.0.0', port: '4000-5000', probe: 'range' as const },
+      ],
+    };
+    expect(find(facts, 'ports.3100')).toMatchObject({
+      level: 'fail',
+      detail: expect.stringContaining('::1 is not an address of this machine'),
+    });
+    expect(find(facts, 'ports.3101')?.level).toBe('warn');
+    expect(find(facts, 'ports.4000_5000')?.level).toBe('warn');
+  });
+
+  test('a published range is probed port by port up to its limit', () => {
+    expect(expandPublished('3100-3102')).toEqual([3100, 3101, 3102]);
+    expect(expandPublished('8080')).toEqual([8080]);
+    expect(expandPublished('4000-5000')).toBeNull();
+    expect(expandPublished('')).toBeNull();
+  });
+
+  test('the probe connects and never binds: a listener reads as in use, a closed port as free', async () => {
+    const server = createServer(() => {});
+    await new Promise<void>((settle) => server.listen(0, '127.0.0.1', () => settle()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      expect(await probePort('127.0.0.1', port)).toBe('in_use');
+      // A wildcard publication is probed through loopback.
+      expect(await probePort('0.0.0.0', port)).toBe('in_use');
+    } finally {
+      await new Promise((settle) => server.close(settle));
+    }
+    expect(await probePort('127.0.0.1', port)).toBe('free');
+    // An address that is not this machine's is not connected to at all.
+    expect(await probePort('192.0.2.10', port)).toBe('no_address');
+  });
+
+  test('a missing image or an unreachable registry warns rather than fails', () => {
+    const facts = {
+      ...healthy,
+      images: [{ name: 'ghcr.io/ychampion/openduet-web:main', present: false }],
+      registry: { url: 'https://ghcr.io/v2/', answered: false, detail: 'timed out' },
+    };
+    expect(find(facts, 'images.present')?.level).toBe('warn');
+    expect(find(facts, 'images.registry_reachable')?.level).toBe('warn');
+  });
+
+  test('without an engine, only the engine is reported', () => {
+    const results = judgeDoctor({ ...healthy, docker: ['Docker Engine 27.5 is too old.'] });
+    expect(results.map((result) => result.id)).toEqual(['deploy.contract', 'docker.engine']);
+  });
+
+  test("published ports are read from Compose's JSON rows", () => {
+    const rows = [
+      { Service: 'openduet', Publishers: [{ PublishedPort: 3100, TargetPort: 8787 }] },
+      { Service: 'runtime', Publishers: [{ PublishedPort: 0, TargetPort: 8790 }] },
+    ];
+    expect([...publishedByProject(rows.map((row) => JSON.stringify(row)).join('\n'))]).toEqual([
+      3100,
+    ]);
+    expect([...publishedByProject(JSON.stringify(rows))]).toEqual([3100]);
+  });
+
+  test("it gathers with read-only commands and judges against the contract's floors", async () => {
+    const deployDir = temporaryDeployDir();
+    writeEnv(deployDir);
+    writeFileSync(
+      join(deployDir, 'openduet.deploy.json'),
+      JSON.stringify({ contract: 1, disk: { min_free_mb: 600, pull_margin_mb: 200 } }),
+    );
+    const dockerRoot = mkdtempSync(join(tmpdir(), 'openduet-docker-root-'));
+    const probed: string[] = [];
+    const fetched: string[] = [];
+    const context = testContext(
+      deployDir,
+      [
+        ['docker info --format {{.DockerRootDir}}', ok(dockerRoot)],
+        ['docker image inspect', ok('sha256:abc')],
+      ],
+      {
+        probePort: async (host, port) => {
+          probed.push(`${host}:${port}`);
+          return port === 3101 ? 'in_use' : 'free';
+        },
+        fetch: async (url) => {
+          fetched.push(url);
+          return new Response(null, { status: 401 });
+        },
+      },
+    );
+    // Compose answers by sub-command: the image list, then the running services.
+    const run = context.run;
+    context.run = (command) => {
+      if (command.includes('config') || command.includes('ps'))
+        context.docker.calls.push([...command]);
+      if (command.includes('config') && command.includes('--images'))
+        return {
+          code: 0,
+          stdout: 'postgres:17-alpine\nghcr.io/ychampion/openduet-service:main\n',
+          stderr: '',
+        };
+      if (command.includes('ps'))
+        return {
+          code: 0,
+          stdout: JSON.stringify({ Service: 'web', Publishers: [{ PublishedPort: 3101 }] }),
+          stderr: '',
+        };
+      return run(command);
+    };
+    expect(await runDoctor(context, true, false)).toBe(0);
+    const value = reportSchema.parse(JSON.parse(context.printed()));
+    expect(value.results.find((result) => result.id === 'disk.free_mb')?.detail).toContain(
+      'the floor is 600 MB',
+    );
+    // 3101 is held by the stack's own web container, so it is not probed.
+    expect(probed).toEqual(['127.0.0.1:3100']);
+    expect(value.results.find((result) => result.id === 'ports.3101')?.level).toBe('ok');
+    expect(fetched).toEqual(['https://ghcr.io/v2/']);
+    const asked = context.docker.calls.map((call) => call.join(' '));
+    expect(
+      asked.filter((line) => / compose .*(config --images|ps --format json)$/.test(line)),
+    ).toHaveLength(2);
+    expect(changingCalls(context.docker.calls)).toEqual([]);
+  });
+
+  test('--offline makes no network call', async () => {
+    const deployDir = temporaryDeployDir();
+    writeEnv(deployDir);
+    const fetched: string[] = [];
+    const context = testContext(deployDir, [], {
+      fetch: async (url) => {
+        fetched.push(url);
+        return new Response(null);
+      },
+    });
+    await runDoctor(context, true, true);
+    expect(fetched).toEqual([]);
+  });
+});
+
+describe('the network pool doctor judges', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Doctor's results with OPENDUET_NETWORK_POOL as deploy/.env and this shell give it. */
+  async function judged(file: string | undefined, shell: string | undefined) {
+    const deployDir = temporaryDeployDir();
+    made.push(dirname(deployDir));
+    writeEnv(deployDir, file === undefined ? {} : { OPENDUET_NETWORK_POOL: file });
+    const context = testContext(deployDir, [['docker network ls --quiet', ok('')]], {
+      environment: shell === undefined ? {} : { OPENDUET_NETWORK_POOL: shell },
+    });
+    await runDoctor(context, true, true);
+    const { results } = reportSchema.parse(JSON.parse(context.printed()));
+    return {
+      pool: results.find((result) => result.id === 'docker.network_pool'),
+      shell: results.find((result) => result.id === 'docker.network_pool_shell'),
+    };
+  }
+
+  test("a value this shell sets is the one judged, because Compose takes it over deploy/.env's", async () => {
+    const { pool, shell } = await judged('nonsense', '10.214.0.0/16');
+    expect(pool).toMatchObject({ level: 'ok' });
+    expect(pool?.detail).toContain("OpenDuet's network pool 10.214.0.0/16 (OPENDUET_NETWORK_POOL)");
+    expect(shell).toMatchObject({ level: 'warn' });
+    expect(shell?.detail).toContain(
+      'This shell sets OPENDUET_NETWORK_POOL=10.214.0.0/16, which Compose reads before deploy/.env (OPENDUET_NETWORK_POOL=nonsense)',
+    );
+    expect(shell?.fix).toContain('unset OPENDUET_NETWORK_POOL');
+  });
+
+  test('a shell value that matches deploy/.env is said, not warned about', async () => {
+    const { pool, shell } = await judged('10.214.0.0/16', '10.214.0.0/16');
+    expect(pool).toMatchObject({ level: 'ok' });
+    expect(shell).toMatchObject({ level: 'ok' });
+    expect(shell?.detail).toContain('which Compose reads before deploy/.env');
+  });
+
+  test('a shell that sets nothing leaves deploy/.env the one judged, with no note', async () => {
+    const { pool, shell } = await judged('nonsense', undefined);
+    expect(pool).toMatchObject({ level: 'fail' });
+    expect(shell).toBeUndefined();
+  });
+
+  test('a reference in deploy/.env is not judged: Compose fills it in, doctor does not', async () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: Compose references, not templates.
+    for (const reference of ['${OTHER}', '${OTHER:-10.214.0.0/16}', '$OTHER']) {
+      const { pool, shell } = await judged(reference, undefined);
+      expect(pool).toMatchObject({ level: 'warn' });
+      expect(pool?.detail).toContain(`OPENDUET_NETWORK_POOL in deploy/.env is ${reference}`);
+      expect(pool?.detail).toContain('not judged');
+      expect(shell).toBeUndefined();
+    }
+    // A value this shell sets is used as written, so it is judged.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: a Compose reference, not a template.
+    const { pool } = await judged('${OTHER}', '10.214.0.0/16');
+    expect(pool).toMatchObject({ level: 'ok' });
+  });
+});

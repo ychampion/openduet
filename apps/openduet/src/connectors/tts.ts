@@ -1,0 +1,448 @@
+/**
+ * Text to speech, as a capability.
+ *
+ * Adapters behind one manifest. The fake one writes a valid silent WAV with
+ * the script in its metadata, so the whole path — propose, approve, reserve
+ * budget, dispatch, receipt, artifact, verify — is exercised by the test suite
+ * with no key and no network. The real ones post to ElevenLabs (elevenlabs.ts)
+ * or to an OpenAI-compatible speech endpoint, and are only advertised when a
+ * key is configured, because a capability that is advertised and then refused
+ * is worse than one that was never offered.
+ */
+
+import { createHash, randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
+import { link, lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
+import path from 'node:path';
+import type {
+  Action,
+  CapabilityManifest,
+  ConnectorHealth,
+  ConnectorManifest,
+  DispatchResult,
+  JsonValue,
+  Receipt,
+  VerifyResult,
+} from '@openduet/contracts';
+import {
+  artifactIdForAction,
+  canonicalizePayload,
+  capabilityTool,
+  receipt,
+} from '@openduet/contracts';
+import type { Sql } from 'postgres';
+import { z } from 'zod';
+import { BrokerFault } from '../broker/errors.ts';
+import type { Query } from '../broker/records.ts';
+import type { ProviderCheck } from './elevenlabs.ts';
+import { alreadyInFiles, filesHold, inFilesTurn, onlyNewFiles } from './shared-files.ts';
+import type { Connector, ConnectorContext } from './types.ts';
+import { silentWav, WAV_MIME } from './wav.ts';
+
+export const digest = (value: Uint8Array): string =>
+  createHash('sha256').update(Buffer.from(value)).digest('hex');
+
+const speechEvidence = z.object({
+  version: z.literal(1),
+  space_id: z.string(),
+  job_id: z.string(),
+  payload_hash: z.string(),
+  receipt,
+});
+
+/** Write to a temporary name and rename, so a reader sees the whole file or none. */
+export async function atomicWrite(file: string, bytes: Uint8Array): Promise<void> {
+  const temporary = `${file}.${randomUUID()}.part`;
+  const handle = await open(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+    0o600,
+  );
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(temporary, file);
+}
+
+/**
+ * Write a file that must be new: whole or not at all, and never over one
+ * already at its name. A retry finding its own bytes there is done; anything
+ * else there answers false, and is left as it is.
+ */
+export async function writeNew(file: string, bytes: Uint8Array): Promise<boolean> {
+  const temporary = `${file}.${randomUUID()}.part`;
+  const handle = await open(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+    0o600,
+  );
+  try {
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // A second name, which the system refuses to make over one that is there.
+    await link(temporary, file);
+    return true;
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+    const there = await readBytes(file);
+    return there !== null && digest(there) === digest(bytes);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+}
+
+/**
+ * Whether a capability's output must be a new file in the space's Files
+ * (`shared-files.ts`). Without a database to ask, as in a bare connector, it need not.
+ */
+export const outputOnlyNew = (query: Query | undefined, ctx: ConnectorContext) =>
+  query ? onlyNewFiles(query, ctx.job_id, ctx.space_id) : Promise.resolve(false);
+
+/**
+ * Save a capability's output at `file` in the space's Files, in its turn
+ * there on every instance (`inFilesTurn`, held through `sql`), so it never
+ * replaces a file between another step's check of it and its change to it.
+ * Only as a new file where `outputOnlyNew` says so: false when that name is
+ * taken.
+ */
+export const saveOutput = (
+  sql: Sql | undefined,
+  ctx: ConnectorContext,
+  file: string,
+  bytes: Uint8Array,
+): Promise<boolean> =>
+  inFilesTurn(
+    ctx.space_id,
+    async (query) => {
+      if (await outputOnlyNew(query ?? sql, ctx)) return writeNew(file, bytes);
+      await atomicWrite(file, bytes);
+      return true;
+    },
+    filesHold(sql),
+  );
+
+/**
+ * Refuse, before anyone is asked, a capability step whose output name is
+ * already taken in the space's Files when only new files are open to it.
+ */
+export async function refuseTakenOutput(
+  query: Query,
+  spacesRoot: string,
+  ctx: ConnectorContext,
+  name: string | null,
+): Promise<void> {
+  if (!name || !/^sp_[A-Za-z0-9]+$/.test(ctx.space_id)) return;
+  const taken = await lstat(path.join(spacesRoot, ctx.space_id, 'artifacts', name)).then(
+    () => true,
+    (error: unknown) => !(error instanceof Error && 'code' in error && error.code === 'ENOENT'),
+  );
+  if (taken && (await onlyNewFiles(query, ctx.job_id, ctx.space_id)))
+    throw new BrokerFault('payload_invalid', alreadyInFiles(name));
+}
+
+/**
+ * The directory a capability writes into: the space artifacts root, or, for
+ * evidence, a directory of its own outside both areas the runtime can write.
+ * Every component is created if missing and refused if it is a link.
+ */
+export async function capabilityDirectory(
+  spacesRoot: string,
+  ctx: ConnectorContext,
+  evidence: string | null,
+): Promise<string> {
+  if (!/^sp_[A-Za-z0-9]+$/.test(ctx.space_id)) throw new Error('invalid trusted file scope');
+  let current = await realpath(spacesRoot);
+  for (const segment of evidence ? [evidence, ctx.space_id] : [ctx.space_id, 'artifacts']) {
+    current = path.join(current, segment);
+    try {
+      await mkdir(current);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+    }
+    const stat = await lstat(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error('unsafe capability directory');
+  }
+  return current;
+}
+
+/** A file's bytes, or null when it is missing, a link, or unreadable. */
+export async function readBytes(file: string): Promise<Uint8Array | null> {
+  try {
+    const handle = await open(
+      file,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      return new Uint8Array(await handle.readFile());
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+export type SpeechRequest = { script: string; voice: string };
+/** What an adapter has to do: bytes in, bytes out. Nothing about files or rows. */
+export type SpeechAdapter = {
+  model: string;
+  /**
+   * Whether the provider accepts this installation's key, by a call that costs
+   * nothing. Left out, a configured adapter is taken to work until a call fails.
+   */
+  verify?(): Promise<ProviderCheck>;
+  synthesize(request: SpeechRequest): Promise<Uint8Array>;
+};
+
+export const VOICES = ['alto', 'tenor'] as const;
+
+const speechSchema = {
+  type: 'object',
+  properties: {
+    script: { type: 'string', minLength: 1, maxLength: 20_000 },
+    voice: { type: 'string', enum: [...VOICES] },
+    path: { type: 'string', minLength: 1, maxLength: 200 },
+  },
+  required: ['script', 'path'],
+  additionalProperties: false,
+} as const;
+
+/** The fake adapter: a real file, no key, deterministic bytes for one script. */
+export const fakeSpeechAdapter: SpeechAdapter = {
+  model: 'fake-tts-v1',
+  async synthesize(request) {
+    return silentWav({ script: request.script, title: `OpenDuet, ${request.voice}` });
+  },
+};
+
+/**
+ * The real adapter. Key-gated: without `OPENAI_API_KEY` or an OpenAI-compatible
+ * base URL there is no adapter, the capability is marked unavailable, and the
+ * skill that needs it is not offered.
+ */
+export function openAiSpeechAdapter(options: {
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+  fetch?: typeof fetch;
+}): SpeechAdapter {
+  const base = (options.baseUrl ?? 'https://api.openai.com/v1/').replace(/\/*$/, '/');
+  const call = options.fetch ?? fetch;
+  const model = options.model ?? 'gpt-4o-mini-tts';
+  return {
+    model,
+    async synthesize(request) {
+      const response = await call(new URL('audio/speech', base), {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${options.apiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          voice: request.voice === 'tenor' ? 'onyx' : 'nova',
+          input: request.script,
+          response_format: 'wav',
+        }),
+      });
+      if (!response.ok) throw new Error(`speech provider answered ${response.status}`);
+      return new Uint8Array(await response.arrayBuffer());
+    },
+  };
+}
+
+export const speechCapability = (
+  adapter: SpeechAdapter | null,
+  provider: string,
+  unitCostUsd: number,
+): CapabilityManifest => ({
+  kind: 'audio.synthesize',
+  provider,
+  model: adapter?.model ?? 'unconfigured',
+  description:
+    'Read a script aloud and write the audio into the space artifacts as a file you can play.',
+  effect_class: 'spend',
+  unit_cost_usd: unitCostUsd,
+  produces: WAV_MIME,
+  input_schema: speechSchema,
+  required_scopes: ['audio.synthesize'],
+  available: adapter !== null,
+});
+
+const requiredString = (payload: Record<string, JsonValue>, key: string): string => {
+  const value = payload[key];
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} must be a string`);
+  return value;
+};
+
+/** A file name, not a path: generated audio lands in the space artifacts root. */
+function safeName(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(value) || value.includes('..'))
+    throw new Error('path must be a simple file name');
+  return value.endsWith('.wav') ? value : `${value}.wav`;
+}
+
+export type CapabilityConnectorOptions = {
+  spacesRoot: string;
+  /** Where whose job it is is read, for the shared Files rule (`shared-files.ts`). */
+  sql?: Sql;
+  adapter: SpeechAdapter | null;
+  provider: string;
+  unitCostUsd?: number;
+};
+
+/**
+ * A capability behind the connector interface, so a generation call goes down
+ * the path every other effect goes down: one action, an approval bound to the
+ * payload hash, a budget reservation, an idempotency key, a receipt persisted
+ * before the runtime hears anything, and a verify that reads the file back.
+ */
+export function createCapabilityConnector(options: CapabilityConnectorOptions): Connector {
+  const capability = speechCapability(options.adapter, options.provider, options.unitCostUsd ?? 0);
+  const manifest: ConnectorManifest = {
+    name: 'generation',
+    version: '0.1.0',
+    provider: 'generation',
+    description: 'Generative capabilities the configured providers advertise.',
+    credentials: [],
+    health: true,
+    tools: [capabilityTool(capability)],
+  };
+
+  const directory = (ctx: ConnectorContext, evidence = false) =>
+    capabilityDirectory(options.spacesRoot, ctx, evidence ? '.speech-receipts' : null);
+  const target = async (ctx: ConnectorContext, name: string) =>
+    path.join(await directory(ctx), safeName(name));
+  const evidenceFile = async (action: Action, ctx: ConnectorContext) => {
+    if (!/^act_[A-Za-z0-9]+$/.test(action.id)) throw new Error('invalid action identity');
+    // Evidence is outside both runtime-writable areas: work and space artifacts.
+    return path.join(await directory(ctx, true), `${action.id}.json`);
+  };
+
+  return {
+    manifest,
+    capability,
+    async prepare(payload, ctx, tx) {
+      // In a shared space, anyone but its owner reads aloud only into a new file.
+      let name: string | null = null;
+      try {
+        name = typeof payload.path === 'string' ? safeName(payload.path) : null;
+      } catch {
+        // A name that cannot be used is refused when the step runs, as before.
+      }
+      await refuseTakenOutput(tx, options.spacesRoot, ctx, name);
+      return payload;
+    },
+    async execute(action: Action, ctx: ConnectorContext): Promise<DispatchResult> {
+      if (!options.adapter)
+        return { outcome: 'failed', reason: 'no speech provider is configured', retryable: false };
+      if (action.id !== ctx.idempotency_key || action.job_id !== ctx.job_id)
+        throw new Error('connector action identity mismatch');
+      const payload = action.canonical_payload;
+      const script = requiredString(payload, 'script');
+      const name = requiredString(payload, 'path');
+      const voice = typeof payload.voice === 'string' ? payload.voice : 'alto';
+      const bytes = await options.adapter.synthesize({ script, voice });
+      const file = await target(ctx, name);
+      if (!(await saveOutput(options.sql, ctx, file, bytes)))
+        return { outcome: 'failed', reason: alreadyInFiles(safeName(name)), retryable: false };
+      const hash = digest(bytes);
+      const proof: Receipt = {
+        action_id: action.id,
+        connection_id: action.connection_id,
+        external_ref: hash,
+        detail: {
+          kind: 'artifact',
+          artifact_id: artifactIdForAction(action.id),
+          path: `artifacts/${safeName(name)}`,
+          mime: capability.produces,
+          bytes: bytes.length,
+          content_hash: hash,
+          model: options.adapter.model,
+          provider: capability.provider,
+        },
+        received_at: new Date().toISOString(),
+        late: false,
+      };
+      // Publish evidence only after the complete audio is named. A crash between
+      // these writes stays undecided, even when an older episode occupied the path.
+      await atomicWrite(
+        await evidenceFile(action, ctx),
+        Buffer.from(
+          JSON.stringify({
+            version: 1,
+            space_id: ctx.space_id,
+            job_id: action.job_id,
+            payload_hash: action.payload_hash,
+            receipt: proof,
+          }),
+        ),
+      );
+      return { outcome: 'succeeded', receipt: proof };
+    },
+    async verify(action: Action, ctx: ConnectorContext): Promise<VerifyResult> {
+      const undecided = {
+        decision: 'undecided',
+        reason: 'No matching action-bound speech evidence',
+      } as const;
+      if (action.id !== ctx.idempotency_key || action.job_id !== ctx.job_id) return undecided;
+      const payload = action.canonical_payload;
+      const name = typeof payload.path === 'string' ? payload.path : null;
+      if (!name) return { decision: 'undecided', reason: 'the action names no file' };
+      const bytes = await readBytes(await target(ctx, name));
+      const saved = await readBytes(await evidenceFile(action, ctx));
+      if (!bytes || !saved) return undecided;
+      let evidence: z.infer<typeof speechEvidence>;
+      try {
+        evidence = speechEvidence.parse(JSON.parse(Buffer.from(saved).toString('utf8')));
+      } catch {
+        return undecided;
+      }
+      const proof = evidence.receipt;
+      const hash = digest(bytes);
+      if (
+        evidence.space_id !== ctx.space_id ||
+        evidence.job_id !== action.job_id ||
+        evidence.payload_hash !== action.payload_hash ||
+        canonicalizePayload(payload).hash !== action.payload_hash ||
+        proof.action_id !== action.id ||
+        proof.connection_id !== action.connection_id ||
+        proof.detail.path !== `artifacts/${safeName(name)}` ||
+        proof.detail.content_hash !== hash ||
+        proof.external_ref !== hash ||
+        proof.detail.bytes !== bytes.length
+      )
+        return undecided;
+      return {
+        decision: 'succeeded',
+        evidence: { present: true, action_id: action.id, content_hash: hash, bytes: bytes.length },
+        receipt: proof,
+      };
+    },
+    async health(): Promise<ConnectorHealth> {
+      const verified = await options.adapter?.verify?.();
+      if (verified && !verified.ok)
+        return {
+          status: 'failing',
+          detail: verified.detail,
+          checked_at: new Date().toISOString(),
+          ...(verified.keyRefused ? { reason: 'credential_refused' as const } : {}),
+        };
+      return {
+        status: options.adapter ? 'ok' : 'degraded',
+        detail: options.adapter
+          ? `${capability.kind} via ${capability.provider}/${options.adapter.model}`
+          : 'no speech provider is configured',
+        checked_at: new Date().toISOString(),
+      };
+    },
+  };
+}

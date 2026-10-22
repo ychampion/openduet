@@ -1,0 +1,556 @@
+/**
+ * The per-space full-text index. One SQLite file per space, derived from the
+ * Markdown and rebuildable at any time.
+ *
+ * Isolation is structural. A handle is opened from one space's paths and keeps
+ * that space's name; there is no argument anywhere in this file that selects a
+ * space, so a caller holding a handle to the personal space cannot reach a
+ * shared one however it is asked. Cross-space search is impossible rather than
+ * disallowed.
+ */
+
+import { Database } from 'bun:sqlite';
+import { mkdirSync, statfsSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { isRetrievable, type KnowledgeRecordStatus, type KnowledgeType } from '@openduet/contracts';
+import type { SpacePaths } from './layout.ts';
+
+export type IndexedRecord = {
+  id: string;
+  path: string;
+  title: string;
+  tags: string[];
+  body: string;
+  status: KnowledgeRecordStatus;
+  type: KnowledgeType;
+};
+
+export type SearchHit = {
+  id: string;
+  path: string;
+  title: string;
+  excerpt: string;
+  status: KnowledgeRecordStatus;
+  type: KnowledgeType;
+  /** Lower is a better match in FTS5; negated here so higher is better. */
+  score: number;
+};
+
+export type QueryOptions = {
+  /** Restrict to one or more record types. */
+  type?: KnowledgeType | readonly KnowledgeType[];
+  /** Every tag named here must be present on the record. */
+  tags?: readonly string[];
+  limit?: number;
+};
+
+/**
+ * Bumped whenever the columns change, or when an older file may hold something
+ * it should not. An index file written by an older build is thrown away and
+ * rebuilt rather than migrated: it is derived from the Markdown, so the
+ * cheapest correct thing to do is start again.
+ *
+ * Version 4 is the first that erases a removed record's words from the file
+ * itself. A version 3 file can still hold the words of anything forgotten or
+ * deleted while it was in use, so it is wiped, not just emptied.
+ */
+const INDEX_SCHEMA_VERSION = 4;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS record (
+  id TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  title TEXT NOT NULL,
+  tags TEXT NOT NULL,
+  type TEXT NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
+  id UNINDEXED,
+  title,
+  tags,
+  body,
+  tokenize = 'unicode61'
+);
+`;
+
+const DROP = `
+DROP TABLE IF EXISTS record;
+DROP TABLE IF EXISTS record_fts;
+DROP TABLE IF EXISTS meta;
+`;
+
+/** Ids per DELETE statement, well under SQLite's limit on bound parameters. */
+const DELETE_CHUNK = 500;
+
+/**
+ * The row in `meta` that says removed words may still be in the file: written
+ * in the same transaction as the delete, and cleared only once VACUUM has run
+ * and the write-ahead log has been emptied into the file.
+ */
+const ERASE_PENDING = 'erase_pending';
+
+/** How long a statement waits for another connection's lock before it fails. */
+const BUSY_MS = 5000;
+
+/**
+ * Free bytes on the disk an index file is on, or null when that cannot be
+ * told. An object so a test can stand in for a disk that is almost full.
+ */
+export const indexDisk = {
+  free(file: string): number | null {
+    try {
+      const disk = statfsSync(dirname(file));
+      return disk.bavail * disk.bsize;
+    } catch {
+      return null;
+    }
+  },
+};
+
+const userVersion = (db: Database): number =>
+  db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version ?? 0;
+
+/**
+ * Wipe a file written by an older build. Dropping the tables zeroes their pages,
+ * because secure_delete is on by now; VACUUM then rewrites the file, which
+ * clears the pages freed before that, and those still hold old text.
+ *
+ * Two processes can open the same old file at once. The version is checked
+ * again under the write lock, so a file another process has already brought up
+ * to date, and perhaps refilled, is left alone. It is written only after VACUUM,
+ * so a wipe that is cut short runs again on the next open.
+ */
+function wipeOlderIndex(db: Database): void {
+  const dropped = db
+    .transaction(() => {
+      if (userVersion(db) === INDEX_SCHEMA_VERSION) return false;
+      db.run(DROP);
+      return true;
+    })
+    .immediate();
+  if (!dropped) return;
+  db.run('VACUUM');
+  db.run(`PRAGMA user_version = ${INDEX_SCHEMA_VERSION}`);
+}
+
+/** Another connection holds a lock this one would have to wait for. */
+const isBusy = (error: unknown): boolean =>
+  String((error as { code?: unknown } | null)?.code ?? '').startsWith('SQLITE_BUSY');
+
+/**
+ * Turn on FTS5's secure-delete, which takes a deleted record's words out of the
+ * segments that hold them instead of leaving them there until a later merge.
+ * The setting is stored with the table, so this writes only once. SQLite before
+ * 3.42 does not have it; the index then merges its segments after a removal
+ * instead, which costs more on a large space but leaves nothing behind either.
+ */
+function eraseTermsOnDelete(db: Database): boolean {
+  const row = db
+    .query<{ v: number }, []>("SELECT v FROM record_fts_config WHERE k = 'secure-delete'")
+    .get();
+  if (row?.v === 1) return true;
+  try {
+    db.run("INSERT INTO record_fts (record_fts, rank) VALUES ('secure-delete', 1)");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Tags are stored space-delimited and space-padded, so a filter is a whole-word match. */
+const packTags = (tags: readonly string[]): string =>
+  tags.length === 0 ? ' ' : ` ${tags.join(' ')} `;
+
+/**
+ * Turn a person's words into an FTS5 query. Every token is quoted, so a stray
+ * quote or a bare `AND` is searched for rather than interpreted.
+ */
+export function toMatchQuery(input: string): string | null {
+  const tokens = input
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return null;
+  return tokens.map((t) => `"${t}"`).join(' OR ');
+}
+
+export class SpaceIndex {
+  private constructor(
+    private readonly db: Database,
+    /** The one space this handle can ever see. */
+    readonly space: string,
+    /** Whether FTS5 erases a removed record's words itself; see `eraseTermsOnDelete`. */
+    private erasesTerms: boolean,
+  ) {}
+
+  /**
+   * Open the index for one space, creating the file and schema when this space
+   * has never been indexed. The path comes from the space handle, never from a
+   * caller's argument.
+   */
+  static open(paths: SpacePaths): SpaceIndex {
+    mkdirSync(dirname(paths.indexDb), { recursive: true });
+    return SpaceIndex.attach(new Database(paths.indexDb, { create: true }), paths.space);
+  }
+
+  /** An index that lives only in memory, for tests and for a dry run. */
+  static memory(space: string): SpaceIndex {
+    return SpaceIndex.attach(new Database(':memory:'), space);
+  }
+
+  private static attach(db: Database, space: string): SpaceIndex {
+    // Another process may hold the write lock for a moment; wait rather than fail.
+    db.run(`PRAGMA busy_timeout = ${BUSY_MS}`);
+    db.run('PRAGMA journal_mode = WAL');
+    // A deleted row is overwritten with zeros, not left in the file as free space.
+    db.run('PRAGMA secure_delete = ON');
+    const wiped = userVersion(db) !== INDEX_SCHEMA_VERSION;
+    if (wiped) wipeOlderIndex(db);
+    db.run(SCHEMA);
+    const index = new SpaceIndex(db, space, eraseTermsOnDelete(db));
+    // A removal whose rewrite failed (a full disk) or never ran (the process
+    // stopped) is finished now.
+    if (index.erasePending()) index.finishPendingErase();
+    else if (wiped) index.flush();
+    return index;
+  }
+
+  /**
+   * Throw away the index and build it again. Cheap and honest.
+   *
+   * The fingerprint goes with it. An index rebuilt from a list of records has
+   * no claim about which files on disk it matches; the store makes that claim
+   * afterwards, once it knows. An index that wrongly says it is current is
+   * worse than one that admits it does not know.
+   */
+  rebuild(records: readonly IndexedRecord[]): void {
+    // Dropping `meta` would drop an erase still owed; it is carried over.
+    const pending = this.erasePending();
+    this.db.transaction(() => {
+      // The tables are dropped rather than emptied row by row. Their pages are
+      // zeroed either way, and FTS5's secure-delete makes a row-by-row delete
+      // of a large space take minutes.
+      this.db.run(DROP);
+      this.db.run(SCHEMA);
+      // The zeroed pages reach the file only once the log is emptied into it,
+      // so whatever the rebuild dropped is owed until then.
+      this.markErasePending();
+      this.erasesTerms = eraseTermsOnDelete(this.db);
+      for (const record of records) this.insert(record);
+    })();
+    // An older erase needs the file rewritten. The rebuild's own needs only
+    // the log emptied, and a reader that keeps it from emptying leaves the
+    // mark for a later try rather than holding this up.
+    if (pending) this.finishPendingErase();
+    else this.withoutWaiting(() => this.settleErase());
+  }
+
+  /**
+   * Finish an erase a removal still owes, where the caller only wants the
+   * index usable: opening it, rebuilding it, adding a record, or a removal
+   * that found nothing left to delete. If the rewrite fails again, the mark
+   * stays for a later removal or open to try once more, and search keeps
+   * working meanwhile. A removal that deleted rows and then fails this way
+   * throws to its own caller.
+   *
+   * Here it is only tried when it can work. VACUUM writes a new copy of the
+   * whole file, so on a disk without room for one, each try would fill the disk
+   * for everything else on it, at every open. And it never waits for another
+   * connection: one still reading the log keeps the mark for a later try,
+   * rather than holding up every open for the lock timeout.
+   */
+  private finishPendingErase(): void {
+    if (!this.roomToRewrite()) return;
+    try {
+      this.withoutWaiting(() => this.afterRemoval());
+    } catch {
+      // Still owed; see above.
+    }
+  }
+
+  /**
+   * The erase a removal owes for the rows it just deleted. The rows are gone
+   * whatever happens here; this takes their words out of the file. A failure
+   * to rewrite reaches the caller. Two things leave the erase owed instead,
+   * for a later open or removal to finish: a disk without room for the
+   * rewrite, which it would fill for everything else on it, and another
+   * connection still reading the log, which is not waited for.
+   */
+  private eraseRemoved(): void {
+    if (!this.roomToRewrite()) {
+      console.warn(
+        `Not enough disk to finish erasing removed records from the search index of space "${this.space}". Their rows are gone; their words are cleared from the file once there is room.`,
+      );
+      return;
+    }
+    this.withoutWaiting(() => this.afterRemoval());
+  }
+
+  /**
+   * Run part of an erase without waiting for another connection's lock. A
+   * lock held elsewhere ends it early with the mark left set; any other
+   * failure is thrown.
+   */
+  private withoutWaiting(work: () => void): void {
+    this.db.run('PRAGMA busy_timeout = 0');
+    try {
+      work();
+    } catch (error) {
+      if (!isBusy(error)) throw error;
+    } finally {
+      this.db.run(`PRAGMA busy_timeout = ${BUSY_MS}`);
+    }
+  }
+
+  /** Whether the index's disk has room for VACUUM's copies of the file: twice its size. */
+  private roomToRewrite(): boolean {
+    const file = this.db.filename;
+    if (!file || file === ':memory:') return true;
+    const pages = this.db
+      .query<{ size: number }, []>(
+        'SELECT page_count * page_size AS size FROM pragma_page_count(), pragma_page_size()',
+      )
+      .get();
+    const free = indexDisk.free(file);
+    return free === null || free >= 2 * (pages?.size ?? 0);
+  }
+
+  /** What the files looked like when this index was last known to match them. */
+  fingerprint(): string | null {
+    const row = this.db
+      .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'fingerprint'")
+      .get();
+    return row?.value ?? null;
+  }
+
+  setFingerprint(value: string): void {
+    this.db.run(
+      `INSERT INTO meta (key, value) VALUES ('fingerprint', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [value],
+    );
+  }
+
+  upsert(record: IndexedRecord): void {
+    const replaced = this.db.transaction(() => {
+      const removed = this.deleteRows([record.id]);
+      this.insert(record);
+      return removed;
+    })();
+    // Replacing a record takes its old words out, and that erase is this
+    // write's own. Adding one owes nothing: it only finishes an older erase
+    // when it can, and is never failed by one.
+    if (replaced) this.eraseRemoved();
+    else if (this.erasePending()) this.finishPendingErase();
+  }
+
+  /**
+   * Remove a record from the index. Retraction and hard deletion both call
+   * this, which is why retrieval cannot return a retracted record after a
+   * restart: the row is gone, not filtered. Its words go from the file too.
+   */
+  remove(id: string): void {
+    this.removeMany([id]);
+  }
+
+  /**
+   * Remove several records in one go. Their words leave the file before this
+   * returns, as with `remove`, but the file is rewritten once for the whole
+   * set rather than once per record. On a large space that turns most of a
+   * minute, with nothing else able to run, into a second or two. On a disk
+   * without room for the rewrite, or while another connection reads the log,
+   * the rows still go at once and the rest is left to a later open or removal
+   * (see `eraseRemoved`).
+   */
+  removeMany(ids: readonly string[]): void {
+    const removed = this.db.transaction(() => this.deleteRows(ids))();
+    // This removal's own erase: a failure reaches the caller. With nothing left
+    // to delete (a retry after a rewrite that failed finds the rows gone), the
+    // erase still owed is finished as an open finishes it, so a retry neither
+    // fails nor fills the disk again for as long as there is no room for it.
+    if (removed) this.eraseRemoved();
+    else if (this.erasePending()) this.finishPendingErase();
+  }
+
+  /** Whether a removal's words may still be in the file, waiting for a rewrite. */
+  erasePending(): boolean {
+    return Boolean(
+      this.db
+        .query<{ value: string }, [string]>('SELECT value FROM meta WHERE key = ?')
+        .get(ERASE_PENDING),
+    );
+  }
+
+  /** Search this space. There is no parameter that could reach another one. */
+  query(text: string, options: QueryOptions = {}): SearchHit[] {
+    const match = toMatchQuery(text);
+    if (!match) return [];
+
+    const clauses: string[] = ['record_fts MATCH ?'];
+    const parameters: Array<string | number> = [match];
+
+    const types =
+      options.type === undefined ? [] : Array.isArray(options.type) ? options.type : [options.type];
+    if (types.length > 0) {
+      clauses.push(`r.type IN (${types.map(() => '?').join(', ')})`);
+      parameters.push(...(types as string[]));
+    }
+    for (const tag of options.tags ?? []) {
+      clauses.push('instr(r.tags, ?) > 0');
+      parameters.push(` ${tag} `);
+    }
+    parameters.push(options.limit ?? 10);
+
+    const rows = this.db
+      .query<
+        {
+          id: string;
+          path: string;
+          title: string;
+          status: string;
+          type: string;
+          excerpt: string;
+          rank: number;
+        },
+        Array<string | number>
+      >(
+        `SELECT r.id AS id, r.path AS path, r.title AS title, r.status AS status, r.type AS type,
+                snippet(record_fts, 3, '', '', ' ... ', 12) AS excerpt,
+                bm25(record_fts) AS rank
+         FROM record_fts
+         JOIN record r ON r.id = record_fts.id
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY rank
+         LIMIT ?`,
+      )
+      .all(...parameters);
+
+    return rows.map((row) => ({
+      id: row.id,
+      path: row.path,
+      title: row.title,
+      excerpt: row.excerpt,
+      status: row.status as KnowledgeRecordStatus,
+      type: row.type as KnowledgeType,
+      score: -row.rank,
+    }));
+  }
+
+  /** The plain form: words in, hits out. */
+  search(text: string, limit = 10): SearchHit[] {
+    return this.query(text, { limit });
+  }
+
+  count(): number {
+    const row = this.db.query<{ n: number }, []>('SELECT count(*) AS n FROM record').get();
+    return row?.n ?? 0;
+  }
+
+  has(id: string): boolean {
+    return Boolean(
+      this.db.query<{ id: string }, [string]>('SELECT id FROM record WHERE id = ?').get(id),
+    );
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  /**
+   * Whether there was anything to delete. The id column of the full-text table
+   * is not indexed, so each statement reads the whole table once; a batch of
+   * ids goes in one statement rather than one per id.
+   */
+  private deleteRows(ids: readonly string[]): boolean {
+    let changes = 0;
+    for (let at = 0; at < ids.length; at += DELETE_CHUNK) {
+      const chunk = ids.slice(at, at + DELETE_CHUNK);
+      const list = chunk.map(() => '?').join(', ');
+      changes += this.db.run(`DELETE FROM record WHERE id IN (${list})`, chunk).changes;
+      changes += this.db.run(`DELETE FROM record_fts WHERE id IN (${list})`, chunk).changes;
+    }
+    // In the caller's transaction, so the mark commits with the delete or not at all.
+    if (changes > 0) this.markErasePending();
+    return changes > 0;
+  }
+
+  private markErasePending(): void {
+    this.db.run(
+      `INSERT INTO meta (key, value) VALUES (?, '1')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [ERASE_PENDING],
+    );
+  }
+
+  /**
+   * Once words have left the index, make sure no copy of them is left in the
+   * file. First the segments are merged when FTS5 could not erase the words
+   * itself. Then VACUUM: secure_delete zeroes a row where it lies, but when
+   * SQLite moves rows between pages it leaves older copies in the unused part
+   * of a page, and only rewriting the file from what is live clears those.
+   * Last, the change goes into the file and the write-ahead log, which still
+   * holds the pages as they were, is emptied.
+   *
+   * VACUUM costs time in proportion to the index, under a second for tens of
+   * thousands of records, and this runs only when something is taken out.
+   *
+   * The erase-pending mark is cleared only when all of that is done. A VACUUM
+   * that fails throws and leaves it set; a log another process is still
+   * reading cannot be emptied, and leaves it set too. Either way the next
+   * removal that deletes rows runs this again, and anything else that uses the
+   * index does when the disk has room for it (finishPendingErase).
+   */
+  private afterRemoval(): void {
+    if (!this.erasesTerms) this.db.run("INSERT INTO record_fts (record_fts) VALUES ('optimize')");
+    this.db.run('VACUUM');
+    this.settleErase();
+  }
+
+  /** Empty the log into the file, then clear the erase-pending mark; see `afterRemoval`. */
+  private settleErase(): void {
+    if (!this.flush()) return;
+    this.db.run('DELETE FROM meta WHERE key = ?', [ERASE_PENDING]);
+    this.flush();
+  }
+
+  /**
+   * Copy the write-ahead log into the file and truncate it. Closing the last
+   * handle does the same; this covers a handle another request still holds.
+   * False when another connection kept it from finishing.
+   */
+  private flush(): boolean {
+    const result = this.db.query<{ busy: number }, []>('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    return result?.busy === 0;
+  }
+
+  /**
+   * Only retrievable records enter the index at all. A superseded or retracted
+   * record is not indexed and then hidden; it is never there.
+   */
+  private insert(record: IndexedRecord): void {
+    if (!isRetrievable(record.status)) return;
+    const tags = packTags(record.tags);
+    this.db.run(
+      'INSERT INTO record (id, path, title, tags, type, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [record.id, record.path, record.title, tags, record.type, record.status],
+    );
+    this.db.run('INSERT INTO record_fts (id, title, tags, body) VALUES (?, ?, ?, ?)', [
+      record.id,
+      record.title,
+      tags,
+      record.body,
+    ]);
+  }
+}
+
+/**
+ * The free form of `SpaceIndex.query`, for callers that read better with the
+ * space handle first. The handle is the only way to name a space.
+ */
+export const query = (index: SpaceIndex, text: string, options: QueryOptions = {}): SearchHit[] =>
+  index.query(text, options);

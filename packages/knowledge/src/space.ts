@@ -1,0 +1,476 @@
+/**
+ * A space is one git repository. Creating it, committing a record into it,
+ * undoing a commit, and reading a record's history are the whole of the storage
+ * layer: there is no audit table and no undo table, because the commit is both.
+ *
+ * Every write goes through here, so every write is attributable. A commit made
+ * for an agent carries a `OpenDuet-Proposed-By:` trailer, and one a person let
+ * through carries `OpenDuet-Approved-By:` as well.
+ */
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import {
+  defaultGitignore,
+  defaultLog,
+  defaultSchema,
+  type IndexEntry,
+  logLine,
+  renderIndex,
+} from './catalog.ts';
+import {
+  APPROVED_BY_TRAILER,
+  commitMessage,
+  git,
+  gitBytes,
+  hasCommits,
+  isGitRepo,
+  PROPOSED_BY_TRAILER,
+  runGit,
+} from './git.ts';
+import { resolveInSpace, type SpacePaths, spacePaths } from './layout.ts';
+import { ensureSpaceDirs, loadSpace } from './store.ts';
+
+export type CommitAttribution = {
+  /** Who asked for the write: an agent name, or `user` when a person typed it. */
+  proposedBy: string;
+  /** Who let it through: a person, or the policy that auto-applied it. */
+  approvedBy?: string;
+  /** The one-line commit subject. A plain sentence, not a code comment. */
+  subject?: string;
+  /** Injected so a test can pin the log timestamps. */
+  now?: () => Date;
+};
+
+export type SpaceCommit = {
+  sha: string;
+  subject: string;
+  /** Paths relative to the space root that this commit changed. */
+  changed: string[];
+  /** False when the write left the tree byte-identical and nothing was committed. */
+  committed: boolean;
+};
+
+export type HistoryEntry = {
+  sha: string;
+  /** ISO-8601, from the author date. */
+  at: string;
+  subject: string;
+  proposedBy: string | null;
+  approvedBy: string | null;
+};
+
+const FIELD = String.fromCharCode(0x1f);
+const RECORD = String.fromCharCode(0x1e);
+
+const HISTORY_FORMAT = [
+  '%H',
+  '%aI',
+  '%s',
+  `%(trailers:key=${PROPOSED_BY_TRAILER},valueonly,separator=%x2c)`,
+  `%(trailers:key=${APPROVED_BY_TRAILER},valueonly,separator=%x2c)`,
+].join(FIELD);
+
+const CATALOG_FILES = ['index.md', 'log.md'];
+
+const toPosix = (p: string): string => p.replace(/\\/g, '/');
+
+/** Fail loudly rather than writing outside the space a caller was given. */
+function insideSpace(paths: SpacePaths, relativePath: string): string {
+  const absolute = resolveInSpace(paths, relativePath);
+  if (!absolute) {
+    throw new Error(`path "${relativePath}" resolves outside the space root ${paths.root}`);
+  }
+  return absolute;
+}
+
+/** Regenerate `index.md` from the files on disk. Returns the bytes written. */
+export function refreshCatalog(paths: SpacePaths): string {
+  const contents = loadSpace(paths);
+  const entries: IndexEntry[] = contents.records.map((record) => ({
+    id: record.frontmatter.id,
+    path: record.path,
+    title: record.frontmatter.title,
+    type: record.frontmatter.type,
+    status: record.frontmatter.status,
+    tags: record.frontmatter.tags,
+  }));
+  const rendered = renderIndex(entries);
+  writeFileSync(paths.index, rendered, 'utf8');
+  return rendered;
+}
+
+/**
+ * Create a space: the directory layout, the two generated files, the schema a
+ * person then owns, and a git repository with one commit in it. Safe to call
+ * on a space that already exists.
+ */
+export async function initSpace(spacesRoot: string, space: string): Promise<SpacePaths> {
+  const paths = ensureSpaceDirs(spacesRoot, space);
+  mkdirSync(paths.proposed, { recursive: true });
+  mkdirSync(dirname(paths.indexDb), { recursive: true });
+
+  const seeds: Array<[string, () => string]> = [
+    [paths.schema, () => defaultSchema(space)],
+    [paths.log, defaultLog],
+    [`${paths.root}/.gitignore`, defaultGitignore],
+  ];
+  for (const [file, make] of seeds) {
+    if (!existsSync(file)) writeFileSync(file, make(), 'utf8');
+  }
+  if (!existsSync(paths.index)) refreshCatalog(paths);
+
+  if (!isGitRepo(paths.root)) {
+    await git(paths.root, ['init', '--quiet']);
+    await git(paths.root, ['add', '--', '.']);
+    await git(paths.root, [
+      'commit',
+      '--quiet',
+      '-m',
+      commitMessage(`Create the ${space} space`, { [PROPOSED_BY_TRAILER]: 'openduet' }),
+    ]);
+  }
+  return paths;
+}
+
+/** Open a space that already exists. Refuses one that was never initialised. */
+export function openSpace(spacesRoot: string, space: string): SpacePaths {
+  const paths = spacePaths(spacesRoot, space);
+  if (!existsSync(paths.root)) throw new Error(`no space at ${paths.root}`);
+  if (!isGitRepo(paths.root)) {
+    throw new Error(`${paths.root} is not a git repository; run initSpace first`);
+  }
+  return paths;
+}
+
+/** What is staged for the next commit, measured against the last one. */
+async function stagedPaths(paths: SpacePaths): Promise<string[]> {
+  const staged = await runGit(paths.root, ['diff', '--cached', '--name-only']);
+  return staged.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+async function commitStaged(
+  paths: SpacePaths,
+  subject: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  const changed = await stagedPaths(paths);
+  if (changed.length === 0) {
+    return { sha: await headSha(paths), subject, changed: [], committed: false };
+  }
+
+  await git(paths.root, [
+    'commit',
+    '--quiet',
+    '-m',
+    commitMessage(subject, {
+      [PROPOSED_BY_TRAILER]: attribution.proposedBy,
+      [APPROVED_BY_TRAILER]: attribution.approvedBy,
+    }),
+  ]);
+  const sha = (await git(paths.root, ['rev-parse', 'HEAD'])).trim();
+  return { sha, subject, changed, committed: true };
+}
+
+async function stageCatalog(paths: SpacePaths, note: string, at: Date): Promise<void> {
+  refreshCatalog(paths);
+  appendFileSync(paths.log, logLine(at, note), 'utf8');
+  await git(paths.root, ['add', '--', ...CATALOG_FILES]);
+}
+
+/**
+ * One write at a time per space.
+ *
+ * A git repository has a single index, and staging a file and then committing
+ * it is a read-modify-write across it. Two overlapping writes do not merely
+ * collide on the lock file: whichever commit runs first sweeps up everything
+ * the others have staged, so their records land inside someone else's commit,
+ * under someone else's message and someone else's trailer, while their callers
+ * are told the write failed. The commit is the audit record here, so it has to
+ * describe exactly the write that produced it, and a caller has to be told the
+ * truth about whether its write landed.
+ *
+ * This serializes within one process, which is what v0.1 is. Two processes
+ * writing one space would still need a lock in the filesystem.
+ */
+const writeQueues = new Map<string, Promise<unknown>>();
+
+function withSpaceLock<T>(paths: SpacePaths, work: () => Promise<T>): Promise<T> {
+  const key = resolve(paths.root);
+  const previous = writeQueues.get(key) ?? Promise.resolve();
+  // The queue continues whether the previous write succeeded or failed: one
+  // caller's error must not strand every write behind it.
+  const result = previous.then(work, work);
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  writeQueues.set(key, settled);
+  void settled.then(() => {
+    if (writeQueues.get(key) === settled) writeQueues.delete(key);
+  });
+  return result;
+}
+
+/**
+ * Write a record and commit it, with the catalog and the chronicle in the same
+ * commit so the space is never half-updated. An identical write commits
+ * nothing and says so rather than making an empty commit.
+ */
+export function commitRecord(
+  paths: SpacePaths,
+  relativePath: string,
+  content: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  return withSpaceLock(paths, () => commitRecordAlone(paths, relativePath, content, attribution));
+}
+
+async function commitRecordAlone(
+  paths: SpacePaths,
+  relativePath: string,
+  content: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  const absolute = insideSpace(paths, relativePath);
+  const posix = toPosix(relativePath);
+  const subject = attribution.subject ?? `Write ${posix}`;
+
+  mkdirSync(dirname(absolute), { recursive: true });
+  writeFileSync(absolute, content, 'utf8');
+  await git(paths.root, ['add', '--', posix]);
+
+  // A write that leaves the record exactly as the last commit had it is not an
+  // event. Stopping here keeps the chronicle free of lines saying nothing
+  // happened, and makes no empty commit.
+  if ((await stagedPaths(paths)).length === 0) {
+    return { sha: await headSha(paths), subject, changed: [], committed: false };
+  }
+
+  const now = attribution.now ?? (() => new Date());
+  await stageCatalog(paths, `${subject} (proposed by ${attribution.proposedBy})`, now());
+  return commitStaged(paths, subject, attribution);
+}
+
+/**
+ * Remove a record and commit the removal. This is deletion, not retraction: the
+ * text is gone from the working tree, and the caller drops the index row in the
+ * same operation so it is gone from the only derived copy too.
+ */
+export function commitRemoval(
+  paths: SpacePaths,
+  relativePath: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  return withSpaceLock(paths, () => commitRemovalAlone(paths, relativePath, attribution));
+}
+
+async function commitRemovalAlone(
+  paths: SpacePaths,
+  relativePath: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  const absolute = insideSpace(paths, relativePath);
+  const posix = toPosix(relativePath);
+  const subject = attribution.subject ?? `Delete ${posix}`;
+
+  if (existsSync(absolute)) rmSync(absolute);
+  await git(paths.root, ['add', '--all', '--', posix]);
+  if ((await stagedPaths(paths)).length === 0) {
+    return { sha: await headSha(paths), subject, changed: [], committed: false };
+  }
+
+  const now = attribution.now ?? (() => new Date());
+  await stageCatalog(paths, `${subject} (requested by ${attribution.proposedBy})`, now());
+  return commitStaged(paths, subject, attribution);
+}
+
+/**
+ * Undo one commit by making another. History is not rewritten: what happened
+ * stays visible, and the reversal is itself attributable.
+ */
+export function revert(
+  paths: SpacePaths,
+  sha: string,
+  attribution: CommitAttribution = { proposedBy: 'user' },
+): Promise<SpaceCommit> {
+  return withSpaceLock(paths, () => revertAlone(paths, sha, attribution));
+}
+
+async function revertAlone(
+  paths: SpacePaths,
+  sha: string,
+  attribution: CommitAttribution,
+): Promise<SpaceCommit> {
+  const run = await runGit(paths.root, ['revert', '--no-edit', '--no-commit', sha]);
+  if (run.code !== 0) {
+    await runGit(paths.root, ['revert', '--quit']);
+    await runGit(paths.root, ['reset', '--hard', 'HEAD']);
+    throw new Error(
+      `reverting ${sha} would not apply cleanly, so nothing was changed: ${
+        run.stderr.trim() || run.stdout.trim()
+      }`,
+    );
+  }
+  const now = attribution.now ?? (() => new Date());
+  const subject = attribution.subject ?? `Revert ${sha.slice(0, 12)}`;
+  await stageCatalog(paths, `${subject} (requested by ${attribution.proposedBy})`, now());
+  return commitStaged(paths, subject, attribution);
+}
+
+/**
+ * Every commit that touched one record, newest first, with who asked for it.
+ *
+ * Deliberately without `--follow`. Following renames sounds right for a record
+ * that was retitled into a new filename, but git decides what a rename is by
+ * how similar two files are, and knowledge records are similar to each other:
+ * asked to follow one record it happily returns commits belonging to other
+ * records that merely look like it. History that quietly attributes somebody
+ * else's write to this record is worse than history that starts at the rename,
+ * so a retitled record's earlier life is found through its stable id instead.
+ */
+export async function history(paths: SpacePaths, relativePath: string): Promise<HistoryEntry[]> {
+  const posix = toPosix(relativePath);
+  const run = await runGit(paths.root, ['log', `--format=${HISTORY_FORMAT}${RECORD}`, '--', posix]);
+  if (run.code !== 0) return [];
+
+  return run.stdout
+    .split(RECORD)
+    .map((chunk) => chunk.replace(/^\r?\n/, '').trim())
+    .filter((chunk) => chunk.length > 0)
+    .map((chunk) => {
+      const [sha = '', at = '', subject = '', proposedBy = '', approvedBy = ''] =
+        chunk.split(FIELD);
+      return {
+        sha,
+        at,
+        subject,
+        proposedBy: proposedBy.trim() || null,
+        approvedBy: approvedBy.trim() || null,
+      };
+    });
+}
+
+/**
+ * Take every version of the files `match` names out of the space's history,
+ * as if they had never been committed, and out of the index, leaving the
+ * files themselves where they are. This is the one place history is
+ * rewritten, and it exists for one reason: a value a person asked to have
+ * erased must not stay readable in an old commit. Every other commit keeps
+ * its tree, author, date and message; commits that touched only these files
+ * stay, empty. The old commits and their objects are then pruned, so nothing
+ * still reachable or still in the object store holds the files' bytes.
+ *
+ * `glob` is the same set as a git pathspec, used to ask cheaply whether there
+ * is anything to do. Answers whether the history was rewritten.
+ */
+export function eraseFromHistory(
+  paths: SpacePaths,
+  glob: string,
+  match: (path: string) => boolean,
+): Promise<boolean> {
+  return withSpaceLock(paths, () => eraseFromHistoryAlone(paths, glob, match));
+}
+
+async function eraseFromHistoryAlone(
+  paths: SpacePaths,
+  glob: string,
+  match: (path: string) => boolean,
+): Promise<boolean> {
+  const spec = `:(glob)${glob}`;
+  const tracked = (await git(paths.root, ['ls-files', '-z', '--', spec]))
+    .split('\0')
+    .filter((path) => path.length > 0 && match(path));
+  // The glob only narrows the search: a file of the person's own that merely
+  // looks like one of ours never sets off a rewrite.
+  const committed =
+    (await hasCommits(paths.root)) &&
+    (await git(paths.root, ['log', '--all', '--format=', '--name-only', '-z', '--', spec]))
+      .split(/[\0\n]/)
+      .some((path) => path.length > 0 && match(path));
+  if (!committed && tracked.length === 0) return false;
+  if (committed) {
+    const exported = await gitBytes(paths.root, [
+      'fast-export',
+      '--all',
+      '--no-data',
+      '--signed-tags=strip',
+      // A commit written in another encoding would otherwise stop the export.
+      '--reencode=yes',
+    ]);
+    await gitBytes(paths.root, ['fast-import', '--force', '--quiet'], dropPaths(exported, match));
+  }
+  // The index still names the files' old contents; it has to let go of them
+  // too, or they stay reachable and survive the prune below.
+  if (tracked.length)
+    await git(paths.root, ['rm', '--cached', '--quiet', '--ignore-unmatch', '--', ...tracked]);
+  rmSync(resolve(paths.root, '.git', 'ORIG_HEAD'), { force: true });
+  await git(paths.root, ['reflog', 'expire', '--expire=now', '--all']);
+  await git(paths.root, ['gc', '--prune=now', '--quiet']);
+  return true;
+}
+
+/**
+ * A `git fast-export --no-data` stream without the file changes `match`
+ * names. Commands are lines; a `data <n>` command is followed by exactly n
+ * bytes (a commit or tag message), which pass through untouched. Only
+ * `M <mode> <ref> <path>` and `D <path>` lines name a file, and a path git
+ * had to quote is never one of ours, so it is left as it is.
+ */
+export function dropPaths(stream: Uint8Array, match: (path: string) => boolean): Uint8Array {
+  const bytes = Buffer.from(stream.buffer, stream.byteOffset, stream.byteLength);
+  const kept: Buffer[] = [];
+  let at = 0;
+  while (at < bytes.length) {
+    const newline = bytes.indexOf(0x0a, at);
+    const end = newline < 0 ? bytes.length : newline;
+    const next = newline < 0 ? bytes.length : newline + 1;
+    const line = bytes.subarray(at, end).toString('latin1');
+    if (line.startsWith('data ')) {
+      const size = Number(line.slice(5));
+      if (!Number.isSafeInteger(size) || size < 0)
+        throw new Error('the history export used a data form this does not read');
+      kept.push(bytes.subarray(at, next + size));
+      at = next + size;
+      continue;
+    }
+    const path = line.startsWith('M ')
+      ? line.split(' ').slice(3).join(' ')
+      : line.startsWith('D ')
+        ? line.slice(2)
+        : null;
+    if (path === null || path.startsWith('"') || !match(Buffer.from(path, 'latin1').toString()))
+      kept.push(bytes.subarray(at, next));
+    at = next;
+  }
+  return Buffer.concat(kept);
+}
+
+/** The current commit. */
+export const headSha = async (paths: SpacePaths): Promise<string> =>
+  (await git(paths.root, ['rev-parse', 'HEAD'])).trim();
+
+/**
+ * A file as it was at the last commit, or null when the commit does not have
+ * it. The lint uses this to see which status a record is moving from.
+ */
+export async function readAtHead(paths: SpacePaths, relativePath: string): Promise<string | null> {
+  const run = await runGit(paths.root, ['show', `HEAD:${toPosix(relativePath)}`]);
+  return run.code === 0 ? run.stdout : null;
+}
+
+/** The file as it is now, or the empty string when it does not exist yet. */
+export function readWorkingTree(paths: SpacePaths, relativePath: string): string {
+  const absolute = resolveInSpace(paths, relativePath);
+  if (!absolute || !existsSync(absolute)) return '';
+  return readFileSync(absolute, 'utf8');
+}

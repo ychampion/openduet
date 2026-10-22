@@ -1,0 +1,144 @@
+"""The prompt seam is applied only to the audited source, and fails closed otherwise.
+
+The pinned engine source is read from the local checkout named by
+``OPENDUET_HERMES_ROOT`` (or ``.hermes-src`` at the repository root). Without one
+the tests that need it are skipped with the reason; the refusal test needs none.
+"""
+from __future__ import annotations
+
+import base64
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+PACKAGE = Path(__file__).parents[1]
+REPOSITORY = PACKAGE.parents[1]
+SEAM_FILE = "agent/system_prompt.py"
+
+
+def bridge():
+    spec = importlib.util.spec_from_file_location(
+        "observer_bridge", PACKAGE / "patches" / "observer_bridge.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def engine_source() -> str:
+    root = Path(os.environ.get("OPENDUET_HERMES_ROOT") or REPOSITORY / ".hermes-src")
+    target = root / SEAM_FILE
+    if not target.exists():
+        pytest.skip(f"No pinned engine checkout at {root}; set OPENDUET_HERMES_ROOT to run this.")
+    return target.read_text(encoding="utf-8")
+
+
+def test_the_seam_applies_to_the_pinned_source_and_again_to_its_own_result():
+    module = bridge()
+    expected_hash, changes = module.PATCHES[SEAM_FILE]
+    once = module.patched(engine_source(), expected_hash, changes)
+    assert once.count("# OpenDuet prompt seam") == 4
+    assert "def _host_prompt(agent: Any) -> bool:" in once
+    # A checkout that already carries this seam is restored and patched to the same bytes.
+    assert module.patched(once, expected_hash, changes) == once
+
+
+def test_an_unreadable_configuration_keeps_the_host_blocks_out(monkeypatch):
+    """The seam's own reader, run as it is inserted: a configuration that cannot
+    be read leaves the host blocks out; an unset key keeps them; false drops them."""
+    import sys
+    import types
+    from typing import Any
+
+    module = bridge()
+    _, changes = module.PATCHES[SEAM_FILE]
+    helper = changes[0][1].split("def _join_tier", 1)[0]
+    config = types.ModuleType("hermes_cli.config")
+    package = types.ModuleType("hermes_cli")
+    package.config = config
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    scope: dict = {"Any": Any}
+    exec(compile(helper, "system_prompt.py", "exec"), scope)
+    host_prompt = scope["_host_prompt"]
+
+    def unreadable():
+        raise OSError("config.yaml is unreadable")
+
+    config.load_config_readonly = unreadable
+    assert host_prompt(object()) is False
+    config.load_config_readonly = lambda: {}
+    assert host_prompt(object()) is True
+    config.load_config_readonly = lambda: {"agent": {"host_prompt": False}}
+    assert host_prompt(object()) is False
+
+
+def test_a_source_that_is_not_the_audited_pin_is_refused():
+    module = bridge()
+    expected_hash, changes = module.PATCHES[SEAM_FILE]
+    drifted = "def _join_tier(parts: List[Optional[str]]) -> str:\n    return ''\n"
+    with pytest.raises(ValueError):
+        module.patched(drifted, expected_hash, changes)
+
+
+def test_the_image_installs_openduet_identity_as_the_engine_soul():
+    script = (PACKAGE / "entrypoint.sh").read_text(encoding="utf-8")
+    assert 'cp /opt/openduet-runtime/SOUL.md "$HERMES_HOME/SOUL.md"' in script
+    assert "COPY config/SOUL.md /opt/openduet-runtime/SOUL.md" in (
+        PACKAGE / "Dockerfile").read_text(encoding="utf-8")
+
+
+def soul_step() -> str:
+    """The entrypoint's SOUL.md step, from its `if` to the `unset` that ends it."""
+    script = (PACKAGE / "entrypoint.sh").read_text(encoding="utf-8")
+    start = script.index('if [ -n "${OPENDUET_ENGINE_SOUL:-}" ]; then')
+    end = script.index("unset OPENDUET_ENGINE_SOUL", start) + len("unset OPENDUET_ENGINE_SOUL")
+    return script[start:end]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_the_installation_identity_the_service_passes_becomes_the_engine_soul(tmp_path):
+    """The image's SOUL.md is the release's; an installation that named its
+    assistant or wrote its own identity hands that one in, and it is written
+    byte for byte, line breaks and all."""
+    image = tmp_path / "opt"
+    image.mkdir()
+    (image / "SOUL.md").write_text("You are OpenDuet, the release's own.\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    step = (soul_step()
+            .replace("/opt/openduet-runtime/SOUL.md", (image / "SOUL.md").as_posix())
+            .replace("python -c", f'"{Path(sys.executable).as_posix()}" -c'))
+    script = f"set -eu\nHERMES_HOME='{home.as_posix()}'\n{step}\nprintf '%s' \"${{OPENDUET_ENGINE_SOUL:-gone}}\"\n"
+    own = "You are Juniper, the Riverside assistant.\n\nAnswer first in chat.\n"
+    passed = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, check=True,
+        env={**os.environ, "OPENDUET_ENGINE_SOUL": base64.b64encode(own.encode()).decode()})
+    assert (home / "SOUL.md").read_bytes() == own.encode()
+    # Not left for the engine's own processes to inherit.
+    assert passed.stdout == "gone"
+    env = {key: value for key, value in os.environ.items() if key != "OPENDUET_ENGINE_SOUL"}
+    subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=True, env=env)
+    assert (home / "SOUL.md").read_text(encoding="utf-8") == "You are OpenDuet, the release's own.\n"
+
+
+def test_a_checkout_carrying_the_earlier_patch_is_moved_to_this_one_and_nothing_else_is():
+    """The upgrade path in miniature: the pin, an earlier patch, the current patch."""
+    module = bridge()
+    pinned = "alpha\nbeta\ngamma\n"
+    changes = [("alpha\n", "alpha one\n"), ("gamma\n", "gamma two\n")]
+    expected = module.digest(pinned)
+    earlier = module.patched(pinned, expected, changes[:1])
+    current = module.patched(pinned, expected, changes)
+    assert module.patched(earlier, expected, changes, (1,)) == current
+    assert module.patched(current, expected, changes, (1,)) == current
+    # Without the earlier version named, the earlier patch is refused.
+    with pytest.raises(ValueError):
+        module.patched(earlier, expected, changes)
+    # Anything else about the file still has to match the pin.
+    with pytest.raises(ValueError):
+        module.patched(earlier.replace("beta", "delta"), expected, changes, (1,))

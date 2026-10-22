@@ -1,0 +1,76 @@
+import { expect, test } from 'bun:test';
+import { recallRequest } from '@openduet/contracts';
+import { cacheIdentity, lexicalQuery, queryParts, type ReadAudience } from './recall.ts';
+import { cosine, validateVector } from './views.ts';
+
+test('cache identity binds audience, policy, data, access, job revision, query, and recipe', () => {
+  const audience: ReadAudience = {
+    scope: {
+      ownerId: 'owner',
+      spaceId: 'space',
+      role: 'owner',
+      publisher: 'server',
+      audience: 'private',
+    },
+    audiences: ['private'],
+    jobRevision: 1,
+    constraints: null,
+    purpose: 'responsibility',
+    publicCompartment: false,
+  };
+  const snapshot = {
+    space_id: 'space',
+    policy_generation: 1,
+    data_revision: 1,
+    access_generation: 1,
+    eligibility_generation: 1,
+    restore_ready: true,
+  };
+  const request = recallRequest.parse({ query: 'trip' });
+  const key = cacheIdentity(audience, snapshot, request, 'lexical-v1');
+  for (const field of ['policy_generation', 'data_revision', 'access_generation'] as const)
+    expect(cacheIdentity(audience, { ...snapshot, [field]: 2 }, request, 'lexical-v1')).not.toBe(
+      key,
+    );
+  expect(
+    cacheIdentity({ ...audience, audiences: ['space'] }, snapshot, request, 'lexical-v1'),
+  ).not.toBe(key);
+  expect(cacheIdentity({ ...audience, jobRevision: 2 }, snapshot, request, 'lexical-v1')).not.toBe(
+    key,
+  );
+  expect(cacheIdentity(audience, snapshot, { ...request, query: 'travel' }, 'lexical-v1')).not.toBe(
+    key,
+  );
+  expect(cacheIdentity(audience, snapshot, request, 'dense-v1')).not.toBe(key);
+});
+test('dense vectors cannot mix dimensions or nonfinite components', () => {
+  expect(cosine([1, 0], [1, 0])).toBe(1);
+  expect(() => validateVector([1, Number.NaN], 2)).toThrow('embedding_space_mismatch');
+  expect(() => cosine([1, 0], [1])).toThrow('embedding_space_mismatch');
+});
+
+test('a plain word is matched by its stem, so other forms of it are found', () => {
+  expect(lexicalQuery('do I have allergies?')).toBe("'allerg':*");
+  expect(lexicalQuery('cashews')).toBe("'cashew':*");
+  // Short words, numbers and addresses match as written.
+  expect(lexicalQuery('nut 2019 maya@example.com')).toBe("'nut' | '2019' | 'maya@example.com'");
+});
+
+test('a request that asks several things is split into its questions and lines', () => {
+  const asked =
+    'Which sibling is out in Colorado… which nut to stay away from… which mornings do I work out?';
+  expect(queryParts(asked)).toEqual([
+    asked,
+    'Which sibling is out in Colorado',
+    'which nut to stay away from',
+    'which mornings do I work out?',
+  ]);
+  expect(queryParts('Any food I should avoid? And my sister?\nNew chat')).toEqual([
+    'Any food I should avoid? And my sister?\nNew chat',
+    'Any food I should avoid?',
+    'And my sister?\nNew chat',
+  ]);
+  // One question, with the chat's title below it, is the whole request alone.
+  expect(queryParts('do I have allergies?\nNew chat')).toEqual(['do I have allergies?\nNew chat']);
+  expect(queryParts('   ')).toEqual([]);
+});

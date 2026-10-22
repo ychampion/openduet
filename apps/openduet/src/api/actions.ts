@@ -1,0 +1,98 @@
+import {
+  type Action,
+  actionListQuery,
+  actionListResponse,
+  actionResponse,
+  actionSummaryListResponse,
+  actionSummaryOf,
+  resolveActionRequest,
+} from '@openduet/contracts';
+import { sql as query } from 'drizzle-orm';
+import { Hono } from 'hono';
+import type { Sql } from 'postgres';
+import { actionFromRow } from '../broker/records.ts';
+import type { BrokerService } from '../broker/service.ts';
+import type { Database } from '../db/client.ts';
+import { requestPrincipal, visibleJob } from '../principals/authority.ts';
+import { ServiceError } from './errors.ts';
+
+/** The list in the shape asked for: every field, or the lean summary a person is shown. */
+const listed = (actions: Action[], view: 'full' | 'summary') =>
+  view === 'summary'
+    ? actionSummaryListResponse.parse({ actions: actions.map(actionSummaryOf) })
+    : actionListResponse.parse({ actions });
+
+/**
+ * The same ledger read on the owner API, for a conversation's unconfirmed
+ * effects, and the owner's answer to one. Both reach only actions on jobs the
+ * caller owns, in spaces they can see; a space member never reads or settles
+ * another person's ledger through them.
+ */
+export function mountActions(app: Hono, db: Database, broker?: BrokerService) {
+  if (broker)
+    app.post('/actions/:actionId/resolve', async (c) => {
+      const id = c.req.param('actionId');
+      const parsed = resolveActionRequest.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success)
+        throw new ServiceError('invalid_request', 'Say whether it happened.', 400);
+      // An answer is always someone's: with no signed-in principal there is nobody to record.
+      const principalId = requestPrincipal();
+      if (!principalId) throw new ServiceError('scope_denied', 'Sign in to answer this.', 403);
+      // Only the caller's own action, checked where it is changed: anyone else's
+      // reads as not being here at all.
+      const settled = await broker.resolveByOwner(principalId, id, parsed.data);
+      if (settled.status === 'not_found') throw new ServiceError('not_found', 'Not found.', 404);
+      if (settled.status === 'not_awaiting')
+        throw new ServiceError(
+          'not_awaiting_reconciliation',
+          'This is not waiting for your answer.',
+          409,
+        );
+      return c.json(actionResponse.parse({ action: settled.action }));
+    });
+  app.get('/actions', async (c) => {
+    const parsed = actionListQuery.safeParse(c.req.query());
+    if (!parsed.success) throw new ServiceError('invalid_query', 'Invalid action query', 400);
+    const filter = parsed.data;
+    const own = visibleJob(query`a.job_id`);
+    // Job cancellation is intent, not delivery evidence. Never filter on job.state.
+    const rows = await db.execute<Record<string, unknown>>(query`select a.* from action a
+      where (${filter.job_id ?? null}::text is null or a.job_id = ${filter.job_id ?? null})
+        and (${filter.status ?? null}::text is null or a.status = ${filter.status ?? null})
+        and (${filter.effect_class ?? null}::text is null or a.effect_class = ${filter.effect_class ?? null})
+        ${own ? query`and ${own}` : query``}
+      order by (a.status in ('unknown', 'unresolved')) desc, a.created_at desc, a.id
+      limit ${filter.limit}`);
+    return c.json(listed([...rows].map(actionFromRow), filter.view));
+  });
+}
+
+/** The service supplies owner authentication and a selected space; runtime capabilities cannot read here. */
+export function createActionReadApi(options: {
+  sql: Sql;
+  authorizeSpace(request: Request): Promise<string | null>;
+}) {
+  const app = new Hono();
+  app.get('/actions', async (c) => {
+    const spaceId = await options.authorizeSpace(c.req.raw);
+    if (!spaceId)
+      return c.json(
+        { error: { code: 'unauthorized', message: 'Owner authorization required' } },
+        401,
+      );
+    const parsed = actionListQuery.safeParse(c.req.query());
+    if (!parsed.success)
+      return c.json({ error: { code: 'invalid_query', message: 'Invalid action query' } }, 400);
+    const query = parsed.data;
+    // Job cancellation is intent, not delivery evidence. Never filter on job.state.
+    const rows = await options.sql`select a.* from action a join job j on j.id = a.job_id
+      where j.space_id = ${spaceId}
+        and (${query.job_id ?? null}::text is null or a.job_id = ${query.job_id ?? null})
+        and (${query.status ?? null}::text is null or a.status = ${query.status ?? null})
+        and (${query.effect_class ?? null}::text is null or a.effect_class = ${query.effect_class ?? null})
+      order by (a.status in ('unknown', 'unresolved')) desc, a.created_at desc, a.id
+      limit ${query.limit}`;
+    return c.json(listed(rows.map(actionFromRow), query.view));
+  });
+  return app;
+}

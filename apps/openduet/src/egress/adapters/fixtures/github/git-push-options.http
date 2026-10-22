@@ -1,0 +1,20 @@
+# git push -o ci.skip -o merge_request.create origin openduet/fix-login
+### read base64
+GET https://github.com/alice/site.git/info/refs?service=git-receive-pack
+accept: */*
+user-agent: git/2.39.5
+
+
+### write base64
+POST https://github.com/alice/site.git/git-receive-pack
+accept: application/x-git-receive-pack-result
+content-type: application/x-git-receive-pack-request
+user-agent: git/2.39.5
+
+MDBkNDk0ZDE5YjgyMGRmYjY2M2FlMWJmZDUwMTMwMTY5MTkwZGE4Nzc2MmUgNDJlOWNiMWY1YzIyNDI2NGM4YTliNzVhZmEzZTQz
+OTQ1ZmY4MDAzNCByZWZzL2hlYWRzL29wZW5kdWV0L2ZpeC1sb2dpbgAgcmVwb3J0LXN0YXR1cy12MiBzaWRlLWJhbmQtNjRrIHF1
+aWV0IHB1c2gtb3B0aW9ucyBvYmplY3QtZm9ybWF0PXNoYTEgYWdlbnQ9Z2l0LzIuMzkuNS5kZWJpYW4uMTIwMDAwMDAwYmNpLnNr
+aXAwMDE4bWVyZ2VfcmVxdWVzdC5jcmVhdGUwMDAwUEFDSwAAAAIAAAADnAt4nI2OQQrCMBAA73lF7oLspkm6CyL6Bz+wyW6oYG0p
+EXy+eYJzHOYw/TDzopKwZaagkCqLmWqLXEKyWgog1VglYnC7HPbunqMiFwqgreQ8iWFpmgAnwMzIoELznIM5+fRlO/zdX+RmX1n3
+l53rtl49zgwUiQD8CQZu2PXZu/0Vu8cytt0PdbQ11qECeJwzNDAwMzFRSNMrqShh0L6fvnpj8pL/m65//tDBM/8pW8/zJgDXpA+W
+NnicK8koSk3lAgAIkQIjUDPFgEpDUauvX8BDeZ/PowRCp4s=

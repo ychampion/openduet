@@ -1,0 +1,218 @@
+import type { Row, Sql } from 'postgres';
+import { z } from 'zod';
+import { ConnectorFaultError } from './faults.ts';
+import { jsonDepthWithin } from './mcp-transport.ts';
+import { type PrivateHosts, privateHostListed, privateHostsFromEnv } from './private-hosts.ts';
+import type { SealedSecretStore } from './secrets.ts';
+
+/**
+ * Whether a token may be sent to this address: over TLS, or over plain http to
+ * this machine or to an internal host the operator listed in
+ * OPENDUET_PRIVATE_HOSTS, whose network they vouch for.
+ */
+export function tokenMayTravel(
+  value: string,
+  privateHosts: PrivateHosts = privateHostsFromEnv(),
+): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return (
+    !url.username &&
+    !url.password &&
+    !url.hash &&
+    (url.protocol === 'https:' ||
+      (url.protocol === 'http:' &&
+        (['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
+          privateHostListed(url.hostname, privateHosts))))
+  );
+}
+
+/** Credentials only travel over TLS, except to loopback or a listed internal host. */
+export const mcpCredentialUrl = z.url().refine((value) => tokenMayTravel(value));
+
+export const mcpCredentials = z
+  .object({
+    access_token: z
+      .string()
+      .min(1)
+      .max(16_384)
+      .regex(/^[A-Za-z0-9\-._~+/]+=*$/),
+    expires_at: z.iso.datetime().optional(),
+    refresh_token: z.string().min(1).max(16_384).optional(),
+    token_url: mcpCredentialUrl.optional(),
+    client_id: z.string().min(1).max(1024).optional(),
+    client_secret: z.string().min(1).max(16_384).optional(),
+    /**
+     * The resource the token was issued for (RFC 8707), as the server's own
+     * metadata declares it. A refresh asks for the same one.
+     */
+    resource: mcpCredentialUrl.optional(),
+    /** The scopes granted at sign-in, so signing in again can ask for them all. */
+    scope: z.string().max(4096).optional(),
+    status: z.enum(['active', 'revoked']).default('active'),
+  })
+  .strict()
+  .refine(
+    (value) => Boolean(value.refresh_token) === Boolean(value.token_url),
+    'A refresh token needs its operator-configured token endpoint',
+  );
+
+type Credential = z.infer<typeof mcpCredentials>;
+/** An RFC 6749 scope token. */
+export const SCOPE_TOKEN = /^[\x21\x23-\x5b\x5d-\x7e]{1,256}$/;
+const revoked = () =>
+  new ConnectorFaultError({
+    kind: 'revoked_credential',
+    detail: 'MCP credential is no longer available',
+  });
+
+/** A refresh rotates sealed bytes, never the operator's scopes, principal or connection identity. */
+export function mcpCredentialAccess(
+  sql: Sql,
+  store: SealedSecretStore,
+  binding: { connectionId: string; spaceId: string },
+  resource?: string,
+  /** How the refresh is sent. The connector supplies the public-only fetch where it must. */
+  fetcher: (url: string, init: RequestInit) => Promise<Response> = fetch,
+) {
+  let refreshing: Promise<boolean> | undefined;
+  async function read(again = true): Promise<{ row: Row; credential: Credential | undefined }> {
+    const [row] = await sql`select secret_ref, generation, scopes, status from connection
+      where id = ${binding.connectionId} and space_id = ${binding.spaceId} and provider = 'mcp'`;
+    if (!row) throw revoked();
+    if (!row.secret_ref) return { row, credential: undefined };
+    try {
+      const credential = await store.withSecret(row.secret_ref, binding.spaceId, async (value) =>
+        mcpCredentials.parse(JSON.parse(value)),
+      );
+      if (credential.status === 'revoked') throw revoked();
+      return { row, credential };
+    } catch {
+      // A refresh elsewhere removes the copy it replaced; a read that took the
+      // old reference just before reads again once and finds the new one.
+      if (again) {
+        const [now] = await sql`select secret_ref from connection
+          where id = ${binding.connectionId} and space_id = ${binding.spaceId} and provider = 'mcp'`;
+        if (now?.secret_ref && now.secret_ref !== row.secret_ref) return read(false);
+      }
+      throw revoked();
+    }
+  }
+  return {
+    async accessToken() {
+      return (await read()).credential?.access_token;
+    },
+    /**
+     * The server refused a call for want of scope (RFC 6750 `insufficient_scope`).
+     * The scopes it named are kept on the connection, so the person sees that it
+     * needs more access and signing in again asks for them.
+     */
+    async onInsufficientScope(scope: string) {
+      const named = scope
+        .split(/\s+/)
+        .filter((token) => SCOPE_TOKEN.test(token))
+        .slice(0, 32);
+      if (!named.length) return;
+      const [row] = await sql`select configuration->'needs_scope' as needed from connection
+        where id = ${binding.connectionId} and space_id = ${binding.spaceId} and provider = 'mcp'`;
+      const earlier = Array.isArray(row?.needed)
+        ? row.needed.filter((token: unknown): token is string => typeof token === 'string')
+        : [];
+      const needed = [...new Set([...earlier, ...named])].slice(0, 64);
+      await sql`update connection
+        set configuration = jsonb_set(configuration, '{needs_scope}', ${JSON.stringify(needed)}::jsonb)
+        where id = ${binding.connectionId} and space_id = ${binding.spaceId}
+          and provider = 'mcp' and status <> 'revoked'`;
+    },
+    async checkCredential() {
+      const { credential } = await read();
+      if (credential?.expires_at && Date.parse(credential.expires_at) <= Date.now())
+        throw new ConnectorFaultError({
+          kind: 'expired_credential',
+          detail: 'MCP credential expired',
+        });
+    },
+    async refresh(): Promise<boolean> {
+      refreshing ??= (async () => {
+        const { row, credential } = await read();
+        if (row.status !== 'active' || !credential?.refresh_token || !credential.token_url)
+          return false;
+        const form = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: credential.refresh_token,
+          ...((credential.resource ?? resource)
+            ? { resource: credential.resource ?? resource }
+            : {}),
+          ...(credential.client_id ? { client_id: credential.client_id } : {}),
+          ...(credential.client_secret ? { client_secret: credential.client_secret } : {}),
+        });
+        const response = await fetcher(credential.token_url, {
+          method: 'POST',
+          redirect: 'error',
+          keepalive: false,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString(),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!response.ok || !response.body) {
+          await response.body?.cancel().catch(() => {});
+          return false;
+        }
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let size = 0;
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            size += chunk.value.byteLength;
+            if (size > 65_536) return false;
+            chunks.push(chunk.value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+        const token = z
+          .object({
+            access_token: mcpCredentials.shape.access_token,
+            token_type: z.string().refine((value) => value.toLowerCase() === 'bearer'),
+            expires_in: z.number().int().positive().max(31_536_000).optional(),
+            refresh_token: mcpCredentials.shape.refresh_token,
+          })
+          .parse(
+            ((text) => (jsonDepthWithin(text) ? JSON.parse(text) : null))(
+              Buffer.concat(chunks).toString('utf8'),
+            ),
+          );
+        const next: Credential = {
+          ...credential,
+          access_token: token.access_token,
+          refresh_token: token.refresh_token ?? credential.refresh_token,
+          expires_at: token.expires_in
+            ? new Date(Date.now() + token.expires_in * 1000).toISOString()
+            : undefined,
+        };
+        const secret = await store.put(binding.spaceId, JSON.stringify(next));
+        const changed = await sql`update connection set secret_ref = ${secret}
+          where id = ${binding.connectionId} and space_id = ${binding.spaceId}
+            and provider = 'mcp' and status = 'active' and generation = ${row.generation}
+            and secret_ref = ${row.secret_ref} and scopes = ${JSON.stringify(row.scopes)}::jsonb
+          returning id`;
+        // One sealed copy is kept: the one the row points at.
+        await store
+          .forget(changed.length === 1 ? String(row.secret_ref) : secret, binding.spaceId)
+          .catch(() => undefined);
+        return changed.length === 1;
+      })()
+        .catch(() => false)
+        .finally(() => {
+          refreshing = undefined;
+        });
+      return refreshing;
+    },
+  };
+}

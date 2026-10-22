@@ -1,0 +1,211 @@
+/**
+ * The wake queue. pg-boss runs in the same Postgres as the state, so a job
+ * transition and the enqueue of its next wake commit in one transaction.
+ *
+ * The runner registers bounded attempt and recovery workers after startup.
+ */
+
+import { type SchedulingClass, schedulingClass } from '@openduet/contracts';
+import { sql } from 'drizzle-orm';
+import { fromDrizzle, PgBoss } from 'pg-boss';
+import { type VerifyingTls, verifyingTls } from '../db/tls.ts';
+import type { Transaction } from '../db/transaction.ts';
+import { quietQueue, startDueWaker } from './quiet.ts';
+
+/** The only queues v0.1 uses. Naming them here keeps the set closed. */
+export const QUEUES = {
+  /** One bounded attempt for one job. */
+  attempt: 'job.wake.interactive',
+  background: 'job.wake.background',
+  quiet: 'job.wake.quiet',
+  legacyAttempt: 'job.wake',
+  /** Re-enqueues jobs whose next_wake_at passed with no live wake. */
+  recoveryScan: 'openduet.recovery-scan',
+  /** Polls connectors that carry a cursor instead of a webhook. */
+  triggerPoll: 'openduet.trigger-poll',
+  /** A persisted schedule occurrence, converted to a job wake after matching the wait. */
+  triggerSchedule: 'job.trigger',
+  /** Continues a bounded scan through observations already delivered to a watch. */
+  triggerScan: 'openduet.trigger-scan',
+  /** Retries verify for actions that came back unknown. */
+  reconcile: 'openduet.reconcile',
+  operation: 'openduet.operation',
+  /** Looks for a company writing back to a chase that is waiting on a reply. */
+  companyReplies: 'openduet.company-replies',
+  /** Sends what a person's devices may be told, once a minute. */
+  pushDispatch: 'openduet.push-dispatch',
+  /** Looks at the clocks that are due: deadlines and waits on a reply. */
+  clockSweep: 'openduet.clock-sweep',
+  /** Texts and calls to a person's own number that are due: the reach-me ladder. */
+  reachSweep: 'openduet.reach-sweep',
+} as const;
+
+/**
+ * Queues whose workers are woken by notices instead of polling (jobs/quiet.ts).
+ * Their work arrives through the queue alone, so a notice or the due-job waker
+ * always reaches it. Their workers start with `workQuiet`.
+ *
+ * An attempt's wake is sent in the transaction that makes it due, and its
+ * notice goes out when that commits; a wake due later (a timer, a scheduled
+ * start) is the waker's. A job whose wake never reached the queue is the
+ * recovery scan's, which is itself sent on its schedule and woken the same way.
+ */
+export const QUIET_QUEUES: readonly string[] = [
+  QUEUES.attempt,
+  QUEUES.background,
+  QUEUES.quiet,
+  QUEUES.legacyAttempt,
+  QUEUES.recoveryScan,
+  QUEUES.pushDispatch,
+  QUEUES.triggerPoll,
+  QUEUES.triggerSchedule,
+  QUEUES.triggerScan,
+  QUEUES.reconcile,
+  QUEUES.operation,
+  QUEUES.companyReplies,
+  QUEUES.clockSweep,
+  QUEUES.reachSweep,
+];
+
+export const ATTEMPT_QUEUES: Record<SchedulingClass, string> = {
+  interactive: QUEUES.attempt,
+  background: QUEUES.background,
+  quiet: QUEUES.quiet,
+};
+export const attemptQueue = (value: string) => ATTEMPT_QUEUES[schedulingClass.parse(value)];
+
+export const RECOVERY_SCAN_SECONDS = 60;
+
+export type AttemptWake = {
+  job_id: string;
+  /** The epoch the wake was scheduled for; a stale wake is dropped, not run. */
+  expected_epoch: number;
+  /** A timer from an earlier wait must not wake a later wait in the same epoch. */
+  expected_version: number;
+  reason: 'created' | 'input' | 'approval' | 'timer' | 'event' | 'recovery';
+};
+
+export type QueueHandle = {
+  boss: PgBoss;
+  stop: () => Promise<void>;
+};
+
+/**
+ * The queue's connection, with DATABASE_URL read as the service's own client
+ * and libpq read it. pg-boss's driver reads `sslmode=require` as verify-full,
+ * reads `sslrootcert=system` as a file named "system", and, like the service's
+ * client, checks an IP-addressed server against "localhost". So, when no root
+ * certificate file is named:
+ * - `verify-ca`, `verify-full` and `sslrootcert=system` leave the URL, and the
+ *   server is checked against the URL's own host (db/tls.ts), with Node's
+ *   authorities plus NODE_EXTRA_CA_CERTS;
+ * - `require` leaves the URL, and TLS is asked for without verifying the
+ *   certificate, which is what `require` means to libpq.
+ * Every other setting stays as written.
+ */
+export function queueConnection(connectionString: string): {
+  connectionString: string;
+  ssl?: { rejectUnauthorized: false } | VerifyingTls;
+} {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    return { connectionString };
+  }
+  const rootCert = url.searchParams.get('sslrootcert');
+  if (rootCert !== null && rootCert !== 'system') return { connectionString };
+  const verifying = verifyingTls(connectionString);
+  if (verifying) {
+    url.searchParams.delete('sslmode');
+    url.searchParams.delete('sslrootcert');
+    return { connectionString: url.toString(), ssl: verifying };
+  }
+  if (rootCert === 'system') {
+    url.searchParams.delete('sslrootcert');
+    return { connectionString: url.toString() };
+  }
+  if (url.searchParams.get('sslmode') !== 'require') return { connectionString };
+  url.searchParams.delete('sslmode');
+  return { connectionString: url.toString(), ssl: { rejectUnauthorized: false } };
+}
+
+/**
+ * Whether the queue creates its own schema: yes with one database role; no
+ * with separate roles, where the database's setup step creates the schema for
+ * the service's role, which may not create schemas (db/roles.ts).
+ */
+export const queueCreatesSchema = (env: { OPENDUET_EFFECTS_DATABASE_URL?: string | undefined }) =>
+  !env.OPENDUET_EFFECTS_DATABASE_URL;
+
+/**
+ * Start pg-boss against the same connection string the service uses. The
+ * tables are created on first start; nothing is scheduled here.
+ */
+export async function startQueue(
+  connectionString: string,
+  {
+    createSchema = true,
+    dueScanMs,
+    dueWaker = true,
+  }: {
+    createSchema?: boolean;
+    /** How long the due-job waker waits, at most, between looks (jobs/quiet.ts). */
+    dueScanMs?: number;
+    /**
+     * Whether this process wakes quiet queues when their jobs fall due. The
+     * service does; a process sharing its database, such as the effect broker,
+     * leaves it to the service, since a notice reaches every instance.
+     */
+    dueWaker?: boolean;
+  } = {},
+): Promise<QueueHandle> {
+  const boss = new PgBoss({
+    ...queueConnection(connectionString),
+    schema: 'pgboss',
+    max: 4,
+    createSchema,
+    useListenNotify: true,
+  });
+  boss.on('error', (error) => process.stderr.write(`pg-boss: ${error.message}\n`));
+  // Without notices the quiet queues poll again; say so, once per failure.
+  boss.on('warning', (warning) => {
+    if ((warning.data as { type?: string } | undefined)?.type === 'listen_notify_unavailable')
+      process.stderr.write(`pg-boss: ${warning.message}\n`);
+  });
+  let waker: ReturnType<typeof startDueWaker> | undefined;
+  try {
+    await boss.start();
+    for (const queue of Object.values(QUEUES)) {
+      await boss.createQueue(queue);
+    }
+    for (const queue of QUIET_QUEUES) await quietQueue(boss, queue);
+    if (dueWaker) waker = startDueWaker(boss, dueScanMs === undefined ? {} : { scanMs: dueScanMs });
+  } catch (error) {
+    await boss.stop({ graceful: false });
+    throw error;
+  }
+  return {
+    boss,
+    stop: async () => {
+      await waker?.stop();
+      await boss.stop({ graceful: true, timeout: 1000 });
+    },
+  };
+}
+
+/** The Drizzle adapter executes enqueue SQL on the very same transaction client. */
+export async function enqueueWake(
+  boss: PgBoss,
+  tx: Transaction,
+  wake: AttemptWake,
+  at: Date,
+  scheduling: SchedulingClass = 'interactive',
+): Promise<string | null> {
+  return boss.send(attemptQueue(scheduling), wake, {
+    db: fromDrizzle(tx, sql),
+    startAfter: at,
+    retryLimit: 0,
+    expireInSeconds: 1800,
+  });
+}

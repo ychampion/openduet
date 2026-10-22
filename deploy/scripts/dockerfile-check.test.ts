@@ -1,0 +1,123 @@
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  checkDockerfileWorkspaces,
+  checkServiceImageSources,
+  developmentSourcesCopied,
+  installingDockerfiles,
+  missingWorkspaceManifests,
+  workspaceDirectories,
+} from './dockerfile-check.ts';
+
+const root = join(import.meta.dir, '..', '..');
+
+describe('the shipped Dockerfiles', () => {
+  test('the root manifest declares the evaluation workspace', () => {
+    expect(workspaceDirectories(root)).toContain('evals');
+  });
+
+  test('both images that install dependencies are checked', () => {
+    expect(installingDockerfiles(root)).toEqual(
+      expect.arrayContaining(['deploy/Dockerfile.openduet', 'deploy/Dockerfile.web']),
+    );
+  });
+
+  test('keep downloads in a build cache and retry an install that stalls', () => {
+    for (const file of installingDockerfiles(root)) {
+      const text = readFileSync(join(root, file), 'utf8');
+      const cached = text.includes('RUN --mount=type=cache,target=/var/cache/bun');
+      const retried = /for attempt in 1 2 3; do[\s\\]+timeout \d+ bun install /.test(text);
+      expect([file, cached, retried]).toEqual([file, true, true]);
+    }
+  });
+
+  test('the web image installs only the root tooling and the web client', () => {
+    const text = readFileSync(join(root, 'deploy/Dockerfile.web'), 'utf8');
+    expect(text).toContain('bun install --frozen-lockfile --filter ./ --filter @openduet/web');
+  });
+
+  test('copy every workspace manifest before a frozen install', () => {
+    expect(
+      checkDockerfileWorkspaces(root)
+        .filter((result) => !result.ok)
+        .map((result) => `${result.name}: ${result.detail}`),
+    ).toEqual([]);
+  });
+});
+
+describe('the check catches the mistakes that would break a build', () => {
+  const workspaces = ['apps/openduet', 'evals', 'packages/contracts'];
+
+  test('a workspace manifest that is never copied', () => {
+    const dockerfile = [
+      'FROM oven/bun:1',
+      'COPY package.json bun.lock ./',
+      'COPY apps/openduet/package.json apps/openduet/',
+      'COPY packages/contracts/package.json packages/contracts/',
+      'RUN bun install --frozen-lockfile',
+    ].join('\n');
+    expect(missingWorkspaceManifests(dockerfile, workspaces)).toEqual(['evals/package.json']);
+  });
+
+  test('a manifest copied only after the install', () => {
+    const dockerfile = [
+      'FROM oven/bun:1',
+      'COPY apps/openduet/package.json apps/openduet/',
+      'COPY packages/contracts/package.json packages/contracts/',
+      'RUN bun install --frozen-lockfile --production',
+      'COPY evals/package.json evals/',
+    ].join('\n');
+    expect(missingWorkspaceManifests(dockerfile, workspaces)).toEqual(['evals/package.json']);
+  });
+
+  test('a manifest copied in an earlier stage or from another image', () => {
+    const dockerfile = [
+      'FROM oven/bun:1 AS manifests',
+      'COPY evals/package.json evals/',
+      'FROM oven/bun:1',
+      'COPY --from=manifests /app/evals/package.json evals/',
+      'COPY apps/ apps/',
+      'COPY packages/contracts/package.json packages/contracts/',
+      'RUN apt-get update \\',
+      '    && bun install --frozen-lockfile',
+    ].join('\n');
+    expect(missingWorkspaceManifests(dockerfile, workspaces)).toEqual(['evals/package.json']);
+  });
+
+  test('directory and whole-context copies cover the manifests inside them', () => {
+    const dockerfile = [
+      'FROM oven/bun:1',
+      '# COPY evals/package.json evals/ is not an instruction',
+      'COPY --chown=1000:1000 apps/ packages/ ./',
+      'COPY ./evals/package.json evals/',
+      'RUN bun install --frozen-lockfile',
+      'FROM oven/bun:1',
+      'COPY . .',
+      'RUN bun install',
+    ].join('\n');
+    expect(missingWorkspaceManifests(dockerfile, workspaces)).toEqual([]);
+  });
+});
+
+describe('the service image', () => {
+  test('copies the service, and no mock, try-it or web client sources', () => {
+    expect(checkServiceImageSources(root).filter((result) => !result.ok)).toEqual([]);
+  });
+
+  test('copying apps/ or the whole context is caught, and a manifest alone is not', () => {
+    expect(developmentSourcesCopied('COPY apps/ apps/')).toEqual(['apps']);
+    expect(developmentSourcesCopied('COPY . .')).toEqual(['.']);
+    expect(developmentSourcesCopied('COPY apps/mock-api/src apps/mock-api/src')).toEqual([
+      'apps/mock-api/src',
+    ]);
+    expect(
+      developmentSourcesCopied(
+        [
+          'COPY apps/mock-api/package.json apps/mock-api/',
+          'COPY apps/openduet/ apps/openduet/',
+        ].join(String.fromCharCode(10)),
+      ),
+    ).toEqual([]);
+  });
+});

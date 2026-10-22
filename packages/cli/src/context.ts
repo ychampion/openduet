@@ -1,0 +1,553 @@
+/**
+ * What every command is given: where the deployment directory is, and the ways
+ * it reaches the machine. Each is injected so a command is tested with a fake
+ * Docker and a temporary directory.
+ */
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  mkdtempSync,
+  openSync,
+  read,
+  rmSync,
+  statfsSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
+import { connect } from 'node:net';
+import { networkInterfaces, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import {
+  type CommandOutput,
+  spawnCommand,
+} from '../../../apps/openduet/src/runtime/docker-engine.ts';
+import {
+  localMachine,
+  type MachineAccess,
+} from '../../../apps/openduet/src/runtime/docker-host.ts';
+
+export type Run = (command: readonly string[], timeoutMs?: number) => CommandOutput;
+
+/** Where a stream's bytes come from, or go: a file, or a command's stdout or stdin. */
+export type Endpoint = { file: string } | { command: readonly string[] };
+/** A stream's source may also be bytes already in hand, such as a checksum list. */
+export type Source = Endpoint | { bytes: Uint8Array };
+
+export type StreamResult = {
+  /** The source and every sink finished without an error. */
+  ok: boolean;
+  bytes: number;
+  /** sha256 of the bytes, hex. */
+  sha256: string;
+  /** Why it did not finish; stderr is cut short and never holds the bytes themselves. */
+  detail: string;
+  /**
+   * The end of the source command's stderr, also when it succeeded: a source
+   * says how it finished on its last line, however long the lines before it.
+   */
+  stderr?: string;
+};
+
+/**
+ * - `free`: nothing listens there;
+ * - `in_use`: something accepted a connection;
+ * - `no_address`: the address is not one of this machine's, so nothing can be published on it;
+ * - `unknown`: no answer in time.
+ */
+export type PortProbe = 'free' | 'in_use' | 'no_address' | 'unknown';
+
+export type Context = {
+  /** The deployment directory: deploy/ in the checkout, or the one --deploy-dir names. */
+  deployDir: string;
+  /** The checkout the deployment directory belongs to. */
+  root: string;
+  /** Runs a command to completion and returns what it printed. */
+  run: Run;
+  /** Runs a command with this terminal attached, and returns its exit code. */
+  attach: (command: readonly string[]) => Promise<number>;
+  machine: MachineAccess;
+  /** Whether something listens on an address and port of this machine. It never binds the port. */
+  probePort: (host: string, port: number) => Promise<PortProbe>;
+  /** Fetch, for the registry check `doctor` makes and the health check after a deploy. */
+  fetch: (url: string, init?: RequestInit) => Promise<Response>;
+  /**
+   * Copies bytes from a file or a command's output into every sink at once, hashing
+   * them on the way. A file sink is created new and private (0600); one that exists
+   * is refused. Nothing passes through a string, so a dump or an archive is binary-safe
+   * and no secret is ever held as text.
+   */
+  stream: (source: Source, sinks: readonly Endpoint[]) => Promise<StreamResult>;
+  /** Free bytes on the filesystem holding a path, or its nearest existing parent; null when unknown. */
+  freeAt: (path: string) => number | null;
+  /** Whether two paths are on one filesystem; null when either cannot be read. */
+  sameDisk: (a: string, b: string) => boolean | null;
+  sleep: (ms: number) => Promise<void>;
+  now: () => Date;
+  /** The environment this command runs in, which Compose reads before deploy/.env. */
+  environment: Readonly<Record<string, string | undefined>>;
+  /**
+   * What to say if Ctrl-C stops this command now: where it stands and what to run
+   * next. Null goes back to the command's general line. Left out, nothing listens.
+   */
+  interruptHint?: (hint: string | null) => void;
+  out: (text: string) => void;
+  err: (text: string) => void;
+};
+
+export const DEFAULT_DEPLOY_DIR = resolve(import.meta.dir, '../../../deploy');
+
+/**
+ * Set by deploy/Dockerfile.openduet. Inside the service image the host's Docker
+ * Engine, Compose files and deploy/.env are out of reach by design, so the
+ * read-only commands report those rules as skipped rather than failed.
+ */
+export const SERVICE_IMAGE_MARKER = 'OPENDUET_SERVICE_IMAGE';
+
+export const inServiceImage = (environment: Context['environment']): boolean =>
+  environment[SERVICE_IMAGE_MARKER] === '1';
+
+async function attach(command: readonly string[]): Promise<number> {
+  try {
+    const child = Bun.spawn([...command], {
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    return await child.exited;
+  } catch {
+    return 127;
+  }
+}
+
+/** Addresses that mean every interface: probed through loopback, which a wildcard listener also covers. */
+const WILDCARD = new Set(['', '0.0.0.0', '::']);
+
+/** Whether `address` belongs to this machine, from its interfaces. */
+function localAddress(address: string): boolean {
+  if (address === 'localhost' || /^127(\.\d{1,3}){3}$/.test(address)) return true;
+  return Object.values(networkInterfaces()).some((entries) =>
+    (entries ?? []).some((entry) => entry.address === address),
+  );
+}
+
+/**
+ * Asks by connecting, so the probe has no effect on the port: a bind, even a
+ * brief one, could make Compose's own bind fail if it started at that moment.
+ * An address that is not this machine's is never connected to, so a listener
+ * on another machine is not mistaken for one here.
+ */
+export async function probePort(host: string, port: number): Promise<PortProbe> {
+  const target = WILDCARD.has(host) ? '127.0.0.1' : host;
+  if (!localAddress(target)) return 'no_address';
+  return await new Promise((settle) => {
+    const socket = connect({ host: target, port });
+    socket.setTimeout(1_500);
+    const done = (probe: PortProbe) => {
+      socket.destroy();
+      settle(probe);
+    };
+    socket.once('connect', () => done('in_use'));
+    socket.once('timeout', () => done('unknown'));
+    socket.once('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ECONNREFUSED') done('free');
+      else if (
+        ['EADDRNOTAVAIL', 'EAFNOSUPPORT', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error.code ?? '')
+      )
+        done('no_address');
+      else done('unknown');
+    });
+  });
+}
+
+function nearest(path: string): string {
+  let current = resolve(path);
+  for (;;) {
+    try {
+      statSync(current);
+      return current;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return current;
+      current = parent;
+    }
+  }
+}
+
+function freeAt(path: string): number | null {
+  try {
+    const stats = statfsSync(nearest(path));
+    return stats.bavail * stats.bsize;
+  } catch {
+    return null;
+  }
+}
+
+function sameDisk(a: string, b: string): boolean | null {
+  try {
+    return statSync(nearest(a)).dev === statSync(nearest(b)).dev;
+  } catch {
+    return null;
+  }
+}
+
+const STREAM_TIMEOUT_MS = 6 * 60 * 60_000;
+/** A pipe holds 64 KB on Linux. */
+const PIPE_SLICE = 64 * 1024;
+
+/** Why a temporary folder took no private folder, by its error code. */
+const FOLDER_TROUBLE: Record<string, string> = {
+  ENOENT: 'which does not exist',
+  ENOTDIR: 'which is not a folder',
+  EROFS: 'which is read-only',
+  EACCES: 'which cannot be written to',
+  EPERM: 'which cannot be written to',
+  ENOSPC: 'which is full',
+};
+
+/** Why every source command on Windows is read without the bound. */
+const UNBOUNDED_ON_WINDOWS = 'Windows has no private pipe of the kind used elsewhere';
+
+/**
+ * A pipe for a source command's output that is read here only when the next bytes
+ * are wanted. Bun reads a command's own stdout as fast as the command writes it,
+ * whatever the sinks take, so a dump decrypted faster than it loads would gather in
+ * memory. On this pipe the command waits instead. Its name is removed at once.
+ * Where none can be made (no mkfifo, or a temporary folder that cannot be written),
+ * it says why, in plain words: the source is then read as Bun reads it, which works,
+ * only unbounded.
+ */
+function sourcePipe(): { read: number; write: number } | string {
+  let dir: string | null = null;
+  const opened: number[] = [];
+  const code = (error: unknown) =>
+    error instanceof Error && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : String(error instanceof Error ? error.message : error);
+  try {
+    const folder = tmpdir();
+    try {
+      dir = mkdtempSync(join(folder, 'openduet-stream-'));
+    } catch (error) {
+      const why = FOLDER_TROUBLE[code(error)] ?? `which gave ${code(error)}`;
+      return `No private pipe could be made in the temporary folder ${folder}, ${why}`;
+    }
+    const path = join(dir, 'source');
+    let made: ReturnType<typeof Bun.spawnSync>;
+    try {
+      made = Bun.spawnSync(['mkfifo', '-m', '600', path], { stdout: 'ignore', stderr: 'ignore' });
+    } catch (error) {
+      return code(error) === 'ENOENT' || /not found/i.test(String(error))
+        ? 'There is no mkfifo command on this machine to make a private pipe with'
+        : `mkfifo could not be run to make a private pipe (${code(error)})`;
+    }
+    if (made.exitCode !== 0) return `mkfifo exited ${made.exitCode} making a private pipe`;
+    // A read end that does not wait comes first, so neither of the others waits to open.
+    const opening = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    opened.push(opening);
+    const write = openSync(path, constants.O_WRONLY);
+    opened.push(write);
+    const read = openSync(path, constants.O_RDONLY);
+    opened.length = 0;
+    closeSync(opening);
+    return { read, write };
+  } catch (error) {
+    for (const fd of opened) closeSync(fd);
+    return `A private pipe could not be opened (${code(error)})`;
+  } finally {
+    if (dir !== null) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** How far a source is read ahead of its sinks: enough that reading and writing overlap. */
+const READ_AHEAD = 16;
+
+/**
+ * Reads a descriptor a pipe's worth at a time, at most READ_AHEAD pieces ahead of
+ * what was asked for, so a source that outruns its sinks holds about 1 MB here.
+ */
+function pulled(fd: number): ReadableStream<Uint8Array> {
+  let reading: Promise<unknown> = Promise.resolve();
+  let closed = false;
+  let cancelled = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    closeSync(fd);
+  };
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        const buffer = new Uint8Array(PIPE_SLICE);
+        const count = new Promise<number>((settle, fail) =>
+          read(fd, buffer, 0, buffer.length, null, (error, n) => (error ? fail(error) : settle(n))),
+        );
+        reading = count.catch(() => undefined);
+        let n: number;
+        try {
+          n = await count;
+        } catch (error) {
+          close();
+          throw error;
+        }
+        if (cancelled) return;
+        if (n === 0) {
+          close();
+          controller.close();
+        } else controller.enqueue(buffer.subarray(0, n));
+      },
+      cancel() {
+        // A read under way still uses the descriptor, so it is closed once that read
+        // returns: at once when the source, stopped, has exited, or with its next bytes.
+        cancelled = true;
+        void reading.then(close);
+      },
+    },
+    { highWaterMark: READ_AHEAD },
+  );
+}
+
+/**
+ * `unbounded` is told, once, why a source command is read without the bound, when it is.
+ */
+export async function stream(
+  source: Source,
+  sinks: readonly Endpoint[],
+  unbounded?: (reason: string) => void,
+): Promise<StreamResult> {
+  const hash = createHash('sha256');
+  let bytes = 0;
+  const problems: string[] = [];
+  let sourceStderr = '';
+  const files: number[] = [];
+  // stderr is read from the start, so a process that writes a lot there never stalls.
+  // `short`: bytes came that the sink no longer took, because it had closed its input or exited.
+  const children: {
+    name: string;
+    child: ReturnType<typeof Bun.spawn>;
+    stderr: Promise<string>;
+    exit: number | null;
+    short: boolean;
+  }[] = [];
+  let producer: ReturnType<typeof Bun.spawn> | null = null;
+  // Set when every sink had stopped taking bytes, and the source was stopped before its end.
+  let cut = false;
+  // Set when the source command was still running when it was stopped here.
+  let stoppedRunning = false;
+  // Called when a command sink exits, to wake the read that waits beside it.
+  let wake: (() => void) | undefined;
+  let producerStderr: Promise<string> = Promise.resolve('');
+  const short = (text: string) => text.trim().split('\n').slice(-3).join(' ').slice(0, 400);
+  try {
+    const writers: ((chunk: Uint8Array) => Promise<void>)[] = [];
+    const closers: (() => Promise<void>)[] = [];
+    for (const sink of sinks) {
+      if ('file' in sink) {
+        const fd = openSync(sink.file, 'wx', 0o600);
+        files.push(fd);
+        writers.push(async (chunk) => {
+          let offset = 0;
+          while (offset < chunk.length) offset += writeSync(fd, chunk, offset);
+        });
+      } else {
+        const child = Bun.spawn([...sink.command], {
+          stdin: 'pipe',
+          stdout: 'ignore',
+          stderr: 'pipe',
+        });
+        const entry = {
+          name: sink.command[0] ?? 'command',
+          child,
+          stderr: new Response(child.stderr as ReadableStream).text(),
+          exit: null as number | null,
+          short: false,
+        };
+        children.push(entry);
+        void child.exited.then((code) => {
+          entry.exit = code;
+          wake?.();
+        });
+        const stdin = child.stdin as import('bun').FileSink;
+        // A sink that stops reading early (pg_restore at its first error) says why by
+        // its exit; the bytes it no longer takes are dropped, never left to throw later.
+        // Bytes it did not take fail the stream even when it exits 0: its part is short.
+        let closed = false;
+        writers.push(async (chunk) => {
+          // A pipe's worth at a time: when the pipe breaks part way through a large
+          // write, Bun can drop the rest of it with no error, so a short sink went unseen.
+          for (let offset = 0; offset < chunk.length; offset += PIPE_SLICE) {
+            if (closed || entry.exit !== null) {
+              entry.short = true;
+              return;
+            }
+            try {
+              await stdin.write(chunk.subarray(offset, offset + PIPE_SLICE));
+              await stdin.flush();
+            } catch {
+              closed = true;
+              entry.short = true;
+            }
+          }
+        });
+        closers.push(async () => {
+          if (closed) return;
+          try {
+            await stdin.end();
+          } catch {
+            closed = true;
+          }
+        });
+      }
+    }
+    let reader: ReadableStream<Uint8Array>;
+    const producerName = 'command' in source ? (source.command[0] ?? 'command') : '';
+    if ('bytes' in source) reader = new Blob([source.bytes]).stream();
+    else if ('file' in source) reader = Bun.file(source.file).stream();
+    else {
+      // Windows has no named pipes of this kind: there, as where none can be made, the
+      // source is read as Bun reads it.
+      const made = process.platform === 'win32' ? UNBOUNDED_ON_WINDOWS : sourcePipe();
+      const pipe = typeof made === 'string' ? null : made;
+      if (typeof made === 'string') unbounded?.(made);
+      try {
+        producer = Bun.spawn([...source.command], {
+          stdin: 'ignore',
+          stdout: pipe ? pipe.write : 'pipe',
+          stderr: 'pipe',
+        });
+      } catch (error) {
+        if (pipe) closeSync(pipe.read);
+        throw error;
+      } finally {
+        // The command holds the write end alone, so the read ends when it does.
+        if (pipe) closeSync(pipe.write);
+      }
+      reader = pipe ? pulled(pipe.read) : (producer.stdout as ReadableStream<Uint8Array>);
+      producerStderr = new Response(producer.stderr as ReadableStream).text();
+    }
+    const timer = setTimeout(() => {
+      producer?.kill();
+      for (const { child } of children) child.kill();
+    }, STREAM_TIMEOUT_MS);
+    // Once no sink takes more and each has failed (by its exit, or by bytes it left),
+    // the rest of the source changes nothing: it is not read, so a restore that stops
+    // at its first error says so then, not after the whole dump. A sink that exited 0
+    // is waited on: the next bytes, if any come, show it stopped short. A file takes
+    // every byte, so a stream with a file sink, or with none, is always read to its end.
+    const watched = sinks.length > 0 && children.length === sinks.length;
+    const stopped = () =>
+      watched &&
+      children.every((entry) => entry.short || (entry.exit !== null && entry.exit !== 0));
+    const chunks = reader.getReader();
+    try {
+      let next = chunks.read();
+      let finished = false;
+      for (;;) {
+        // A sink's exit is raced with the next bytes, so a slow source does not delay its failure.
+        // The race is with a promise made for this read alone: one raced with a sink's own exit
+        // would hold every chunk read before that exit, so a long stream would fill memory.
+        const running = watched && children.some((entry) => entry.exit === null);
+        const step = running
+          ? await Promise.race([
+              next,
+              new Promise<null>((settle) => {
+                wake = () => settle(null);
+              }),
+            ])
+          : await next;
+        wake = undefined;
+        if (step === null) {
+          if (stopped()) break;
+          continue;
+        }
+        if (step.done) {
+          finished = true;
+          break;
+        }
+        hash.update(step.value);
+        bytes += step.value.length;
+        for (const write of writers) await write(step.value);
+        if (stopped()) break;
+        next = chunks.read();
+      }
+      cut = !finished;
+      if (cut) {
+        stoppedRunning =
+          producer !== null && producer.exitCode === null && producer.signalCode === null;
+        producer?.kill();
+        await chunks.cancel().catch(() => undefined);
+      }
+      for (const close of closers) await close();
+      if (producer) {
+        const [code, stderr] = await Promise.all([producer.exited, producerStderr]);
+        sourceStderr = stderr.trimEnd().slice(-400);
+        // A source stopped here says nothing of its own, whether the signal ended it or it
+        // exited on the pipe it could no longer write (docker run does); one that had already
+        // failed by itself still does.
+        if (code !== 0 && !stoppedRunning)
+          problems.push(`${producerName} exited ${code}: ${short(stderr)}`);
+      }
+      for (const { name, child, stderr: text, short: left } of children) {
+        const [code, stderr] = await Promise.all([child.exited, text]);
+        if (code !== 0) problems.push(`${name} exited ${code}: ${short(stderr)}`);
+        else if (left)
+          problems.push(
+            `${name} exited 0 but stopped reading before the end of its input${stderr.trim() ? `: ${short(stderr)}` : ''}`,
+          );
+      }
+    } finally {
+      clearTimeout(timer);
+      // Lets go of the source when something here failed part way; otherwise a no-op.
+      await chunks.cancel().catch(() => undefined);
+    }
+  } catch (error) {
+    problems.push(error instanceof Error ? error.message : String(error));
+    producer?.kill();
+    for (const { child } of children) child.kill();
+  } finally {
+    for (const fd of files) closeSync(fd);
+  }
+  return {
+    ok: problems.length === 0,
+    bytes,
+    sha256: hash.digest('hex'),
+    detail: problems.join('; '),
+    stderr: sourceStderr,
+  };
+}
+
+/**
+ * `quiet` (--json) keeps the line that a backup or restore reads without the memory
+ * bound off stderr. It is said once a run: its reason is the same for every part.
+ */
+export function realContext(
+  deployDir: string = DEFAULT_DEPLOY_DIR,
+  options: { quiet?: boolean } = {},
+): Context {
+  const dir = resolve(deployDir);
+  let told = false;
+  const unbounded = (reason: string) => {
+    if (options.quiet || told) return;
+    told = true;
+    process.stderr.write(
+      `${reason}, so this backup or restore reads its data without a memory limit. It will work, but may use as much memory as the data it moves.\n`,
+    );
+  };
+  return {
+    deployDir: dir,
+    root: dirname(dir),
+    run: (command, timeoutMs = 60_000) => spawnCommand(command, timeoutMs),
+    attach,
+    machine: localMachine,
+    probePort,
+    fetch: (url, init) => fetch(url, init),
+    stream: (source, sinks) => stream(source, sinks, unbounded),
+    freeAt,
+    sameDisk,
+    sleep: (ms) => Bun.sleep(ms),
+    now: () => new Date(),
+    environment: process.env,
+    out: (text) => process.stdout.write(text),
+    err: (text) => process.stderr.write(text),
+  };
+}

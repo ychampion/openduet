@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["bun"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "baseUrl": "../..",
+    "paths": {
+      "@openduet/client": ["./packages/client/src/index.ts"],
+      "@openduet/client/*": ["./packages/client/src/*"],
+      "@openduet/contracts/redact": ["./packages/contracts/src/redact.ts"],
+      "@openduet/contracts/mention": ["./packages/contracts/src/mention.ts"],
+      "@openduet/contracts/agent-library": ["./packages/contracts/src/agent-library.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"]
+}

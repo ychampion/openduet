@@ -1,0 +1,80 @@
+# Add to the base file with -f docker-compose.yml -f docker-compose.browser.yml.
+# One worker and one pre-existing space subdirectory; duplicate the deployment
+# with distinct control networks to add another space. No control port is published.
+networks:
+  browser-control:
+    driver: bridge
+    internal: true
+  browser-egress:
+    driver: bridge
+    internal: false
+
+services:
+  openduet:
+    networks: [edge, internal, browser-control]
+    depends_on:
+      browser:
+        condition: service_healthy
+    environment:
+      OPENDUET_BROWSER_URL: http://browser:3132
+      OPENDUET_BROWSER_SPACE: ${OPENDUET_BROWSER_SPACE:?set OPENDUET_BROWSER_SPACE in .env}
+      OPENDUET_BROWSER_TOKEN: ${OPENDUET_BROWSER_TOKEN:?set OPENDUET_BROWSER_TOKEN in .env}
+
+  browser:
+    # The published image when OPENDUET_IMAGE_TAG is set, as the base file's services
+    # are; otherwise the name Compose gives a build, <project>-browser:latest.
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/openduet-browser:}${OPENDUET_IMAGE_TAG:-${COMPOSE_PROJECT_NAME:-openduet}-browser}"
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.browser
+    restart: unless-stopped
+    # The same bound as the base file's services; an anchor cannot cross files.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        labels: "com.docker.compose.project,com.docker.compose.service"
+    init: true
+    networks: [browser-control, browser-egress]
+    user: "10003:10003"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      # Chromium puts each renderer in a user namespace of its own, which the engine's default
+      # seccomp profile refuses. config/browser-seccomp.json is that default profile with the
+      # user, pid and net namespace calls the sandbox makes added to it, and nothing else.
+      - seccomp=./config/browser-seccomp.json
+    pids_limit: 384
+    mem_limit: 2g
+    shm_size: 256m
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    stop_grace_period: 20s
+    environment:
+      OPENDUET_BROWSER_SPACE: ${OPENDUET_BROWSER_SPACE:?set OPENDUET_BROWSER_SPACE in .env}
+      OPENDUET_BROWSER_ROOT: /space
+      OPENDUET_BROWSER_TOKEN: ${OPENDUET_BROWSER_TOKEN:?set OPENDUET_BROWSER_TOKEN in .env}
+      OPENDUET_BROWSER_HOST: 0.0.0.0
+      OPENDUET_BROWSER_PORT: "3132"
+      PLAYWRIGHT_BROWSERS_PATH: /opt/chromium
+    volumes:
+      - type: volume
+        source: spaces
+        target: /space
+        read_only: false
+        volume:
+          nocopy: true
+          subpath: ${OPENDUET_BROWSER_SPACE:?set OPENDUET_BROWSER_SPACE in .env}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3132/health',{headers:{authorization:'Bearer '+process.env.OPENDUET_BROWSER_TOKEN}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      start_interval: 1s
+      retries: 3

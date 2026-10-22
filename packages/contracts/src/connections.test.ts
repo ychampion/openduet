@@ -1,0 +1,913 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  ACCOUNT_CATALOG,
+  COMMAND_LINE_ADAPTERS,
+  CONNECTION_CHECK_DETAIL,
+  CONNECTION_KIND_DESCRIPTORS,
+  CONNECTION_KIND_SCOPES,
+  type ConnectionFormItemField,
+  type ConnectionKindDescriptor,
+  connectionCheck,
+  connectionInstallation,
+  connectionKindListResponse,
+  connectionRequestProblem,
+  connectionResponse,
+  createConnectionRequest,
+  modalTokenParts,
+  SANDBOX_ADAPTER_DESKTOP,
+  SANDBOX_ADAPTERS,
+  sandboxAdapterHasDesktop,
+  sandboxAdapterTakesKey,
+  sandboxCredentialRefusal,
+} from './connections.ts';
+import { connectionView } from './entities.ts';
+import { addressPointsAtHost, mayPullImage, mcpConnectionConfig } from './mcp.ts';
+import { MCP_CATALOG } from './mcp-catalog.ts';
+
+const SPACE = 'sp_01J00000000000000000000000';
+
+const mail = {
+  space_id: SPACE,
+  provider: 'imap',
+  label: 'Personal mail',
+  credentials: { password: 'app-password-value' },
+  mail: {
+    username: 'owner@example.test',
+    from: 'owner@example.test',
+    imap: { host: 'imap.example.test', port: 993, secure: true },
+    smtp: { host: 'smtp.example.test', port: 465, secure: true },
+  },
+};
+const caldav = {
+  space_id: SPACE,
+  provider: 'caldav',
+  label: 'Calendar',
+  credentials: { password: 'calendar-password' },
+  caldav: { calendar_url: 'https://dav.example.test/calendars/owner/', username: 'owner' },
+};
+const ics = {
+  provider: 'caldav',
+  label: 'Holidays',
+  ics: { url: 'webcal://feeds.example.test/holidays.ics?token=private' },
+};
+const mcp = {
+  space_id: SPACE,
+  provider: 'mcp',
+  label: 'Notes',
+  mcp: {
+    id: 'notes',
+    url: 'https://mcp.example.test/mcp',
+    allowed_scopes: ['mcp_notes.search'],
+    audience: 'owner',
+    tools: [
+      {
+        name: 'search',
+        alias: 'search',
+        required_scopes: ['mcp_notes.search'],
+        effect_class: 'read',
+      },
+    ],
+  },
+};
+
+const mcpStdio = {
+  space_id: SPACE,
+  provider: 'mcp',
+  label: 'Files',
+  mcp_stdio: {
+    id: 'files',
+    runner: 'npx',
+    source: '@modelcontextprotocol/server-filesystem@2026.1.14',
+    args: ['/data'],
+    secret_env: [{ name: 'FILES_TOKEN', value: 'sealed-on-arrival' }],
+    allowed_scopes: ['mcp_files.read'],
+    audience: 'owner',
+    tools: [
+      {
+        name: 'read_file',
+        alias: 'read',
+        required_scopes: ['mcp_files.read'],
+        effect_class: 'read',
+      },
+    ],
+  },
+};
+
+const resolve = (input: unknown) => connectionInstallation(createConnectionRequest.parse(input));
+
+describe('connection installation requests', () => {
+  test('each credentialed kind resolves to its provider, configuration and default scopes', () => {
+    const resolved = [mail, caldav, ics, mcp, mcpStdio].map(resolve);
+    expect(
+      resolved.map((item) => (item.ok ? [item.value.kind, item.value.provider] : item)),
+    ).toEqual([
+      ['mail', 'imap'],
+      ['caldav', 'caldav'],
+      ['ics', 'caldav'],
+      ['mcp', 'mcp'],
+      ['mcp_stdio', 'mcp'],
+    ]);
+    const [first, second, third] = resolved;
+    expect(first?.ok && first.value.kind === 'mail' && first.value.scopes).toEqual([
+      ...CONNECTION_KIND_SCOPES.mail,
+    ]);
+    expect(second?.ok && second.value.kind === 'caldav' && second.value.scopes).toEqual([
+      ...CONNECTION_KIND_SCOPES.caldav,
+    ]);
+    // A webcal address is the same feed over HTTPS.
+    expect(third?.ok && third.value.kind === 'ics' && third.value.config.url).toBe(
+      'https://feeds.example.test/holidays.ics?token=private',
+    );
+  });
+
+  test('a narrower grant is kept and a scope outside the kind is refused', () => {
+    const narrowed = resolve({ ...mail, scopes: ['email.search', 'email.read'] });
+    expect(narrowed.ok && narrowed.value.kind === 'mail' && narrowed.value.scopes).toEqual([
+      'email.search',
+      'email.read',
+    ]);
+    expect(resolve({ ...mail, scopes: ['calendar.list'] }).ok).toBe(false);
+    expect(resolve({ ...ics, scopes: ['calendar.create'] }).ok).toBe(false);
+    expect(resolve({ ...mcp, scopes: ['mcp_notes.search'] }).ok).toBe(false);
+  });
+
+  test('the configuration block must be single and match the provider', () => {
+    expect(resolve({ space_id: SPACE, provider: 'imap', label: 'Nothing' }).ok).toBe(false);
+    expect(resolve({ ...mail, caldav: caldav.caldav }).ok).toBe(false);
+    expect(resolve({ ...mail, provider: 'caldav' }).ok).toBe(false);
+    expect(resolve({ ...ics, provider: 'imap' }).ok).toBe(false);
+    expect(resolve({ ...caldav, provider: 'mcp' }).ok).toBe(false);
+  });
+
+  test('credentials are required where the kind has one and refused where it has none', () => {
+    expect(resolve({ ...mail, credentials: undefined }).ok).toBe(false);
+    expect(resolve({ ...mail, credentials: { password: 'x', token: 'y' } }).ok).toBe(false);
+    expect(resolve({ ...caldav, credentials: {} }).ok).toBe(false);
+    expect(resolve({ ...ics, credentials: { password: 'unused' } }).ok).toBe(false);
+  });
+
+  test('a stdio MCP launch names only a registry package or an image, never a flag, URL or path', () => {
+    const parse = (patch: Record<string, unknown>) =>
+      createConnectionRequest.safeParse({
+        ...mcpStdio,
+        mcp_stdio: { ...mcpStdio.mcp_stdio, ...patch },
+      }).success;
+    expect(parse({})).toBe(true);
+    for (const source of [
+      'mcp-server-fetch',
+      'mcp-server-fetch==2026.1.1',
+      'mcp-server-git[extra]>=1.0,<2',
+      'mcp-server-time@2026.1.0',
+    ])
+      expect([source, parse({ runner: 'uvx', source })]).toEqual([source, true]);
+    expect(
+      parse({ runner: 'image', source: `ghcr.io/example/server:1.0@sha256:${'a'.repeat(64)}` }),
+    ).toBe(true);
+    // A tag alone can move to other content.
+    expect(parse({ runner: 'image', source: 'ghcr.io/example/server:1.0' })).toBe(false);
+    expect(parse({ runner: 'image', source: `server@sha256:${'a'.repeat(64)}` })).toBe(true);
+    expect(
+      parse({ runner: 'image', source: `registry.local:5000/server@sha256:${'a'.repeat(64)}` }),
+    ).toBe(true);
+    // The engine pulls from the host, so a registry given as the host itself would point it
+    // at the host's own ports.
+    for (const registry of [
+      'localhost:5000',
+      'localhost',
+      'registry.localhost:5000',
+      '127.0.0.1:5000',
+      '127.1.2.3',
+      '172.17.0.1:2375',
+      '169.254.169.254',
+    ])
+      expect([
+        registry,
+        parse({ runner: 'image', source: `${registry}/server@sha256:${'a'.repeat(64)}` }),
+      ]).toEqual([registry, false]);
+    for (const source of [
+      '--registry=https://evil.example',
+      'git+https://example.test/repo.git',
+      'user/repo',
+      'file:../local',
+      'https://example.test/pkg.tgz',
+      'npm:other@1',
+      'name with space',
+    ])
+      expect([source, parse({ source })]).toEqual([source, false]);
+    expect(parse({ runner: 'uvx', source: '--with=evil' })).toBe(false);
+    expect(parse({ runner: 'image', source: 'Uppercase/Image' })).toBe(false);
+    expect(parse({ command: '--eval' })).toBe(false);
+    expect(parse({ egress: ['api.example.com', 'api.example.com:8443'] })).toBe(true);
+    for (const egress of [
+      ['localhost'],
+      ['10.0.0.1'],
+      ['api.example.com:0'],
+      ['a.b', 'a.b'],
+      ['*.example.com'],
+    ])
+      expect([egress, parse({ egress })]).toEqual([egress, false]);
+    for (const name of ['HOME', 'HTTPS_PROXY', 'lower', 'A-B'])
+      expect([name, parse({ secret_env: [{ name, value: 'x' }] })]).toEqual([name, false]);
+    expect(
+      parse({
+        secret_env: [
+          { name: 'TOKEN', value: 'x' },
+          { name: 'TOKEN', value: 'y' },
+        ],
+      }),
+    ).toBe(false);
+    // Its secrets are named variables in the block; the generic credentials record is refused.
+    expect(resolve({ ...mcpStdio, credentials: { password: 'x' } }).ok).toBe(false);
+    expect(resolve({ ...mcpStdio, scopes: ['mcp_files.read'] }).ok).toBe(false);
+  });
+
+  test('an image is pulled from any registry, except one that points back at the host', () => {
+    const pinned = (name: string) => `${name}@sha256:${'a'.repeat(64)}`;
+    const installs = (source: string) =>
+      createConnectionRequest.safeParse({
+        ...mcpStdio,
+        mcp_stdio: { ...mcpStdio.mcp_stdio, runner: 'image', source },
+      }).success;
+    // Public and private registries, and Docker Hub's short names.
+    for (const name of [
+      'registry.acme.com/tools/x:1',
+      '10.0.0.5:5000/x',
+      '192.168.1.20/team/server',
+      '[fd12::5]:5000/x',
+      'ghcr.io/example/server:1.0',
+      'alpine',
+      'org/image',
+    ])
+      expect([name, installs(pinned(name)), mayPullImage(pinned(name))]).toEqual([
+        name,
+        true,
+        true,
+      ]);
+    // Each reaches the host itself, its Docker engine or its cloud metadata service.
+    for (const name of [
+      '127.0.0.1.nip.io:2375/x',
+      '169.254.169.254.nip.io/x',
+      'metadata.google.internal/x',
+      'host.docker.internal/x',
+      'gateway.docker.internal/x',
+      'localhost:5000/x',
+      'registry.acme.com:2376/x',
+      '10.0.0.5:2375/x',
+      'metadata:80/x',
+      'instance-data:80/x',
+      '0.0.0.0/x',
+      '127.1/x',
+      '[::1]:5000/x',
+      '[fe80::1]/x',
+      '[::ffff:127.0.0.1]/x',
+      'app.127.0.0.1.nip.io/x',
+      'app-127-0-0-1.sslip.io/x',
+      '169-254-169-254.sslip.io/x',
+      '7f000001.nip.io/x',
+      '--1.sslip.io/x',
+      'fe80--1.sslip.io/x',
+      'a.0x7f000001/x',
+    ])
+      expect([name, installs(pinned(name)), mayPullImage(pinned(name))]).toEqual([
+        name,
+        false,
+        false,
+      ]);
+    // Still a digest-pinned reference.
+    expect(mayPullImage('registry.acme.com/tools/x:1')).toBe(false);
+  });
+
+  test('a resolved registry address is refused only when it is the host or its metadata service', () => {
+    for (const address of [
+      '127.0.0.1',
+      '127.8.9.10',
+      '0.0.0.0',
+      '169.254.169.254',
+      '100.100.100.200',
+      '::1',
+      '::',
+      '::ffff:127.0.0.1',
+      '::ffff:a9fe:a9fe',
+      '64:ff9b::7f00:1',
+      'fe80::1%eth0',
+      'febf::1',
+      'fd00:ec2::254',
+      'not-an-address',
+    ])
+      expect([address, addressPointsAtHost(address)]).toEqual([address, true]);
+    for (const address of [
+      '10.0.0.5',
+      '172.17.0.2',
+      '192.168.1.20',
+      '100.64.0.1',
+      '8.8.8.8',
+      'fd12::5',
+      '2606:4700::1111',
+      '::ffff:10.0.0.5',
+      'fec0::1',
+    ])
+      expect([address, addressPointsAtHost(address)]).toEqual([address, false]);
+  });
+
+  test('endpoints are validated per kind', () => {
+    const parse = (input: unknown) => createConnectionRequest.safeParse(input).success;
+    expect(
+      parse({ ...mail, mail: { ...mail.mail, imap: { ...mail.mail.imap, port: 70000 } } }),
+    ).toBe(false);
+    expect(parse({ ...mail, mail: { ...mail.mail, from: 'not-an-address' } })).toBe(false);
+    expect(parse({ ...mail, mail: { ...mail.mail, username: 'owner\r\nBcc: x' } })).toBe(false);
+    expect(parse({ ...mail, mail: { ...mail.mail, extra: true } })).toBe(false);
+    // A mailbox that starts in the clear and upgrades is a request the service
+    // takes; whether it upgrades is settled by the test, not by validation.
+    expect(
+      parse({
+        ...mail,
+        mail: {
+          ...mail.mail,
+          imap: { host: 'imap.example.test', port: 143, secure: false },
+          smtp: { host: 'smtp.example.test', port: 587, secure: false },
+        },
+      }),
+    ).toBe(true);
+    for (const calendar_url of [
+      'http://dav.example.test/calendars/owner/',
+      'https://owner:secret@dav.example.test/calendars/owner/',
+      'https://dav.example.test/calendars/owner/?x=1',
+    ])
+      expect(parse({ ...caldav, caldav: { ...caldav.caldav, calendar_url } })).toBe(false);
+    for (const url of [
+      'http://feeds.example.test/holidays.ics',
+      'ftp://feeds.example.test/holidays.ics',
+      'https://owner:secret@feeds.example.test/holidays.ics',
+    ])
+      expect(parse({ ...ics, ics: { url } })).toBe(false);
+    // A loopback fixture may be plain HTTP; nothing else may.
+    expect(parse({ ...ics, ics: { url: 'http://127.0.0.1:8080/feed.ics' } })).toBe(true);
+  });
+});
+
+/** Fill a form the way a client that knows only the descriptor would. */
+function filled(descriptor: ConnectionKindDescriptor): Record<string, unknown> {
+  const body: Record<string, unknown> = { label: descriptor.title };
+  const put = (target: Record<string, unknown>, path: string, value: unknown) => {
+    const keys = path.split('.');
+    let at = target;
+    for (const key of keys.slice(0, -1)) {
+      at[key] = at[key] ?? {};
+      at = at[key] as Record<string, unknown>;
+    }
+    at[keys.at(-1) as string] = value;
+  };
+  const sample = (field: ConnectionFormItemField): unknown => {
+    if (field.default !== undefined) return field.default;
+    if (field.input === 'select') return field.options?.[0]?.value;
+    if (field.input === 'number') return 993;
+    if (field.input === 'checkbox') return true;
+    if (field.input === 'email') return 'owner@example.test';
+    if (field.input === 'url') return 'https://service.example.test/path/';
+    if (field.path.endsWith('egress')) return ['registry.example.test'];
+    if (field.path === 'sms.allowed_numbers') return ['+15557654321'];
+    if (field.path === 'credentials.from_number') return '+15550001111';
+    if (field.path === 'credentials.account_sid') return `AC${'0'.repeat(32)}`;
+    if (field.path === 'credentials.auth_token') return 'a'.repeat(32);
+    if (field.input === 'string_list') return ['mcp_notes.search'];
+    if (field.path.endsWith('source')) return '@example/notes-server';
+    if (field.path === 'name') return 'NOTES_TOKEN';
+    // An AWS account's key, region and role, in the shapes IAM issues them.
+    if (field.path === 'credentials.access_key_id') return 'AKIAEXAMPLEKEY000001';
+    if (field.path === 'credentials.secret_access_key') return 'example/Secret+value0000000';
+    if (field.path.endsWith('.region')) return 'us-east-1';
+    if (field.path.endsWith('.role_arn')) return 'arn:aws:iam::123456789012:role/agent';
+    return field.path.endsWith('id') || field.path === 'alias' ? 'notes' : 'value';
+  };
+  for (const item of descriptor.fixed) put(body, item.path, item.value);
+  for (const field of descriptor.fields) {
+    if (field.input === 'list') {
+      const row: Record<string, unknown> = {};
+      for (const item of field.item_fields ?? []) put(row, item.path, sample(item));
+      put(body, field.path, [row]);
+    } else put(body, field.path, sample({ ...field, input: field.input }));
+  }
+  const scopes = descriptor.scopes.filter((scope) => scope.default).map((scope) => scope.scope);
+  if (scopes.length) body.scopes = scopes;
+  return body;
+}
+
+describe('connection kind descriptors', () => {
+  test('cover every credentialed kind and parse as the served response', () => {
+    const parsed = connectionKindListResponse.parse({ kinds: CONNECTION_KIND_DESCRIPTORS });
+    expect([...new Set(parsed.kinds.map((kind) => kind.kind))].sort()).toEqual([
+      'caldav',
+      'command_line',
+      'ics',
+      'mail',
+      'mcp',
+      'mcp_stdio',
+      'sandbox',
+      'sms',
+    ]);
+    const ids = parsed.kinds.map((kind) => kind.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    // Every kind keeps an entry for a server no provider entry names.
+    for (const kind of [
+      'caldav',
+      'ics',
+      'mail',
+      'mcp',
+      'mcp_stdio',
+      'sandbox',
+      'command_line',
+      'sms',
+    ])
+      expect(ids).toContain(kind);
+    for (const kind of parsed.kinds) {
+      const secrets = kind.fields.flatMap((field) => [
+        ...(field.secret ? [field.path] : []),
+        ...(field.item_fields ?? [])
+          .filter((item) => item.secret)
+          .map((item) => `${field.path}.${item.path}`),
+      ]);
+      expect(
+        secrets.every(
+          (path) =>
+            path.startsWith('credentials.') ||
+            path === 'ics.url' ||
+            path === 'mcp_stdio.secret_env.value',
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test('a form filled only from a descriptor is an installable request', () => {
+    for (const descriptor of CONNECTION_KIND_DESCRIPTORS) {
+      const request = createConnectionRequest.safeParse(filled(descriptor));
+      expect(request.success ? null : [descriptor.kind, request.error.issues]).toBeNull();
+      if (!request.success) continue;
+      const installation = connectionInstallation(request.data);
+      expect(installation.ok ? installation.value.kind : installation).toBe(descriptor.kind);
+    }
+  });
+
+  test('offered scopes are exactly the scopes the kind may be granted', () => {
+    for (const descriptor of CONNECTION_KIND_DESCRIPTORS) {
+      if (descriptor.kind === 'mcp' || descriptor.kind === 'mcp_stdio')
+        expect(descriptor.scopes).toEqual([]);
+      else if (descriptor.kind === 'command_line') {
+        // Each command-line service offers its own two grants, and nothing of another service.
+        const adapter = descriptor.fixed.find(
+          (item) => item.path === 'command_line.adapter',
+        )?.value;
+        expect(descriptor.scopes.map((scope) => scope.scope)).toEqual([
+          `egress.${adapter}_read`,
+          `egress.${adapter}_write`,
+        ]);
+      } else
+        expect(descriptor.scopes.map((scope) => scope.scope)).toEqual([
+          ...CONNECTION_KIND_SCOPES[descriptor.kind],
+        ]);
+    }
+    // Together the command-line services offer every grant the kind may hold.
+    expect(
+      CONNECTION_KIND_DESCRIPTORS.filter((kind) => kind.kind === 'command_line')
+        .flatMap((kind) => kind.scopes.map((scope) => scope.scope))
+        .sort(),
+    ).toEqual([...CONNECTION_KIND_SCOPES.command_line].sort());
+  });
+
+  test('each command-line service installs as itself, with only its own grants', () => {
+    // AWS takes a key and a region rather than a token; its own tests are below.
+    for (const adapter of COMMAND_LINE_ADAPTERS.filter((name) => name !== 'aws')) {
+      const request = (scopes: string[]) =>
+        connectionInstallation(
+          createConnectionRequest.parse({
+            label: adapter,
+            provider: 'command_line',
+            command_line: { adapter },
+            credentials: { token: 'token-value' },
+            scopes,
+          }),
+        );
+      const installed = request([]);
+      expect(
+        installed.ok && installed.value.kind === 'command_line' && installed.value,
+      ).toMatchObject({
+        config: { adapter },
+        scopes: [`egress.${adapter}_read`, `egress.${adapter}_write`],
+      });
+      const other = adapter === 'npm' ? 'gitlab' : 'npm';
+      const mixed = request([`egress.${adapter}_read`, `egress.${other}_write`]);
+      expect(mixed.ok).toBe(false);
+    }
+  });
+});
+
+describe('an AWS account for the agent’s computer', () => {
+  const aws = (extra: Record<string, unknown> = {}, credentials?: unknown) => ({
+    label: 'AWS',
+    provider: 'command_line',
+    command_line: { adapter: 'aws', region: 'eu-west-1', ...extra },
+    credentials: credentials ?? {
+      access_key_id: 'AKIAEXAMPLEKEY000001',
+      secret_access_key: 'example/Secret+value0000000',
+    },
+  });
+
+  test('needs its key and a region, and takes a role only as an ARN', () => {
+    const installed = resolve(aws({ role_arn: 'arn:aws:iam::123456789012:role/agent' }));
+    expect(installed.ok ? installed.value : installed).toMatchObject({
+      kind: 'command_line',
+      config: {
+        adapter: 'aws',
+        region: 'eu-west-1',
+        role_arn: 'arn:aws:iam::123456789012:role/agent',
+      },
+      scopes: ['egress.aws_read', 'egress.aws_write'],
+    });
+    expect(resolve(aws({ region: undefined }))).toMatchObject({ ok: false });
+    expect(resolve(aws({}, { token: 'github_pat_x' }))).toMatchObject({ ok: false });
+    expect(resolve(aws({ external_id: 'ext-1' }))).toMatchObject({ ok: false });
+    expect(createConnectionRequest.safeParse(aws({ role_arn: 'admin' })).success).toBe(false);
+    expect(createConnectionRequest.safeParse(aws({ region: 'Earth' })).success).toBe(false);
+    // A GitHub account takes none of AWS's settings, and grants only GitHub's.
+    expect(
+      resolve({
+        ...aws(),
+        command_line: { adapter: 'github', region: 'eu-west-1' },
+        credentials: { token: 't' },
+      }),
+    ).toMatchObject({ ok: false });
+    expect(resolve({ ...aws(), scopes: ['egress.github_read'] })).toMatchObject({ ok: false });
+  });
+});
+
+describe('connection views and checks', () => {
+  const view = {
+    id: 'conn_01J00000000000000000000000',
+    space_id: SPACE,
+    provider: 'imap',
+    label: 'Personal mail',
+    scopes: ['email.search'],
+    status: 'revoked',
+    health: 'unknown',
+    generation: 2,
+    last_checked_at: null,
+    created_at: '2026-01-01T00:00:00.000Z',
+  };
+
+  test('a revoked connection is still a readable view and never carries its secret pointer', () => {
+    const parsed = connectionView.parse({ ...view, secret_ref: 'sec_01J00000000000000000000000' });
+    expect(parsed.status).toBe('revoked');
+    expect(parsed.generation).toBe(2);
+    expect(JSON.stringify(parsed)).not.toContain('sec_');
+  });
+
+  test('a check is a fixed code and sentence, not a transport message', () => {
+    const check = connectionCheck.parse({
+      status: 'failing',
+      code: 'unavailable',
+      detail: CONNECTION_CHECK_DETAIL.unavailable,
+      checked_at: '2026-01-01T00:00:00.000Z',
+    });
+    expect(connectionResponse.parse({ connection: view, check }).check?.code).toBe('unavailable');
+    expect(connectionCheck.safeParse({ ...check, code: 'ECONNREFUSED 10.0.0.1' }).success).toBe(
+      false,
+    );
+  });
+
+  test('what a person is told about a check names no setting only the operator can change', () => {
+    for (const detail of Object.values(CONNECTION_CHECK_DETAIL))
+      expect(detail).not.toContain('OPENDUET_');
+    expect(CONNECTION_CHECK_DETAIL.needs_sign_in).toContain('Choose Sign in');
+  });
+});
+
+describe('what a person is told when a request is refused', () => {
+  const told = (body: unknown) => {
+    const parsed = createConnectionRequest.safeParse(body);
+    if (parsed.success) throw new Error('expected a refusal');
+    return connectionRequestProblem(parsed.error.issues);
+  };
+
+  test('names the field by its form label and says what is wrong in plain words', () => {
+    expect(
+      told({ ...mail, mail: { ...mail.mail, imap: { ...mail.mail.imap, port: 70000 } } }),
+    ).toBe('IMAP port is too large.');
+    expect(told({ ...mail, mail: { ...mail.mail, from: 'owner' } })).toBe(
+      'Send as is not an email address.',
+    );
+    expect(told({ ...mail, mail: { ...mail.mail, imap: { port: 993, secure: true } } })).toBe(
+      'IMAP server is needed.',
+    );
+    expect(
+      told({ ...caldav, caldav: { ...caldav.caldav, calendar_url: 'http://dav.example.test/c/' } }),
+    ).toBe('Calendar address: The address must use TLS and carry no credentials or fragment.');
+    expect(told({ ...ics, ics: {} })).toBe('Feed address is needed.');
+  });
+
+  test('a row in a list is named by its position', () => {
+    const mcp = {
+      provider: 'mcp',
+      label: 'Notes',
+      mcp: {
+        id: 'notes',
+        url: 'https://mcp.example.test/mcp',
+        audience: 'owner',
+        allowed_scopes: ['mcp_notes.search'],
+        tools: [{ name: 'search', alias: 'Search Tool', required_scopes: ['mcp_notes.search'] }],
+      },
+    };
+    expect(told(mcp)).toBe('Tools, row 1: Alias has characters it cannot contain.');
+  });
+
+  test('never repeats a value the person typed, so a password cannot come back', () => {
+    const message = told({
+      ...mail,
+      credentials: { password: 42 } as unknown as Record<string, string>,
+    });
+    expect(message).toBe('Password has the wrong kind of value.');
+    expect(
+      told({
+        ...mail,
+        mail: { ...mail.mail, imap: { ...mail.mail.imap, port: 'value-never-echoed' } },
+      }),
+    ).not.toContain('value-never-echoed');
+  });
+});
+
+describe('an address that is not a web address', () => {
+  test('is refused as invalid rather than failing the request', () => {
+    for (const body of [
+      { ...ics, ics: { url: 'not a link' } },
+      { ...caldav, caldav: { ...caldav.caldav, calendar_url: 'dav.example.test/calendars' } },
+      {
+        provider: 'mcp',
+        label: 'Notes',
+        mcp: {
+          id: 'notes',
+          url: 'mcp.example.test',
+          audience: 'owner',
+          allowed_scopes: ['mcp_notes.search'],
+          tools: [{ name: 'search', alias: 'search', required_scopes: ['mcp_notes.search'] }],
+        },
+      },
+    ]) {
+      const parsed = createConnectionRequest.safeParse(body);
+      expect(parsed.success).toBe(false);
+      if (!parsed.success)
+        expect(connectionRequestProblem(parsed.error.issues)).toMatch(
+          /^(Feed address|Calendar address|Server address) is not a web address\.$/,
+        );
+    }
+  });
+});
+
+describe('a mailbox sender', () => {
+  test('is the account name when that is an address, so a person types it once', () => {
+    const { from: _, ...rest } = mail.mail;
+    const resolved = connectionInstallation(createConnectionRequest.parse({ ...mail, mail: rest }));
+    expect(
+      resolved.ok && resolved.value.kind === 'mail' ? resolved.value.config.from : resolved,
+    ).toBe('owner@example.test');
+  });
+
+  test('is asked for when the account name is not an address', () => {
+    const { from: _, ...rest } = mail.mail;
+    const resolved = connectionInstallation(
+      createConnectionRequest.parse({ ...mail, mail: { ...rest, username: 'owner' } }),
+    );
+    expect(resolved).toEqual({
+      ok: false,
+      error: 'Send as is needed when the account name is not an email address.',
+    });
+  });
+});
+
+describe('a CalDAV calendar', () => {
+  test('may be named by its calendar service instead of its own address, never both', () => {
+    const service = { server_url: 'https://caldav.example.test/', username: 'owner' };
+    const resolved = resolve({ ...caldav, caldav: service });
+    expect(resolved.ok && resolved.value.config).toEqual(service);
+    const both = createConnectionRequest.safeParse({
+      ...caldav,
+      caldav: { ...caldav.caldav, server_url: service.server_url },
+    });
+    expect(both.success ? 'accepted' : connectionRequestProblem(both.error.issues)).toBe(
+      'Calendar address: Give either the calendar address or the calendar service address.',
+    );
+    const plain = createConnectionRequest.safeParse({
+      ...caldav,
+      caldav: { server_url: 'http://caldav.example.test/', username: 'owner' },
+    });
+    expect(plain.success).toBe(false);
+  });
+});
+
+describe('providers whose servers are known', () => {
+  // Command-line services are told apart by their adapter, not by known servers.
+  const providers = CONNECTION_KIND_DESCRIPTORS.filter(
+    (kind) => kind.id !== kind.kind && kind.kind !== 'command_line',
+  );
+
+  test('ask only for an address and an app password, or a feed address', () => {
+    expect(providers.map((kind) => kind.id)).toEqual([
+      'gmail',
+      'icloud-mail',
+      'fastmail',
+      'yahoo-mail',
+      'icloud-calendar',
+      'fastmail-calendar',
+      'google-calendar-feed',
+    ]);
+    for (const kind of providers) {
+      const shown = kind.fields.map((field) => field.path).sort();
+      expect(shown).toEqual(
+        kind.kind === 'ics'
+          ? ['ics.url']
+          : [`${kind.kind}.username`, 'credentials.password'].sort(),
+      );
+      expect(kind.fields.find((field) => field.secret)?.help).toBeTruthy();
+    }
+  });
+
+  test('fill in their servers, so what the person typed becomes a complete installation', () => {
+    const typed = (kind: ConnectionKindDescriptor) =>
+      kind.kind === 'ics'
+        ? { ics: { url: 'https://calendar.google.com/calendar/ical/me/private-x/basic.ics' } }
+        : {
+            [kind.kind]: { username: 'me@example.test' },
+            credentials: { password: 'app-password' },
+          };
+    const installed = Object.fromEntries(
+      providers.map((kind) => {
+        const body: Record<string, unknown> = { label: kind.title };
+        for (const { path, value } of kind.fixed) {
+          const keys = path.split('.');
+          let at = body;
+          for (const key of keys.slice(0, -1)) {
+            at[key] = at[key] ?? {};
+            at = at[key] as Record<string, unknown>;
+          }
+          at[keys.at(-1) as string] = value;
+        }
+        const extra = typed(kind) as Record<string, Record<string, unknown>>;
+        for (const [key, value] of Object.entries(extra))
+          body[key] = { ...((body[key] as object) ?? {}), ...value };
+        const resolved = connectionInstallation(createConnectionRequest.parse(body));
+        if (!resolved.ok) throw new Error(`${kind.id}: ${resolved.error}`);
+        return [kind.id, resolved.value.kind === 'mcp' ? null : resolved.value.config];
+      }),
+    );
+    expect(installed.gmail).toEqual({
+      username: 'me@example.test',
+      from: 'me@example.test',
+      imap: { host: 'imap.gmail.com', port: 993, secure: true },
+      smtp: { host: 'smtp.gmail.com', port: 465, secure: true },
+    });
+    // iCloud sends over STARTTLS on 587, which the connector demands before it signs in.
+    expect(installed['icloud-mail']).toMatchObject({
+      smtp: { host: 'smtp.mail.me.com', port: 587, secure: false },
+    });
+    expect(installed['icloud-calendar']).toEqual({
+      server_url: 'https://caldav.icloud.com/',
+      username: 'me@example.test',
+    });
+  });
+});
+
+describe('the one sandbox credential field', () => {
+  test('is read as the adapter it belongs to, and never split into one', () => {
+    // Modal wants both halves, exactly once.
+    expect(modalTokenParts('ak-token-id:as-token-secret')).toEqual({
+      token_id: 'ak-token-id',
+      token_secret: 'as-token-secret',
+    });
+    for (const key of ['ak-token-id', ':as-token-secret', 'ak-token-id:', 'a:b:c', ''])
+      expect([key, modalTokenParts(key)]).toEqual([key, null]);
+
+    // Each adapter refuses the other's shape, and says what it wants instead.
+    expect(sandboxCredentialRefusal('modal', 'ak-token-id:as-token-secret')).toBeNull();
+    expect(sandboxCredentialRefusal('modal', 'ak-token-id')).toContain('token_id:token_secret');
+    expect(sandboxCredentialRefusal('e2b', 'e2b_0123456789')).toBeNull();
+    expect(sandboxCredentialRefusal('e2b', 'ak-token-id:as-token-secret')).toContain(
+      'has no colon in it',
+    );
+    expect(sandboxCredentialRefusal('daytona', 'dtn_0123456789')).toBeNull();
+    expect(sandboxCredentialRefusal('daytona', 'ak-token-id:as-token-secret')).toContain(
+      'has no colon in it',
+    );
+    expect(sandboxCredentialRefusal('maritime', 'mk_0123456789')).toBeNull();
+    expect(sandboxCredentialRefusal('maritime', 'ak-token-id:as-token-secret')).toContain(
+      'computers scope',
+    );
+    // One closed code, whichever adapter refused.
+    for (const [adapter, key] of [
+      ['modal', 'ak-token-id'],
+      ['e2b', 'a:b'],
+      ['daytona', 'a:b'],
+      ['maritime', 'a:b'],
+    ] as const)
+      expect(sandboxCredentialRefusal(adapter, key)).toStartWith('credential_invalid:');
+  });
+});
+
+describe('a sandbox on this service Docker engine', () => {
+  const sandbox = (adapter: string, credentials?: Record<string, string>) =>
+    resolve({
+      provider: 'sandbox',
+      label: 'Computer',
+      sandbox: {
+        adapter,
+        image: 'openduet-sandbox:local',
+        egress: 'open',
+        persistence: 'pause',
+        lifetime_seconds: 3600,
+      },
+      ...(credentials ? { credentials } : {}),
+    });
+
+  test('takes no key, and is granted the terminal and the desktop', () => {
+    const docker = sandbox('docker');
+    expect(
+      docker.ok && docker.value.kind === 'sandbox' ? docker.value.credentials : 'refused',
+    ).toBeNull();
+    expect(docker.ok && docker.value.kind === 'sandbox' ? docker.value.scopes : []).toEqual([
+      ...CONNECTION_KIND_SCOPES.sandbox,
+    ]);
+    expect(sandboxAdapterTakesKey('docker')).toBe(false);
+    expect(sandboxAdapterHasDesktop('docker')).toBe(true);
+  });
+
+  test('refuses a key it would seal and never read', () => {
+    const keyed = sandbox('docker', { api_key: 'e2b_0123456789' });
+    expect(keyed.ok ? 'accepted' : keyed.error).toStartWith('credential_invalid:');
+    expect(sandboxCredentialRefusal('docker', 'anything')).toContain('takes no key');
+  });
+
+  test('each adapter says whether its computers have a desktop', () => {
+    expect(SANDBOX_ADAPTER_DESKTOP).toEqual({
+      docker: true,
+      maritime: true,
+      e2b: false,
+      daytona: false,
+      modal: false,
+    });
+    for (const adapter of SANDBOX_ADAPTERS)
+      expect([adapter, sandboxAdapterHasDesktop(adapter)]).toEqual([
+        adapter,
+        SANDBOX_ADAPTER_DESKTOP[adapter],
+      ]);
+  });
+
+  test('a Maritime computer takes a key and is granted the terminal and the desktop', () => {
+    const installed = sandbox('maritime', { api_key: 'mk_0123456789' });
+    expect(
+      installed.ok && installed.value.kind === 'sandbox' ? installed.value.scopes : [],
+    ).toEqual([...CONNECTION_KIND_SCOPES.sandbox]);
+    expect(sandboxAdapterHasDesktop('maritime')).toBe(true);
+  });
+
+  test('an adapter without a desktop is granted the terminal and background processes alone', () => {
+    for (const [adapter, key] of [
+      ['e2b', 'e2b_0123456789'],
+      ['daytona', 'dtn_0123456789'],
+      ['modal', 'ak-token-id:as-token-secret'],
+    ] as const) {
+      const installed = sandbox(adapter, { api_key: key });
+      expect([
+        adapter,
+        installed.ok && installed.value.kind === 'sandbox' ? installed.value.scopes : installed,
+      ]).toEqual([
+        adapter,
+        CONNECTION_KIND_SCOPES.sandbox.filter((scope) => !scope.startsWith('computer.')),
+      ]);
+      expect(
+        installed.ok && installed.value.kind === 'sandbox' ? installed.value.scopes : [],
+      ).toContain('process.start');
+      expect(sandboxAdapterHasDesktop(adapter)).toBe(false);
+    }
+  });
+});
+
+describe('the connector catalog', () => {
+  test('every entry has its own id, and a known server is an address an MCP connection accepts', () => {
+    const ids = [
+      ...ACCOUNT_CATALOG.map((entry) => entry.id),
+      ...MCP_CATALOG.map((entry) => entry.id),
+      ...CONNECTION_KIND_DESCRIPTORS.map((kind) => kind.id),
+    ];
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const entry of MCP_CATALOG) {
+      expect(new URL(entry.url).protocol).toBe('https:');
+      // The suggested id is usable as the installation's own.
+      expect(
+        mcpConnectionConfig.safeParse({
+          id: entry.id,
+          url: entry.url,
+          audience: 'owner',
+          allowed_scopes: [`mcp_${entry.id}.search`],
+          tools: [{ name: 'search', alias: 'search', required_scopes: [`mcp_${entry.id}.search`] }],
+        }).success,
+      ).toBe(true);
+    }
+  });
+});

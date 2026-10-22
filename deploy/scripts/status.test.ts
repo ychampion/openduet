@@ -1,0 +1,312 @@
+import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  type Check,
+  gatherStatus,
+  getJson,
+  judgeModel,
+  judgeStatus,
+  parseComposePs,
+  parseDfAvailable,
+  render,
+  type StatusFacts,
+} from './status.ts';
+
+const GB = 1024 ** 3;
+
+const env = {
+  COMPOSE_PROJECT_NAME: 'openduet',
+  OPENDUET_DEFAULT_PROVIDER: 'anthropic',
+  OPENDUET_DEFAULT_MODEL: 'claude-model',
+  ANTHROPIC_API_KEY: 'sk-secret-value',
+  OPENDUET_ENABLE_FAKE_PROVIDER: 'false',
+  OPENDUET_IMAGE_TAG: 'main',
+  WEB_PORT: '3101',
+};
+
+const healthy: StatusFacts = {
+  docker: [],
+  dockerVersions: 'Engine 28.3.0, Compose 2.39.1',
+  env,
+  freeBytes: 40 * GB,
+  images: [
+    { name: 'postgres:17-alpine', present: true },
+    { name: 'ghcr.io/ychampion/openduet-service:main', present: true },
+  ],
+  services: ['postgres', 'openduet-cells', 'openduet', 'runtime', 'web'].map((service) => ({
+    service,
+    state: 'running',
+    health: 'healthy',
+  })),
+  health: { status: 'ok', database: 'ok' },
+  setupNeeded: false,
+};
+
+const find = (checks: Check[], name: string) => checks.find((check) => check.name === name);
+
+describe('the installation report', () => {
+  test('a healthy installation is ready, and no key is ever printed', () => {
+    const checks = judgeStatus(healthy);
+    expect(checks.filter((check) => check.level !== 'ok')).toEqual([]);
+    const text = render(checks);
+    expect(text).toContain('Ready.');
+    expect(text).not.toContain('sk-secret-value');
+    expect(JSON.stringify(checks)).not.toContain('sk-secret-value');
+  });
+
+  test('without deploy/.env it names configure and stops there', () => {
+    const checks = judgeStatus({ ...healthy, env: null, images: null, services: null });
+    expect(find(checks, 'Configuration')).toMatchObject({ level: 'fail' });
+    expect(find(checks, 'Configuration')?.fix).toContain('configure.ts --connect-in-app');
+    expect(find(checks, 'Services')).toBeUndefined();
+  });
+
+  test('a Docker problem fails with the reason', () => {
+    const checks = judgeStatus({ ...healthy, docker: ['Docker Engine 27.5 is too old.'] });
+    expect(find(checks, 'Docker')).toMatchObject({
+      level: 'fail',
+      detail: 'Docker Engine 27.5 is too old.',
+    });
+    // What depends on the engine is not reported as a second, misleading failure.
+    expect(find(checks, 'Images')).toBeUndefined();
+    expect(find(checks, 'Services')).toBeUndefined();
+  });
+
+  test('free space below the first-install minimum warns, and below the update floor fails', () => {
+    expect(find(judgeStatus({ ...healthy, freeBytes: 6 * GB }), 'Disk')?.level).toBe('warn');
+    expect(find(judgeStatus({ ...healthy, freeBytes: 2 * GB }), 'Disk')?.level).toBe('fail');
+    expect(find(judgeStatus({ ...healthy, freeBytes: null }), 'Disk')?.level).toBe('warn');
+  });
+
+  test('a missing image names pull for published images and a build otherwise', () => {
+    const missing = [{ name: 'ghcr.io/ychampion/openduet-web:main', present: false }];
+    expect(find(judgeStatus({ ...healthy, images: missing }), 'Images')?.fix).toContain(' pull');
+    const built = judgeStatus({
+      ...healthy,
+      env: { ...env, OPENDUET_IMAGE_TAG: '' },
+      images: [{ name: 'openduet-web:local', present: false }],
+    });
+    expect(find(built, 'Images')?.fix).toContain('--build');
+  });
+
+  test('services: none started, one unhealthy, one still starting', () => {
+    const none = judgeStatus({ ...healthy, services: [] });
+    expect(find(none, 'Services')).toMatchObject({ level: 'fail', detail: 'Not started.' });
+    expect(find(none, 'Services')?.fix).toContain('up -d --no-build --wait');
+
+    const services = healthy.services ?? [];
+    const sick = judgeStatus({
+      ...healthy,
+      services: services.map((s) => (s.service === 'runtime' ? { ...s, health: 'unhealthy' } : s)),
+    });
+    expect(find(sick, 'Services')).toMatchObject({ level: 'fail', detail: 'runtime unhealthy' });
+
+    const starting = judgeStatus({
+      ...healthy,
+      services: services.map((s) => (s.service === 'openduet' ? { ...s, health: 'starting' } : s)),
+    });
+    expect(find(starting, 'Services')?.level).toBe('warn');
+  });
+
+  test('the API and the account', () => {
+    expect(find(judgeStatus({ ...healthy, health: null }), 'API')?.level).toBe('fail');
+    expect(
+      find(
+        judgeStatus({ ...healthy, health: { status: 'degraded', database: 'unreachable' } }),
+        'API',
+      )?.level,
+    ).toBe('fail');
+    const fresh = judgeStatus({ ...healthy, setupNeeded: true });
+    expect(find(fresh, 'Account')).toMatchObject({ level: 'warn' });
+    expect(find(fresh, 'Account')?.fix).toContain('http://localhost:3101');
+    expect(render(fresh)).toContain('Running, with 1 thing(s) to finish.');
+  });
+
+  test('while the account is missing, it says how it is claimed', () => {
+    const exposed = { ...env, OPENDUET_PUBLIC_URL: 'https://m.example.net' };
+    const withCode = find(
+      judgeStatus({ ...healthy, env: exposed, setupNeeded: true, setupCodeRequired: true }),
+      'Account',
+    );
+    expect(withCode).toMatchObject({
+      level: 'warn',
+      detail: expect.stringContaining('setup code'),
+    });
+    expect(withCode?.fix).toContain('bun run openduet account setup-code');
+
+    // Open to the first visitor at an address other machines reach.
+    const open = find(
+      judgeStatus({
+        ...healthy,
+        env: { ...exposed, OPENDUET_SETUP_OPEN: 'true' },
+        setupNeeded: true,
+        setupCodeRequired: false,
+      }),
+      'Account',
+    );
+    expect(open).toMatchObject({ level: 'warn' });
+    expect(open?.detail).toContain('whoever opens https://m.example.net first becomes its owner');
+    expect(open?.detail).toContain('OPENDUET_SETUP_OPEN=true');
+    expect(open?.fix).toContain('OPENDUET_SETUP_OPEN=false');
+
+    // On this machine only, it is the plain first-account step.
+    const local = find(
+      judgeStatus({ ...healthy, setupNeeded: true, setupCodeRequired: false }),
+      'Account',
+    );
+    expect(local).toEqual({
+      level: 'warn',
+      name: 'Account',
+      detail: 'No account yet.',
+      fix: 'Open http://localhost:3101 and create your account.',
+    });
+    // Once it exists, none of that is said.
+    expect(
+      find(judgeStatus({ ...healthy, env: exposed, setupCodeRequired: false }), 'Account'),
+    ).toEqual({ level: 'ok', name: 'Account', detail: 'The owner account exists.' });
+  });
+
+  test('the computer is checked only when it is turned on', () => {
+    expect(find(judgeStatus(healthy), 'Computer')?.detail).toBe('Off (optional).');
+    const on = { ...env, OPENDUET_SANDBOX_PROVIDER: 'docker' };
+    expect(find(judgeStatus({ ...healthy, env: on }), 'Computer')?.level).toBe('fail');
+    const withImage = judgeStatus({
+      ...healthy,
+      env: on,
+      images: [{ name: 'ghcr.io/ychampion/openduet-sandbox:main', present: true }],
+    });
+    expect(find(withImage, 'Computer')?.level).toBe('ok');
+  });
+
+  test('voice and the public address are reported without their secrets', () => {
+    const checks = judgeStatus({
+      ...healthy,
+      env: {
+        ...env,
+        ELEVENLABS_API_KEY: 'el-secret',
+        OPENDUET_PUBLIC_URL: 'https://m.example.net/',
+      },
+    });
+    expect(find(checks, 'Voice')?.detail).toBe('On.');
+    expect(find(checks, 'Public address')?.detail).toContain('https://m.example.net/api/mcp');
+    expect(render(checks)).not.toContain('el-secret');
+  });
+});
+
+describe('the model as deploy/.env sets it', () => {
+  test('a key in the file is ok; an empty one points at the app', () => {
+    expect(judgeModel(env).level).toBe('ok');
+    const empty = judgeModel({ ...env, ANTHROPIC_API_KEY: '' });
+    expect(empty.level).toBe('warn');
+    expect(empty.fix).toContain('Settings › Models');
+  });
+
+  test('the practice model warns, and a setting that stops the service fails', () => {
+    expect(
+      judgeModel({ OPENDUET_DEFAULT_PROVIDER: 'fake', OPENDUET_ENABLE_FAKE_PROVIDER: 'true' })
+        .level,
+    ).toBe('warn');
+    expect(judgeModel({ OPENDUET_DEFAULT_PROVIDER: 'ollama' }).level).toBe('fail');
+  });
+});
+
+describe('reading Compose and df', () => {
+  test('both shapes of compose ps json', () => {
+    const lines =
+      '{"Service":"web","State":"running","Health":"healthy"}\n{"Service":"openduet","State":"exited","Health":""}\n';
+    expect(parseComposePs(lines)).toEqual([
+      { service: 'web', state: 'running', health: 'healthy' },
+      { service: 'openduet', state: 'exited', health: '' },
+    ]);
+    expect(parseComposePs('[{"Service":"web","State":"running","Health":"starting"}]')).toEqual([
+      { service: 'web', state: 'running', health: 'starting' },
+    ]);
+    expect(parseComposePs('')).toEqual([]);
+  });
+
+  test('the available column of df -Pk', () => {
+    const df =
+      'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sdd 1000 200 800 20% /docker-root\n';
+    expect(parseDfAvailable(df)).toBe(800 * 1024);
+    expect(parseDfAvailable('nonsense')).toBeNull();
+  });
+});
+
+test('/health answering 503 while the database is down still gives its report', async () => {
+  const server = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    fetch: () => Response.json({ status: 'degraded', database: 'unreachable' }, { status: 503 }),
+  });
+  try {
+    expect(await getJson(`http://127.0.0.1:${server.port}/health`)).toEqual({
+      status: 'degraded',
+      database: 'unreachable',
+    });
+  } finally {
+    server.stop(true);
+  }
+});
+
+describe('what the service says about its account reaches the report', () => {
+  /** An installation whose deploy/.env names a public address and opts out of the code. */
+  async function gathered(setup: Record<string, unknown>) {
+    const root = mkdtempSync(join(tmpdir(), 'openduet-status-'));
+    try {
+      mkdirSync(join(root, 'deploy'));
+      writeFileSync(
+        join(root, 'deploy/.env'),
+        'WEB_PORT=3101\nOPENDUET_PUBLIC_URL=https://m.example.net\nOPENDUET_SETUP_OPEN=true\n',
+      );
+      const asked: string[] = [];
+      const facts = await gatherStatus(
+        root,
+        [],
+        () => ({ code: 1, stdout: '', stderr: 'no engine' }),
+        async (url) => {
+          asked.push(url);
+          if (url.endsWith('/health')) return { status: 'ok', database: 'ok' };
+          if (url.endsWith('/setup')) return setup;
+          return null;
+        },
+      );
+      // No engine answers here, so what was gathered is judged on an otherwise healthy, configured stack.
+      const { env: settings, health, setupNeeded, setupCodeRequired } = facts;
+      const printed = render(
+        judgeStatus({
+          ...healthy,
+          env: { ...env, ...settings },
+          health,
+          setupNeeded,
+          setupCodeRequired,
+        }),
+      );
+      return { facts, asked, printed };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test('a code is required: the report says to enter it or make one', async () => {
+    const { facts, asked, printed } = await gathered({ needed: true, code_required: true });
+    expect(asked).toEqual(['http://127.0.0.1:3101/api/health', 'http://127.0.0.1:3101/api/setup']);
+    expect(facts.setupCodeRequired).toBe(true);
+    expect(printed).toContain('Creating it needs this installation’s setup code.');
+    expect(printed).toContain('bun run openduet account setup-code');
+  });
+
+  test('no code is required at a public address: the report warns who becomes the owner', async () => {
+    const { facts, printed } = await gathered({ needed: true, code_required: false });
+    expect(facts.setupCodeRequired).toBe(false);
+    expect(printed).toContain('whoever opens https://m.example.net first becomes its owner');
+  });
+
+  test('a service that does not say leaves it unknown', async () => {
+    const { facts, printed } = await gathered({ needed: true });
+    expect(facts.setupCodeRequired).toBeNull();
+    expect(printed).not.toContain('setup code');
+    expect(printed).not.toContain('whoever opens');
+  });
+});

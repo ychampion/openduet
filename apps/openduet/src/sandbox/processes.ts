@@ -1,0 +1,755 @@
+/**
+ * Background processes in an agent's computer, from the service's side.
+ *
+ * A process belongs to the computer, which is one agent in one space, and is
+ * attributed to the job and action that started it. Its row is written before
+ * anything starts, under a lock on the space, so the caps are decided by
+ * Postgres: a computer runs at most a few processes, a space a few more, and
+ * the processes of a space may keep its computers running, after the
+ * attempts that used them ended, for a set time each day (metered by
+ * `sessions.ts`). The action is unique on the row, so one admitted start is one process
+ * however often it is dispatched; the helper's own directory per process is
+ * the guard inside the computer.
+ *
+ * The rows follow the computer, never the other way round. Whenever the
+ * service talks to a computer it reconciles: a process the computer reports
+ * ended is closed with its exit status, one recorded under an earlier boot is
+ * lost, and one the service has already closed but the computer still runs
+ * is killed. A periodic sweep does the same for computers nobody is using,
+ * stops processes past their time limit, stops a space's processes once its
+ * allowance for the day is used, with a notice in the conversations that
+ * started them, and stops those whose starting job was cancelled or deleted,
+ * or whose starting turn was stopped (at once when the stop is made here, see
+ * `endStopped`, and by the sweep for any start that was still on its way).
+ * A computer found stopped while its session says it runs has lost its
+ * processes, and their rows are closed. A process outlives the job that started it when that
+ * job completes; that is the point of it.
+ */
+import type { ProcessState } from '@openduet/contracts';
+import type { Sql } from 'postgres';
+import { appendEvent, recordId } from '../broker/records.ts';
+import {
+  type ComputerStatus,
+  helperComputer,
+  type ProcessComputer,
+  type ProcessComputerFor,
+  type ProcessFacts,
+  ProcessHelperLost,
+  ProcessHelperRefusal,
+  ProcessHelperUnavailable,
+} from './process-helper.ts';
+import { awakeSecondsToday } from './sessions.ts';
+import type { SandboxHandle, SandboxProvider } from './types.ts';
+
+export type ProcessLimits = {
+  maxPerComputer: number;
+  maxPerSpace: number;
+  defaultTtlMinutes: number;
+  maxTtlMinutes: number;
+  outputMaxBytes: number;
+  /**
+   * How long a space's processes may keep its computers running in one UTC
+   * day. Undefined is no daily limit; the time is recorded either way.
+   */
+  awakeSecondsPerDay: number | undefined;
+};
+
+export const LIVE_STATES: readonly ProcessState[] = ['starting', 'running'];
+const FINAL_STATES: readonly ProcessState[] = ['exited', 'stopped', 'expired', 'lost'];
+
+export type ProcessRow = {
+  id: string;
+  spaceId: string;
+  agentId: string;
+  connectionId: string;
+  sessionId: string | null;
+  jobId: string | null;
+  actionId: string | null;
+  command: string;
+  commandDigest: string;
+  cwd: string;
+  name: string;
+  port: number | null;
+  state: ProcessState;
+  exitCode: number | null;
+  signal: string | null;
+  bootId: string | null;
+  startedAt: Date | null;
+  endedAt: Date | null;
+  expiresAt: Date;
+  outputCursor: number;
+  outputBytes: number;
+  lastLine: string | null;
+  lastOutputAt: Date | null;
+  endReason: string | null;
+  createdAt: Date;
+};
+
+/** One `sandbox_process` row as the service reads it. */
+export function rowOf(raw: Record<string, unknown>): ProcessRow {
+  const date = (value: unknown) => (value ? new Date(value as string) : null);
+  return {
+    id: String(raw.id),
+    spaceId: String(raw.space_id),
+    agentId: String(raw.agent_id),
+    connectionId: String(raw.connection_id),
+    sessionId: (raw.session_id as string | null) ?? null,
+    jobId: (raw.job_id as string | null) ?? null,
+    actionId: (raw.action_id as string | null) ?? null,
+    command: String(raw.command_redacted),
+    commandDigest: String(raw.command_digest),
+    cwd: String(raw.cwd),
+    name: String(raw.name),
+    port: raw.port === null || raw.port === undefined ? null : Number(raw.port),
+    state: raw.state as ProcessState,
+    exitCode: raw.exit_code === null || raw.exit_code === undefined ? null : Number(raw.exit_code),
+    signal: (raw.signal as string | null) ?? null,
+    bootId: (raw.boot_id as string | null) ?? null,
+    startedAt: date(raw.started_at),
+    endedAt: date(raw.ended_at),
+    expiresAt: new Date(raw.expires_at as string),
+    outputCursor: Number(raw.output_cursor ?? 0),
+    outputBytes: Number(raw.output_bytes ?? 0),
+    lastLine: (raw.last_line as string | null) ?? null,
+    lastOutputAt: date(raw.last_output_at),
+    endReason: (raw.end_reason as string | null) ?? null,
+    createdAt: new Date(raw.created_at as string),
+  };
+}
+
+/** A start the caps refuse; nothing was recorded and nothing ran. */
+export class ProcessRefusal extends Error {
+  override readonly name = 'ProcessRefusal';
+  constructor(
+    readonly code:
+      | 'computer_full'
+      | 'space_full'
+      | 'awake_allowance_used'
+      | 'no_computer'
+      | 'not_found',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Why a process was ended by the service, in words the person can be told. */
+export const END_REASONS = {
+  expired: 'its time limit passed',
+  allowance: "the space's awake time for today was used up",
+  job: 'the job that started it was cancelled or deleted',
+  turn: 'the turn that started it was stopped',
+  connection: "the computer's connection was revoked or removed",
+  computer_gone: 'the computer it ran in no longer exists',
+  computer_stopped:
+    'the computer it ran in was stopped (it reached its time limit, or its host restarted), which ends every process in it',
+  suspended:
+    "the attempt that used the computer ended, and on this computer's provider that stops every process in it",
+  restarted: 'the computer restarted, which ends every process in it',
+  vanished: 'its record in the computer is gone',
+  stopped: 'it was stopped',
+} as const;
+
+export type AdmitRequest = {
+  actionId: string;
+  spaceId: string;
+  agentId: string;
+  connectionId: string;
+  sessionId: string;
+  jobId: string;
+  command: string;
+  commandDigest: string;
+  cwd: string;
+  name: string;
+  port: number | null;
+  ttlMinutes: number | null;
+};
+
+/**
+ * Whether the attempt that started a process (`p`, with its action `a` and
+ * attempt `t` joined) was stopped or cancelled: Stop and a cancellation end
+ * the attempt in flight as fenced with a `cancelled` detail, and Stop marks
+ * the whole turn stopped, so a step of it that had already ended (one that
+ * then asked the person and waited) counts too. A takeover fences with its
+ * own detail and stops no turn, so it keeps its processes.
+ */
+const startedByStopped = (sql: Sql) =>
+  sql`((t.outcome = 'fenced' and t.outcome_detail->>'kind' = 'cancelled')
+    or exists (select 1 from experience_turn u where u.id = t.turn_id and u.status = 'stopped'))`;
+
+/** How long a start may take to reach the computer before its missing directory means it never did. */
+const STARTING_GRACE_MS = 300_000;
+/** A time as Postgres reads it; the driver is given text, never a Date. */
+const iso = (ms: number) => new Date(ms).toISOString();
+
+export type SandboxProcessesOptions = {
+  limits: ProcessLimits;
+  /** How the service reaches one computer's processes; the helper unless a test says otherwise. */
+  computerFor?: ProcessComputerFor;
+  now?: () => Date;
+  log?: (line: string) => void;
+};
+
+export type ProcessProviders = () => ReadonlyMap<
+  string,
+  { adapter: string; provider: SandboxProvider }
+>;
+
+export class SandboxProcesses {
+  readonly limits: ProcessLimits;
+  private readonly computerFor: ProcessComputerFor;
+  private readonly now: () => Date;
+  private readonly say: (line: string) => void;
+
+  constructor(
+    private readonly sql: Sql,
+    options: SandboxProcessesOptions,
+  ) {
+    this.limits = options.limits;
+    this.computerFor = options.computerFor ?? helperComputer;
+    this.now = options.now ?? (() => new Date());
+    this.say = options.log ?? ((line) => process.stderr.write(`${line}\n`));
+  }
+
+  computer(provider: SandboxProvider, handle: SandboxHandle): ProcessComputer {
+    return this.computerFor(provider, handle);
+  }
+
+  /** The time limit a start asks for, held to the longest allowed. */
+  ttlMinutes(requested: number | null): number {
+    return Math.min(requested ?? this.limits.defaultTtlMinutes, this.limits.maxTtlMinutes);
+  }
+
+  async get(id: string): Promise<ProcessRow | null> {
+    const [row] = await this.sql`select * from sandbox_process where id = ${id}`;
+    return row ? rowOf(row) : null;
+  }
+
+  async byAction(actionId: string): Promise<ProcessRow | null> {
+    const [row] = await this.sql`select * from sandbox_process where action_id = ${actionId}`;
+    return row ? rowOf(row) : null;
+  }
+
+  /** One computer's processes: every live one, then the most recent ended ones. */
+  async forComputer(spaceId: string, agentId: string, ended = 20): Promise<ProcessRow[]> {
+    const rows = await this.sql`(select * from sandbox_process
+        where space_id = ${spaceId} and agent_id = ${agentId}
+          and state in ('starting', 'running'))
+      union all
+      (select * from sandbox_process
+        where space_id = ${spaceId} and agent_id = ${agentId}
+          and state not in ('starting', 'running')
+        order by created_at desc limit ${ended})
+      order by created_at desc`;
+    return rows.map(rowOf);
+  }
+
+  /**
+   * How long the space's computers were kept running by their processes
+   * today (UTC), after the attempts that used them ended, in seconds.
+   */
+  awakeSecondsToday(spaceId: string, sql: Sql = this.sql): Promise<number> {
+    return awakeSecondsToday(sql, spaceId);
+  }
+
+  /**
+   * Record a start before anything runs, within the caps; or hand back the row
+   * an earlier dispatch of the same action wrote. Counting and inserting
+   * happen under one lock per space, so two starts cannot both take the last
+   * place.
+   */
+  async admit(request: AdmitRequest): Promise<{ row: ProcessRow; repeated: boolean }> {
+    return (await this.sql.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtext(${`sandbox-process:${request.spaceId}`}))`;
+      const [prior] = await tx`select * from sandbox_process where action_id = ${request.actionId}`;
+      if (prior) return { row: rowOf(prior), repeated: true };
+      const [counts] = await tx`select
+          count(*) filter (where agent_id = ${request.agentId})::int as computer,
+          count(*)::int as space
+        from sandbox_process
+        where space_id = ${request.spaceId} and state in ('starting', 'running')`;
+      if (Number(counts?.computer ?? 0) >= this.limits.maxPerComputer)
+        throw new ProcessRefusal(
+          'computer_full',
+          `This computer is already running ${this.limits.maxPerComputer} processes. Nothing was started. Stop one first, or tell the person`,
+        );
+      if (Number(counts?.space ?? 0) >= this.limits.maxPerSpace)
+        throw new ProcessRefusal(
+          'space_full',
+          `This space is already running ${this.limits.maxPerSpace} processes across its computers. Nothing was started. Stop one first, or tell the person`,
+        );
+      const allowance = this.limits.awakeSecondsPerDay;
+      if (
+        allowance !== undefined &&
+        (await this.awakeSecondsToday(request.spaceId, tx as unknown as Sql)) >= allowance
+      )
+        throw new ProcessRefusal(
+          'awake_allowance_used',
+          `This space's awake time for today is used up (${hours(allowance)} of ${hours(allowance)}). Nothing was started. It resets at midnight UTC; tell the person`,
+        );
+      const ttl = this.ttlMinutes(request.ttlMinutes);
+      const [row] = await tx`insert into sandbox_process
+          (id, space_id, agent_id, connection_id, session_id, job_id, action_id,
+           command_redacted, command_digest, cwd, name, port, state, expires_at)
+        values (${recordId('prc')}, ${request.spaceId}, ${request.agentId},
+          ${request.connectionId}, ${request.sessionId}, ${request.jobId}, ${request.actionId},
+          ${request.command}, ${request.commandDigest}, ${request.cwd}, ${request.name},
+          ${request.port}, 'starting',
+          ${iso(this.now().getTime() + ttl * 60_000)}::timestamptz)
+        returning *`;
+      if (!row) throw new Error('the process row was not written');
+      return { row: rowOf(row), repeated: false };
+    })) as { row: ProcessRow; repeated: boolean };
+  }
+
+  /** A start the helper refused or could not reach: the row is closed, since nothing runs. */
+  async abandon(id: string, reason: string): Promise<void> {
+    await this.sql`update sandbox_process
+      set state = 'lost', ended_at = coalesce(ended_at, now()), end_reason = ${reason.slice(0, 500)}
+      where id = ${id} and state = 'starting'`;
+  }
+
+  /**
+   * Bring one row up to what the computer says about its process. The row is
+   * changed only while it is still in the state it was read in: a copy read
+   * before a stop, an expiry or a cancellation closed it never reopens it, and
+   * a final state stays final. When the row moved on, it is read again.
+   */
+  async apply(row: ProcessRow, facts: ProcessFacts, boot: string): Promise<ProcessRow> {
+    const recordedBoot = row.bootId ?? boot;
+    let state: ProcessState = row.state;
+    let endReason: string | null = row.endReason;
+    let exitCode = row.exitCode;
+    if (LIVE_STATES.includes(row.state)) {
+      if (recordedBoot !== boot || facts.state === 'lost') {
+        state = 'lost';
+        endReason = END_REASONS.restarted;
+      } else if (facts.state === 'exited') {
+        state = 'exited';
+        exitCode = facts.exit_code;
+      } else if (facts.state === 'running') state = 'running';
+    }
+    const grew = facts.cursor > row.outputCursor;
+    const [updated] = await this.sql`update sandbox_process set
+        state = ${state},
+        exit_code = ${exitCode},
+        end_reason = ${endReason},
+        boot_id = coalesce(boot_id, ${boot}),
+        started_at = coalesce(started_at, ${facts.started ? iso(facts.started) : null}::timestamptz),
+        ended_at = case when ${state} in ('starting', 'running') then null
+          else coalesce(ended_at, now()) end,
+        output_cursor = greatest(output_cursor, ${facts.cursor}),
+        last_line = coalesce(${facts.last_line}, last_line),
+        last_output_at = case when ${grew} then now() else last_output_at end
+      where id = ${row.id} and state = ${row.state}
+        and state in ('starting', 'running')
+      returning *`;
+    if (updated) return rowOf(updated);
+    return (await this.get(row.id)) ?? row;
+  }
+
+  /** Close a row the service ended, with the reason it ended. */
+  async close(
+    id: string,
+    state: Extract<ProcessState, 'stopped' | 'expired' | 'lost' | 'exited'>,
+    reason: string | null,
+    facts?: ProcessFacts,
+  ): Promise<ProcessRow | null> {
+    const [row] = await this.sql`update sandbox_process set
+        state = ${state},
+        exit_code = coalesce(${facts?.state === 'exited' ? facts.exit_code : null}, exit_code),
+        end_reason = coalesce(end_reason, ${reason}),
+        ended_at = coalesce(ended_at, now()),
+        output_cursor = greatest(output_cursor, ${facts?.cursor ?? 0}),
+        last_line = coalesce(${facts?.last_line ?? null}, last_line)
+      where id = ${id} and state in ('starting', 'running')
+      returning *`;
+    // A row that ended meanwhile keeps the end it was given first.
+    return row ? rowOf(row) : this.get(id);
+  }
+
+  /** A later time limit, never past the longest from its start. */
+  async extend(id: string, ttlMinutes: number): Promise<ProcessRow | null> {
+    const minutes = Math.min(ttlMinutes, this.limits.maxTtlMinutes);
+    const [row] = await this.sql`update sandbox_process set
+        expires_at = least(
+          ${iso(this.now().getTime() + minutes * 60_000)}::timestamptz,
+          coalesce(started_at, created_at) + make_interval(mins => ${this.limits.maxTtlMinutes}))
+      where id = ${id} and state in ('starting', 'running')
+      returning *`;
+    return row ? rowOf(row) : null;
+  }
+
+  /**
+   * Whether a start may still be on its way: its action is still being
+   * dispatched, or it is younger than the longest a start's dispatch may take.
+   */
+  private async stillStarting(row: ProcessRow): Promise<boolean> {
+    if (this.now().getTime() - row.createdAt.getTime() < STARTING_GRACE_MS) return true;
+    if (!row.actionId) return false;
+    const [action] = await this.sql`select status from action where id = ${row.actionId}`;
+    return action?.status === 'dispatched';
+  }
+
+  /**
+   * Reconcile one computer's rows with what its helper reports, and end what
+   * the service has decided must end. Returns the rows as they now stand.
+   */
+  async reconcile(
+    spaceId: string,
+    agentId: string,
+    computer: ProcessComputer,
+    signal: AbortSignal,
+  ): Promise<ProcessRow[]> {
+    return this.reconcileWith(
+      spaceId,
+      agentId,
+      computer,
+      await computer.status('all', signal),
+      signal,
+    );
+  }
+
+  /** The same, from an answer to `status('all')` the caller already has. */
+  async reconcileWith(
+    spaceId: string,
+    agentId: string,
+    computer: ProcessComputer,
+    status: ComputerStatus,
+    signal: AbortSignal,
+  ): Promise<ProcessRow[]> {
+    const found = new Map(status.processes.map((facts) => [facts.id, facts]));
+    const rows = await this.forComputer(spaceId, agentId);
+    const out: ProcessRow[] = [];
+    for (const row of rows) {
+      const facts = found.get(row.id);
+      if (LIVE_STATES.includes(row.state)) {
+        if (!facts) {
+          // A start still on its way to the computer has not made its directory yet.
+          if (row.state === 'starting' && (await this.stillStarting(row))) {
+            out.push(row);
+            continue;
+          }
+          // A start whose helper never made the directory left nothing to find.
+          out.push(
+            (await this.close(row.id, 'lost', END_REASONS.vanished)) ?? { ...row, state: 'lost' },
+          );
+          continue;
+        }
+        const applied = await this.apply(row, facts, status.boot);
+        out.push(applied);
+        // A supervisor that died leaves the process lost, while what it started may run on.
+        if (orphaned(facts, row, status.boot))
+          await computer.stop(row.id, 0, signal).catch((error) => {
+            this.say(`process ${row.id} could not be killed: ${String(error)}`);
+          });
+        continue;
+      }
+      // Ended here and still running there: the service's decision stands.
+      if (
+        facts &&
+        (facts.state === 'running' || orphaned(facts, row, status.boot)) &&
+        (row.bootId ?? status.boot) === status.boot
+      ) {
+        await computer.stop(row.id, 0, signal).catch((error) => {
+          this.say(`process ${row.id} could not be killed: ${String(error)}`);
+        });
+      }
+      out.push(row);
+    }
+    return out;
+  }
+
+  /**
+   * Stop one live process and close its row with the reason. Whatever the
+   * computer answers, the row ends: a computer that cannot be reached kills
+   * nothing, and the next contact with it does.
+   */
+  async end(
+    row: ProcessRow,
+    computer: ProcessComputer | null,
+    state: 'stopped' | 'expired',
+    reason: string,
+    signal: AbortSignal,
+    graceMs = 10_000,
+  ): Promise<ProcessRow> {
+    let facts: ProcessFacts | undefined;
+    if (computer) {
+      try {
+        facts = (await computer.stop(row.id, graceMs, signal)).process;
+      } catch (error) {
+        this.say(`process ${row.id} was not stopped in its computer: ${String(error)}`);
+      }
+    }
+    return (await this.close(row.id, state, reason, facts)) ?? row;
+  }
+
+  /**
+   * A conversation's turn was stopped: end, now, the processes that turn
+   * started, so the browser or server it left behind does not keep running
+   * into the next one. Processes earlier turns started stay; they were what
+   * those turns left on purpose. A computer that cannot be reached kills
+   * nothing here, and the next contact with it does.
+   */
+  async endStopped(
+    providers: ProcessProviders,
+    jobId: string,
+    signal: AbortSignal,
+  ): Promise<string[]> {
+    const rows = (
+      await this.sql`select p.* from sandbox_process p
+        join action a on a.id = p.action_id
+        join attempt t on t.id = a.attempt_id
+        where p.job_id = ${jobId} and p.state in ('starting', 'running')
+          and ${startedByStopped(this.sql)}
+        order by p.created_at, p.id`
+    ).map(rowOf);
+    const ended: string[] = [];
+    for (const row of rows) {
+      const held = providers().get(row.connectionId);
+      const [session] = await this.sql`select provider_sandbox_id, image_digest, region
+        from sandbox_session
+        where space_id = ${row.spaceId} and agent_id = ${row.agentId}
+          and connection_id = ${row.connectionId} and status = 'ready'
+        order by opened_at desc limit 1`;
+      const computer =
+        held && session
+          ? this.computer(held.provider, {
+              providerSandboxId: String(session.provider_sandbox_id),
+              imageDigest: (session.image_digest as string | null) ?? null,
+              region: (session.region as string | null) ?? null,
+            })
+          : null;
+      await this.end(row, computer, 'stopped', END_REASONS.turn, signal);
+      ended.push(row.id);
+    }
+    return ended;
+  }
+
+  /** Close every live row of a connection whose computers were destroyed with it. */
+  async closeForConnection(connectionId: string, reason: string = END_REASONS.connection) {
+    const rows = await this.sql`update sandbox_process
+      set state = 'stopped', ended_at = coalesce(ended_at, now()),
+        end_reason = coalesce(end_reason, ${reason})
+      where connection_id = ${connectionId} and state in ('starting', 'running')
+      returning id`;
+    return rows.map((row) => String(row.id));
+  }
+
+  /**
+   * The periodic pass: end what must end, and bring rows of computers nobody
+   * is using up to date. Each computer is asked once.
+   */
+  async sweep(providers: ProcessProviders, signal: AbortSignal): Promise<{ ended: string[] }> {
+    const ended: string[] = [];
+    const stoppedForAllowance: ProcessRow[] = [];
+    const live = (
+      await this.sql`select p.*, c.status as connection_status,
+          j.state as job_state, coalesce(${startedByStopped(this.sql)}, false) as turn_stopped
+        from sandbox_process p
+        join connection c on c.id = p.connection_id
+        left join job j on j.id = p.job_id
+        left join action a on a.id = p.action_id
+        left join attempt t on t.id = a.attempt_id
+        where p.state in ('starting', 'running')
+        order by p.space_id, p.agent_id`
+    ).map((raw) => ({
+      row: rowOf(raw),
+      connectionActive: raw.connection_status === 'active',
+      jobGone: raw.job_id === null || raw.job_state === 'cancelled',
+      turnStopped: raw.turn_stopped === true,
+    }));
+    const computers = new Map<string, typeof live>();
+    for (const each of live) {
+      const key = `${each.row.spaceId}\u0000${each.row.agentId}\u0000${each.row.connectionId}`;
+      computers.set(key, [...(computers.get(key) ?? []), each]);
+    }
+    const overAllowance = new Set<string>();
+    const allowance = this.limits.awakeSecondsPerDay;
+    if (allowance !== undefined)
+      for (const spaceId of new Set(live.map((each) => each.row.spaceId)))
+        if ((await this.awakeSecondsToday(spaceId)) >= allowance) overAllowance.add(spaceId);
+
+    for (const members of computers.values()) {
+      const first = members[0];
+      if (!first) continue;
+      const { spaceId, agentId, connectionId } = first.row;
+      if (!first.connectionActive) {
+        ended.push(...(await this.closeForConnection(connectionId)));
+        continue;
+      }
+      const held = providers().get(connectionId);
+      const [session] = await this.sql`select * from sandbox_session
+        where space_id = ${spaceId} and agent_id = ${agentId} and connection_id = ${connectionId}
+          and status in ('opening', 'ready', 'paused')
+        order by opened_at desc limit 1`;
+      if (!session) {
+        for (const { row } of members) {
+          await this.close(row.id, 'lost', END_REASONS.computer_gone);
+          ended.push(row.id);
+        }
+        continue;
+      }
+      if (!held) continue;
+      // Each computer has its own budget: a slow or broken one cannot use up
+      // the time the others' limits are enforced in.
+      if (signal.aborted) break;
+      const budget = AbortSignal.timeout(COMPUTER_SWEEP_MS);
+      const handle: SandboxHandle = {
+        providerSandboxId: String(session.provider_sandbox_id),
+        imageDigest: (session.image_digest as string | null) ?? null,
+        region: (session.region as string | null) ?? null,
+      };
+      let reachable = false;
+      try {
+        const where = await held.provider.inspect(handle, budget);
+        if (where === 'gone') {
+          for (const { row } of members) {
+            await this.close(row.id, 'lost', END_REASONS.computer_gone);
+            ended.push(row.id);
+          }
+          continue;
+        }
+        // Stopped under a session that says it runs: whatever ran in it ended
+        // with it. Suspended where a suspend ends processes: the same. A
+        // computer that keeps its processes through a suspend is not that.
+        const ends = session.status === 'ready' || !held.provider.capabilities.keepAwake;
+        if (where !== 'running' && ends) {
+          const reason =
+            session.status === 'ready' ? END_REASONS.computer_stopped : END_REASONS.suspended;
+          for (const { row } of members) {
+            await this.close(row.id, 'lost', reason);
+            ended.push(row.id);
+          }
+          continue;
+        }
+        // A computer that is not running is not woken for this: what must end
+        // is closed here, and killed the next time the computer is used.
+        reachable = where === 'running' && session.status !== 'opening';
+      } catch (error) {
+        // Not reached: what must end is still closed below.
+        this.say(`the computer of ${agentId} could not be inspected: ${String(error)}`);
+      }
+      let computer = reachable ? this.computer(held.provider, handle) : null;
+      let current = members.map((each) => each.row);
+      if (computer) {
+        try {
+          current = (await this.reconcile(spaceId, agentId, computer, budget)).filter((row) =>
+            LIVE_STATES.includes(row.state),
+          );
+        } catch (error) {
+          if (
+            !(error instanceof ProcessHelperLost) &&
+            !(error instanceof ProcessHelperRefusal) &&
+            !(error instanceof ProcessHelperUnavailable) &&
+            !budget.aborted
+          )
+            throw error;
+          this.say(`the processes of ${agentId} could not be read: ${String(error)}`);
+          // What must end is closed here without waiting on it, and killed the
+          // next time the computer answers.
+          computer = null;
+        }
+      }
+      const now = this.now().getTime();
+      for (const row of current) {
+        const member = members.find((each) => each.row.id === row.id);
+        let ending: { state: 'stopped' | 'expired'; reason: string } | null = null;
+        if (row.expiresAt.getTime() <= now)
+          ending = { state: 'expired', reason: END_REASONS.expired };
+        else if (overAllowance.has(spaceId))
+          ending = { state: 'stopped', reason: END_REASONS.allowance };
+        else if (member?.jobGone) ending = { state: 'stopped', reason: END_REASONS.job };
+        else if (member?.turnStopped) ending = { state: 'stopped', reason: END_REASONS.turn };
+        if (!ending) continue;
+        const closed = await this.end(row, computer, ending.state, ending.reason, budget);
+        ended.push(row.id);
+        if (ending.reason === END_REASONS.allowance && closed.endReason === END_REASONS.allowance)
+          stoppedForAllowance.push(closed);
+      }
+    }
+    await this.noticeAllowance(stoppedForAllowance);
+    return { ended };
+  }
+
+  /**
+   * Tell each conversation whose processes the allowance stopped, once for
+   * the processes one pass stopped: how much awake time the space has, and
+   * when they stopped.
+   */
+  private async noticeAllowance(rows: ProcessRow[]): Promise<void> {
+    const byJob = new Map<string, ProcessRow[]>();
+    for (const row of rows)
+      if (row.jobId) byJob.set(row.jobId, [...(byJob.get(row.jobId) ?? []), row]);
+    for (const [jobId, stopped] of byJob) {
+      const at = stopped[0]?.endedAt ?? this.now();
+      await appendEvent(
+        this.sql,
+        jobId,
+        null,
+        'notice',
+        {
+          kind: 'processes_stopped',
+          reason: 'awake_allowance_used',
+          allowance_seconds: this.limits.awakeSecondsPerDay ?? null,
+          stopped_at: at.toISOString(),
+          processes: stopped.map((row) => ({ process_id: row.id, name: row.name })),
+        },
+        `processes_stopped:${jobId}:${at.toISOString().slice(0, 10)}:${stopped.map((row) => row.id).join(',')}`,
+      ).catch((error: unknown) => {
+        this.say(`the notice for processes stopped in ${jobId} was not written: ${String(error)}`);
+      });
+    }
+  }
+
+  /** Run the sweep on a timer. */
+  start(providers: ProcessProviders, everyMs = 60_000): { stop(): void } {
+    let running = false;
+    // Only stopping the service ends a sweep early; each computer has its own budget.
+    const stopping = new AbortController();
+    const timer = setInterval(() => {
+      if (running) return;
+      running = true;
+      void this.sweep(providers, stopping.signal)
+        .catch((error) => this.say(`process sweep failed: ${String(error)}`))
+        .finally(() => {
+          running = false;
+        });
+    }, everyMs);
+    timer.unref?.();
+    return {
+      stop: () => {
+        clearInterval(timer);
+        stopping.abort();
+      },
+    };
+  }
+}
+
+/** Lost under the same boot, with members of its session still alive. */
+const orphaned = (facts: ProcessFacts, row: ProcessRow, boot: string) =>
+  facts.state === 'lost' && facts.members > 0 && (row.bootId ?? boot) === boot;
+
+/** How long the sweep gives one computer, so a slow one cannot hold up the rest. */
+const COMPUTER_SWEEP_MS = 45_000;
+
+const hours = (seconds: number) => {
+  const value = seconds / 3600;
+  return `${Number.isInteger(value) ? value : value.toFixed(1)} hours`;
+};
+
+export { FINAL_STATES };
+
+/**
+ * The process sweep for an installation that owns sandboxes, or nothing when
+ * it owns none. Its providers are the connector factory's, so a connection's
+ * key stays with the connection.
+ */
+export function startProcesses(factory: {
+  options: { sandbox?: { processes?: SandboxProcesses } };
+  sandboxProviders: ReadonlyMap<string, { adapter: string; provider: SandboxProvider }>;
+}): { stop(): void } | undefined {
+  const processes = factory.options.sandbox?.processes;
+  if (!processes) return undefined;
+  return processes.start(() => factory.sandboxProviders);
+}

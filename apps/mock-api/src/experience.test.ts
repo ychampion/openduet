@@ -1,0 +1,458 @@
+import { expect, test } from 'bun:test';
+import * as C from '@openduet/contracts';
+import { BACKEND_VOCABULARY } from '../../openduet/src/experience/projectors.ts';
+import {
+  applyEvents,
+  applyMessageEvent,
+  fromTurns,
+  turnIndexForReaction,
+} from '../../web/src/experience/reduce.ts';
+import { createMock } from './index.ts';
+
+const call = async (
+  mock: ReturnType<typeof createMock>,
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  headers = {},
+) => {
+  const response = await mock.app.request(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...headers },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  return { response, body: await response.json() };
+};
+async function chatFixture(objective = 'Reply about the repair') {
+  const mock = createMock({ speed: 0 });
+  const agents = C.agentList.parse((await call(mock, '/agents')).body).agents;
+  const agentId = agents[0]?.id;
+  if (!agentId) throw new Error('Missing mock agent');
+  const chat = C.conversationResponse.parse(
+    (await call(mock, '/conversations', 'POST', { title: objective, agent_id: agentId })).body,
+  ).conversation;
+  const accepted = C.messageAcceptance.parse(
+    (
+      await call(
+        mock,
+        `/conversations/${chat.id}/messages`,
+        'POST',
+        { text: objective },
+        { 'Idempotency-Key': 'one' },
+      )
+    ).body,
+  );
+  for (let index = 0; index < 100; index++) {
+    const view = C.conversationResponse.parse(
+      (await call(mock, `/conversations/${chat.id}`)).body,
+    ).conversation;
+    if (view.status === 'done' || view.status === 'needs_you') return { mock, chat, accepted };
+    await Bun.sleep(5);
+  }
+  throw new Error('Mock scenario did not settle');
+}
+
+test('the acknowledgement names the persisted person message and survives transcript replay', async () => {
+  const { mock, chat, accepted } = await chatFixture('Thanks, that is perfect.');
+  const { turns } = C.turnList.parse((await call(mock, `/conversations/${chat.id}/messages`)).body);
+  const messages = mock.store.eventsAfter(0, { jobId: chat.id, limit: 1000 }).events;
+  const person = messages.find((event) => event.payload.kind === 'user_message');
+  expect(person?.created_at).toBe(turns[0]?.created_at);
+  expect(person?.created_at).toBe(accepted.receipt.received_at);
+  const { reactions } = C.reactionListResponse.parse(
+    (await call(mock, `/jobs/${chat.id}/reactions`)).body,
+  );
+  expect(reactions).toHaveLength(1);
+  const acknowledged = reactions[0];
+  if (!acknowledged) throw new Error('Missing acknowledgement');
+  expect(acknowledged.message_id).toBe(String(person?.seq));
+  expect(acknowledged.by).toBe('assistant');
+  const page = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events`)).body,
+  );
+  const state = messages.reduce(
+    applyMessageEvent,
+    applyEvents(fromTurns(turns, 'send', 'done'), page.events),
+  );
+  expect(turnIndexForReaction(state, acknowledged)).toBe(0);
+  expect(state.turns[0]?.messageSeq).toBeNull();
+  expect(state.turns[0]?.turn.answer).toBe('');
+});
+
+test('experience scenario drafts first, reviews an explicit send, and replays safe events', async () => {
+  const { mock, chat, accepted } = await chatFixture();
+  const drafts = C.experienceOperations['GET /conversations/{id}/drafts'].response.parse(
+    (await call(mock, `/conversations/${chat.id}/drafts`)).body,
+  );
+  const draft = C.experienceDraft.parse(drafts.drafts[0]);
+  expect(draft.status).toBe('draft');
+  expect(
+    C.experienceOperations['GET /permissions'].response.parse(
+      (await call(mock, '/permissions')).body,
+    ).permissions,
+  ).toHaveLength(0);
+  expect(
+    C.experienceOperations['GET /conversations/{id}/receipts'].response.parse(
+      (await call(mock, `/conversations/${chat.id}/receipts`)).body,
+    ).receipts,
+  ).toHaveLength(0);
+  const duplicate = C.messageAcceptance.parse(
+    (
+      await call(
+        mock,
+        `/conversations/${chat.id}/messages`,
+        'POST',
+        { text: 'Reply about the repair' },
+        { 'Idempotency-Key': 'one' },
+      )
+    ).body,
+  );
+  expect(duplicate).toEqual(accepted);
+  const send = C.experienceOperations['POST /drafts/{id}/send'].response.parse(
+    (await call(mock, `/drafts/${draft.id}/send`, 'POST')).body,
+  );
+  const permission = C.permissionCard.parse(send.permission);
+  expect(
+    (
+      await call(mock, `/permissions/${permission.id}`, 'POST', {
+        option: 'allow_once',
+        version: 'stale',
+      })
+    ).response.status,
+  ).toBe(409);
+  const decision = await call(mock, `/permissions/${permission.id}`, 'POST', {
+    option: 'always',
+    version: permission.version,
+    bounds: {
+      count_cap: 2,
+      expires_at: new Date(Date.now() + 86400000).toISOString(),
+      reconsent_after_days: 1,
+    },
+  });
+  expect(C.permissionOutcome.parse(decision.body).rule?.bounds.count_cap).toBe(2);
+  // The decision rides the conversation stream, so a reload shows it decided.
+  const stream = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?limit=200`)).body,
+  );
+  expect(
+    stream.events.flatMap((event) =>
+      event.item.type === 'decision' ? [[event.item.decision.id, event.item.decision.outcome]] : [],
+    ),
+  ).toEqual([[permission.id, 'always']]);
+  expect(
+    C.experienceDraft.parse(
+      C.experienceOperations['GET /conversations/{id}/drafts'].response.parse(
+        (await call(mock, `/conversations/${chat.id}/drafts`)).body,
+      ).drafts[0],
+    ).status,
+  ).toBe('sent');
+  expect(
+    C.experienceOperations['GET /conversations/{id}/receipts'].response.parse(
+      (await call(mock, `/conversations/${chat.id}/receipts`)).body,
+    ).receipts,
+  ).toHaveLength(1);
+  await call(mock, `/drafts/${draft.id}/send`, 'POST');
+  expect(
+    C.experienceOperations['GET /conversations/{id}/receipts'].response.parse(
+      (await call(mock, `/conversations/${chat.id}/receipts`)).body,
+    ).receipts,
+  ).toHaveLength(1);
+  const page = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?since=0`)).body,
+  );
+  expect(page.events.some((event) => event.item.type === 'action')).toBe(true);
+  // Memory and each scripted tool reach the conversation as tool entries, start and end.
+  const tools = page.events.flatMap((event) =>
+    event.item.type === 'tool' ? [event.item.tool] : [],
+  );
+  expect(tools.some((tool) => tool.kind === 'memory_recall' && tool.status === 'done')).toBe(true);
+  for (const id of new Set(tools.map((tool) => tool.id)))
+    expect(tools.filter((tool) => tool.id === id).map((tool) => tool.status)).toEqual([
+      'running',
+      'done',
+    ]);
+  // Home reads the finished turn's steps; nothing is under way once it is done.
+  const view = C.conversationResponse.parse(
+    (await call(mock, `/conversations/${chat.id}`)).body,
+  ).conversation;
+  expect(view.progress?.steps_done).toBeGreaterThan(0);
+  expect(view.progress?.current).toBeNull();
+  expect(JSON.stringify(page)).not.toMatch(BACKEND_VOCABULARY);
+  expect(
+    C.experienceEventPage.parse(
+      (await call(mock, `/conversations/${chat.id}/events?since=${page.next_cursor}`)).body,
+    ).events,
+  ).toEqual([]);
+  const response = await mock.app.request(`/conversations/${chat.id}/events?since=0`, {
+    headers: { Accept: 'text/event-stream', 'Last-Event-ID': String(page.events[0]?.seq ?? 0) },
+  });
+  const reader = response.body?.getReader();
+  const chunk = await reader?.read();
+  expect(new TextDecoder().decode(chunk?.value)).toContain('event:');
+  await reader?.cancel();
+});
+
+test('mock task, plan, profile and saved-detail changes conform to the experience contract', async () => {
+  const mock = createMock({ speed: 0 });
+  expect(
+    (
+      await call(mock, '/profile', 'PATCH', {
+        name: 'Jamie',
+        time_zone: 'Asia/Kolkata',
+        day_hours: { start: '08:00', end: '22:00' },
+      })
+    ).response.status,
+  ).toBe(200);
+  const task = C.taskResponse.parse(
+    (await call(mock, '/tasks', 'POST', { title: 'Buy dinner', due_at: null })).body,
+  ).task;
+  const plan = C.planResponse.parse(
+    (
+      await call(mock, '/plans', 'POST', {
+        title: 'Dinner plan',
+        category: 'Home',
+        milestones: [{ title: 'Choose food', assignee: { kind: 'person' } }],
+      })
+    ).body,
+  ).plan;
+  const changed = C.planResponse.parse(
+    (
+      await call(mock, `/plans/${plan.id}/milestones/${plan.milestones[0]?.id}`, 'PATCH', {
+        done: true,
+      })
+    ).body,
+  ).plan;
+  expect(changed.progress_percent).toBe(100);
+  expect(
+    C.homeResponse.parse((await call(mock, '/home')).body).tasks.some((row) => row.id === task.id),
+  ).toBe(true);
+  expect(
+    C.experienceSearch.parse((await call(mock, '/search?q=dinner')).body).results,
+  ).toHaveLength(2);
+  const items = C.memoryItemList.parse((await call(mock, '/memory/items')).body).items;
+  const item = items[0];
+  if (!item) throw new Error('Missing saved mock detail');
+  expect(
+    (
+      await call(mock, `/memory/items/${item.id}`, 'PATCH', {
+        value: 'Updated preference',
+        version: item.version,
+      })
+    ).response.status,
+  ).toBe(200);
+  expect(
+    (
+      await call(mock, `/memory/items/${item.id}`, 'PATCH', {
+        value: 'Stale edit',
+        version: item.version,
+      })
+    ).response.status,
+  ).toBe(409);
+  expect(
+    (await call(mock, '/tasks', 'POST', { title: 'No', due_at: null, space_id: 'foreign' }))
+      .response.status,
+  ).toBe(400);
+  expect(
+    C.notAvailable.parse((await call(mock, `/plans/${plan.id}/share`, 'POST')).body).status,
+  ).toBe('not_available');
+  const cors = await mock.app.request('/conversations', {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'http://localhost:3202',
+      'Access-Control-Request-Method': 'PATCH',
+      'Access-Control-Request-Headers': 'Idempotency-Key',
+    },
+  });
+  expect(cors.headers.get('Access-Control-Allow-Methods')).toContain('PATCH');
+  expect(cors.headers.get('Access-Control-Allow-Headers')?.toLowerCase()).toContain(
+    'idempotency-key',
+  );
+});
+
+test('the uncertain scenario leaves a reviewed send unconfirmed without repeating it', async () => {
+  const { mock, chat } = await chatFixture('Try the flaky destination');
+  const { drafts } = C.experienceOperations['GET /conversations/{id}/drafts'].response.parse(
+    (await call(mock, `/conversations/${chat.id}/drafts`)).body,
+  );
+  const draft = drafts[0];
+  if (!draft) throw new Error('Expected scenario draft');
+  const send = C.experienceOperations['POST /drafts/{id}/send'].response.parse(
+    (await call(mock, `/drafts/${draft.id}/send`, 'POST')).body,
+  );
+  const permission = C.permissionCard.parse(send.permission);
+  expect(permission.options).not.toContain('always');
+  expect(
+    (
+      await call(mock, `/permissions/${permission.id}`, 'POST', {
+        option: 'allow_once',
+        version: permission.version,
+      })
+    ).response.status,
+  ).toBe(200);
+  const page = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events`)).body,
+  );
+  const notices = page.events.filter((event) => event.item.type === 'note');
+  expect(notices).toHaveLength(1);
+  expect(
+    C.notAvailable.parse((await call(mock, `/drafts/${draft.id}/send`, 'POST')).body).status,
+  ).toBe('not_available');
+  const after = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?since=${page.next_cursor}`)).body,
+  );
+  expect(after.events).toHaveLength(0);
+  expect(
+    C.experienceOperations['GET /conversations/{id}/receipts'].response.parse(
+      (await call(mock, `/conversations/${chat.id}/receipts`)).body,
+    ).receipts,
+  ).toHaveLength(0);
+  expect(
+    C.conversationResponse.parse((await call(mock, `/conversations/${chat.id}`)).body).conversation
+      .status,
+  ).toBe('needs_you');
+});
+
+test('the chats list pages most recent first, as the service does', async () => {
+  const mock = createMock({ speed: 0 });
+  const agentId = C.agentList.parse((await call(mock, '/agents')).body).agents[0]?.id;
+  if (!agentId) throw new Error('Missing mock agent');
+  for (const title of ['One', 'Two', 'Three'])
+    await call(mock, '/conversations', 'POST', { title, agent_id: agentId });
+  const seen: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const path = `/conversations?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
+    const page = C.conversationList.parse((await call(mock, path)).body);
+    expect(page.conversations.length).toBeLessThanOrEqual(2);
+    seen.push(...page.conversations.map((entry) => `${entry.updated_at}|${entry.id}`));
+    cursor = page.next_cursor;
+  } while (cursor);
+  const all = C.conversationList.parse((await call(mock, '/conversations')).body);
+  expect(all.next_cursor).toBeNull();
+  expect(seen).toHaveLength(all.conversations.length);
+  expect(new Set(seen).size).toBe(seen.length);
+  expect([...seen].sort().reverse()).toEqual(seen);
+  expect((await call(mock, '/conversations?cursor=nonsense')).response.status).toBe(400);
+});
+
+test('a chats cursor carries its position and nothing else is taken for one', () => {
+  const cursor = C.encodeConversationCursor({
+    updated_at: '2026-09-24T08:00:00.000Z',
+    id: 'job_1',
+  });
+  expect(C.decodeConversationCursor(cursor)).toEqual({
+    updated_at: '2026-09-24T08:00:00.000Z',
+    id: 'job_1',
+  });
+  for (const bad of ['nonsense', Buffer.from('2026|a|b').toString('base64url'), ''])
+    expect(C.decodeConversationCursor(bad)).toBeNull();
+});
+
+test('a new message makes a pending draft send stale, as the service does', async () => {
+  const { mock, chat } = await chatFixture();
+  const drafts = C.experienceOperations['GET /conversations/{id}/drafts'].response.parse(
+    (await call(mock, `/conversations/${chat.id}/drafts`)).body,
+  );
+  const draft = C.experienceDraft.parse(drafts.drafts[0]);
+  const send = C.experienceOperations['POST /drafts/{id}/send'].response.parse(
+    (await call(mock, `/drafts/${draft.id}/send`, 'POST')).body,
+  );
+  const permission = C.permissionCard.parse(send.permission);
+  const firmer = await call(mock, `/conversations/${chat.id}/messages`, 'POST', {
+    text: 'Make it firmer',
+  });
+  expect(firmer.response.status).toBe(200);
+  expect(
+    C.experienceOperations['GET /permissions'].response.parse(
+      (await call(mock, '/permissions')).body,
+    ).permissions,
+  ).toHaveLength(0);
+  const allowed = await call(mock, `/permissions/${permission.id}`, 'POST', {
+    option: 'allow_once',
+    version: permission.version,
+  });
+  expect(allowed.response.status).toBe(409);
+  expect((allowed.body as { error: { code: string } }).error.code).toBe('permission_replaced');
+  expect(
+    C.experienceOperations['GET /conversations/{id}/receipts'].response.parse(
+      (await call(mock, `/conversations/${chat.id}/receipts`)).body,
+    ).receipts,
+  ).toHaveLength(0);
+  const stream = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?limit=200`)).body,
+  );
+  expect(
+    stream.events.flatMap((event) =>
+      event.item.type === 'decision' ? [[event.item.decision.id, event.item.decision.outcome]] : [],
+    ),
+  ).toEqual([[permission.id, 'replaced']]);
+});
+
+test('stop withdraws a waiting permission, and a later allow says so', async () => {
+  const { mock, chat } = await chatFixture();
+  const drafts = C.experienceOperations['GET /conversations/{id}/drafts'].response.parse(
+    (await call(mock, `/conversations/${chat.id}/drafts`)).body,
+  );
+  const draft = C.experienceDraft.parse(drafts.drafts[0]);
+  const send = C.experienceOperations['POST /drafts/{id}/send'].response.parse(
+    (await call(mock, `/drafts/${draft.id}/send`, 'POST')).body,
+  );
+  const permission = C.permissionCard.parse(send.permission);
+  expect((await call(mock, `/conversations/${chat.id}/stop`, 'POST')).response.status).toBe(200);
+  expect(
+    C.experienceOperations['GET /permissions'].response.parse(
+      (await call(mock, '/permissions')).body,
+    ).permissions,
+  ).toHaveLength(0);
+  const allowed = await call(mock, `/permissions/${permission.id}`, 'POST', {
+    option: 'allow_once',
+    version: permission.version,
+  });
+  expect(allowed.response.status).toBe(409);
+  expect(allowed.body).toMatchObject({
+    error: { code: 'permission_withdrawn', message: 'This was withdrawn when you stopped.' },
+  });
+  const stream = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?limit=200`)).body,
+  );
+  expect(
+    stream.events.flatMap((event) =>
+      event.item.type === 'decision' ? [[event.item.decision.id, event.item.decision.outcome]] : [],
+    ),
+  ).toEqual([[permission.id, 'withdrawn']]);
+});
+
+test('a research run tells each piece of work as a row, a failure and a waiting send included', async () => {
+  const { mock, chat } = await chatFixture('Make me a rent report for Lisbon and mail it to Sam');
+  const page = C.experienceEventPage.parse(
+    (await call(mock, `/conversations/${chat.id}/events?limit=200`)).body,
+  );
+  const tools = page.events.flatMap((event) =>
+    event.item.type === 'tool' ? [event.item.tool] : [],
+  );
+  const last = new Map(tools.map((tool) => [tool.id, tool]));
+  const rows = [...last.values()].filter((tool) => tool.kind !== 'model');
+  expect(rows.map((tool) => [tool.status, tool.title])).toContainEqual([
+    'done',
+    'Searched the web for “Lisbon rent prices October 2026”',
+  ]);
+  expect(rows.find((tool) => tool.status === 'failed')).toMatchObject({
+    failure: 'error',
+    output_summary: { text: 'The site would not let the page be read.' },
+  });
+  expect(rows.find((tool) => tool.kind === 'sandbox')?.output_excerpt?.text).toContain(
+    'Average one-bedroom',
+  );
+  expect(rows.find((tool) => tool.status === 'needs_approval')?.title).toBe(
+    'Proposed sending an email to sam@example.com — waiting for you',
+  );
+  // Every entry started as a running copy before it ended.
+  for (const id of last.keys())
+    expect(tools.find((tool) => tool.id === id)?.status).toBe('running');
+  const { turns } = C.turnList.parse((await call(mock, `/conversations/${chat.id}/messages`)).body);
+  const state = applyEvents(fromTurns(turns, 'send', 'done'), page.events);
+  const trail = state.turns[0]?.trail ?? [];
+  expect(trail.filter((step) => step.type === 'action' && step.tool).length).toBe(rows.length);
+  expect(trail.some((step) => step.type === 'reasoning')).toBe(true);
+  expect(JSON.stringify(page)).not.toMatch(BACKEND_VOCABULARY);
+});

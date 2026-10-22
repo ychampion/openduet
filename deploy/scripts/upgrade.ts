@@ -1,0 +1,1069 @@
+/**
+ * Upgrade a running Compose installation to a tagged release. The procedure is
+ * docs/UPGRADING.md; this file is that document as one ordered plan:
+ *
+ *   preflight -> stop the writers -> back up -> switch the tree -> rebuild and
+ *   tag the images -> start -> wait for health and for every migration
+ *
+ * and it always ends by printing the exact rollback for this run. Nothing here
+ * removes a volume. The plan, the preflight judgement and the rollback text are
+ * pure functions, and every command goes through an injected runner, so the
+ * tests exercise the procedure without Docker.
+ *
+ *   bun run deploy/scripts/upgrade.ts <tag> [--dry-run] [--browser] [--tailscale]
+ *     [--tailscale-kernel] [--external-db] [--blobs-s3] [--profile sandbox]
+ *     [--compose-file path/under/deploy.yml]
+ *     [--backup-dir /absolute/parent] [--wait-timeout seconds]
+ *     [--repository /absolute/installation]
+ *
+ * Name the same overlay files and profiles the installation runs with. An
+ * upgrade that forgets one would rebuild the stack without that service.
+ * `openduet upgrade` names them from deploy/openduet.deploy.json.
+ *
+ * The script that runs is the target release's own, taken from the tag into a
+ * directory outside the installation (docs/UPGRADING.md), so an installation
+ * whose tree predates this file upgrades the same way. `--repository` names the
+ * installation it acts on. For that, everything this file imports is Bun and
+ * relative files: the copy runs without installing dependencies.
+ *
+ * The host-side steps use mkdir, cp, sha256sum, chmod and df. On Windows,
+ * Git Bash provides them, so the upgrade runs from Git Bash there.
+ */
+import { closeSync, openSync, realpathSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, posix, resolve } from 'node:path';
+import {
+  type CommandOutput,
+  HOST_DOCKER_COMMANDS,
+  type HostDockerOutputs,
+} from '../../apps/openduet/src/runtime/docker-engine.ts';
+import {
+  DOCKER_HOST_COMMANDS,
+  type DockerHostFacts,
+  describeDockerHost,
+  dockerHostFacts,
+  engineElsewhere,
+  judgeDockerMachine,
+  localMachine,
+  longPathCommands,
+  longPathFacts,
+  type MachineAccess,
+} from '../../apps/openduet/src/runtime/docker-host.ts';
+import { parseEnvFile } from './provider-settings.ts';
+
+/** The external-database file's client service (packages/cli/src/database.ts). */
+const DATABASE_CLIENT = 'database-client';
+/**
+ * packages/cli/src/database.ts's CLIENT_TLS, repeated because that file reaches
+ * the CLI's dependencies and this copy runs without them; a test keeps them equal.
+ */
+export const UPGRADE_CLIENT_TLS =
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: a shell parameter expansion, not a template.
+  'case "$DATABASE_URL" in *sslmode=verify-*) export PGSSLROOTCERT="${PGSSLROOTCERT:-system}" ;; *) unset PGSSLROOTCERT ;; esac; ';
+const CLIENT_TLS = UPGRADE_CLIENT_TLS;
+/**
+ * packages/cli/src/database.ts's EXTERNAL_LOAD, repeated for the same reason: it
+ * loads a dump only into an empty database, in one transaction.
+ */
+export const UPGRADE_EXTERNAL_LOAD = `${CLIENT_TLS}n=$(psql --dbname="$DATABASE_URL" -X -At -c "select count(*) from pg_catalog.pg_tables where schemaname not in ('pg_catalog', 'information_schema')") || exit 1; if [ "$n" != 0 ]; then s=$(psql --dbname="$DATABASE_URL" -X -At -c "select string_agg(schemaname, ', ' order by schemaname) || case when max(total) > 5 then ' and ' || (max(total) - 5) || ' more' else '' end from (select schemaname, count(*) over () as total from pg_catalog.pg_tables where schemaname not in ('pg_catalog', 'information_schema') group by schemaname order by schemaname limit 5) as held" 2>/dev/null); echo "The database DATABASE_URL names already holds $n table(s), and a restore loads only into an empty one. Nothing was loaded." >&2; [ -z "$s" ] || echo "The schemas that hold them: $s. A provider's default database can hold tables of its own; load into a new, empty database." >&2; cat >/dev/null; exit 1; fi; err=$(pg_restore --dbname="$DATABASE_URL" --single-transaction --no-owner --no-privileges --exit-on-error 2>&1); rc=$?; if [ "$rc" = 0 ]; then [ -z "$err" ] || printf '%s\\n' "$err" >&2; exit 0; fi; printf '%s\\n%s\\n%s\\n' "$err" "$(printf '%s\\n' "$err" | grep -E '(error|ERROR|FATAL|HINT): ' | tail -n 2)" "The load was undone: the database DATABASE_URL names holds nothing of it, and the same load can run again." >&2; cat >/dev/null; exit "$rc"`;
+
+export const USAGE =
+  'Usage: bun run deploy/scripts/upgrade.ts <tag> [--dry-run] [--browser] [--tailscale] [--tailscale-kernel] [--external-db] [--blobs-s3] [--profile name] [--compose-file path] [--backup-dir /absolute/parent] [--wait-timeout seconds] [--repository /absolute/installation]';
+
+const GIB = 1024 ** 3;
+/** docs/UPGRADING.md's floor for the filesystem that holds Docker's data. */
+const MIN_DOCKER_FREE_BYTES = 8 * GIB;
+const MIN_BACKUP_FREE_BYTES = 1 * GIB;
+/** A Compose file relative to deploy/, as openduet.deploy.json's `compose_files` holds it. */
+export const COMPOSE_FILE = /^[A-Za-z0-9._-][A-Za-z0-9._/-]*\.ya?ml$/;
+const TAG = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;
+const IMAGES = ['openduet-service', 'openduet-web', 'openduet-runtime'] as const;
+const OPERATOR_CONFIGURATION = 'deploy/config/';
+/** The programs the plan runs on the host besides git, bun and docker. */
+export const HOST_TOOLS = ['mkdir', 'cp', 'sha256sum', 'chmod', 'df'] as const;
+
+export type UpgradeOptions = {
+  tag: string;
+  /** The directory this run creates; its parent must exist. */
+  backupDir: string;
+  /**
+   * No --backup-dir was given: `backupDir` is in ~/openduet-backups, and moves
+   * into the project's own folder there once deploy/.env names the project,
+   * the folder `openduet backup` uses by default (packages/cli's
+   * defaultBackupDir; a test keeps them equal). The project `openduet` keeps
+   * ~/openduet-backups itself.
+   */
+  backupDirByProject?: boolean;
+  repositoryRoot: string;
+  /** Include deploy/docker-compose.browser.yml in every Compose command. */
+  browser: boolean;
+  /** Include deploy/docker-compose.tailscale.yml in every Compose command. */
+  tailscale: boolean;
+  /** Include deploy/docker-compose.tailscale-kernel.yml, read on top of the Tailscale file. */
+  tailscaleKernel?: boolean;
+  /**
+   * Include deploy/docker-compose.external-db.yml: the database is the server
+   * DATABASE_URL names, reached from the database-client service, and there is
+   * no bundled postgres to dump from or to replace in a rollback.
+   */
+  externalDatabase?: boolean;
+  /** Include deploy/docker-compose.blobs-s3.yml, read last. */
+  blobsS3?: boolean;
+  /** Compose profiles the installation runs with, such as `sandbox` for the agents' computer image. */
+  profiles?: string[];
+  /**
+   * The installation's own Compose files, relative to deploy/, read after all
+   * the others (openduet.deploy.json, `compose_files`).
+   */
+  composeFiles?: string[];
+  waitTimeoutSeconds: number;
+};
+
+/** The overlay files and profiles an installation runs with, which the upgrade must repeat. */
+export type Overlays = Pick<
+  UpgradeOptions,
+  | 'browser'
+  | 'tailscale'
+  | 'tailscaleKernel'
+  | 'externalDatabase'
+  | 'blobsS3'
+  | 'profiles'
+  | 'composeFiles'
+>;
+
+export type UpgradeContext = UpgradeOptions & {
+  project: string;
+  fromCommit: string;
+  /** Null when the installation runs from a detached commit. */
+  fromBranch: string | null;
+  /** `git describe` of the running tree; also the tag its images are kept under. */
+  fromVersion: string;
+};
+
+export type RunOptions = { stdoutFile?: string; stdinFile?: string; timeoutMs?: number };
+export type CommandRunner = (
+  command: readonly string[],
+  options?: RunOptions,
+) => Promise<CommandOutput>;
+
+export type PlanStep = RunOptions & {
+  phase: 'backup' | 'switch' | 'build' | 'start' | 'verify';
+  title: string;
+  command: readonly string[];
+  /** Repeat the command until the new journal's migrations are all recorded. */
+  until?: 'journal-recorded';
+};
+
+export function parseArguments(
+  argv: readonly string[],
+  now: Date,
+  home: string,
+  repositoryRoot: string,
+): UpgradeOptions & { dryRun: boolean } {
+  const fail = (): never => {
+    throw new Error(USAGE);
+  };
+  let tag: string | undefined;
+  let parent: string | undefined;
+  let dryRun = false;
+  let browser = false;
+  let tailscale = false;
+  let tailscaleKernel = false;
+  let externalDatabase = false;
+  let blobsS3 = false;
+  const profiles: string[] = [];
+  const composeFiles: string[] = [];
+  let waitTimeoutSeconds = 300;
+  let repository = repositoryRoot;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index] ?? '';
+    if (argument === '--dry-run') dryRun = true;
+    else if (argument === '--browser') browser = true;
+    else if (argument === '--tailscale') tailscale = true;
+    else if (argument === '--tailscale-kernel') tailscaleKernel = true;
+    else if (argument === '--external-db') externalDatabase = true;
+    else if (argument === '--blobs-s3') blobsS3 = true;
+    else if (argument === '--profile') {
+      index += 1;
+      const value = argv[index] ?? '';
+      if (!/^[a-z0-9][a-z0-9_-]*$/.test(value)) fail();
+      if (!profiles.includes(value)) profiles.push(value);
+    } else if (argument === '--compose-file') {
+      index += 1;
+      const value = argv[index] ?? '';
+      // The rule openduet.deploy.json holds `compose_files` to (packages/cli, deploy-config.ts).
+      if (!COMPOSE_FILE.test(value) || posix.normalize(value) !== value) fail();
+      if (!composeFiles.includes(value)) composeFiles.push(value);
+    } else if (argument === '--backup-dir') {
+      index += 1;
+      const value = argv[index];
+      if (!value || !isAbsolute(value)) fail();
+      else parent = value;
+    } else if (argument === '--wait-timeout') {
+      index += 1;
+      const value = argv[index] ?? '';
+      if (!/^[1-9]\d{1,4}$/.test(value)) fail();
+      waitTimeoutSeconds = Number(value);
+    } else if (argument === '--repository') {
+      index += 1;
+      const value = argv[index];
+      if (!value || !isAbsolute(value)) fail();
+      else repository = value;
+    } else if (TAG.test(argument) && tag === undefined) tag = argument;
+    else fail();
+  }
+  if (tag === undefined) return fail();
+  // The kernel file adjusts the Tailscale node; without that node it has nothing to adjust.
+  if (tailscaleKernel && !tailscale) fail();
+  const stamp = now
+    .toISOString()
+    .replace(/\.\d+Z$/, 'Z')
+    .replace(/[-:]/g, '');
+  return {
+    tag,
+    dryRun,
+    browser,
+    tailscale,
+    tailscaleKernel,
+    externalDatabase,
+    blobsS3,
+    profiles,
+    ...(composeFiles.length ? { composeFiles } : {}),
+    waitTimeoutSeconds,
+    repositoryRoot: repository,
+    backupDir: join(parent ?? join(home, 'openduet-backups'), `upgrade-${tag}-${stamp}`).replaceAll(
+      '\\',
+      '/',
+    ),
+    ...(parent === undefined ? { backupDirByProject: true } : {}),
+  };
+}
+
+/**
+ * Each image the stack starts, as the repository a version tag is kept under
+ * and the reference Compose starts. The browser worker's file names no image,
+ * so Compose builds it as `<project>-browser:latest`; without it here a
+ * rollback would start the old service beside the new release's browser.
+ */
+const stackImages = (context: Pick<UpgradeContext, 'browser' | 'project' | 'profiles'>) => [
+  ...IMAGES.map((image) => ({ repository: image, running: `${image}:local` })),
+  // The agents' computer image, built only with the sandbox profile.
+  ...(context.profiles?.includes('sandbox')
+    ? [{ repository: 'openduet-sandbox', running: 'openduet-sandbox:local' }]
+    : []),
+  ...(context.browser
+    ? [
+        {
+          repository: `${context.project}-browser`,
+          running: `${context.project}-browser:latest`,
+        },
+      ]
+    : []),
+];
+
+/** The files, in the order `openduet deploy` reads them, and the profiles. */
+export const composeArguments = (overlays: Overlays) => [
+  'docker',
+  'compose',
+  '-f',
+  'deploy/docker-compose.yml',
+  ...(overlays.browser ? ['-f', 'deploy/docker-compose.browser.yml'] : []),
+  ...(overlays.tailscale ? ['-f', 'deploy/docker-compose.tailscale.yml'] : []),
+  ...(overlays.tailscaleKernel ? ['-f', 'deploy/docker-compose.tailscale-kernel.yml'] : []),
+  ...(overlays.externalDatabase ? ['-f', 'deploy/docker-compose.external-db.yml'] : []),
+  ...(overlays.blobsS3 ? ['-f', 'deploy/docker-compose.blobs-s3.yml'] : []),
+  ...(overlays.composeFiles ?? []).flatMap((file) => ['-f', posix.normalize(`deploy/${file}`)]),
+  ...(overlays.profiles ?? []).flatMap((profile) => ['--profile', profile]),
+];
+
+/**
+ * Where a database client runs: inside the bundled postgres or, for an external
+ * database, in a one-off database-client container, which has DATABASE_URL in
+ * its environment so the address never reaches a command line.
+ */
+const databaseClient = (overlays: Overlays) =>
+  overlays.externalDatabase
+    ? ['run', '--rm', '--no-deps', '-T', DATABASE_CLIENT]
+    : ['exec', '-T', 'postgres'];
+/** A shell line run where the database client is; `script` receives the connection arguments. */
+const inDatabase = (overlays: Overlays, script: (db: string) => string) => [
+  ...databaseClient(overlays),
+  'sh',
+  '-c',
+  overlays.externalDatabase
+    ? `${CLIENT_TLS}${script('--dbname="$DATABASE_URL"')}`
+    : script('-U "$POSTGRES_USER" -d "$POSTGRES_DB"'),
+];
+const migrationCount = (overlays: Overlays) =>
+  inDatabase(
+    overlays,
+    (db) => `exec psql ${db} -At -c "select count(*) from drizzle.__drizzle_migrations"`,
+  );
+
+/** Every command of the upgrade, in the order it runs, relative to the repository root. */
+export function upgradePlan(context: UpgradeContext): PlanStep[] {
+  const compose = composeArguments(context);
+  const backup = (name: string) => `${context.backupDir}/${name}`;
+  // The node holds no backed-up data, but it proxies the web service, so it is
+  // stopped with it: a device on the tailnet then finds a closed address rather
+  // than a gateway error for as long as the upgrade runs.
+  const writers = [
+    'openduet',
+    'runtime',
+    'web',
+    ...(context.browser ? ['browser'] : []),
+    ...(context.tailscale ? ['tailscale'] : []),
+  ];
+  const archives = ['database.dump', 'data.tar', 'work.tar', 'restrictions.tar', 'deploy.env'];
+  return [
+    {
+      phase: 'backup',
+      title: 'Create a private backup directory',
+      command: ['mkdir', '-m', '700', context.backupDir],
+    },
+    {
+      phase: 'backup',
+      title: 'Stop everything that writes, so the database and the volumes agree',
+      command: [...compose, 'stop', ...writers],
+    },
+    {
+      phase: 'backup',
+      title: 'Dump the database in custom format',
+      command: [...compose, ...inDatabase(context, (db) => `exec pg_dump ${db} --format=custom`)],
+      stdoutFile: backup('database.dump'),
+    },
+    {
+      phase: 'backup',
+      title: 'Check that the dump is a readable archive',
+      command: [...compose, ...databaseClient(context), 'pg_restore', '--list'],
+      stdinFile: backup('database.dump'),
+      stdoutFile: backup('database.contents'),
+    },
+    {
+      phase: 'backup',
+      title: 'Keep the configuration, including the keys that open the sealed credentials',
+      command: ['cp', '-p', 'deploy/.env', backup('deploy.env')],
+    },
+    {
+      phase: 'backup',
+      title: 'Keep the operator configuration directory',
+      command: ['cp', '-a', 'deploy/config', backup('config')],
+    },
+    {
+      phase: 'backup',
+      title:
+        "Archive spaces, artifacts and the current restriction journal, without each space's search index and staged writes",
+      // As packages/cli's backup leaves them out (files.ts LEFT_OUT; a test keeps them equal):
+      // the service rebuilds an index from the space's files, and an old index can hold the
+      // words of a record removed since. A one-off container of the stopped service reads
+      // its volumes, as `cp` did, with the same names in the archive (data/...).
+      command: [
+        ...compose,
+        'run',
+        '--rm',
+        '--no-deps',
+        '-T',
+        '--user',
+        '0:0',
+        '--entrypoint',
+        'tar',
+        'openduet',
+        '-C',
+        '/',
+        '--numeric-owner',
+        '--anchored',
+        '--no-wildcards-match-slash',
+        '--exclude=data/spaces/*/.index',
+        '--exclude=data/spaces/*/.proposed',
+        '-cf',
+        '-',
+        'data',
+      ],
+      stdoutFile: backup('data.tar'),
+    },
+    {
+      phase: 'backup',
+      title: 'Archive the job workspaces',
+      command: [...compose, 'cp', '-a', 'openduet:/work', '-'],
+      stdoutFile: backup('work.tar'),
+    },
+    {
+      phase: 'backup',
+      title: 'Keep the restriction journal on its own, apart from the database snapshot',
+      command: [...compose, 'cp', '-a', 'openduet:/data/restrictions', '-'],
+      stdoutFile: backup('restrictions.tar'),
+    },
+    {
+      phase: 'backup',
+      title: 'Record checksums of the backup',
+      command: ['sha256sum', ...archives.map(backup)],
+      stdoutFile: backup('SHA256SUMS'),
+    },
+    {
+      phase: 'backup',
+      title: 'Make the backup private',
+      command: ['chmod', '600', ...[...archives, 'database.contents', 'SHA256SUMS'].map(backup)],
+    },
+    ...stackImages(context).map(
+      ({ repository, running }): PlanStep => ({
+        phase: 'backup',
+        title: `Keep the running ${repository} image for a rollback without a rebuild`,
+        command: ['docker', 'tag', running, `${repository}:${context.fromVersion}`],
+      }),
+    ),
+    {
+      phase: 'switch',
+      title: `Check out ${context.tag}`,
+      command: [
+        'git',
+        '-c',
+        'advice.detachedHead=false',
+        'checkout',
+        '--detach',
+        `refs/tags/${context.tag}`,
+      ],
+    },
+    {
+      phase: 'switch',
+      title: "Install the release's locked dependencies for the host scripts",
+      command: ['bun', 'install', '--frozen-lockfile'],
+    },
+    {
+      phase: 'switch',
+      title: "Run the release's own Compose boundary check",
+      command: ['bun', 'run', 'compose:check'],
+    },
+    {
+      phase: 'build',
+      title: 'Build the release images as :local',
+      command: [...compose, 'build'],
+      timeoutMs: 60 * 60_000,
+    },
+    ...stackImages(context).map(
+      ({ repository, running }): PlanStep => ({
+        phase: 'build',
+        title: `Tag ${repository} with the release version`,
+        command: ['docker', 'tag', running, `${repository}:${context.tag}`],
+      }),
+    ),
+    {
+      phase: 'start',
+      title: 'Start the release and wait for every health check',
+      command: [
+        ...compose,
+        'up',
+        '-d',
+        '--wait',
+        '--wait-timeout',
+        String(context.waitTimeoutSeconds),
+      ],
+      timeoutMs: (context.waitTimeoutSeconds + 120) * 1000,
+    },
+    {
+      phase: 'verify',
+      title: "Wait until every migration in the release's journal is recorded",
+      command: [...compose, ...migrationCount(context)],
+      until: 'journal-recorded',
+    },
+  ];
+}
+
+/** The commands that return this installation to where it started, as shell lines. */
+export function rollbackSteps(context: UpgradeContext): string[] {
+  const compose = renderCommand({ command: composeArguments(context) });
+  const back = context.fromBranch
+    ? `git checkout ${context.fromBranch}`
+    : `git checkout --detach ${context.fromCommit}`;
+  return [
+    `cd ${quote(context.repositoryRoot)}`,
+    `# Stop the release. Never add --volumes: the volumes are the installation.`,
+    `${compose} down`,
+    `# Return the tree, its dependencies and the preserved images to ${context.fromVersion}.`,
+    back,
+    'bun install --frozen-lockfile',
+    ...stackImages(context).map(
+      ({ repository, running }) => `docker tag ${repository}:${context.fromVersion} ${running}`,
+    ),
+    `cp -p ${quote(`${context.backupDir}/deploy.env`)} deploy/.env`,
+    ...(context.externalDatabase
+      ? [
+          `# Load the backup into a new, empty database, and leave the one the release used as it is:`,
+          `# loading over it would keep the tables the release's migrations added, and the load refuses`,
+          `# a database that holds tables. Create an empty database at the provider (or use the`,
+          `# provider's restore to a time before the upgrade), then point DATABASE_URL at it.`,
+          'read -rs DATABASE_URL && export DATABASE_URL',
+          'bun run openduet set --from-env DATABASE_URL',
+          'unset DATABASE_URL',
+          `# Where the database's administrator made the roles (deploy/.env sets OPENDUET_MIGRATE_DATABASE_URL,`,
+          `# OPENDUET_API_DATABASE_URL and OPENDUET_EFFECTS_DATABASE_URL), they grant them the new database as`,
+          `# docs/DEPLOYMENT.md "Roles an administrator creates" shows, and you point all three at it the`,
+          `# same way; otherwise the service starts on the database the release used.`,
+          `# Keep ${context.project}_restrictions and every volume as they are now: the newer removal`,
+          `# journal is replayed at startup, so nothing forgotten since the backup comes back. Do not`,
+          `# unpack restrictions.tar over it. The load runs in one transaction: one that fails leaves`,
+          `# the new database empty, and can be run again.`,
+          `${compose} run --rm --no-deps -T ${DATABASE_CLIENT} sh -c ${quote(UPGRADE_EXTERNAL_LOAD)} < ${quote(`${context.backupDir}/database.dump`)}`,
+        ]
+      : [
+          `# Replace only the database volume. Keep ${context.project}_restrictions and every other`,
+          `# volume as they are now: the newer removal journal is replayed at startup, so nothing`,
+          `# forgotten since the backup comes back. Do not unpack restrictions.tar over it.`,
+          `docker volume rm ${context.project}_pgdata`,
+          `${compose} up -d --wait postgres`,
+          `${compose} exec -T postgres sh -c 'exec pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-owner --no-privileges --exit-on-error' < ${quote(`${context.backupDir}/database.dump`)}`,
+        ]),
+    `# Start only after the restore has finished, then check health and any waiting approval.`,
+    `${compose} up -d --wait --wait-timeout ${context.waitTimeoutSeconds}`,
+    `${compose} ps`,
+  ];
+}
+
+export type PreflightFacts = {
+  tag: string;
+  /**
+   * The commit `git archive` stamped into this copy of the script. Null when it
+   * runs from a checkout, where there is no stamp and nothing to compare.
+   */
+  scriptCommit?: string | null;
+  /**
+   * The installation this run acts on, and where it sits in its git checkout:
+   * '' at the top, the path below the top when inside one, null outside any.
+   * Git answers this itself, so no two spellings of a path are ever compared.
+   */
+  repositoryRoot: string;
+  repositoryPrefix: string | null;
+  /** `git status --porcelain` of the repository's tracked files. */
+  status: string;
+  tagCommit: string | null;
+  headCommit: string;
+  /** The target tag descends from the running commit. */
+  targetContainsHead: boolean;
+  /** deploy/config differs between the running commit and the target. */
+  configChangedInTarget: boolean;
+  envFile: boolean;
+  docker: HostDockerOutputs;
+  /** The machine running the engine: Docker Desktop's mode and memory, and Windows paths. */
+  host: DockerHostFacts;
+  /** HOST_TOOLS that are not on PATH; on Windows outside Git Bash, all of them. */
+  missingTools: string[];
+  postgresRunning: boolean;
+  /** The database is external, so no bundled postgres has to be running. */
+  externalDatabase?: boolean;
+  serviceContainer: boolean;
+  dockerRootFreeBytes: number | null;
+  backupFreeBytes: number | null;
+  /** The folder the backup directory is made in. */
+  backupParent?: string;
+  /** Database plus /data plus /work; null when the stopped stack could not be measured. */
+  backupEstimateBytes: number | null;
+  /**
+   * With --browser, the worker image the backup keeps for a rollback, and
+   * whether it exists. Unset without --browser.
+   */
+  browserImage?: { name: string; present: boolean };
+};
+
+const gib = (bytes: number) => `${(bytes / GIB).toFixed(1)} GiB`;
+
+/** One line per reason not to start; an empty list means the upgrade may begin. */
+export function judgePreflight(facts: PreflightFacts): string[] {
+  const problems: string[] = [];
+  // Every command runs from the installation's root with its relative Compose paths.
+  if (facts.repositoryPrefix !== '')
+    problems.push(
+      facts.repositoryPrefix === null
+        ? `${facts.repositoryRoot} is not a git checkout. Give --repository the directory the installation was cloned into.`
+        : `${facts.repositoryRoot} is ${facts.repositoryPrefix.replace(/\/$/, '')} inside its git checkout. Give --repository the top of the installation's checkout.`,
+    );
+  const changed = facts.status
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => line.slice(3).trim());
+  const foreign = changed.filter((path) => !path.startsWith(OPERATOR_CONFIGURATION));
+  if (foreign.length > 0)
+    problems.push(
+      `The working tree is not clean (${foreign.join(', ')}). Commit, stash or remove these first; only ${OPERATOR_CONFIGURATION} may carry local edits.`,
+    );
+  if (changed.length > foreign.length && facts.configChangedInTarget)
+    problems.push(
+      `${OPERATOR_CONFIGURATION} has local edits and ${facts.tag} also changes it. Merge the release's version by hand, then run the upgrade again.`,
+    );
+  if (facts.scriptCommit && facts.tagCommit && facts.scriptCommit !== facts.tagCommit)
+    problems.push(
+      `This copy of the upgrade script was taken from commit ${facts.scriptCommit.slice(0, 12)}, but ${facts.tag} is ${facts.tagCommit.slice(0, 12)}. Take the copy from the tag you are upgrading to: git archive ${facts.tag}.`,
+    );
+  if (!facts.tagCommit)
+    problems.push(
+      `The tag ${facts.tag} does not exist in this clone. Run \`git fetch --tags origin\` and check the name.`,
+    );
+  else if (facts.tagCommit === facts.headCommit)
+    problems.push(`This installation is already at ${facts.tag}; there is nothing to upgrade.`);
+  else if (!facts.targetContainsHead)
+    problems.push(
+      `${facts.tag} does not contain the running commit ${facts.headCommit.slice(0, 12)}. Moving to an older or unrelated release would run old code against a newer database; restore a backup instead.`,
+    );
+  if (!facts.envFile)
+    problems.push(
+      'deploy/.env is missing. The upgrade keeps an installation; it does not create one.',
+    );
+  problems.push(...judgeDockerMachine(facts.docker, facts.host));
+  if (facts.missingTools.length > 0)
+    problems.push(
+      facts.host.platform === 'win32'
+        ? `${facts.missingTools.join(', ')} ${facts.missingTools.length === 1 ? 'is' : 'are'} not on PATH. Run the upgrade from Git Bash, which comes with Git for Windows and provides them.`
+        : `${facts.missingTools.join(', ')} ${facts.missingTools.length === 1 ? 'is' : 'are'} not on PATH; the backup steps need them.`,
+    );
+  if (!facts.postgresRunning && !facts.externalDatabase)
+    problems.push(
+      'The postgres service is not running, so the database cannot be dumped. Start the stack and wait for it to be healthy.',
+    );
+  if (!facts.serviceContainer)
+    problems.push(
+      'The openduet service has no container, so its volumes cannot be archived. Start the stack first.',
+    );
+  if (facts.browserImage && !facts.browserImage.present)
+    problems.push(
+      `--browser was given, but the browser worker image ${facts.browserImage.name} does not exist, so it cannot be kept for a rollback. Leave --browser out if this installation does not run the browser worker; add the worker after the upgrade.`,
+    );
+  if (facts.dockerRootFreeBytes === null)
+    problems.push("The free space on Docker's data filesystem could not be measured.");
+  else if (facts.dockerRootFreeBytes < MIN_DOCKER_FREE_BYTES)
+    problems.push(
+      `Docker's data filesystem has ${gib(facts.dockerRootFreeBytes)} free; rebuilding the images needs at least ${gib(MIN_DOCKER_FREE_BYTES)}.`,
+    );
+  // The archives are not compressed, so they need the measured size and a margin.
+  const needed = Math.max(
+    MIN_BACKUP_FREE_BYTES,
+    Math.ceil((facts.backupEstimateBytes ?? 0) * 1.2) + 256 * 1024 ** 2,
+  );
+  if (facts.backupFreeBytes === null)
+    problems.push(
+      facts.backupParent
+        ? `The free space for the backup directory could not be measured; its parent, ${facts.backupParent}, must exist (mkdir -p -m 700 ${facts.backupParent}).`
+        : 'The free space for the backup directory could not be measured; its parent must exist.',
+    );
+  else if (facts.backupEstimateBytes === null)
+    // Sizing an unknown backup at the floor could fill the filesystem Postgres writes to.
+    problems.push(
+      'The size of the backup could not be measured: the database size query or `du -sk /data /work` inside the running openduet service failed. Start the stack and check that the service can read its volumes.',
+    );
+  else if (facts.backupFreeBytes < needed)
+    problems.push(
+      `The backup directory's filesystem has ${gib(facts.backupFreeBytes)} free; this backup needs about ${gib(needed)}.`,
+    );
+  return problems;
+}
+
+function quote(value: string): string {
+  return /^[A-Za-z0-9_@%+=:,./^{}-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** A shell line an operator could paste, including the redirections the runner performs. */
+export function renderCommand(step: { command: readonly string[] } & RunOptions): string {
+  return [
+    step.command.map(quote).join(' '),
+    ...(step.stdinFile ? [`< ${quote(step.stdinFile)}`] : []),
+    ...(step.stdoutFile ? [`> ${quote(step.stdoutFile)}`] : []),
+  ].join(' ');
+}
+
+export type UpgradeDependencies = {
+  run: CommandRunner;
+  log: (line: string) => void;
+  sleep: (ms: number) => Promise<void>;
+  /** Entries in the checked-out tree's migration journal; read after the switch. */
+  journalEntries: () => Promise<number>;
+  /** deploy/.env as key-value pairs; the values are only used to name the project and redact. */
+  environment: () => Promise<Record<string, string> | null>;
+  /** The commit this copy of the script was archived from, or null outside an archive. */
+  releaseCommit?: () => Promise<string | null>;
+  /** The machine the upgrade runs on, and where a program would be found on PATH. */
+  machine: MachineAccess & { which: (program: string) => string | null };
+};
+
+export type UpgradeResult = {
+  status: 'planned' | 'refused' | 'upgraded' | 'failed-before-switch' | 'failed-after-switch';
+  context: UpgradeContext;
+};
+
+function availableBytes(df: CommandOutput): number | null {
+  const fields = df.stdout.trim().split('\n').at(-1)?.trim().split(/\s+/) ?? [];
+  const kilobytes = Number(fields[3]);
+  return df.code === 0 && Number.isFinite(kilobytes) && fields.length >= 6
+    ? kilobytes * 1024
+    : null;
+}
+
+/** Read-only questions about the repository, the host and the running stack. */
+export async function gatherPreflight(
+  options: UpgradeOptions,
+  {
+    run,
+    environment,
+    machine,
+    releaseCommit = async () => null,
+  }: Pick<UpgradeDependencies, 'run' | 'environment' | 'machine' | 'releaseCommit'>,
+): Promise<{ facts: PreflightFacts; context: UpgradeContext; secrets: string[] }> {
+  const compose = composeArguments(options);
+  const text = async (command: readonly string[]) => {
+    const result = await run(command);
+    return result.code === 0 ? result.stdout.trim() : null;
+  };
+  const target = `refs/tags/${options.tag}`;
+  const repositoryPrefix = await text(['git', 'rev-parse', '--show-prefix']);
+  // Untracked files are left out, as `openduet deploy` leaves them out: the deploy
+  // file `openduet init` writes is one, and checking out the tag keeps them.
+  const status = (await run(['git', 'status', '--porcelain', '--untracked-files=no'])).stdout;
+  const tagCommit = await text(['git', 'rev-parse', '--verify', '--quiet', `${target}^{commit}`]);
+  const headCommit = (await text(['git', 'rev-parse', 'HEAD'])) ?? '';
+  const fromBranch = await text(['git', 'symbolic-ref', '-q', '--short', 'HEAD']);
+  const described = await text(['git', 'describe', '--tags', '--always']);
+  const targetContainsHead =
+    tagCommit !== null &&
+    (await run(['git', 'merge-base', '--is-ancestor', 'HEAD', target])).code === 0;
+  const configChangedInTarget =
+    tagCommit !== null &&
+    (await run(['git', 'diff', '--quiet', 'HEAD', target, '--', OPERATOR_CONFIGURATION])).code !==
+      0;
+  const values = await environment();
+  const project = /^[a-z0-9][a-z0-9_-]*$/.test(values?.COMPOSE_PROJECT_NAME ?? '')
+    ? (values?.COMPOSE_PROJECT_NAME as string)
+    : 'openduet';
+  const backupDir =
+    options.backupDirByProject && project !== 'openduet'
+      ? join(dirname(options.backupDir), project, basename(options.backupDir)).replaceAll('\\', '/')
+      : options.backupDir;
+  const docker: HostDockerOutputs = {
+    engine: await run(HOST_DOCKER_COMMANDS.engine),
+    compose: await run(HOST_DOCKER_COMMANDS.compose),
+  };
+  const pathCommands = longPathCommands(options.repositoryRoot);
+  const host = dockerHostFacts({
+    platform: machine.platform,
+    env: machine.env,
+    info: await run(DOCKER_HOST_COMMANDS.info),
+    context: await run(DOCKER_HOST_COMMANDS.context),
+    exists: machine.exists,
+    ...(machine.platform === 'win32'
+      ? {
+          paths: longPathFacts({
+            root: options.repositoryRoot,
+            registry: await run(pathCommands.registry),
+            git: await run(pathCommands.git),
+            tracked: await run(pathCommands.tracked),
+            installed: machine.installed(options.repositoryRoot),
+          }),
+        }
+      : {}),
+  });
+  const missingTools = HOST_TOOLS.filter((tool) => machine.which(tool) === null);
+  // Docker Desktop keeps images and volumes in its VM, and a remote engine on
+  // its own machine; this host's df sees neither. The volumes are on that disk,
+  // so ask from beside one: the database's, or the service's when the database
+  // is elsewhere.
+  const dockerRootFreeBytes = engineElsewhere(host)
+    ? availableBytes(
+        await run(
+          options.externalDatabase
+            ? [...compose, 'exec', '-T', 'openduet', 'df', '-Pk', '/data']
+            : [...compose, 'exec', '-T', 'postgres', 'df', '-Pk', '/var/lib/postgresql/data'],
+        ),
+      )
+    : host.info?.dockerRootDir
+      ? availableBytes(await run(['df', '-Pk', host.info.dockerRootDir]))
+      : null;
+  const backupFreeBytes = availableBytes(await run(['df', '-Pk', dirname(backupDir)]));
+  const postgresRunning = options.externalDatabase
+    ? false
+    : Boolean(await text([...compose, 'ps', '-q', 'postgres']));
+  const serviceContainer = Boolean(await text([...compose, 'ps', '-a', '-q', 'openduet']));
+  // Sizes are an estimate for the disk check; one that cannot be measured refuses the upgrade.
+  const volumes = await text([...compose, 'exec', '-T', 'openduet', 'du', '-sk', '/data', '/work']);
+  const database = await text([
+    ...compose,
+    ...inDatabase(
+      options,
+      (db) => `exec psql ${db} -At -c "select pg_database_size(current_database())"`,
+    ),
+  ]);
+  const volumeBytes = (volumes ?? '')
+    .split('\n')
+    .reduce((total, line) => total + (Number(line.trim().split(/\s+/)[0]) || 0) * 1024, 0);
+  const backupEstimateBytes =
+    volumes !== null && database !== null && /^\d+$/.test(database)
+      ? volumeBytes + Number(database)
+      : null;
+  const fromVersion = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(described ?? '')
+    ? (described as string)
+    : `g${headCommit.slice(0, 12)}`;
+  // The image the backup phase tags for a rollback; a missing one is named now.
+  const browserImageName = options.browser
+    ? stackImages({ browser: true, project, profiles: [] }).at(-1)?.running
+    : undefined;
+  const browserImage = browserImageName
+    ? {
+        name: browserImageName,
+        present:
+          (await run(['docker', 'image', 'inspect', '--format', '{{.Id}}', browserImageName]))
+            .code === 0,
+      }
+    : undefined;
+  return {
+    facts: {
+      tag: options.tag,
+      scriptCommit: await releaseCommit(),
+      repositoryRoot: options.repositoryRoot,
+      repositoryPrefix,
+      status,
+      tagCommit,
+      headCommit,
+      targetContainsHead,
+      configChangedInTarget,
+      envFile: values !== null,
+      docker,
+      host,
+      missingTools,
+      postgresRunning,
+      ...(options.externalDatabase ? { externalDatabase: true } : {}),
+      serviceContainer,
+      dockerRootFreeBytes,
+      backupFreeBytes,
+      backupParent: dirname(backupDir),
+      backupEstimateBytes,
+      ...(browserImage ? { browserImage } : {}),
+    },
+    context: {
+      ...options,
+      backupDir,
+      project,
+      fromCommit: headCommit,
+      fromBranch,
+      fromVersion,
+    },
+    secrets: Object.entries(values ?? {})
+      .filter(([key, value]) => value.length >= 8 && /KEY|TOKEN|SECRET|PASSWORD|_URL$/.test(key))
+      .map(([, value]) => value),
+  };
+}
+
+export function renderPlan(context: UpgradeContext, plan: PlanStep[]): string[] {
+  return [
+    `Upgrade ${context.fromVersion} -> ${context.tag} (Compose project ${context.project})`,
+    `Backup directory: ${context.backupDir}`,
+    '',
+    ...plan.flatMap((step, index) => [
+      `${String(index + 1).padStart(2)}. [${step.phase}] ${step.title}`,
+      `    ${renderCommand(step)}`,
+    ]),
+    '',
+    `To return to ${context.fromVersion} after this upgrade:`,
+    ...rollbackSteps(context).map((line) => `    ${line}`),
+  ];
+}
+
+const MIGRATION_POLLS = 60;
+const MIGRATION_POLL_MS = 2000;
+
+export async function runUpgrade(
+  options: UpgradeOptions & { dryRun: boolean },
+  dependencies: UpgradeDependencies,
+): Promise<UpgradeResult> {
+  const { run, log, sleep, journalEntries } = dependencies;
+  const { dryRun, ...upgrade } = options;
+  const { facts, context, secrets } = await gatherPreflight(upgrade, dependencies);
+  const redact = (message: string) =>
+    secrets.reduce((result, secret) => result.replaceAll(secret, '[redacted]'), message);
+  const plan = upgradePlan(context);
+  const problems = judgePreflight(facts);
+  for (const note of describeDockerHost(facts.host)) log(note);
+  // Said whenever there is a stamp, so a matching copy is seen to have been checked.
+  if (facts.scriptCommit) log(`This copy was taken from ${facts.scriptCommit.slice(0, 12)}.`);
+  if (problems.length > 0) {
+    log(`Preflight found ${problems.length} problem(s); nothing was changed:`);
+    for (const problem of problems) log(`  - ${problem}`);
+  } else log('Preflight passed: clean tree, known tag, supported Docker, enough disk.');
+  if (dryRun) {
+    log('Dry run: nothing below was executed.');
+    for (const line of renderPlan(context, plan)) log(line);
+    return { status: problems.length > 0 ? 'refused' : 'planned', context };
+  }
+  if (problems.length > 0) return { status: 'refused', context };
+
+  let switched = false;
+  let stopped = false;
+  let reached = 0;
+  try {
+    for (const [index, step] of plan.entries()) {
+      reached = index;
+      log(`[${index + 1}/${plan.length}] ${step.title}`);
+      log(`    ${renderCommand(step)}`);
+      if (step.until === 'journal-recorded') {
+        const expected = await journalEntries();
+        let recorded = Number.NaN;
+        for (let poll = 0; poll < MIGRATION_POLLS && recorded !== expected; poll += 1) {
+          if (poll > 0) await sleep(MIGRATION_POLL_MS);
+          const result = await run(step.command, step);
+          recorded = result.code === 0 ? Number(result.stdout.trim()) : Number.NaN;
+        }
+        if (recorded !== expected)
+          throw new Error(
+            `${Number.isNaN(recorded) ? 0 : recorded} of ${expected} migrations are recorded; the release did not finish migrating.`,
+          );
+        log(`    ${recorded} of ${expected} migrations recorded.`);
+        continue;
+      }
+      const result = await run(step.command, step);
+      if (step.command.includes('stop')) stopped = true;
+      if (result.code !== 0)
+        throw new Error(
+          `${renderCommand(step)} exited ${result.code}: ${result.stderr.trim().slice(-2000)}`,
+        );
+      // Only a checkout that succeeded has changed the tree.
+      if (step.phase === 'switch') switched = true;
+    }
+  } catch (error) {
+    log(`Upgrade failed: ${redact(error instanceof Error ? error.message : String(error))}`);
+    if (!switched) {
+      // The tree, the images' :local tags and the database are untouched.
+      if (stopped) {
+        const restart = await run(
+          [
+            ...composeArguments(context),
+            'up',
+            '-d',
+            '--wait',
+            '--wait-timeout',
+            String(context.waitTimeoutSeconds),
+          ],
+          { timeoutMs: (context.waitTimeoutSeconds + 120) * 1000 },
+        );
+        log(
+          restart.code === 0
+            ? 'The previous release was started again; nothing was upgraded.'
+            : `The previous release did not start again: ${redact(restart.stderr.trim().slice(-2000))}`,
+        );
+      }
+      log(`Any partial backup is in ${context.backupDir}.`);
+      return { status: 'failed-before-switch', context };
+    }
+    // Migrations may already have run, so the old code must not be started
+    // against this database. The operator decides: fix and continue, or roll back.
+    log(`The tree is at ${context.tag}. The stack was left as it is.`);
+    log('Commands that were not completed:');
+    for (const step of plan.slice(reached)) log(`    ${renderCommand(step)}`);
+    log(`To return to ${context.fromVersion}:`);
+    for (const line of rollbackSteps(context)) log(`    ${line}`);
+    return { status: 'failed-after-switch', context };
+  }
+  log(`Upgraded to ${context.tag}. The backup is in ${context.backupDir}; keep it until the`);
+  log('release has run to your satisfaction, and keep restrictions.tar independently of it.');
+  log(`To return to ${context.fromVersion}:`);
+  for (const line of rollbackSteps(context)) log(`    ${line}`);
+  return { status: 'upgraded', context };
+}
+
+/**
+ * deploy/.env as Compose reads it, or null when there is none. The values name
+ * the project and are redacted from output, so an inline comment must not
+ * become part of a key: redacting `key # note` would leave `key` printed.
+ */
+export async function readEnvironment(
+  repositoryRoot: string,
+): Promise<Record<string, string> | null> {
+  const source = await readFile(join(repositoryRoot, 'deploy/.env'), 'utf8').catch(() => null);
+  return source === null ? null : parseEnvFile(source);
+}
+
+/** Binary-safe: a dump or an archive goes straight to its file, never through a string. */
+export const spawnRunner =
+  (cwd: string): CommandRunner =>
+  async (command, options = {}) => {
+    let file: number | undefined;
+    try {
+      // Exclusive and private: a backup never overwrites an earlier one.
+      if (options.stdoutFile) file = openSync(options.stdoutFile, 'wx', 0o600);
+      const child = Bun.spawn([...command], {
+        cwd,
+        stdin: options.stdinFile ? Bun.file(options.stdinFile) : 'ignore',
+        stdout: file ?? 'pipe',
+        stderr: 'pipe',
+      });
+      const timer = setTimeout(() => child.kill(), options.timeoutMs ?? 15 * 60_000);
+      try {
+        const [code, stdout, stderr] = await Promise.all([
+          child.exited,
+          file === undefined ? new Response(child.stdout as ReadableStream).text() : '',
+          new Response(child.stderr).text(),
+        ]);
+        return { code, stdout, stderr };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      return { code: 127, stdout: '', stderr: error instanceof Error ? error.message : 'failed' };
+    } finally {
+      if (file !== undefined) closeSync(file);
+    }
+  };
+
+/**
+ * `git archive` writes the archived commit into release-commit.txt (the file is
+ * marked export-subst in .gitattributes). A checkout holds the placeholder
+ * instead, and so does a copy made any other way: neither has a stamp.
+ */
+export async function readReleaseCommit(scriptDirectory: string): Promise<string | null> {
+  const stamp = await readFile(join(scriptDirectory, 'release-commit.txt'), 'utf8').catch(() => '');
+  return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(stamp.trim()) ? stamp.trim() : null;
+}
+
+/**
+ * What the run reads and where its commands run: always the installation named
+ * by --repository, never the directory this script was taken into.
+ */
+export function installationDependencies(
+  repositoryRoot: string,
+): Pick<UpgradeDependencies, 'run' | 'journalEntries' | 'environment'> {
+  return {
+    run: spawnRunner(repositoryRoot),
+    // Read after the switch, so it is the release's journal in the installation.
+    journalEntries: async () =>
+      (
+        JSON.parse(
+          await readFile(join(repositoryRoot, 'apps/openduet/drizzle/meta/_journal.json'), 'utf8'),
+        ) as { entries: unknown[] }
+      ).entries.length,
+    environment: () => readEnvironment(repositoryRoot),
+  };
+}
+
+if (import.meta.main) {
+  let options: ReturnType<typeof parseArguments>;
+  try {
+    options = parseArguments(
+      process.argv.slice(2),
+      new Date(),
+      homedir(),
+      resolve(import.meta.dir, '../..'),
+    );
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : USAGE}\n`);
+    process.exit(2);
+  }
+  try {
+    // Only to name a directory that does not exist; git decides whether it is a checkout's top.
+    options.repositoryRoot = realpathSync(options.repositoryRoot).replaceAll('\\', '/');
+  } catch {
+    // Not 2: `openduet upgrade` reads 2 as options an older release does not know.
+    process.stderr.write(`repository not found: ${options.repositoryRoot}\n`);
+    process.exit(3);
+  }
+  const result = await runUpgrade(options, {
+    ...installationDependencies(options.repositoryRoot),
+    releaseCommit: () => readReleaseCommit(import.meta.dir),
+    log: (line) => process.stdout.write(`${line}\n`),
+    sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
+    machine: { ...localMachine, which: (program) => Bun.which(program) },
+  });
+  process.exit(result.status === 'planned' || result.status === 'upgraded' ? 0 : 1);
+}

@@ -1,0 +1,1316 @@
+/**
+ * The file server is only allowed to read the bundle it was pointed at.
+ *
+ * Two layers, because either alone would prove less than it looks. The unit
+ * tests exercise the guard directly, since `fetch` and `new URL` collapse dot
+ * segments before a server ever sees them and would quietly pass a server that
+ * had no guard at all. The HTTP tests write the request line onto a socket
+ * themselves, which is the only way to send what an attacker actually sends.
+ *
+ * The invariant every hostile case asserts is the same one: a file outside the
+ * bundle never reaches the response body.
+ */
+
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { realpathSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { connect } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
+import { CLIENT_ADDRESS_HEADER as API_CLIENT_ADDRESS_HEADER } from '../../apps/openduet/src/api/listener.ts';
+import { isIsolated, viewHeaders } from '../../apps/openduet/src/viewer/headers.ts';
+import {
+  BRAND_CSS_MAX_BYTES,
+  BRAND_FILE_MAX_BYTES,
+  BRAND_TOKENS,
+  brandCssIssues,
+  brandFile,
+  CLIENT_ADDRESS_HEADER,
+  createStaticServer,
+  defaultGateway,
+  readBrandFile,
+  renderIndex,
+  resolveInside,
+} from './serve-static.ts';
+
+/** Appears only in files outside the bundle. Any response carrying it is a leak. */
+const SENTINEL = 'openduet-outside-the-bundle-4f9c2a';
+const INDEX_HTML = '<!doctype html><title>OpenDuet</title><div id="root"></div>';
+const ASSET_JS = 'export const ok = true;\n';
+
+let base = '';
+let server: ReturnType<typeof createStaticServer> | null = null;
+
+beforeAll(async () => {
+  base = await mkdtemp(join(tmpdir(), 'openduet-serve-'));
+  // Two decoys beside the bundle, which is where a climb of one level lands.
+  await writeFile(join(base, 'package.json'), `{"name":"${SENTINEL}"}`, 'utf8');
+  await writeFile(join(base, 'secret.txt'), SENTINEL, 'utf8');
+  await mkdir(join(base, 'dist', 'assets'), { recursive: true });
+  await writeFile(join(base, 'dist', 'index.html'), INDEX_HTML, 'utf8');
+  await writeFile(join(base, 'dist', 'assets', 'app.js'), ASSET_JS, 'utf8');
+
+  server = createStaticServer({ root: join(base, 'dist'), port: 0, hostname: '127.0.0.1' });
+});
+
+afterAll(async () => {
+  server?.stop(true);
+  if (base) await rm(base, { recursive: true, force: true });
+});
+
+type RawResponse = { status: number; body: string };
+
+/**
+ * Send a request line verbatim. `fetch` would normalise `/../` and `%2e%2e`
+ * out of the path first, so it cannot test what this server is guarding.
+ */
+const raw = (path: string): Promise<RawResponse> =>
+  new Promise((settle, fail) => {
+    const port = server?.port;
+    if (!port) {
+      fail(new Error('the server is not listening'));
+      return;
+    }
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+    let text = '';
+    socket.setTimeout(5000, () => {
+      socket.destroy();
+      fail(new Error(`no answer for ${path}`));
+    });
+    socket.on('data', (chunk) => {
+      text += chunk.toString('utf8');
+    });
+    socket.on('error', fail);
+    socket.on('end', () => {
+      const split = text.indexOf('\r\n\r\n');
+      const head = split === -1 ? text : text.slice(0, split);
+      const body = split === -1 ? '' : text.slice(split + 4);
+      settle({ status: Number(head.split(' ')[1] ?? 0), body });
+    });
+  });
+
+/** Resolved late, because the port is only known once the server is listening. */
+const origin = () => `http://127.0.0.1:${server?.port}`;
+
+/** Refused, or handed the client's own index. Never anything from outside. */
+const expectConfined = (response: RawResponse, path: string) => {
+  expect(response.body, `${path} leaked a file from outside the bundle`).not.toContain(SENTINEL);
+  const refused = response.status === 404;
+  const servedIndex = response.status === 200 && response.body.includes('id="root"');
+  expect(
+    refused || servedIndex,
+    `${path} answered ${response.status} with unexpected content`,
+  ).toBe(true);
+};
+
+describe('resolveInside', () => {
+  const root = resolve(sep === '\\' ? 'C:\\app\\dist' : '/app/dist');
+  const inside = (relative: string) => resolve(root, relative);
+
+  test('accepts a file in the bundle', () => {
+    expect(resolveInside(root, '/assets/app.js')).toBe(inside('assets/app.js'));
+  });
+
+  test('accepts the bundle root itself', () => {
+    expect(resolveInside(root, '/')).toBe(root);
+  });
+
+  test('percent-encoded dot segments do not climb out', () => {
+    for (const pathname of [
+      '/../package.json',
+      '/%2e%2e/package.json',
+      '/%2E%2E%2Fpackage.json',
+      '/%2e%2e%2f%2e%2e%2fsecret.txt',
+      '/assets/../../package.json',
+    ]) {
+      expect(resolveInside(root, pathname), pathname).toBeNull();
+    }
+  });
+
+  test('a backslash is a separator on Windows, so it is refused everywhere', () => {
+    for (const pathname of ['/..%5cpackage.json', '/%2e%2e%5cpackage.json', '/a%5cb']) {
+      expect(resolveInside(root, pathname), pathname).toBeNull();
+    }
+  });
+
+  test('a colon opens a drive letter and a URL scheme, so it is refused', () => {
+    for (const pathname of [
+      '/C:/Windows/win.ini',
+      '/file:///etc/passwd',
+      '/http://example.com/x',
+      '/%43%3a/Windows/win.ini',
+    ]) {
+      expect(resolveInside(root, pathname), pathname).toBeNull();
+    }
+  });
+
+  test('an absolute-looking path is still resolved inside the bundle', () => {
+    expect(resolveInside(root, '//etc/passwd')).toBe(inside('etc/passwd'));
+    expect(resolveInside(root, '/etc/passwd')).toBe(inside('etc/passwd'));
+  });
+
+  test('a NUL byte is refused, because the kernel would read a shorter name', () => {
+    expect(resolveInside(root, '/app.js%00.txt')).toBeNull();
+  });
+
+  test('a malformed percent sequence is refused rather than guessed at', () => {
+    expect(resolveInside(root, '/%zz')).toBeNull();
+    expect(resolveInside(root, '/%')).toBeNull();
+  });
+
+  test('a sibling directory sharing the prefix is not inside it', () => {
+    // `dist-backup` starts with `dist`, which is why the check ends at a separator.
+    expect(resolveInside(root, '/../dist-backup/secret.txt')).toBeNull();
+  });
+});
+
+describe('the server over a socket', () => {
+  test('serves the index at the root', async () => {
+    const response = await raw('/');
+    expect(response.status).toBe(200);
+    expect(response.body).toContain('id="root"');
+  });
+
+  test('serves an asset out of the bundle', async () => {
+    const response = await raw('/assets/app.js');
+    expect(response.status).toBe(200);
+    expect(response.body).toContain('export const ok = true;');
+  });
+
+  test('the OpenDuet app refuses to be framed by another site', async () => {
+    for (const path of ['/', '/assets/app.js', '/chat/c_01']) {
+      const response = await fetch(`${origin()}${path}`);
+      expect(response.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+      expect(response.headers.get('content-security-policy')).toBe(
+        "frame-ancestors 'self'; frame-src 'self'",
+      );
+      await response.arrayBuffer();
+    }
+    // The file's own type survives the added headers.
+    const script = await fetch(`${origin()}/assets/app.js`);
+    expect(script.headers.get('content-type')).toContain('javascript');
+    await script.arrayBuffer();
+  });
+
+  test('falls back to the index for a deep link with no file behind it', async () => {
+    const response = await raw('/jobs/job_01J');
+    expect(response.status).toBe(200);
+    expect(response.body).toContain('id="root"');
+  });
+
+  test('one connection serves several requests in turn, then closes when asked', async () => {
+    // The web container sits behind a browser that reuses connections. A server
+    // that answered only the first request per socket, or never closed one it
+    // was asked to close, would look fine in a single fetch and fail in production.
+    const port = server?.port;
+    if (!port) throw new Error('the server is not listening');
+    const socket = connect(port, '127.0.0.1');
+    await new Promise<void>((ready) => socket.once('connect', ready));
+    let text = '';
+    socket.on('data', (chunk) => {
+      text += chunk.toString('utf8');
+    });
+    const ended = new Promise<void>((settle, fail) => {
+      socket.on('end', settle);
+      socket.on('error', fail);
+      socket.setTimeout(5000, () => fail(new Error('the server did not close the connection')));
+    });
+    const CRLF = '\r\n';
+    const request = (path: string, close = false) =>
+      socket.write(
+        [
+          `GET ${path} HTTP/1.1`,
+          'Host: 127.0.0.1',
+          ...(close ? ['Connection: close'] : []),
+          '',
+          '',
+        ].join(CRLF),
+      );
+    const responses = () => text.split('HTTP/1.1 ').length - 1;
+    const until = async (count: number) => {
+      const deadline = Date.now() + 5000;
+      while (responses() < count && Date.now() < deadline) await Bun.sleep(10);
+      expect(responses(), `after ${count} request(s)`).toBe(count);
+    };
+    request('/assets/app.js');
+    await until(1);
+    request('/jobs/job_01J');
+    await until(2);
+    request('/missing/%2e%2e/secret.txt', true);
+    await ended;
+    expect(responses()).toBe(3);
+    expect(text).toContain('export const ok = true;');
+    expect(text).toContain('id="root"');
+    expect(text).not.toContain(SENTINEL);
+  });
+
+  test('reads an asset with HEAD, headers only', async () => {
+    const response = await fetch(`${origin()}/assets/app.js`, { method: 'HEAD' });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('');
+  });
+
+  test('answers a write verb with 405 and says what it allows', async () => {
+    for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) {
+      const response = await fetch(`${origin()}/assets/app.js`, { method });
+      expect(response.status, `${method} on an asset`).toBe(405);
+      expect(response.headers.get('allow'), `${method} allow header`).toBe('GET, HEAD');
+      expect(await response.text()).not.toContain('export const ok = true;');
+    }
+  });
+
+  test('a write verb cannot reach outside the bundle either', async () => {
+    const response = await fetch(`${origin()}/../secret.txt`, { method: 'POST' });
+    expect(response.status).toBe(405);
+    expect(await response.text()).not.toContain(SENTINEL);
+  });
+
+  test('never answers a traversal with a file from outside the bundle', async () => {
+    for (const path of [
+      '/../package.json',
+      '/../secret.txt',
+      '/%2e%2e/package.json',
+      '/%2E%2E%2Fpackage.json',
+      '/%2e%2e%2f%2e%2e%2fsecret.txt',
+      '/C:/Windows/win.ini',
+      '/file:///etc/passwd',
+      '//etc/passwd',
+      '/..%5cpackage.json',
+      '/%2e%2e%5cpackage.json',
+      '/assets/../../secret.txt',
+      '/app.js%00.txt',
+      '/%00',
+      '/%zz',
+    ]) {
+      expectConfined(await raw(path), path);
+    }
+  });
+});
+
+describe('same-origin API proxy', () => {
+  let api: ReturnType<typeof Bun.serve>;
+  let web: ReturnType<typeof createStaticServer>;
+  let external: ReturnType<typeof Bun.serve>;
+  let apiRequests = 0;
+  let externalRequests = 0;
+  const webOrigin = () => `http://127.0.0.1:${web.port}`;
+  const apiOrigin = () => `http://127.0.0.1:${api.port}`;
+
+  beforeAll(() => {
+    external = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch() {
+        externalRequests++;
+        return new Response('external peer');
+      },
+    });
+    api = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      async fetch(request) {
+        apiRequests++;
+        const url = new URL(request.url);
+        if (url.pathname.startsWith('/apps/view/') || url.pathname.startsWith('/previews/')) {
+          const seen = JSON.stringify({
+            cookie: request.headers.get('cookie'),
+            authorization: request.headers.get('authorization'),
+            origin: request.headers.get('origin'),
+          });
+          // A view answer that lost its isolation, as a bug would leave it.
+          if (url.pathname.includes('/bare/')) return new Response(`<p>${seen}</p>`);
+          const headers = viewHeaders('text/html; charset=utf-8');
+          headers.append('set-cookie', 'openduet_session=tossed; Path=/');
+          return new Response(seen, { headers });
+        }
+        if (url.pathname === '/redirect') {
+          return Response.redirect(`http://127.0.0.1:${external.port}/secret`, 302);
+        }
+        if (url.pathname === '/events') {
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('data: {"seq":1}\n\n'));
+                // Deliberately left open: a buffered proxy would never return this event.
+              },
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        }
+        return Response.json(
+          {
+            method: request.method,
+            path: url.pathname,
+            query: url.search,
+            origin: request.headers.get('origin'),
+            cookie: request.headers.get('cookie'),
+            forwarded: request.headers.get('forwarded'),
+            forwardedHost: request.headers.get('x-forwarded-host'),
+            clientAddress: request.headers.get('x-openduet-client-address'),
+            webOrigin: request.headers.get('x-openduet-web-origin'),
+            body: await request.text(),
+          },
+          {
+            status: 201,
+            headers: [
+              [
+                'set-cookie',
+                'openduet_session=session-value; Path=/; HttpOnly; Secure; SameSite=Lax',
+              ],
+              ['set-cookie', 'other=value; Path=/; HttpOnly'],
+              ['cache-control', 'no-store'],
+            ],
+          },
+        );
+      },
+    });
+    web = createStaticServer({
+      root: join(base, 'dist'),
+      port: 0,
+      hostname: '127.0.0.1',
+      apiOrigin: apiOrigin(),
+    });
+  });
+
+  afterAll(() => {
+    web.stop(true);
+    api.stop(true);
+    external.stop(true);
+  });
+
+  test('forwards authenticated writes with the internal origin and intact cookies', async () => {
+    const response = await fetch(`${webOrigin()}/api/setup?trace=1`, {
+      method: 'POST',
+      headers: {
+        origin: webOrigin(),
+        cookie: 'openduet_session=incoming-session',
+        'content-type': 'application/json',
+        forwarded: 'host=untrusted.example;proto=https',
+        'x-forwarded-host': 'untrusted.example',
+        'x-openduet-web-origin': 'https://untrusted.example',
+      },
+      body: '{"email":"owner@example.test"}',
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      method: 'POST',
+      path: '/setup',
+      query: '?trace=1',
+      origin: apiOrigin(),
+      cookie: 'openduet_session=incoming-session',
+      forwarded: null,
+      forwardedHost: null,
+      clientAddress: '127.0.0.1',
+      // Where the browser opened OpenDuet, replacing anything it claimed.
+      webOrigin: webOrigin(),
+      body: '{"email":"owner@example.test"}',
+    });
+    expect(response.headers.getSetCookie()).toEqual([
+      'openduet_session=session-value; Path=/; HttpOnly; Secure; SameSite=Lax',
+      'other=value; Path=/; HttpOnly',
+    ]);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  test('forwards the OAuth discovery documents to the API at their own paths', async () => {
+    for (const path of [
+      '/.well-known/oauth-authorization-server',
+      '/.well-known/oauth-protected-resource',
+      '/.well-known/oauth-protected-resource/api/mcp',
+    ]) {
+      const response = await fetch(`${webOrigin()}${path}`);
+      expect(response.status).toBe(201);
+      expect(((await response.json()) as { path: string }).path).toBe(path);
+    }
+    // Only those names: any other well-known path is the bundle's, like any other path.
+    const other = await fetch(`${webOrigin()}/.well-known/oauth-authorization-server-x`);
+    expect(await other.text()).toBe(INDEX_HTML);
+  });
+
+  test('states the browser socket as the client address and discards any the browser sent', async () => {
+    for (const claimed of ['203.0.113.9', '203.0.113.9, 198.51.100.4', '']) {
+      const response = await fetch(`${webOrigin()}/api/login`, {
+        method: 'POST',
+        headers: {
+          origin: webOrigin(),
+          'content-type': 'application/json',
+          'x-openduet-client-address': claimed,
+          'x-forwarded-for': '203.0.113.10',
+          'x-real-ip': '203.0.113.11',
+        },
+        body: '{}',
+      });
+      const seen = (await response.json()) as { clientAddress: string | null };
+      expect(seen.clientAddress).toBe('127.0.0.1');
+    }
+    expect(CLIENT_ADDRESS_HEADER).toBe(API_CLIENT_ADDRESS_HEADER);
+  });
+
+  test('rejects foreign, opaque, and cross-site browser requests before contacting the API', async () => {
+    const count = apiRequests;
+    const rejectedHeaders: Record<string, string>[] = [
+      { origin: 'https://untrusted.example' },
+      { origin: 'null' },
+      { origin: webOrigin(), 'sec-fetch-site': 'cross-site' },
+      { origin: 'https://untrusted.example', 'x-forwarded-host': 'untrusted.example' },
+    ];
+    for (const headers of rejectedHeaders) {
+      const response = await fetch(`${webOrigin()}/api/setup`, {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
+      expect(response.status).toBe(403);
+    }
+    expect(apiRequests).toBe(count);
+  });
+
+  test("a sign-in's return from the app's own site reaches the API as a page load, and nothing else does", async () => {
+    for (const path of ['/api/oauth/callback', '/api/oauth/google/callback']) {
+      const response = await fetch(`${webOrigin()}${path}?code=c&state=s`, {
+        headers: {
+          'sec-fetch-site': 'cross-site',
+          'sec-fetch-mode': 'navigate',
+          'sec-fetch-dest': 'document',
+          cookie: 'openduet_session=session-value',
+        },
+      });
+      expect(response.status).toBe(201);
+      const seen = (await response.json()) as { path: string; cookie: string | null };
+      expect(seen.path).toBe(path.slice('/api'.length));
+      // The sign-in is the person's own, so their session goes with it.
+      expect(seen.cookie).toBe('openduet_session=session-value');
+    }
+    const count = apiRequests;
+    const refused: RequestInit[] = [
+      { headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'cors' } },
+      // Another site framing the callback navigates too, but not as a page of its own.
+      {
+        headers: {
+          'sec-fetch-site': 'cross-site',
+          'sec-fetch-mode': 'navigate',
+          'sec-fetch-dest': 'iframe',
+        },
+      },
+      { headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate' } },
+      {
+        method: 'POST',
+        headers: { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate' },
+        body: '{}',
+      },
+    ];
+    for (const init of refused) {
+      const response = await fetch(`${webOrigin()}/api/oauth/callback?code=c&state=s`, init);
+      expect(response.status).toBe(403);
+    }
+    const other = await fetch(`${webOrigin()}/api/connections`, {
+      headers: {
+        'sec-fetch-site': 'cross-site',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-dest': 'document',
+      },
+    });
+    expect(other.status).toBe(403);
+    expect(apiRequests).toBe(count);
+  });
+
+  test('states a browser origin only when it is plain http on this machine, never one the request wrote', async () => {
+    const CRLF = String.fromCharCode(13, 10);
+    /** One request written byte for byte, as no browser would send it. */
+    const written = (line: string, host: string) =>
+      new Promise<{ webOrigin: string | null }>((settle, fail) => {
+        const socket = connect(web.port as number, '127.0.0.1', () => {
+          socket.write([line, `Host: ${host}`, 'Connection: close', '', ''].join(CRLF));
+        });
+        let text = '';
+        socket.setTimeout(4000, () => {
+          socket.destroy();
+          fail(new Error(`no answer for ${line}: ${text.slice(0, 200)}`));
+        });
+        // Settled on the first whole answer: the connection may be kept open.
+        socket.on('data', (chunk) => {
+          text += chunk.toString('utf8');
+          const body = text.slice(text.indexOf(CRLF + CRLF) + 4);
+          try {
+            const answer = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1));
+            socket.destroy();
+            settle(answer);
+          } catch {
+            // Not all of it yet.
+          }
+        });
+        socket.on('error', fail);
+      });
+    // An absolute-form target names https and any host it likes; a forged Host names any host.
+    expect(
+      (await written('GET https://evil.example/api/kinds HTTP/1.1', 'evil.example')).webOrigin,
+    ).toBeNull();
+    expect((await written('GET /api/kinds HTTP/1.1', 'evil.example')).webOrigin).toBeNull();
+    expect((await written('GET /api/kinds HTTP/1.1', `localhost:${web.port}`)).webOrigin).toBe(
+      `http://localhost:${web.port}`,
+    );
+  });
+
+  test("an app's file read from its opaque origin reaches the API, without the session", async () => {
+    const response = await fetch(`${webOrigin()}/api/apps/view/tok/app.js`, {
+      headers: {
+        origin: 'null',
+        'sec-fetch-site': 'cross-site',
+        cookie: 'openduet_session=session-value',
+        authorization: 'Bearer x',
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ cookie: null, authorization: null, origin: null });
+    expect(isIsolated(response.headers)).toBe(true);
+    expect(response.headers.has('set-cookie')).toBe(false);
+  });
+
+  test("an app's file that arrives without its isolation is not passed on", async () => {
+    const response = await fetch(`${webOrigin()}/api/apps/view/tok/bare/index.html`);
+    expect(response.status).toBe(502);
+    expect(await response.text()).not.toContain('<p>');
+    expect(response.headers.get('content-security-policy')).toStartWith('sandbox');
+  });
+
+  test("a preview's page, read from its opaque origin, reaches the API without the session, and only isolated", async () => {
+    const response = await fetch(`${webOrigin()}/api/previews/tok/src/main.js`, {
+      headers: {
+        origin: 'null',
+        'sec-fetch-site': 'cross-site',
+        cookie: 'openduet_session=session-value',
+        authorization: 'Bearer x',
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ cookie: null, authorization: null, origin: null });
+    expect(isIsolated(response.headers)).toBe(true);
+    expect(response.headers.has('set-cookie')).toBe(false);
+    const bare = await fetch(`${webOrigin()}/api/previews/tok/bare/index.html`);
+    expect(bare.status).toBe(502);
+    expect(await bare.text()).not.toContain('<p>');
+    const count = apiRequests;
+    const posted = await fetch(`${webOrigin()}/api/previews/tok/`, {
+      method: 'POST',
+      headers: { origin: 'null', 'sec-fetch-site': 'cross-site' },
+      body: '{}',
+    });
+    expect(posted.status).toBe(403);
+    expect(apiRequests).toBe(count);
+  });
+
+  test('a write under the app view path is still refused from another origin', async () => {
+    const count = apiRequests;
+    const response = await fetch(`${webOrigin()}/api/apps/view/tok/index.html`, {
+      method: 'POST',
+      headers: { origin: 'null', 'sec-fetch-site': 'cross-site' },
+      body: '{}',
+    });
+    expect(response.status).toBe(403);
+    expect(apiRequests).toBe(count);
+  });
+
+  test('supports clients that omit Origin', async () => {
+    const response = await fetch(`${webOrigin()}/api/me`);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ path: '/me' });
+  });
+
+  test('request paths and query parameters cannot choose another upstream', async () => {
+    for (const path of [
+      `/api//127.0.0.1:${external.port}/secret`,
+      `/api/http://127.0.0.1:${external.port}/secret`,
+      `/api/health?url=http://127.0.0.1:${external.port}/secret`,
+    ]) {
+      const response = await fetch(`${webOrigin()}${path}`);
+      expect(response.status).toBe(201);
+    }
+    expect(externalRequests).toBe(0);
+  });
+
+  test('never follows an upstream redirect with a session cookie', async () => {
+    const response = await fetch(`${webOrigin()}/api/redirect`, {
+      redirect: 'manual',
+      headers: { cookie: 'openduet_session=private' },
+    });
+    expect(response.status).toBe(302);
+    expect(externalRequests).toBe(0);
+  });
+
+  test('streams the first SSE event before the upstream closes', async () => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 2000);
+    try {
+      const response = await fetch(`${webOrigin()}/api/events`, { signal: abort.signal });
+      expect(response.headers.get('content-type')).toBe('text/event-stream');
+      const reader = response.body?.getReader();
+      expect(reader).toBeDefined();
+      const first = await reader?.read();
+      expect(new TextDecoder().decode(first?.value)).toBe('data: {"seq":1}\n\n');
+      await reader?.cancel();
+    } finally {
+      clearTimeout(timer);
+      abort.abort();
+    }
+  });
+
+  test('a forwarded address is ignored when no upstream is configured', async () => {
+    const response = await fetch(`${webOrigin()}/api/login`, {
+      headers: {
+        origin: webOrigin(),
+        'x-forwarded-for': '100.100.0.5',
+        'tailscale-user-login': 'stranger@example.test',
+      },
+    });
+    const seen = (await response.json()) as { clientAddress: string | null };
+    expect(seen.clientAddress).toBe('127.0.0.1');
+  });
+
+  test('uses an explicitly configured TLS origin without trusting forwarded headers', async () => {
+    const tlsWeb = createStaticServer({
+      root: join(base, 'dist'),
+      port: 0,
+      hostname: '127.0.0.1',
+      apiOrigin: apiOrigin(),
+      publicOrigin: 'https://openduet.example.test',
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${tlsWeb.port}/api/setup`, {
+        method: 'POST',
+        headers: { origin: 'https://openduet.example.test' },
+      });
+      expect(response.status).toBe(201);
+      expect(await response.json()).toMatchObject({ origin: apiOrigin() });
+    } finally {
+      tlsWeb.stop(true);
+    }
+  });
+});
+
+/**
+ * With the tailnet overlay the browser is no longer the web server's socket
+ * peer: every device arrives through the Tailscale node, so without this every
+ * phone and laptop on the tailnet would share one sign-in limiter. The node
+ * states the device's tailnet address in `X-Forwarded-For`; a browser can send
+ * the same header, so the deciding question is which socket the request came
+ * from, and nothing else.
+ */
+describe('a trusted upstream in front of the web server', () => {
+  let api: ReturnType<typeof Bun.serve>;
+  let seen: {
+    clientAddress: string | null;
+    identity: string | null;
+    invented: string | null;
+    forwarded: string | null;
+  };
+  const apiOrigin = () => `http://127.0.0.1:${api.port}`;
+  /** Two events three seconds apart, then held open, as a job stream is. */
+  const EVENT_GAP_MS = 3000;
+
+  const serverWith = (trustedUpstream?: string) =>
+    createStaticServer({
+      root: join(base, 'dist'),
+      port: 0,
+      hostname: '127.0.0.1',
+      apiOrigin: apiOrigin(),
+      trustedUpstream,
+    });
+
+  beforeAll(() => {
+    api = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch(request) {
+        seen = {
+          clientAddress: request.headers.get('x-openduet-client-address'),
+          identity: request.headers.get('tailscale-user-login'),
+          // A name Serve does not rewrite, so a browser could have written it.
+          invented: request.headers.get('tailscale-account'),
+          forwarded: request.headers.get('x-forwarded-for'),
+        };
+        if (new URL(request.url).pathname !== '/events') return Response.json(seen);
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode('data: {"seq":1}\n\n'));
+              setTimeout(() => {
+                controller.enqueue(encoder.encode('data: {"seq":2}\n\n'));
+                // Held open afterwards, as a quiet conversation is.
+              }, EVENT_GAP_MS);
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
+      },
+    });
+  });
+
+  afterAll(() => {
+    api.stop(true);
+  });
+
+  const ask = async (
+    web: ReturnType<typeof createStaticServer>,
+    headers: Record<string, string>,
+  ) => {
+    // The header handling under test does not depend on the method, and a
+    // read keeps each case to one exchange on the connection.
+    const response = await fetch(`http://127.0.0.1:${web.port}/api/login`, { headers });
+    expect(response.status).toBe(200);
+    return seen;
+  };
+
+  test('the upstream states the address the API limits, in place of its own socket', async () => {
+    const web = serverWith('127.0.0.1');
+    try {
+      // A tailnet peer is a CGNAT address; a tailnet IPv6 peer is unique-local.
+      for (const address of ['100.64.0.1', '100.100.0.5', 'fd7a:115c:a1e0::4501']) {
+        const result = await ask(web, { 'x-forwarded-for': address });
+        expect(result.clientAddress, address).toBe(address);
+      }
+    } finally {
+      web.stop(true);
+    }
+  });
+
+  test('a forged address from a peer that is not the upstream mints no fresh bucket', async () => {
+    // The upstream is named as some other machine, so this socket is not it.
+    for (const upstream of ['203.0.113.7', undefined]) {
+      const web = serverWith(upstream);
+      try {
+        const result = await ask(web, { 'x-forwarded-for': '100.100.0.5' });
+        expect(result.clientAddress, String(upstream)).toBe('127.0.0.1');
+      } finally {
+        web.stop(true);
+      }
+    }
+  });
+
+  /** A container's routing table whose default route goes through `gateway` (little-endian hex). */
+  const table = (gateway: string) =>
+    [
+      'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT',
+      `eth0\t00000000\t${gateway}\t0003\t0\t0\t0\t00000000\t0\t0\t0`,
+      'eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0',
+    ].join('\n');
+
+  test('the routing table names the gateway a proxy on the host reaches the container through', () => {
+    expect(defaultGateway(table('010012AC'))).toBe('172.18.0.1');
+    expect(defaultGateway(table('0100007F'))).toBe('127.0.0.1');
+    expect(defaultGateway(table('00000000'))).toBeNull();
+    expect(defaultGateway('Iface\tDestination\tGateway\n')).toBeNull();
+    expect(defaultGateway('')).toBeNull();
+  });
+
+  test('a proxy on the host, named as the gateway, states the address; any other peer does not', async () => {
+    for (const [gateway, expected] of [
+      ['0100007F', '100.100.0.5'],
+      ['010012AC', '127.0.0.1'],
+    ] as const) {
+      const web = createStaticServer({
+        root: join(base, 'dist'),
+        port: 0,
+        hostname: '127.0.0.1',
+        apiOrigin: apiOrigin(),
+        trustedUpstream: 'gateway',
+        routeTable: async () => table(gateway),
+      });
+      try {
+        const result = await ask(web, { 'x-forwarded-for': '100.100.0.5' });
+        expect(result.clientAddress, gateway).toBe(expected);
+      } finally {
+        web.stop(true);
+      }
+    }
+  });
+
+  test('only one well-formed address is believed, and never a list', async () => {
+    const web = serverWith('127.0.0.1');
+    try {
+      for (const value of [
+        '100.100.0.5, 203.0.113.9',
+        '203.0.113.9, 100.100.0.5',
+        'not-an-address',
+        '100.100.0.5:443',
+        '',
+        '  ',
+        'localhost',
+      ]) {
+        const result = await ask(web, { 'x-forwarded-for': value });
+        expect(result.clientAddress, JSON.stringify(value)).toBe('127.0.0.1');
+      }
+    } finally {
+      web.stop(true);
+    }
+  });
+
+  test('the API never receives a forwarding header, believed or not', async () => {
+    for (const upstream of ['127.0.0.1', undefined]) {
+      const web = serverWith(upstream);
+      try {
+        const result = await ask(web, {
+          'x-forwarded-for': '100.100.0.5',
+          'x-forwarded-proto': 'https',
+          'x-forwarded-host': 'openduet.example.ts.net',
+        });
+        expect(result.forwarded, String(upstream)).toBeNull();
+      } finally {
+        web.stop(true);
+      }
+    }
+  });
+
+  test('an identity header from a browser never reaches the API', async () => {
+    // No sign-in here reads these; stripping them keeps a later one honest.
+    for (const upstream of ['203.0.113.7', undefined]) {
+      const web = serverWith(upstream);
+      try {
+        const result = await ask(web, { 'tailscale-user-login': 'stranger@example.test' });
+        expect(result.identity, String(upstream)).toBeNull();
+      } finally {
+        web.stop(true);
+      }
+    }
+  });
+
+  test('an identity header from the upstream does not reach the API either', async () => {
+    // Serve rewrites the five names it owns and leaves every other
+    // `Tailscale-` header a browser invents in place, so a name from that
+    // connection is not evidence that the node wrote it. Nothing here reads
+    // one, so nothing here forwards one.
+    const web = serverWith('127.0.0.1');
+    try {
+      const result = await ask(web, {
+        'tailscale-user-login': 'owner@example.test',
+        'tailscale-account': 'owner',
+      });
+      expect(result.identity).toBeNull();
+      expect(result.invented).toBeNull();
+    } finally {
+      web.stop(true);
+    }
+  });
+
+  test.each(['127.0.0.1', undefined])(
+    'an event stream through the upstream %s delivers events as they happen and stays open',
+    async (upstream) => {
+      const web = serverWith(upstream);
+      const abort = new AbortController();
+      try {
+        const started = Date.now();
+        const response = await fetch(`http://127.0.0.1:${web.port}/api/events`, {
+          headers: { 'x-forwarded-for': '100.100.0.5' },
+          signal: abort.signal,
+        });
+        expect(response.headers.get('content-type')).toBe('text/event-stream');
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('the stream had no body');
+        const decoder = new TextDecoder();
+
+        const first = await reader.read();
+        // Long before the second event exists: nothing is being accumulated.
+        expect(Date.now() - started).toBeLessThan(EVENT_GAP_MS - 500);
+        expect(decoder.decode(first.value)).toBe('data: {"seq":1}\n\n');
+
+        const second = await reader.read();
+        expect(Date.now() - started).toBeGreaterThanOrEqual(EVENT_GAP_MS - 500);
+        expect(decoder.decode(second.value)).toBe('data: {"seq":2}\n\n');
+        // The upstream address still reached the API on the streaming request.
+        expect(seen.clientAddress).toBe(upstream ? '100.100.0.5' : '127.0.0.1');
+
+        // Quiet, not finished: an idle stream is still a stream.
+        const idle = await Promise.race([
+          reader.read().then(() => 'closed' as const),
+          Bun.sleep(750).then(() => 'open' as const),
+        ]);
+        expect(idle).toBe('open');
+        await reader.cancel();
+      } finally {
+        abort.abort();
+        web.stop(true);
+      }
+    },
+  );
+});
+
+describe('the configured public origin', () => {
+  test('one that is not an origin stops the server naming OPENDUET_WEB_ORIGIN', () => {
+    for (const publicOrigin of [
+      'assistant.example.net',
+      'localhost:3101',
+      'https://assistant.example.net/openduet',
+      'ftp://assistant.example.net',
+    ])
+      expect(() => createStaticServer({ root: base, port: 0, publicOrigin })).toThrow(
+        'OPENDUET_WEB_ORIGIN must be an http:// or https:// origin',
+      );
+  });
+
+  test('a trailing slash is the same origin', () => {
+    const web = createStaticServer({
+      root: base,
+      port: 0,
+      publicOrigin: 'https://assistant.example.net/',
+    });
+    web.stop(true);
+  });
+});
+
+describe("an installation's brand folder", () => {
+  const BRAND_SENTINEL = 'brand-folder-file-7d1e';
+  const PAGE =
+    '<!doctype html><html><head><title>OpenDuet</title>' +
+    '<meta name="apple-mobile-web-app-title" content="OpenDuet" />' +
+    '<link rel="stylesheet" href="/assets/app.css"></head><body><div id="root"></div></body></html>';
+  const TOKENS_ONLY =
+    '/* Riverside colours */\n:root { --primary: #0b6e4f; --radius-card: 6px; }\n' +
+    '@media (prefers-color-scheme: dark) {\n  :root:not([data-theme="light"]) { --primary: #6fd3a8; }\n}\n' +
+    ":root[data-theme='dark'] { --primary: #6fd3a8 }\n";
+  let dir = '';
+  let brand = '';
+  let web: ReturnType<typeof createStaticServer> | null = null;
+
+  /** One request line, verbatim, as `raw` sends it, to this server. */
+  const ask = (path: string): Promise<{ status: number; head: string; body: string }> =>
+    new Promise((settle, fail) => {
+      const socket = connect(web?.port ?? 0, '127.0.0.1', () => {
+        socket.write(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+      });
+      let text = '';
+      socket.setTimeout(5000, () => {
+        socket.destroy();
+        fail(new Error(`no answer for ${path}`));
+      });
+      socket.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+      });
+      socket.on('error', fail);
+      socket.on('end', () => {
+        const split = text.indexOf('\r\n\r\n');
+        const head = split === -1 ? text : text.slice(0, split);
+        settle({
+          status: Number(head.split(' ')[1] ?? 0),
+          head: head.toLowerCase(),
+          body: split === -1 ? '' : text.slice(split + 4),
+        });
+      });
+    });
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'openduet-brand-'));
+    await mkdir(join(dir, 'dist', 'icons'), { recursive: true });
+    await writeFile(join(dir, 'dist', 'index.html'), PAGE, 'utf8');
+    await writeFile(join(dir, 'dist', 'favicon.svg'), '<svg>bundle</svg>', 'utf8');
+    await writeFile(join(dir, 'dist', 'manifest.webmanifest'), '{"name":"bundle"}', 'utf8');
+    await writeFile(join(dir, 'dist', 'openduet-logo.png'), 'bundle-logo', 'utf8');
+    await writeFile(join(dir, 'dist', 'icons', 'icon-192.png'), 'bundle-icon', 'utf8');
+    brand = join(dir, 'brand');
+    await mkdir(join(brand, 'icons'), { recursive: true });
+    await writeFile(join(brand, 'favicon.svg'), `<svg>${BRAND_SENTINEL}</svg>`, 'utf8');
+    await writeFile(join(brand, 'logo.png'), `logo-${BRAND_SENTINEL}`, 'utf8');
+    await writeFile(join(brand, 'icons', 'icon-192.png'), `icon-${BRAND_SENTINEL}`, 'utf8');
+    await writeFile(join(brand, 'manifest.webmanifest'), '{"name":"Riverside"}', 'utf8');
+    await writeFile(join(brand, 'brand.css'), TOKENS_ONLY, 'utf8');
+    // In the folder, but not a file a brand may replace.
+    await writeFile(join(brand, 'index.html'), BRAND_SENTINEL, 'utf8');
+    await writeFile(join(brand, 'notes.txt'), BRAND_SENTINEL, 'utf8');
+    await writeFile(join(brand, 'icons', 'run.js'), BRAND_SENTINEL, 'utf8');
+    await writeFile(join(dir, 'outside.png'), SENTINEL, 'utf8');
+    web = createStaticServer({
+      root: join(dir, 'dist'),
+      brandDir: brand,
+      instanceName: 'Riverside <Assistant>',
+      port: 0,
+      hostname: '127.0.0.1',
+    });
+  });
+
+  afterAll(async () => {
+    web?.stop(true);
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  test('the allowed files are read from the brand folder before the bundle', async () => {
+    const favicon = await ask('/favicon.svg');
+    expect(favicon.status).toBe(200);
+    expect(favicon.body).toContain(BRAND_SENTINEL);
+    expect(favicon.head).toContain('content-type: image/svg+xml');
+    expect(favicon.head).toContain("script-src 'none'");
+    expect((await ask('/icons/icon-192.png')).body).toBe(`icon-${BRAND_SENTINEL}`);
+    const manifest = await ask('/manifest.webmanifest');
+    expect(manifest.body).toBe('{"name":"Riverside"}');
+    expect(manifest.head).toContain('content-type: application/manifest+json');
+    // The mark the app draws is the brand's logo.
+    expect((await ask('/openduet-logo.png')).body).toBe(`logo-${BRAND_SENTINEL}`);
+    expect((await ask('/logo.png')).body).toBe(`logo-${BRAND_SENTINEL}`);
+    const css = await ask('/brand.css');
+    expect(css.status).toBe(200);
+    expect(css.head).toContain('content-type: text/css');
+  });
+
+  test('a file the brand folder does not replace still comes from the bundle', async () => {
+    await rm(join(brand, 'icons', 'icon-192.png'));
+    try {
+      expect((await ask('/icons/icon-192.png')).body).toBe('bundle-icon');
+    } finally {
+      await writeFile(join(brand, 'icons', 'icon-192.png'), `icon-${BRAND_SENTINEL}`, 'utf8');
+    }
+  });
+
+  test('nothing outside the allow-list is read from the brand folder', async () => {
+    for (const path of ['/notes.txt', '/icons/run.js', '/index.html', '/brand/notes.txt']) {
+      const response = await ask(path);
+      expect(response.body, path).not.toContain(BRAND_SENTINEL);
+    }
+    // The page is the bundle's, never the brand folder's.
+    expect((await ask('/index.html')).body).toContain('id="root"');
+  });
+
+  test('traversal out of the brand folder is refused', async () => {
+    for (const path of [
+      '/icons/../../outside.png',
+      '/icons/%2e%2e/%2e%2e/outside.png',
+      '/icons/..%2f..%2foutside.png',
+      '/icons%2f..%2f..%2foutside.png',
+      '/icons/..\\..\\outside.png',
+      '/favicon.svg%00.png',
+    ]) {
+      const response = await ask(path);
+      expect(response.body, path).not.toContain(SENTINEL);
+      expect(response.body, path).not.toContain(BRAND_SENTINEL);
+    }
+  });
+
+  test('a symbolic link that leaves the brand folder is refused', async () => {
+    const outside = join(dir, 'outside-icons');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'icon-512.png'), SENTINEL, 'utf8');
+    const linkedDir = join(brand, 'icons-linked');
+    // A directory junction needs no privilege on Windows; a file link may.
+    await symlink(outside, linkedDir, 'junction');
+    await rm(join(brand, 'icons'), { recursive: true, force: true });
+    await symlink(outside, join(brand, 'icons'), 'junction');
+    let fileLink = true;
+    try {
+      await symlink(join(dir, 'outside.png'), join(brand, 'logo.svg'));
+    } catch {
+      fileLink = false;
+    }
+    try {
+      const response = await ask('/icons/icon-512.png');
+      expect(response.body).not.toContain(SENTINEL);
+      expect(await brandFile(realpathSync(brand), '/icons/icon-512.png')).toBeNull();
+      if (fileLink) {
+        expect((await ask('/logo.svg')).body).not.toContain(SENTINEL);
+        expect(await brandFile(realpathSync(brand), '/logo.svg')).toBeNull();
+      }
+      // A link that stays inside the folder is fine.
+      if (fileLink) {
+        await symlink(join(brand, 'favicon.svg'), join(brand, 'favicon.png'));
+        expect(await brandFile(realpathSync(brand), '/favicon.png')).not.toBeNull();
+      }
+    } finally {
+      await rm(join(brand, 'icons'), { recursive: true, force: true });
+      await rm(linkedDir, { recursive: true, force: true });
+      await rm(join(brand, 'logo.svg'), { force: true });
+      await rm(join(brand, 'favicon.png'), { force: true });
+      await mkdir(join(brand, 'icons'), { recursive: true });
+      await writeFile(join(brand, 'icons', 'icon-192.png'), `icon-${BRAND_SENTINEL}`, 'utf8');
+    }
+  });
+
+  test('the page carries the installation name and links brand.css after the bundle', async () => {
+    const page = (await ask('/')).body;
+    expect(page).toContain('<title>Riverside &lt;Assistant&gt;</title>');
+    expect(page).toContain('content="Riverside &lt;Assistant&gt;"');
+    expect(page).not.toContain('OpenDuet');
+    expect(page.indexOf('/brand.css')).toBeGreaterThan(page.indexOf('/assets/app.css'));
+    expect(page.indexOf('/brand.css')).toBeLessThan(page.indexOf('</head>'));
+    // A deep link is the same page.
+    expect((await ask('/somewhere/deep')).body).toBe(page);
+  });
+
+  test('a brand.css that sets anything but design tokens is neither linked nor served', async () => {
+    for (const css of [
+      'body { display: none; }',
+      ':root { color: red; }',
+      ':root { --not-a-token: 1px; }',
+      ":root { --font-body: 'X'; } @import url(https://elsewhere.test/x.css);",
+      ':root { --canvas: url(https://elsewhere.test/pixel.png); }',
+      ':root { --canvas: \\75 rl(x); }',
+      '@media print { :root { --canvas: #fff; } }',
+      ':root { --canvas: #fff; } }',
+    ]) {
+      expect(brandCssIssues(css).length, css).toBeGreaterThan(0);
+      await writeFile(join(brand, 'brand.css'), css, 'utf8');
+      expect((await ask('/brand.css')).status, css).toBe(404);
+      expect((await ask('/')).body, css).not.toContain('/brand.css');
+    }
+    await writeFile(join(brand, 'brand.css'), TOKENS_ONLY, 'utf8');
+    expect(brandCssIssues(TOKENS_ONLY)).toEqual([]);
+    expect((await ask('/')).body).toContain('/brand.css');
+  });
+
+  test('the tokens brand.css may set are exactly the ones the web client declares', async () => {
+    const tokens = await readFile(
+      join(import.meta.dir, '..', '..', 'apps', 'web', 'src', 'design', 'tokens.css'),
+      'utf8',
+    );
+    const declared = new Set(
+      [...tokens.matchAll(/^\s*(--[a-z0-9-]+)\s*:/gm)].map((match) => match[1] ?? ''),
+    );
+    expect([...BRAND_TOKENS].sort()).toEqual([...declared].sort());
+  });
+
+  test('without a brand folder the page keeps the default name and links no brand.css', async () => {
+    const plain = createStaticServer({ root: join(dir, 'dist'), port: 0, hostname: '127.0.0.1' });
+    try {
+      const page = await (await fetch(`http://127.0.0.1:${plain.port}/`)).text();
+      expect(page).toBe(PAGE);
+      expect(await (await fetch(`http://127.0.0.1:${plain.port}/favicon.svg`)).text()).toBe(
+        '<svg>bundle</svg>',
+      );
+    } finally {
+      plain.stop(true);
+    }
+    expect(renderIndex(PAGE, 'OpenDuet', false)).toBe(PAGE);
+    expect(() => createStaticServer({ root: dir, port: 0, instanceName: 'a\nb' })).toThrow(
+      'OPENDUET_INSTANCE_NAME',
+    );
+  });
+
+  test('a comment opener inside a string does not hide a rule from the check', () => {
+    // A browser reads "/*" as two characters of a string, so the rule between
+    // the two strings below is one it applies.
+    for (const css of [
+      ':root { --font-body: "/*"; } body { display: none } :root { --font-head: "*/"; }',
+      ":root{--font-body:'/*'}*{visibility:hidden}:root{--font-head:'*/'}",
+      ':root{--font-body:"/*\n"} body{display:none} :root{--font-head:"*/"}',
+    ]) {
+      expect(brandCssIssues(css).length, css).toBeGreaterThan(0);
+    }
+    // Comments are still comments, and a string that holds "/*" is still a value.
+    expect(brandCssIssues('/* a } b { */ :root { --primary: #0b6e4f; } /* end')).toEqual([]);
+    expect(brandCssIssues(':root { --font-body: "/* not a comment */", serif; }')).toEqual([]);
+  });
+
+  test('the check reads a long brand.css in time proportional to its length', () => {
+    // Each of these took seconds while the selector pattern and the space
+    // before it competed for the same whitespace.
+    for (const css of [
+      `${' '.repeat(60_000)}x`,
+      `:root{--primary:red}${' '.repeat(60_000)}a`,
+      `@media (prefers-color-scheme: dark) {${' '.repeat(60_000)}`,
+    ]) {
+      const started = performance.now();
+      expect(brandCssIssues(css).length).toBeGreaterThan(0);
+      expect(performance.now() - started).toBeLessThan(500);
+    }
+    expect(brandCssIssues(`:root{--primary:red}/*${'x'.repeat(BRAND_CSS_MAX_BYTES)}*/`)).toEqual([
+      `it is over ${BRAND_CSS_MAX_BYTES / 1024} KiB`,
+    ]);
+  });
+
+  test('brand.css spelt another way is still checked before it is served', async () => {
+    await writeFile(join(brand, 'brand.css'), 'body { display: none; }', 'utf8');
+    try {
+      for (const path of ['/brand.css/', '//brand.css', '/brand.css%2f', '/./brand.css']) {
+        const response = await ask(path);
+        expect(response.body, path).not.toContain('display: none');
+      }
+    } finally {
+      await writeFile(join(brand, 'brand.css'), TOKENS_ONLY, 'utf8');
+    }
+    const served = await ask('//brand.css');
+    expect(served.status).toBe(200);
+    expect(served.body).toBe(TOKENS_ONLY);
+  });
+
+  test('brand files carry nosniff and revalidate, and an SVG runs and loads nothing', async () => {
+    const css = await ask('/brand.css');
+    expect(css.head).toContain('x-content-type-options: nosniff');
+    expect(css.head).toContain('cache-control: no-cache');
+    const favicon = await ask('/favicon.svg');
+    expect(favicon.head).toContain('x-content-type-options: nosniff');
+    expect(favicon.head).toContain('cache-control: no-cache');
+    const policy = /content-security-policy: ([^\r\n]*)/.exec(favicon.head)?.[1] ?? '';
+    for (const directive of [
+      "default-src 'none'",
+      "script-src 'none'",
+      "frame-ancestors 'self'",
+      'sandbox',
+    ]) {
+      expect(
+        policy.split(';').map((part) => part.trim()),
+        directive,
+      ).toContain(directive);
+    }
+    // Only an SVG is a document of its own.
+    expect((await ask('/logo.png')).head).not.toContain('sandbox');
+  });
+
+  test('a brand file over its size limit is not served, and the log says why', async () => {
+    const lines: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await writeFile(join(brand, 'icons', 'icon-192.png'), Buffer.alloc(BRAND_FILE_MAX_BYTES + 1));
+      expect((await ask('/icons/icon-192.png')).body).toBe('bundle-icon');
+      await writeFile(
+        join(brand, 'brand.css'),
+        `${TOKENS_ONLY}/*${' '.repeat(BRAND_CSS_MAX_BYTES)}*/`,
+      );
+      expect((await ask('/brand.css')).status).toBe(404);
+      expect((await ask('/')).body).not.toContain('/brand.css');
+      await writeFile(join(brand, 'brand.css'), ':root { color: red; }');
+      await ask('/');
+      await ask('/');
+    } finally {
+      process.stderr.write = write;
+      await writeFile(join(brand, 'icons', 'icon-192.png'), `icon-${BRAND_SENTINEL}`, 'utf8');
+      await writeFile(join(brand, 'brand.css'), TOKENS_ONLY, 'utf8');
+    }
+    const log = lines.join('');
+    expect(log).toContain('brand icons/icon-192.png is not served: it is over 2048 KiB');
+    expect(log).toContain('brand brand.css is not served: it is over 64 KiB');
+    // Said once, however many pages load.
+    expect(log.split('color is not a design token').length - 1).toBe(1);
+  });
+
+  test('a folder swapped for a link after the path was checked is not read', async () => {
+    const root = realpathSync(brand);
+    const outside = join(dir, 'swapped-icons');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'icon-192.png'), SENTINEL, 'utf8');
+    const checked = brandFile(root, '/icons/icon-192.png');
+    expect(checked).not.toBeNull();
+    // Between the check and the read, icons/ becomes a link out of the folder.
+    await rm(join(brand, 'icons'), { recursive: true, force: true });
+    await symlink(outside, join(brand, 'icons'), 'junction');
+    try {
+      const read = readBrandFile(root, checked as string, BRAND_FILE_MAX_BYTES);
+      expect('bytes' in read ? read.bytes.toString() : '').not.toContain(SENTINEL);
+    } finally {
+      await rm(join(brand, 'icons'), { recursive: true, force: true });
+      await mkdir(join(brand, 'icons'), { recursive: true });
+      await writeFile(join(brand, 'icons', 'icon-192.png'), `icon-${BRAND_SENTINEL}`, 'utf8');
+    }
+    const read = readBrandFile(root, checked as string, BRAND_FILE_MAX_BYTES);
+    expect('bytes' in read ? read.bytes.toString() : '').toBe(`icon-${BRAND_SENTINEL}`);
+  });
+});
+
+test('the page description opens with the installation name, and is unchanged by default', () => {
+  const page =
+    '<title>OpenDuet</title>\n<meta name="description" content="OpenDuet: the assistant that actually does it." />';
+  expect(renderIndex(page, 'OpenDuet', false)).toBe(page);
+  const named = renderIndex(page, 'Riverside Assistant', false);
+  expect(named).toContain('content="Riverside Assistant: the assistant that actually does it."');
+  expect(named).not.toContain('OpenDuet');
+});

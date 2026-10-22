@@ -1,0 +1,1370 @@
+import { afterAll, describe, expect, test } from 'bun:test';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  type AttemptOutcome,
+  agentResponse,
+  automationResponse,
+  conversationList,
+  conversationResponse,
+  dedupKey,
+  experienceOperations,
+  experienceQuestion,
+  experienceSearch,
+  homeResponse,
+  memoryItemList,
+  messageAcceptance,
+  planResponse,
+  type RuntimeEvent,
+  type RuntimeEventType,
+  taskResponse,
+  turnList,
+} from '@openduet/contracts';
+import { eq } from 'drizzle-orm';
+import { BudgetService } from '../../src/broker/budget.ts';
+import { session } from '../../src/db/auth-schema.ts';
+import { openDatabase } from '../../src/db/client.ts';
+import {
+  action,
+  agent,
+  artifact,
+  connection,
+  event,
+  experienceDraftSend,
+  experienceTurn,
+  job,
+  owner,
+  space,
+  trigger,
+} from '../../src/db/schema.ts';
+import { EVENT_ORDER_LOCK } from '../../src/db/transaction.ts';
+import { loadEnv } from '../../src/env.ts';
+import { appendEvent } from '../../src/events/store.ts';
+import { ExperienceEvents } from '../../src/experience/events.ts';
+import { BACKEND_VOCABULARY } from '../../src/experience/projectors.ts';
+import { newId } from '../../src/ids.ts';
+import { createApp } from '../../src/index.ts';
+import { EMPTY_SUMMARY, summaryPayload } from '../../src/jobs/history-summary.ts';
+import { startQueue } from '../../src/jobs/queue.ts';
+import { AttemptRunner } from '../../src/jobs/runner.ts';
+import { JobService } from '../../src/jobs/service.ts';
+import { TriggerService } from '../../src/jobs/triggers.ts';
+import { publishRevision } from '../../src/memory/claims.ts';
+import { lockSpace, type MemoryScope, provisionMemorySpace } from '../../src/memory/db.ts';
+import { ingest } from '../../src/memory/evidence.ts';
+import { recordOutput } from '../../src/memory/outputs.ts';
+import type { RestrictionJournal, RestrictionRecord } from '../../src/memory/restore.ts';
+import { StubRuntimeAdapter } from '../../src/runtime/stub.ts';
+import { freshAgent } from '../helpers/agents.ts';
+import { testDatabase } from '../helpers/database.ts';
+
+const handle = await testDatabase();
+const forgotten: RestrictionRecord[] = [];
+const journal: RestrictionJournal = {
+  read: async () => forgotten,
+  append: async (record) => {
+    forgotten.push(record);
+  },
+};
+const queue = handle ? await startQueue(handle.url) : null;
+const jobs = handle && queue ? new JobService(handle.db, queue.boss) : null;
+const runner = jobs
+  ? new AttemptRunner(jobs, new StubRuntimeAdapter(), {
+      key: 'experience-fixture-signing-key-32-bytes',
+    })
+  : null;
+const triggers = jobs && runner ? new TriggerService(jobs, runner) : undefined;
+const app = handle
+  ? createApp({
+      db: handle.db,
+      env: loadEnv({ NODE_ENV: 'test' }),
+      jobs: jobs ?? undefined,
+      runner: runner ?? undefined,
+      triggers,
+      sql: handle.sql,
+      memory: { sql: handle.sql, journal },
+      checkDatabase: async () => 'ok',
+    })
+  : null;
+const spaceId = newId('sp');
+const foreignSpaceId = newId('sp');
+const ownerId = newId('own');
+const token = randomBytes(32).toString('base64url');
+if (handle) {
+  await handle.db.insert(owner).values({ id: ownerId, email: 'experience@example.test' });
+  await handle.sql`insert into principal (id, email, password_hash) select id, email, password_hash from owner where id = ${ownerId}`;
+  await handle.db.insert(space).values([
+    { id: spaceId, name: 'Personal', gitPath: `/spaces/${spaceId}` },
+    { id: foreignSpaceId, name: 'Separate', gitPath: `/spaces/${foreignSpaceId}` },
+  ]);
+  await handle.db.insert(session).values({
+    tokenHash: createHash('sha256').update(token).digest('hex'),
+    ownerId,
+    spaceId,
+    expiresAt: new Date(Date.now() + 600000),
+  });
+}
+const withDb = handle ? describe : describe.skip;
+async function request(path: string, method = 'GET', body?: unknown, key?: string) {
+  if (!app) throw new Error('Postgres unavailable');
+  return app.request(path, {
+    method,
+    headers: {
+      Cookie: `openduet_session=${token}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(key ? { 'Idempotency-Key': key } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+}
+async function createConversation() {
+  const response = await request('/agents', 'POST', freshAgent());
+  expect(response.status).toBe(200);
+  const persona = agentResponse.parse(await response.json()).agent;
+  const created = await request('/conversations', 'POST', {
+    title: 'Dinner',
+    agent_id: persona.id,
+  });
+  expect(created.status).toBe(200);
+  return conversationResponse.parse(await created.json()).conversation;
+}
+
+withDb('experience rows and authenticated scope', () => {
+  afterAll(async () => {
+    await triggers?.stop();
+    await runner?.stop();
+    await queue?.stop();
+    await handle?.close();
+  }, 30000);
+  test('home uses the saved time zone and tasks; search excludes foreign rows', async () => {
+    expect(
+      (
+        await request('/profile', 'PATCH', {
+          name: 'Alex',
+          time_zone: 'Asia/Kolkata',
+          day_hours: { start: '00:00', end: '00:00' },
+        })
+      ).status,
+    ).toBe(200);
+    const task = taskResponse.parse(
+      await (await request('/tasks', 'POST', { title: 'Dinner groceries', due_at: null })).json(),
+    ).task;
+    await required(handle)
+      .sql`insert into task (id, space_id, title) values (${newId('task')}, ${foreignSpaceId}, 'Dinner private')`;
+    const home = homeResponse.parse(await (await request('/home')).json());
+    expect(home.time_zone).toBe('Asia/Kolkata');
+    expect(home.greeting).toContain('Alex');
+    expect(home.within_day_hours).toBe(true);
+    expect(home.tasks.some((item) => item.id === task.id)).toBe(true);
+    expect(home.upcoming).toMatchObject({ status: 'not_available' });
+    const result = experienceSearch.parse(await (await request('/search?q=Dinner')).json());
+    expect(result.results.some((item) => item.id === task.id && item.kind === 'task')).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('Dinner private');
+    expect((await request(`/tasks/${task.id}`, 'DELETE')).status).toBe(200);
+  });
+  test('the voice is teammate until picked, and a save that leaves it out keeps it', async () => {
+    const profile = async () =>
+      experienceOperations['GET /profile'].response.parse(await (await request('/profile')).json())
+        .profile;
+    const before = await profile();
+    expect(before.voice).toBe('teammate');
+    const save = (extra: Record<string, unknown>) =>
+      request('/profile', 'PATCH', {
+        name: before.name,
+        time_zone: before.time_zone,
+        day_hours: before.day_hours,
+        ...extra,
+      });
+    expect((await save({ voice: 'professional' })).status).toBe(200);
+    expect((await profile()).voice).toBe('professional');
+    expect((await save({})).status).toBe(200);
+    expect((await profile()).voice).toBe('professional');
+    expect((await save({ voice: 'loud' })).status).toBe(400);
+    expect((await save({ voice: 'teammate' })).status).toBe(200);
+    expect((await profile()).voice).toBe('teammate');
+  });
+  test('the profile names the address messages leave from, once a mailbox can send', async () => {
+    const profile = async () =>
+      experienceOperations['GET /profile'].response.parse(await (await request('/profile')).json())
+        .profile;
+    expect((await profile()).sending_address).toBeNull();
+    const mailbox = newId('conn');
+    const db = required(handle).db;
+    await db.insert(connection).values({
+      id: mailbox,
+      spaceId,
+      label: 'Mail',
+      provider: 'imap',
+      scopes: ['email.search', 'email.send'],
+      configuration: { mail: { from: 'alex@example.test' } },
+    });
+    try {
+      expect((await profile()).sending_address).toBe('alex@example.test');
+      // A mailbox that can only read is not where anything leaves from.
+      await db
+        .update(connection)
+        .set({ scopes: ['email.search'] })
+        .where(eq(connection.id, mailbox));
+      expect((await profile()).sending_address).toBeNull();
+    } finally {
+      await db.delete(connection).where(eq(connection.id, mailbox));
+    }
+  });
+  test('plans project real child completion and preserve context in a linked conversation', async () => {
+    const persona = agentResponse.parse(
+      await (await request('/agents', 'POST', freshAgent())).json(),
+    ).agent;
+    const saved = planResponse.parse(
+      await (
+        await request('/plans', 'POST', {
+          title: 'Plan dinner',
+          category: 'Personal',
+          milestones: [
+            { title: 'Choose menu', assignee: { kind: 'person' } },
+            {
+              title: 'Check availability',
+              assignee: { kind: 'agent', agent_id: persona.id },
+              schedule_at: new Date(Date.now() + 3600000).toISOString(),
+            },
+          ],
+        })
+      ).json(),
+    ).plan;
+    expect(saved.progress_percent).toBe(0);
+    const changed = planResponse.parse(
+      await (
+        await request(
+          `/plans/${saved.id}/milestones/${required(saved.milestones[0]).id}`,
+          'PATCH',
+          { done: true },
+        )
+      ).json(),
+    ).plan;
+    expect(changed.progress_percent).toBe(50);
+    expect(changed.next_step).toBe('Check availability');
+    const [child] = await required(handle)
+      .sql`select j.* from job j join plan_milestone m on m.child_job_id = j.id where m.plan_id = ${saved.id}`;
+    expect(child?.state).toBe('waiting_for_event_or_time');
+    // The plan's title is the person's; a milestone composed from it is not.
+    expect((await required(jobs).get(saved.id)).objectiveOrigin).toBe('owner_request');
+    expect(child?.objective_origin).toBe('derived');
+    expect(new Date(child?.next_wake_at).getTime()).toBeGreaterThan(Date.now());
+    const linked = conversationResponse.parse(
+      await (
+        await request(`/plans/${saved.id}/conversation`, 'POST', { agent_id: persona.id })
+      ).json(),
+    ).conversation;
+    expect(linked.plan_id).toBe(saved.id);
+    expect((await required(jobs).get(linked.id)).objective).toContain('Plan dinner');
+    expect((await required(jobs).get(linked.id)).objectiveOrigin).toBe('derived');
+    expect((await request(`/plans/${saved.id}/share`, 'POST')).status).toBe(200);
+    await required(handle)
+      .db.update(job)
+      .set({ spaceId: foreignSpaceId })
+      .where(eq(job.id, saved.id));
+    expect((await request(`/plans/${saved.id}`)).status).toBe(404);
+  });
+  test('a scheduled routine completes twice with separate spending and attempt bounds', async () => {
+    const persona = agentResponse.parse(
+      await (await request('/agents', 'POST', freshAgent())).json(),
+    ).agent;
+    const routine = automationResponse.parse(
+      await (
+        await request('/automations', 'POST', {
+          title: 'Daily dinner',
+          instruction: 'Check today',
+          weekdays: [1, 2, 3, 4, 5],
+          at: '08:30',
+          agent_id: persona.id,
+        })
+      ).json(),
+    ).automation;
+    expect(routine.schedule).toContain('Every weekday at 8:30 AM');
+    const [registration] = await required(handle)
+      .db.select()
+      .from(trigger)
+      .where(eq(trigger.id, routine.id));
+    const id = required(registration).jobId;
+    // A routine runs its instruction long after it was written.
+    expect((await required(jobs).get(id)).objectiveOrigin).toBe('derived');
+    await required(handle)
+      .sql`update job set budget = jsonb_set(jsonb_set(budget, '{max_attempts}', '1'), '{max_output_tokens}', '10') where id = ${id}`;
+    const turnIds = [];
+    for (let index = 0; index < 2; index++) {
+      expect((await request(`/automations/${routine.id}/test`, 'POST')).status).toBe(200);
+      const row = await required(jobs).get(id);
+      turnIds.push(row.currentTurnId);
+      const claimed = required(
+        await required(runner).claim({
+          job_id: id,
+          expected_epoch: row.leaseEpoch,
+          expected_version: row.stateVersion,
+          reason: 'event',
+        }),
+      );
+      await new BudgetService(required(handle).sql).reserve(claimed.claims, [
+        { kind: 'tokens', amount: 10 },
+      ]);
+      await required(runner).commitOutcome(claimed.claims, {
+        kind: 'completed',
+        summary: 'Ready for today.',
+        evidence: [],
+      });
+      expect((await required(jobs).get(id)).state).toBe('waiting_for_event_or_time');
+    }
+    expect(new Set(turnIds).size).toBe(2);
+    const [runs] = await required(handle)
+      .sql`select count(*)::int as n from attempt where job_id = ${id} and outcome = 'completed'`;
+    expect(runs?.n).toBe(2);
+    expect((await request(`/automations/${routine.id}/test`, 'POST')).status).toBe(200);
+    const pending = await required(jobs).get(id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: id,
+        expected_epoch: pending.leaseEpoch,
+        expected_version: pending.stateVersion,
+        reason: 'event',
+      }),
+    );
+    const connectionId = newId('conn');
+    await required(handle)
+      .db.insert(connection)
+      .values({ id: connectionId, spaceId, label: 'Mail', provider: 'imap' });
+    const actionId = newId('act');
+    await required(handle)
+      .db.insert(action)
+      .values({
+        id: actionId,
+        jobId: id,
+        attemptId: claimed.claims.attempt_id,
+        connectionId,
+        kind: 'email.send',
+        effectClass: 'write_external',
+        canonicalPayload: {},
+        payloadHash: 'a'.repeat(64),
+        idempotencyKey: actionId,
+        status: 'unknown',
+      });
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'Unconfirmed.',
+      evidence: [],
+    });
+    const list = experienceOperations['GET /automations'].response.parse(
+      await (await request('/automations')).json(),
+    );
+    expect(list.automations.find((row) => row.id === routine.id)?.runs[0]?.status).toBe(
+      'needs_you',
+    );
+  });
+  test('creates a chat job and projects the agent without identities from the client', async () => {
+    const chat = await createConversation();
+    expect(chat.status).toBe('idle');
+    const [row] = await required(handle).db.select().from(job).where(eq(job.id, chat.id));
+    expect(row?.kind).toBe('chat');
+    expect(row?.objectiveOrigin).toBe('owner_request');
+    expect(row?.spaceId).toBe(spaceId);
+    expect(row?.nextWakeAt).toBeNull();
+    expect(
+      (
+        await request('/conversations', 'POST', {
+          title: 'Bad',
+          agent_id: chat.agent_id,
+          space_id: foreignSpaceId,
+        })
+      ).status,
+    ).toBe(400);
+    await required(handle)
+      .db.update(agent)
+      .set({ spaceId: foreignSpaceId })
+      .where(eq(agent.id, chat.agent_id));
+    expect(
+      (await request('/conversations', 'POST', { title: 'Bad', agent_id: chat.agent_id })).status,
+    ).toBe(404);
+    expect((await request('/conversations', 'GET')).status).toBe(200);
+  });
+  test('the chats list pages most recent first, without a gap or a repeat', async () => {
+    const made = [
+      await createConversation(),
+      await createConversation(),
+      await createConversation(),
+    ];
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const path = `/conversations?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
+      const page = conversationList.parse(await (await request(path)).json());
+      expect(page.conversations.length).toBeLessThanOrEqual(2);
+      seen.push(...page.conversations.map((entry) => entry.updated_at + entry.id));
+      cursor = page.next_cursor;
+    } while (cursor);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect([...seen].sort().reverse()).toEqual(seen);
+    const everything = conversationList.parse(await (await request('/conversations')).json());
+    expect(everything.next_cursor).toBeNull();
+    expect(seen).toHaveLength(everything.conversations.length);
+    for (const chat of made) expect(seen.some((entry) => entry.endsWith(chat.id))).toBe(true);
+    expect((await request('/conversations?cursor=not-a-cursor')).status).toBe(400);
+  });
+  test('submissions persist exactly one turn, finish and accept the next message', async () => {
+    const chat = await createConversation();
+    const first = messageAcceptance.parse(
+      await (
+        await request(
+          `/conversations/${chat.id}/messages`,
+          'POST',
+          { text: 'Find dinner' },
+          'message-one',
+        )
+      ).json(),
+    );
+    const repeated = messageAcceptance.parse(
+      await (
+        await request(
+          `/conversations/${chat.id}/messages`,
+          'POST',
+          { text: 'Find dinner' },
+          'message-one',
+        )
+      ).json(),
+    );
+    expect(repeated).toEqual(first);
+    const row = await required(jobs).get(chat.id);
+    const claimed = await required(runner).claim({
+      job_id: row.id,
+      expected_epoch: row.leaseEpoch,
+      expected_version: row.stateVersion,
+      reason: 'input',
+    });
+    expect(claimed).not.toBeNull();
+    expect(required(claimed).bundle.identity).toContain('In this conversation you are ');
+    await required(runner).commitOutcome(required(claimed).claims, {
+      kind: 'completed',
+      summary: 'Dinner is ready.',
+      evidence: [],
+    });
+    const messages = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(messages.turns).toHaveLength(1);
+    expect(messages.turns[0]?.answer).toBe('Dinner is ready.');
+    expect(messages.turns[0]?.status).toBe('done');
+    expect(
+      (
+        await request(
+          `/conversations/${chat.id}/messages`,
+          'POST',
+          { text: 'What about tomorrow?' },
+          'message-two',
+        )
+      ).status,
+    ).toBe(200);
+  });
+  test('a streamed turn ends done, with its answer free of leading blank lines', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Draft it' }, 'stream-one');
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const attemptId = claimed.claims.attempt_id;
+    const text = '\n\nI drafted the email for you to review.';
+    await required(runner).emit(claimed.claims, {
+      type: 'text_delta',
+      attempt_id: attemptId,
+      local_seq: 1,
+      dedup_key: dedupKey(attemptId, 1),
+      at: new Date().toISOString(),
+      text,
+    });
+    const during = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(during.turns[0]?.status).toBe('streaming');
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: text,
+      evidence: [],
+    });
+    const after = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(after.turns[0]?.status).toBe('done');
+    expect(after.turns[0]?.answer).toBe('I drafted the email for you to review.');
+  });
+  test('reasoning reaches the stream as reasoning, through the answer filter, and never the answer', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'hey' }, 'reason-one');
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const attemptId = claimed.claims.attempt_id;
+    const pieces: [RuntimeEventType, string][] = [
+      ['reasoning_delta', 'The person said hey. '],
+      // A key is hidden from reasoning exactly as from an answer; a tool name is prose.
+      ['reasoning_delta', 'Maybe call email.search with sk-proj-Q7vLm2Xr9T'],
+      ['reasoning_delta', 'bW4kZp8NcY3dHs first. '],
+      ['reasoning_delta', 'A short greeting back.'],
+      ['text_delta', 'Hey!'],
+    ];
+    for (const [index, [type, text]] of pieces.entries())
+      await required(runner).emit(claimed.claims, {
+        type,
+        attempt_id: attemptId,
+        local_seq: index + 1,
+        dedup_key: dedupKey(attemptId, index + 1),
+        at: new Date().toISOString(),
+        text,
+      } as RuntimeEvent);
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'Hey!',
+      evidence: [],
+    });
+    const items = (
+      await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id)
+    ).events.map((event) => event.item);
+    // Each piece's last word waits for the next, and the answer starting shows the rest.
+    expect(items.flatMap((item) => (item.type === 'reasoning' ? [item.text] : []))).toEqual([
+      'The person said hey. ',
+      'Maybe call email.search with ',
+      '[hidden] first. ',
+      'A short greeting ',
+      'back.',
+    ]);
+    const after = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(after.turns[0]?.answer).toBe('Hey!');
+  });
+  test('earlier messages summarised for the agent reach the stream as the same bare marker', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'and so on' }, 'sum-one');
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    // What the summary extension stores before the engine starts.
+    await required(jobs).transaction((tx) =>
+      appendEvent(tx, {
+        jobId: chat.id,
+        attemptId: claimed.claims.attempt_id,
+        type: 'notice',
+        payload: summaryPayload({
+          through: new Date(Date.now() - 60_000).toISOString(),
+          summary: { ...EMPTY_SUMMARY, facts: ['SECRET-CONTAINER-7741'] },
+          messages: 12,
+          generations: { policy_generation: 0, connection_generations: {} },
+        }),
+        dedupKey: `${chat.id}:history-summary:test`,
+      }),
+    );
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'Still here.',
+      evidence: [],
+    });
+    const items = (
+      await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id)
+    ).events.map((event) => event.item);
+    expect(items.filter((item) => item.type === 'compacted')).toEqual([{ type: 'compacted' }]);
+    expect(JSON.stringify(items)).not.toContain('SECRET-CONTAINER-7741');
+  });
+  test('a compaction reaches the stream as a bare marker, with none of the summary', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'go on' }, 'compact-one');
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const attemptId = claimed.claims.attempt_id;
+    const at = new Date().toISOString();
+    await required(runner).emit(claimed.claims, {
+      type: 'hook_event',
+      attempt_id: attemptId,
+      local_seq: 1,
+      dedup_key: dedupKey(attemptId, 1),
+      at,
+      capture_id: `${attemptId}:hook:1`,
+      name: 'on_compaction',
+      tool_name: null,
+      timing: { captured_at: at, duration_ms: 40 },
+      outcome: 'succeeded',
+      redacted_args_digest: null,
+      detail: { compression_count: 1, in_place: true },
+    });
+    await required(runner).emit(claimed.claims, {
+      type: 'text_delta',
+      attempt_id: attemptId,
+      local_seq: 2,
+      dedup_key: dedupKey(attemptId, 2),
+      at,
+      text: 'Carrying on.',
+    });
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'Carrying on.',
+      evidence: [],
+    });
+    const items = (
+      await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id)
+    ).events.map((event) => event.item);
+    expect(items.filter((item) => item.type === 'compacted')).toEqual([{ type: 'compacted' }]);
+    // The marker comes before what the agent said after it.
+    expect(items.findIndex((item) => item.type === 'compacted')).toBeLessThan(
+      items.findIndex((item) => item.type === 'text_delta'),
+    );
+  });
+  test('an answer naming its model streams whole and is saved whole; only a key is hidden', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'name?' }, 'model-id');
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const attemptId = claimed.claims.attempt_id;
+    const pieces = [
+      "I'm Nova. Running on `accounts",
+      '/fireworks/models/deepseek-v4p1-flash`. Mail me at someone@email.com',
+      ' and keep the key sk-proj-Q7vLm2Xr9T',
+      'bW4kZp8NcY3dHs out of chats.',
+    ];
+    for (const [index, text] of pieces.entries()) {
+      await required(runner).emit(claimed.claims, {
+        type: 'text_delta',
+        attempt_id: attemptId,
+        local_seq: index + 1,
+        dedup_key: dedupKey(attemptId, index + 1),
+        at: new Date().toISOString(),
+        text,
+      });
+      // Read the stream between pieces, as a live conversation does.
+      await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id);
+    }
+    const during = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      // A finished turn saves its outcome's summary as the answer, as a runtime sends it.
+      summary: pieces.join(''),
+      evidence: [],
+    });
+    const expected =
+      "I'm Nova. Running on `accounts/fireworks/models/deepseek-v4p1-flash`. Mail me at someone@email.com and keep the key [hidden] out of chats.";
+    const streamed = (
+      await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id)
+    ).events.flatMap((event) => (event.item.type === 'text_delta' ? [event.item.text] : []));
+    expect(streamed.join('')).toBe(expected);
+    expect(streamed.some((text) => text.includes('fireworks/models/deepseek-v4p1-flash'))).toBe(
+      true,
+    );
+    // Mid-answer, the saved copy shows what the stream had shown, so the rest joins it.
+    expect(expected.startsWith(during.turns[0]?.answer ?? 'missing')).toBe(true);
+    const after = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(after.turns[0]?.answer).toBe(expected);
+  });
+  test('the stream carries each turn to the status its saved copy ends in', async () => {
+    const statuses = async (conversationId: string, turnId: string) =>
+      (await new ExperienceEvents(required(handle).db).page(spaceId, 0, conversationId)).events
+        .filter((event) => event.turn_id === turnId)
+        .flatMap((event) =>
+          event.item.type === 'status' ? [`${event.item.status}/${event.item.composer}`] : [],
+        );
+    const endings: [AttemptOutcome, 'done' | 'failed' | 'working'][] = [
+      [{ kind: 'completed', summary: 'Two meetings and a run.', evidence: [] }, 'done'],
+      [{ kind: 'failed', reason: 'The calendar did not answer.', retryable: false }, 'failed'],
+      // A failure the turn will try again stays under way; it never reads failed in between.
+      [{ kind: 'failed', reason: 'The calendar did not answer.', retryable: true }, 'working'],
+    ];
+    for (const [outcome, saved] of endings) {
+      const chat = await createConversation();
+      const sent = messageAcceptance.parse(
+        await (
+          await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'What is on today?' })
+        ).json(),
+      );
+      const row = await required(jobs).get(chat.id);
+      const claimed = required(
+        await required(runner).claim({
+          job_id: row.id,
+          expected_epoch: row.leaseEpoch,
+          expected_version: row.stateVersion,
+          reason: 'input',
+        }),
+      );
+      await required(runner).commitOutcome(claimed.claims, outcome);
+      const turns = turnList.parse(
+        await (await request(`/conversations/${chat.id}/messages`)).json(),
+      );
+      expect(turns.turns[0]?.status).toBe(saved);
+      expect(await statuses(chat.id, sent.turn_id)).toEqual([
+        'working/pause',
+        saved === 'working' ? 'working/pause' : `${saved}/send`,
+      ]);
+    }
+  });
+  test('quick answers persist the offered choices and reject invented option ids', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Find dinner' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    await required(runner).commitOutcome(claimed.claims, {
+      outcome: { kind: 'waiting_for_input', question: 'Eat out or cook?' },
+      questions: [
+        {
+          text: 'Eat out or cook?',
+          because: [`attempt:${claimed.claims.attempt_id}`],
+          if_ignored: 'I will wait.',
+          options: [
+            { id: 'cook', label: 'Cook at home' },
+            { id: 'out', label: 'Eat out' },
+          ],
+        },
+      ],
+    });
+    const body = (await (await request('/quick-answers')).json()) as { questions: unknown[] };
+    const question = required(
+      body.questions
+        .map((value) => experienceQuestion.parse(value))
+        .find((item) => item.conversation_id === chat.id),
+    );
+    expect(question.options).toHaveLength(2);
+    // The queue is oldest first, and each entry says when it was asked.
+    const [asked] = await required(handle)
+      .sql`select created_at from question where id = ${question.id}`;
+    expect(question.created_at).toBe(new Date(asked?.created_at).toISOString());
+    expect(question.why).toEqual(['For Dinner.']);
+    expect(
+      (await request(`/quick-answers/${question.id}`, 'POST', { option_id: 'invented' })).status,
+    ).toBe(400);
+    expect(
+      (await request(`/quick-answers/${question.id}`, 'POST', { option_id: 'cook' })).status,
+    ).toBe(200);
+    expect(
+      (await request(`/quick-answers/${question.id}`, 'POST', { option_id: 'cook' })).status,
+    ).toBe(200);
+    const turns = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    // A picked option is recorded as a choice the agent offered, not as the person's words.
+    expect(turns.turns.filter((turn) => turn.text === 'You chose: Cook at home')).toHaveLength(1);
+    // The answer rides the conversation stream once, so a reload shows it answered.
+    const page = await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id, 200);
+    expect(
+      page.events.flatMap((event) => (event.item.type === 'decision' ? [event.item.decision] : [])),
+    ).toEqual([
+      expect.objectContaining({
+        kind: 'question',
+        id: question.id,
+        outcome: 'answered',
+        answer: 'Cook at home',
+      }),
+    ]);
+  });
+  test('saved details use plain keys, correction history, dependency explanations and durable forgetting', async () => {
+    const sql = required(handle).sql;
+    const scope: MemoryScope = {
+      ownerId,
+      spaceId,
+      publisher: 'experience',
+      audience: 'private',
+      role: 'owner',
+    };
+    await provisionMemorySpace(sql, ownerId, spaceId);
+    await sql`update memory_spaces set restore_ready = true where space_id = ${spaceId}`;
+    const source = await ingest(sql, scope, {
+      stream: 'onboarding',
+      source_identity: 'diet',
+      source_version: '1',
+      source_type: 'message',
+      author: 'owner',
+      event_at: new Date().toISOString(),
+      text: 'I prefer vegetarian meals.',
+    });
+    const first = await sql.begin(async (tx) => {
+      await lockSpace(tx, scope);
+      return publishRevision(tx, scope, 'pref.food.diet', null, {
+        key: 'pref.food.diet',
+        content: 'Vegetarian',
+        kind: 'preference',
+        factual_status: 'attributed',
+        protected: false,
+        valid_from: new Date().toISOString(),
+        valid_until: null,
+        sources: [{ source_id: source.source.source_id, source_version: '1', start: 0, end: 26 }],
+      });
+    });
+    const chat = await createConversation();
+    await recordOutput(sql, scope, {
+      job_id: chat.id,
+      kind: 'plan_step',
+      output_id: 'dinner-choice',
+      output_version: '1',
+      uses: [`${first.claim_id}@${first.revision}`],
+    });
+    const before = memoryItemList.parse(await (await request('/memory/items')).json());
+    const item = required(before.items.find((value) => value.id === first.claim_id));
+    expect(item).toMatchObject({
+      key: 'Food: diet',
+      value: 'Vegetarian',
+      source: 'onboarding',
+      editable: true,
+    });
+    expect(item.last_used).not.toBeNull();
+    const why = await (await request(`/memory/items/${item.id}/why`)).json();
+    expect(why).toMatchObject({ reasons: ['Food: diet: Vegetarian'], output: 'Used for Dinner.' });
+    expect(JSON.stringify(why)).not.toContain(first.claim_id);
+    const edited = await request(`/memory/items/${item.id}`, 'PATCH', {
+      value: 'Vegan',
+      version: item.version,
+    });
+    expect(edited.status).toBe(200);
+    expect(
+      (
+        await request(`/memory/items/${item.id}`, 'PATCH', {
+          value: 'Old choice',
+          version: item.version,
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      memoryItemList
+        .parse(await (await request('/memory/items')).json())
+        .items.find((value) => value.id === item.id)?.value,
+    ).toBe('Vegan');
+    const revisions = await sql`select revision from memory_revisions where claim_id = ${item.id}`;
+    expect(revisions).toHaveLength(2);
+    expect((await request(`/memory/items/${item.id}`, 'DELETE')).status).toBe(200);
+    expect(memoryItemList.parse(await (await request('/memory/items')).json()).items).toEqual([]);
+    expect(forgotten.some((record) => record.claim_ids.includes(item.id))).toBe(true);
+  });
+  test('stopping fences further text and retains the partial answer', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Help me plan' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = await required(runner).claim({
+      job_id: row.id,
+      expected_epoch: row.leaseEpoch,
+      expected_version: row.stateVersion,
+      reason: 'input',
+    });
+    const claims = required(claimed).claims;
+    await required(runner).emit(claims, {
+      type: 'text_delta',
+      text: 'Here is the first part.',
+      attempt_id: claims.attempt_id,
+      local_seq: 0,
+      dedup_key: dedupKey(claims.attempt_id, 0),
+      at: new Date().toISOString(),
+    });
+    const stopped = conversationResponse.parse(
+      await (await request(`/conversations/${chat.id}/stop`, 'POST')).json(),
+    );
+    expect(stopped.conversation.status).toBe('stopped');
+    const [turn] = await required(handle)
+      .db.select()
+      .from(experienceTurn)
+      .where(eq(experienceTurn.id, row.currentTurnId ?? ''));
+    expect(turn?.answer).toBe('Here is the first part.');
+    let rejected = false;
+    try {
+      await required(runner).emit(claims, {
+        type: 'text_delta',
+        text: 'Late text',
+        attempt_id: claims.attempt_id,
+        local_seq: 1,
+        dedup_key: dedupKey(claims.attempt_id, 1),
+        at: new Date().toISOString(),
+      });
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+  });
+  test('a queued pause prevents claim and resume claims the same turn once', async () => {
+    const chat = await createConversation();
+    const accepted = messageAcceptance.parse(
+      await (
+        await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Plan dinner' })
+      ).json(),
+    );
+    expect((await request(`/conversations/${chat.id}/pause`, 'POST')).status).toBe(200);
+    const row = await required(jobs).get(chat.id);
+    const wake = {
+      job_id: row.id,
+      expected_epoch: row.leaseEpoch,
+      expected_version: row.stateVersion,
+      reason: 'input' as const,
+    };
+    expect(await required(runner).claim(wake)).toBeNull();
+    await request(`/conversations/${chat.id}/resume`, 'POST');
+    expect(await required(runner).claim(wake)).not.toBeNull();
+    const messages = turnList.parse(
+      await (await request(`/conversations/${chat.id}/messages`)).json(),
+    );
+    expect(messages.turns.map((turn) => turn.id)).toEqual([accepted.turn_id]);
+  });
+  test('retrying pause and resume appends one notice per turn and action', async () => {
+    const chat = await createConversation();
+    const accepted = messageAcceptance.parse(
+      await (
+        await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Plan dinner' })
+      ).json(),
+    );
+    for (const action of ['pause', 'pause', 'resume', 'resume'])
+      expect((await request(`/conversations/${chat.id}/${action}`, 'POST')).status).toBe(200);
+    const rows = await required(handle).sql`select payload from event where job_id = ${chat.id}
+      and payload->>'kind' in ('experience_paused', 'experience_resumed') order by seq`;
+    expect(rows.map((row) => row.payload)).toEqual([
+      { kind: 'experience_paused', turn_id: accepted.turn_id },
+      { kind: 'experience_resumed', turn_id: accepted.turn_id },
+    ]);
+  });
+  test('an unconfirmed change cannot produce a completed turn or done trail step', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Prepare dinner' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const connectionId = newId('conn');
+    await required(handle)
+      .db.insert(connection)
+      .values({ id: connectionId, spaceId, label: 'Mail', provider: 'imap' });
+    const actionId = newId('act');
+    await required(handle)
+      .db.insert(action)
+      .values({
+        id: actionId,
+        jobId: chat.id,
+        attemptId: claimed.claims.attempt_id,
+        connectionId,
+        kind: 'email.send',
+        effectClass: 'write_external',
+        canonicalPayload: {},
+        payloadHash: 'a'.repeat(64),
+        idempotencyKey: actionId,
+        status: 'unknown',
+      });
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'All ready.',
+      evidence: [],
+    });
+    const view = conversationResponse.parse(
+      await (await request(`/conversations/${chat.id}`)).json(),
+    );
+    expect(view.conversation.status).toBe('needs_you');
+    const page = await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id);
+    expect(page.events.some((event) => event.item.type === 'done')).toBe(false);
+  });
+  test('space event sync skips locked idle conversations and explicit sync retains history', async () => {
+    const idle = await createConversation();
+    const recent = await createConversation();
+    const fixture = required(handle);
+    await fixture.sql`update job set updated_at = now() - interval '2 days' where id = ${idle.id}`;
+    for (const chat of [idle, recent])
+      await fixture.db.insert(event).values({
+        jobId: chat.id,
+        type: 'notice',
+        payload: {
+          kind: 'experience_say',
+          text: chat.id === idle.id ? 'Saved history.' : 'Working now.',
+        },
+        dedupKey: `${chat.id}:fixture-say`,
+        createdAt: new Date(Date.now() - (chat.id === idle.id ? 2 * 86400000 : 0)),
+      });
+    const reader = openDatabase(fixture.url, 1);
+    try {
+      await reader.sql`set lock_timeout = '250ms'`;
+      const projection = new ExperienceEvents(reader.db);
+      await fixture.sql.begin(async (tx) => {
+        await tx`select id from job where id = ${idle.id} for update`;
+        const page = await projection.page(spaceId, 0);
+        expect(
+          page.events.some(
+            (item) => item.conversation_id === recent.id && item.item.type === 'say',
+          ),
+        ).toBe(true);
+        expect(page.events.some((item) => item.conversation_id === idle.id)).toBe(false);
+      });
+      const history = await projection.page(spaceId, 0, idle.id);
+      expect(
+        history.events.some(
+          (item) => item.item.type === 'say' && item.item.text === 'Saved history.',
+        ),
+      ).toBe(true);
+    } finally {
+      await reader.close();
+    }
+  });
+  test('projection waits its turn in event order, so a live stream cannot pass its rows', async () => {
+    const chat = await createConversation();
+    const fixture = required(handle);
+    await fixture.db.insert(event).values({
+      jobId: chat.id,
+      type: 'notice',
+      payload: { kind: 'experience_say', text: 'In order.' },
+      dedupKey: `${chat.id}:ordered-say`,
+    });
+    const reader = openDatabase(fixture.url, 1);
+    try {
+      const projection = new ExperienceEvents(reader.db);
+      let synced = false;
+      let pending: Promise<void> | undefined;
+      await fixture.sql.begin(async (tx) => {
+        // Another writer holds the event order. Anything the projection appends
+        // now would take a sequence number that commits after later ones, and a
+        // stream that had read past it would never show it.
+        await tx`select pg_advisory_xact_lock(${EVENT_ORDER_LOCK})`;
+        pending = projection.sync(spaceId, chat.id).then(() => {
+          synced = true;
+        });
+        await Bun.sleep(300);
+        expect(synced).toBe(false);
+      });
+      await pending;
+      const page = await projection.page(spaceId, 0, chat.id);
+      expect(
+        page.events.some((item) => item.item.type === 'say' && item.item.text === 'In order.'),
+      ).toBe(true);
+    } finally {
+      await reader.close();
+    }
+  });
+  test('real ledger rows yield one grouped trail action and stable resumable safe events', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Check dinner plans' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = await required(runner).claim({
+      job_id: row.id,
+      expected_epoch: row.leaseEpoch,
+      expected_version: row.stateVersion,
+      reason: 'input',
+    });
+    const calendarId = newId('conn');
+    const mailId = newId('conn');
+    await required(handle)
+      .db.insert(connection)
+      .values([
+        { id: calendarId, spaceId, label: 'Calendar', provider: 'caldav' },
+        { id: mailId, spaceId, label: 'Mail', provider: 'imap' },
+      ]);
+    for (const [index, kind] of ['calendar.list', 'email.search', 'email.read'].entries()) {
+      const actionId = newId('act');
+      const detail =
+        index === 0
+          ? { events: [{ summary: 'Dinner' }] }
+          : index === 1
+            ? { messages: [{ subject: 'Invite' }] }
+            : { message: { subject: 'Menu' } };
+      await required(handle)
+        .db.insert(action)
+        .values({
+          id: actionId,
+          jobId: chat.id,
+          attemptId: required(claimed).claims.attempt_id,
+          connectionId: index === 0 ? calendarId : mailId,
+          kind,
+          effectClass: 'read',
+          canonicalPayload: { private: 'must stay inside' },
+          payloadHash: 'a'.repeat(64),
+          idempotencyKey: actionId,
+          status: 'succeeded',
+          receipt: { detail },
+          resolvedAt: new Date(),
+        });
+      await required(handle)
+        .db.insert(event)
+        .values({
+          jobId: chat.id,
+          attemptId: required(claimed).claims.attempt_id,
+          type: 'action_requested',
+          payload: { action_id: actionId, kind },
+          dedupKey: `fixture:${actionId}`,
+        });
+    }
+    await required(runner).commitOutcome(required(claimed).claims, {
+      kind: 'completed',
+      summary: 'Your evening is clear.',
+      evidence: [],
+    });
+    const projection = new ExperienceEvents(required(handle).db);
+    const page = await projection.page(spaceId, 0, chat.id);
+    // The connected-app reads group into one step. Steps carrying a single tool
+    // entry, such as the skills the attempt was given, sit beside it.
+    const grouped = (item: (typeof page.events)[number]) =>
+      item.item.type === 'action' && item.item.tool === undefined;
+    expect(page.events.filter(grouped)).toHaveLength(1);
+    const step = page.events.find(grouped)?.item;
+    if (step?.type !== 'action') throw new Error('Missing action');
+    expect(step.sources.map((source) => source.connection_id)).toEqual([
+      calendarId,
+      mailId,
+      mailId,
+    ]);
+    expect(JSON.stringify(page)).not.toMatch(BACKEND_VOCABULARY);
+    expect(JSON.stringify(page)).not.toContain('must stay inside');
+    expect((await projection.page(spaceId, page.next_cursor, chat.id)).events).toEqual([]);
+    expect((await projection.page(foreignSpaceId, 0, chat.id)).events).toEqual([]);
+    const response = await request(`/conversations/${chat.id}/events?since=0`);
+    expect(response.status).toBe(200);
+  });
+  test('cards project real calendar, draft, file, page and artifact records with safe attribution', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Gather dinner details' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const entries = [
+      {
+        provider: 'caldav',
+        kind: 'calendar.list',
+        payload: {},
+        detail: {
+          events: [
+            {
+              uid: 'dinner-event',
+              summary: 'Dinner event',
+              start: '2026-09-12T19:00:00Z',
+              end: '2026-09-12T20:00:00Z',
+              location: 'Home',
+            },
+          ],
+        },
+      },
+      {
+        provider: 'imap',
+        kind: 'email.draft',
+        payload: { to: 'alex@example.test', subject: 'Dinner invitation', body: 'At seven?' },
+        detail: {},
+      },
+      {
+        provider: 'files',
+        kind: 'files.read',
+        payload: { path: 'artifacts/menu.txt' },
+        detail: { path: 'artifacts/menu.txt', content: 'private details stay inside' },
+      },
+      {
+        provider: 'web',
+        kind: 'web.fetch',
+        payload: {},
+        detail: {
+          final_url: 'https://example.test/menu?access_token=private',
+          body: '<title>Dinner menu</title><p>private details stay inside</p>',
+        },
+      },
+    ];
+    const ids: string[] = [];
+    for (const entry of entries) {
+      const connectionId = newId('conn');
+      ids.push(connectionId);
+      await required(handle)
+        .db.insert(connection)
+        .values({ id: connectionId, spaceId, label: 'Connected app', provider: entry.provider });
+      const id = newId('act');
+      await required(handle)
+        .db.insert(action)
+        .values({
+          id,
+          jobId: chat.id,
+          attemptId: claimed.claims.attempt_id,
+          connectionId,
+          kind: entry.kind,
+          effectClass: entry.kind === 'email.draft' ? 'write_reversible' : 'read',
+          canonicalPayload: entry.payload,
+          payloadHash: 'a'.repeat(64),
+          idempotencyKey: id,
+          status: 'succeeded',
+          receipt: { detail: entry.detail },
+          resolvedAt: new Date(),
+        });
+      await required(handle)
+        .db.insert(event)
+        .values({
+          jobId: chat.id,
+          attemptId: claimed.claims.attempt_id,
+          type: 'action_status_changed',
+          payload: { action_id: id, to: 'succeeded' },
+          dedupKey: `card-fixture:${id}`,
+        });
+    }
+    await required(handle)
+      .db.insert(artifact)
+      .values([
+        {
+          id: newId('art'),
+          spaceId,
+          jobId: chat.id,
+          path: 'artifacts/dinner-notes.txt',
+          contentHash: 'a'.repeat(64),
+          mime: 'text/plain',
+          size: 15,
+        },
+        {
+          id: newId('art'),
+          spaceId: foreignSpaceId,
+          jobId: chat.id,
+          path: 'foreign-secret.txt',
+          contentHash: 'b'.repeat(64),
+          mime: 'text/plain',
+          size: 20,
+        },
+      ]);
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'Dinner details are ready.',
+      evidence: [],
+    });
+    const result = experienceOperations['GET /conversations/{id}/cards'].response.parse(
+      await (await request(`/conversations/${chat.id}/cards`)).json(),
+    );
+    // Reading a file makes nothing new, so it stays in the activity and is not a card.
+    expect(result.cards).toHaveLength(4);
+    expect(result.cards.map((card) => card.title).sort()).toEqual(
+      ['Dinner event', 'Dinner invitation', 'Dinner menu', 'dinner-notes.txt'].sort(),
+    );
+    expect(
+      result.cards.find((card) => card.title === 'Dinner event')?.facts.map((fact) => fact.label),
+    ).toEqual(['Starts', 'Ends', 'Place']);
+    expect(result.cards.find((card) => card.title === 'Dinner invitation')?.facts).toEqual([
+      { label: 'To', value: 'alex@example.test' },
+    ]);
+    // Credential-bearing source addresses never become clickable links.
+    expect(result.cards.find((card) => card.title === 'Dinner menu')?.primary_action).toBeNull();
+    expect(
+      result.cards
+        .filter((card) => card.source_connection)
+        .map((card) => card.source_connection)
+        .sort(),
+    ).toEqual(ids.filter((_, index) => entries[index]?.kind !== 'files.read').sort());
+    expect(JSON.stringify(result)).not.toMatch(BACKEND_VOCABULARY);
+    expect(JSON.stringify(result)).not.toContain('private details stay inside');
+    expect(JSON.stringify(result)).not.toContain('foreign-secret');
+    const page = await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id);
+    expect(page.events.filter((event) => event.item.type === 'card')).toHaveLength(4);
+    expect(JSON.stringify(page)).not.toMatch(BACKEND_VOCABULARY);
+  });
+
+  test('a prepared draft card offers sending until the draft has been sent', async () => {
+    const chat = await createConversation();
+    await request(`/conversations/${chat.id}/messages`, 'POST', { text: 'Write to Alex' });
+    const row = await required(jobs).get(chat.id);
+    const claimed = required(
+      await required(runner).claim({
+        job_id: row.id,
+        expected_epoch: row.leaseEpoch,
+        expected_version: row.stateVersion,
+        reason: 'input',
+      }),
+    );
+    const connectionId = newId('conn');
+    await required(handle)
+      .db.insert(connection)
+      .values({ id: connectionId, spaceId, label: 'Mail', provider: 'imap' });
+    const recorded = async (kind: string) => {
+      const id = newId('act');
+      await required(handle)
+        .db.insert(action)
+        .values({
+          id,
+          jobId: chat.id,
+          attemptId: claimed.claims.attempt_id,
+          connectionId,
+          kind,
+          effectClass: kind === 'email.draft' ? 'write_reversible' : 'external_irreversible',
+          canonicalPayload: { to: 'alex@example.test', subject: 'Dinner', body: 'At seven?' },
+          payloadHash: 'a'.repeat(64),
+          idempotencyKey: id,
+          status: 'succeeded',
+          receipt: { detail: {} },
+          resolvedAt: new Date(),
+        });
+      return id;
+    };
+    const draftId = await recorded('email.draft');
+    await required(handle)
+      .db.insert(event)
+      .values({
+        jobId: chat.id,
+        attemptId: claimed.claims.attempt_id,
+        type: 'action_status_changed',
+        payload: { action_id: draftId, to: 'succeeded' },
+        dedupKey: `send-card-fixture:${draftId}`,
+      });
+    await required(runner).commitOutcome(claimed.claims, {
+      kind: 'completed',
+      summary: 'The draft is ready.',
+      evidence: [],
+    });
+    const cards = async () =>
+      experienceOperations['GET /conversations/{id}/cards'].response.parse(
+        await (await request(`/conversations/${chat.id}/cards`)).json(),
+      ).cards;
+    // The handle is the draft's id, which is what the send route takes.
+    const send = { kind: 'send' as const, label: 'Review and send', handle: draftId };
+    expect((await cards()).find((card) => card.title === 'Dinner')?.primary_action).toEqual(send);
+    const page = await new ExperienceEvents(required(handle).db).page(spaceId, 0, chat.id);
+    const streamed = page.events.flatMap((entry) =>
+      entry.item.type === 'card' ? [entry.item.card] : [],
+    );
+    expect(streamed.find((card) => card.title === 'Dinner')?.primary_action).toEqual(send);
+    // Once the person has asked to send it, the card no longer offers to.
+    const sendId = await recorded('email.send');
+    await required(handle)
+      .db.insert(experienceDraftSend)
+      .values({ draftActionId: draftId, sendActionId: sendId });
+    expect((await cards()).find((card) => card.title === 'Dinner')?.primary_action).toBeNull();
+  });
+});
+
+function required<T>(value: T | null | undefined): T {
+  if (value == null) throw new Error('Expected test fixture');
+  return value;
+}

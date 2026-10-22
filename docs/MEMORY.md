@@ -1,0 +1,527 @@
+# Memory
+
+Memory authority is Postgres evidence and versioned claims. Markdown in git is a
+derived inspection/edit view; the SQLite index belongs to the file-view tooling.
+A plain filesystem edit does not update authoritative memory. This distinction
+is exercised by `Markdown round trips support, preserves local edits, and owner
+edits become protected revisions` in
+[`markdown-tests.ts`](../apps/openduet/test/integration/markdown-tests.ts).
+
+The service entry point wires authenticated jobs, approvals, events and the
+other service modules. Every Postgres-backed `bootstrap`
+starts the memory core and worker behind the restriction-journal restore gate,
+mounts the authenticated memory routes, and wraps each attempt's runtime with
+context recording and invalidation; the `docker` adapter starts the deployment
+memory the same way. An injected runtime receives context recording only when
+the caller supplies the `memory` dependency. The broker origin resolver is wired
+in `broker/start.ts` and tested by `an address read off a page is refused as
+untrusted_recipient_origin`. The scripted HTTP proof `wired-assistant.test.ts`
+corrects a claim over these routes through a real local engine.
+
+## Automatic memory from chat
+
+What a person types into a conversation or a job is offered to their memory
+with no step of theirs. A capture loop reads each user message off the job's
+stream once and keeps it as evidence on the `chat` stream, in the speaker's own
+memory for that space; `memory_capture` records what it did with every message.
+Only the person's own messages are evidence here: assistant answers, pages,
+mail and tool output are never read as facts about them. The memory model then
+reads the message through the model gateway (see
+[DEPLOYMENT](DEPLOYMENT.md#memory-model)) and proposes claims, which pass the
+same validation, precedence and correction rules as every other extraction. It
+keeps lasting facts about the person, their preferences, the people in their
+life and standing instructions, and supersedes a claim the message corrects.
+
+What it proposes is held to that bar before it is kept:
+
+- A detail of one moment or one task is not kept: content tied to today,
+  tonight or this week ("shipped the redesign this week") unless it is a
+  standing instruction, a subject that names a task's working state
+  (`home.heating_issue`, `work.weekly_recap`), and anything the model marks
+  `about: "this_task_only"`.
+- Something memory already holds is not added again. The claims this
+  conversation already taught are always in the snapshot the model reads. An
+  add that says what a held detail says, in other words ("Has a shellfish
+  allergy" beside "Allergic to shellfish"), is filed under that detail's
+  subject, so it attaches as more evidence or becomes that detail's update; one
+  that repeats a registry-keyed detail, or a detail the same message already
+  changes, is not added. Two wordings are the same when nearly all their
+  meaningful words match and neither negates the other; a different name,
+  number or value is a different detail. A list's items are never merged.
+- A detail is worded for the person it is about: one short sentence ("Sister
+  Lena lives in Seattle"), never "the user". A model's third-person wording is
+  rewritten ("Lena, the user's sister" reads "Lena, your sister"; "The user is
+  vegetarian" reads "Vegetarian"). The memory page shows such a sentence as the
+  belief's own line, and a bare value under its subject's name.
+- A detail is kept with the someone it is about. One whose words start with
+  someone ("Maya is allergic to peanuts") is theirs, whatever topic it was
+  proposed under. Two people who share a first name stay two when the person
+  says how each is related to them ("my brother Sam", then "my friend Sam").
+  How a held detail relates someone is read from the latest of its wordings
+  that says it, and how a change relates them from its own words or, when they
+  leave it out, from the word beside the name in the person's sentence: "My
+  sister says Sam lives in Faro" is about the Sam memory already holds. A
+  relative of someone is not them: "My friend Sam's brother moved to Faro" is
+  kept as Sam's brother's ("Sam's brother's city"), never on "Brother Sam",
+  and a later word about Sam himself never lands on his brother's detail.
+  Someone named only as another's relative is theirs: "Alex's brother Sam"
+  is kept as Alex's brother's, apart from a Brother Sam memory holds, and "My
+  brother Sam" never lands on Alex's brother's detail. A short
+  word for a relation ("bro", "sis") is that relation when it is the person's
+  ("my bro Sam") or follows a name ("Sam's sis"), never when it is said to
+  anyone ("Thanks bro"), and a name with an apostrophe ("O'Brien") is one
+  name. A change is proposed under the subject of the detail it changes, so a
+  relation that subject names is the held detail's, not the change's. A word
+  that only starts a sentence ("Coffee is a must", "Monday is gym day") is not
+  someone, but a name that goes on to say who someone is ("Sam is the
+  best cook I know", "Maya is my favourite cousin") is. A detail of the
+  person's own that names no topic is filed under what it says and shown as
+  "About you": said again in other words ("Works nights", then "Usually works
+  at night") it is the same detail, and another detail stays another however
+  its words start or whichever way round they go ("Translates Portuguese into
+  English" and "Translates English into Portuguese"). The city the person
+  lives in is one detail whether it was filed as home.city or self.city; where
+  they work, a city they used to live in, and someone else's city are others
+  (`whoseDetail`, `ownDetailNow`, `relationsIn`, `relativeOf`, `relativeNamed`
+  and `twoPeople` in
+  [labels.ts](../apps/openduet/src/memory/labels.ts), `aboutSubject` in
+  [extract.ts](../apps/openduet/src/memory/extract.ts)).
+
+`mergeIntoHeld` and `readExtractionReply` in
+[extract.ts](../apps/openduet/src/memory/extract.ts) hold these rules
+([extract-quality.test.ts](../apps/openduet/src/memory/extract-quality.test.ts)).
+On a scripted half hour of chat that follows a real first session, they are
+measured with the same model answers once with the rules off and once with
+them on ([memory-noise.test.ts](../apps/openduet/test/integration/memory-noise.test.ts));
+the test prints the counts of beliefs, one-off beliefs, duplicates, lasting
+facts kept, third-person wording and key-like labels.
+
+Memory refuses a change it cannot make and records why at
+`GET /memory/rejections`. A change aimed at a detail it may not change
+(another room member's, someone else's, or one the model was not shown), a
+retraction of the person's own correction, or a change whose dates end before
+they start is refused alone: the message's other details are kept, and only
+they are put to the person when memory asks before keeping anything. A message
+with nothing else to keep is refused as a whole. Words cited that the message
+does not hold, a statement that does not rest on the person's own words, a
+check the model claims, or two changes to one detail still refuse the whole
+message, because its reading cannot be trusted (`one change memory cannot make
+is refused alone; the message's other details are kept` and `a change refused
+alone is not put to the person for review` in
+[memory-whose-detail.test.ts](../apps/openduet/test/integration/memory-whose-detail.test.ts)).
+
+Messages are kept from personal spaces, and in a shared space only from its
+owner. A member's messages in a shared space are not kept in any memory, theirs
+or the owner's. A message counts as the owner's only when the service recorded
+the owner as its speaker, in the owner's own conversation (`only the space
+owner's own messages are kept; a member's are kept nowhere` in
+[memory-shared-space.test.ts](../apps/openduet/test/integration/memory-shared-space.test.ts)).
+What people say in a room's threads is the room's own memory, as
+[Rooms](#rooms) describes.
+
+A person can say these in plain words:
+
+| They say | What memory does |
+| --- | --- |
+| "Remember that ..." or "Keep in mind ..." in their own words | Keeps it as their own statement, at owner trust; quoted or forwarded text is not their statement |
+| "That's wrong, it's ..." or "Actually, ... now" | Supersedes the claim it corrects |
+| "Forget that" or "Don't remember that" | Removes what their previous kept message in the conversation taught, through the restriction journal |
+| "Forget Maya's number" | Removes the one saved detail that names Maya and that field, through the restriction journal |
+| "Forget my number" | Removes the person's own number only, never someone else's |
+| "Forget the number", or a request several details match | Asks which detail they mean and removes nothing |
+| "Forget Carol's number" with nothing saved about Carol | Says nothing saved matched |
+| "Don't remember this" or "Off the record" | Does not keep that message |
+
+A request to forget is never itself kept. The first objective of a job the
+person typed themselves is read the same way as a message.
+
+A list the person adds to over time, such as a reading list or gift ideas, is
+kept one item per detail. One key holds one value at a time, so a whole list on
+one key would keep only one item. When the extractor adds an item on a list's
+own key and the list already holds one, the new item gets a key of its own
+inside the list's, so the earlier items stay. An item already there in the same
+wording is not added again. A `supersede` is kept as one: the model is saying
+the person replaced what was there. A key marked as a preference or a setting
+(`preferences.mailing_list`) is one answer, never a list (`keepListItems` in
+[extract.ts](../apps/openduet/src/memory/extract.ts)). An agent that keeps a list
+for the person keeps it in a file when it can reach Files, reading the file and
+writing it back with the new item added. Memory remembering what the person
+said is not the agent saving it, and an agent says it saved something only when
+a tool call did it.
+
+Each change is shown in the conversation as a tool entry ("Remembered",
+"Updated", "Forgot"). It is written as a
+`notice` with payload kind `memory_tool` and operation `write`, `correct` or
+`forget`, naming the detail by its plain label and quoting the value from the
+person's own message; a forget names the detail without its value. The notice
+goes only on the conversation the message came from. What an attempt was handed
+is read from its context record.
+
+The service's `/health` reports `memory` with the number of messages waiting
+to be read and whether the memory model's provider or the daily reads are the
+reason; it holds counts only.
+
+`GET /memory/settings` and `PUT /memory/settings` (`{ "capture": boolean }`)
+read and change whether new messages are kept for the signed-in person. Capture
+is on by default; turned off, "forget ..." still works.
+
+Evidence: `say, recall later, correct in plain words, and forget, each told as a
+tool entry`, `a person who turns memory off is not remembered, and can still say
+forget`, `a message from someone who does not own the space is never kept in its
+memory`, `the memory gateway holds each person to a daily number of calls` and
+`a message waits out a provider outage unread, costs no reads, and is kept once
+it recovers`
+in [memory-chat.test.ts](../apps/openduet/test/integration/memory-chat.test.ts).
+
+## Rooms
+
+In a room (see [ROOMS](ROOMS.md)) everything anyone says in a thread is room
+material, so it becomes the room's memory, whoever said it. A capture loop
+reads each person's message in a room once (`memory_room_capture` records what
+it did with it) and keeps it as evidence on the `room` stream of the room's own
+memory, with:
+
+- `author = member` and `author_principal_id`, the person who said it;
+- `audience = space`, so everyone in the room, and the room's agent, may read
+  what is learned from it;
+- `external_content` origin trust: another person's words never raise what an
+  approval card trusts, the requester's own included.
+
+"Don't remember this" and "Off the record" keep a message out, and a person who
+turned memory off is not kept in rooms either. "Forget that" takes back what
+the speaker's previous kept message in that thread taught the room, and
+"Forget <detail>" removes one named detail the speaker may forget there.
+
+A room's requests recall as the room: the room's `space` and `public` details,
+never a `private` one, and never anything from anyone's own space. Beside them,
+they are handed the details people shared into the room. A person shares one of
+their own details from their personal memory (`POST /rooms/{id}/shares`); the
+share is a reference, not a copy. The room reads the detail's current value
+from the person's own memory, through one narrow path, and only while the share
+stands, the person is still in the room, and the detail is still remembered
+where it lives. Forgetting it there takes it out of every room at once and
+invalidates any attempt that was handed it. A shared detail carries
+`external_content` trust and names who shared it. A detail learned in a private
+conversation stays its owner's: it cannot be shared, and a shared detail whose
+current value came from a private conversation is shown to nobody in the room
+and handed to none of its work, whichever model runs it. A share is members-only by
+default: while a guest is in the room, the room's work is not handed it.
+Withdrawing a share (`DELETE /rooms/{id}/shares/{share}`) is open to the person
+who shared it and to the room's owners.
+
+`GET /rooms/{id}/memory` lists the room's details, each with the people whose
+words it rests on, and the room's shares. A room's owner forgets any detail in
+it, and anyone else a detail that rests on their own words alone
+(`POST /rooms/{id}/memory/{claim}/forget`). A person deletes their own message
+(`DELETE /rooms/{id}/messages/{message}`): its words leave the thread, the
+request it asked (its messages, its turn and its title), and the room's memory,
+in one transaction, and work under way in the thread starts again without them.
+
+Every one of these removals is written to the restriction journal: forgetting a
+detail and deleting what was kept of a message as usual, and the message
+deletion and a withdrawn share as records that name the message or share and
+hold none of its words. Restoring an older database replays them, so what was
+removed stays removed. Evidence:
+`every member's words in a room become room memory with their author`,
+`a room request recalls room memory and shared items, and never a member's or
+the owner's private memory`, `forgetting a shared personal claim removes it from
+the room, and a restored old database keeps it out`, `an author deletes their
+message and nothing of it is recalled, replayed or shown`, `a members-only share
+stays out while a guest is in the room` and `an owner forgets any room claim, and
+a member forgets only claims from their own words` in
+[rooms-memory.test.ts](../apps/openduet/test/integration/rooms-memory.test.ts).
+
+## Evidence, claims and correction
+
+Accepted evidence records exact source identity, version, spans and stream
+sequence. Claims have stable IDs and numbered revisions, support references,
+validity times and provenance. A correction requires the expected revision and
+an idempotency key. Current recall and historical recall are distinct.
+
+The web app's final setup step saves four owner-stated answers through
+`POST /memory/items` with `{ key, value, statement? }`. The session supplies
+the owner and space. `persistEvidence` records the statement on the `onboarding`
+stream in the same evidence journal used by corrections; `publishRevision`
+creates a protected claim with owner origin trust. No extraction is needed for
+these statements. `GET /memory/items` lists their source as `onboarding`. It
+lists every current detail, one whose question is still open included, 200 at a
+time: `next`, when set, is the `after` value for the following page
+(`a disputed detail is listed, since it is still what memory uses` and
+`details past the first page are reached by following next` in
+[memory-settings.test.ts](../apps/openduet/test/integration/memory-settings.test.ts)).
+
+Stating the same key again supersedes its previous revision and leaves one
+active head. The replacement uses the correction path's invalidation and
+repair journal for outputs that used the old value. Preference answers enter
+the memory profile after its queued rebuild and are then included in attempt
+bundles. Keys maintained by deterministic event and contact extractors receive
+`409 extractor_owned_key`; the existing correction route remains available.
+The [onboarding integration tests](../apps/openduet/test/integration/onboarding-memory.test.ts)
+cover four answers, replacement, provenance, session scope, refusal, repair,
+and an attempt bundle carrying an answer.
+
+Settings also offers `POST /signout`. It revokes only the session behind the
+cookie and clears that cookie; saved memory remains, and another live session
+can still read it. The [sign-out test](../apps/openduet/test/integration/signout.test.ts)
+checks the old cookie is refused while the other session continues to work.
+
+| Behaviour | Named test in the integration suite |
+| --- | --- |
+| Durable ingest and replay identity | `persist before acknowledgment, dedup, immutable versions, separate streams` |
+| Stream and scope checks | `concurrent inputs commit contiguous stream sequences and reject cross-space metadata` |
+| Immediate protected correction | `claim revisions retain exact support and direct corrections are immediate and idempotent` |
+| Correction races with extraction | `HTTP extraction racing a correction retries from a fresh fenced snapshot` |
+| Exact-span validation | `whole-set validation rejects wrong spans, spoofed attribution, and conflicting creates` |
+| Current and dated historical views | `recall supplements a lagging lexical index and dates historical revisions` |
+| End-to-end scripted trip | `July to August survives sessions, an old import, correction races, process kills, scope, forget, and restore` |
+
+These tests are in [memory.test.ts](../apps/openduet/test/integration/memory.test.ts)
+and its imported test modules. They use Postgres, pg-boss and scripted extraction:
+they check how interpretations are stored, validated, corrected and served,
+while the truth of a model's interpretation rests with the model and with the
+owner's corrections.
+
+## Storage and retrieval
+
+| Data | Authority or view |
+| --- | --- |
+| `memory_sources`, `memory_source_content` | Evidence metadata and retained source text |
+| `memory_claims`, `memory_revisions`, support and derivation tables | Versioned interpretations and dependencies |
+| `memory_work`, `memory_outbox`, `memory_streams` | Durable extraction, publication and consumption state |
+| `memory_suppressions`, `memory_spaces` | Serving restrictions and generations |
+| `memory_index_entries`, optional dense entries, profile and index manifest | Rebuildable retrieval views |
+| `memory_contexts`, outputs and repair briefs | Delivered context and recorded dependency information |
+| `knowledge/<claim-id>.md` | Derived inspection/edit surface |
+| Independently retained restriction journal | Removal records replayed before restored data can serve |
+
+The storage paths are defined in `memory/schema.ts`, `db.ts`, `views.ts`
+and `markdown.ts`; the tests above and below exercise them.
+
+Recall uses native Postgres lexical search and, when an embedding model is
+configured ([DEPLOYMENT](DEPLOYMENT.md), "Semantic recall"), ranks by meaning
+beside it: the two candidate sets are merged before ranking, and only semantic
+candidates nearly as close as the closest are kept. Candidates still cross
+authoritative revision, source, suppression and audience checks. Vectors of
+another embedding are never compared, and an embedder that is missing, slow or
+failing leaves recall lexical rather than unavailable (`lexical and dense
+candidates are independent and incompatible embeddings fall back to lexical`).
+Each index build embeds only the revisions it has no vector for; a build the
+provider failed part way marks the space partly embedded, and the next start
+fills it in. A cloud embedder never reads memory learned in a private
+conversation or anything in a space marked private, and every text it is sent
+(the request, memory and notes) first goes through the gateway's own redactor:
+the listed values, every value memory learned privately, the detectors, the
+local name detector and the conversation's vault. A local embedder reads memory
+as written (`semantic recall` in `test/integration/semantic-recall.test.ts`).
+
+Vectors are stored as float32 in base64 and compared in the service. A space's
+vectors are read once per index generation and kept in memory (16 spaces at a
+time), in their own short read: a read that is slow, or a space with more than
+2,000 vectors, leaves recall lexical and is logged, never empty. Indexing
+itself stops at 2,000 claim revisions a space, so a larger space is recalled by
+words alone until that limit is lifted. The request is embedded while the rest
+of the attempt is prepared, and not at all when the space was not indexed with
+the embedding. A provider that fails three times in a row is left alone for a
+minute; `/health` reports the embedder's state (`memory.embedding`), and a recall
+that could not use it says `dense_unavailable`. On a held-out set of 24
+paraphrases ("favourite colour" for a `color` claim), recall@3 with
+`nomic-embed-text-v1.5` was 0.83 to 0.92 against 0.08 for words alone; set
+`OPENDUET_LIVE_EMBEDDINGS=1` with a Fireworks key to run it.
+
+### The agent's own notes
+
+The agent keeps notes for itself with the `notes.write` tool: something it found
+out or worked out in one chat that will help in a later one. A note is never the
+person's statement. It comes back to the agent, when a later request matches it
+by words or meaning, labelled as its own note at `inferred` trust (or, for a
+note written in a chat that had read a page, message or file, at
+`external_content`, labelled as unverified and never an instruction), and the
+person sees each one in Memory as OpenDuet's note and can delete it. Notes are
+kept only in a person's own space and are read back only into their own work
+there, as private memory is: never for a reader of a shared space, a public
+compartment or an agent set not to read memory. A note written in a private
+conversation is read back only into requests that stay on the person's own
+model, and a cloud embedder never reads it. One person keeps at most 500 notes
+in a space; the oldest go first. Deleting a chat and what OpenDuet learned from it
+deletes the notes written there too, and forgetting everything deletes every
+note written before it.
+
+A request is matched by any of its meaningful words, ranked by how many match
+and how closely, so "Email Ana the agenda for Thursday" finds the claim on
+Ana's address. An attempt recalls by the person's newest messages and the job's
+objective, and always carries the eight newest preferences, read from the claims
+themselves. The knowledge budget charges a quarter of each item's UTF-8 bytes
+per token, the estimate the model gateway charges input by
+(`a request phrased as a sentence recalls the fact it needs and not the others`,
+`the four setup answers all reach an everyday request within the knowledge
+budget` and `the newest preferences are the ones every attempt carries` in
+[memory-recall-quality.test.ts](../apps/openduet/test/integration/memory-recall-quality.test.ts)).
+
+Recall reports `complete`, `degraded` or `unavailable`, with a coverage reason.
+A successful empty search is distinct from timeout (`database timeout is
+unavailable and a successful empty search is complete`). Complete refers to
+the bounded search recipe, not exhaustive source coverage. The integration test
+`recall supplements a lagging lexical index and dates historical revisions`
+also checks the recall budget; the timeout test above checks the deadline.
+The budget and deadline bound each recall; its latency at scale depends on the
+host and the size of the corpus.
+
+## Inspect and edit through authenticated routes
+
+The optional `createMemoryRouter` requires a trusted `resolveScope`; scope is
+not accepted from model/request metadata. See `authenticated routes reject body
+scope, foreign claim IDs, and reader writes`.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /memory/sources` | Ingest source evidence |
+| `GET /memory/sources/{id}` | Inspect eligible evidence with suppressed spans masked |
+| `GET /memory/claims` | Inspect eligible heads |
+| `GET /memory/claims/{id}/history` | Inspect dated revisions and support |
+| `POST /memory/recall` | Retrieve current or historical context |
+| `POST /memory/corrections` | Commit a protected correction against an expected revision |
+| `POST /knowledge/{recordId}/edit` | Submit a Markdown edit as owner evidence |
+| `GET /knowledge/proposals` | Inspect pending review |
+| `POST /knowledge/proposals/{id}/apply` | Revalidate and apply a proposal |
+| `DELETE /knowledge/proposals/{id}` | Discard a proposal |
+
+The core route implementation is `memory/routes.ts`; the interface's saved
+details are served by `experience/memory.ts` and `experience/routes.ts`.
+The Markdown round-trip and
+`review mediation stages diffs and revalidates apply against authoritative
+evidence` tests supply authentication, actual IDs and revisions. The default
+service mounts these routes whenever Postgres is configured, with scope derived
+from the authenticated principal's verified membership. Run the fixture command
+below for a reproducible example.
+
+## Dependencies, contradictions and origin
+
+Recall handles identify claim revisions and source versions. Recorded output
+`uses` manifests support selective invalidation and repair briefs
+(`a correction marks stale exactly the output that cited it and says what to
+repair`; `the next attempt is handed the repair brief in its inputs`).
+An output with an empty `uses` manifest, which is mostly chat prose, keeps the
+conservative rule and is recorded as unattributed on its context record.
+
+The typed key registry and uniqueness indexes prevent duplicate heads on keyed
+claims (`the database refuses a second claim on one key`). Precedence and
+disputes are tested by `July, then a document, then August, then a late email:
+one head, one question`. A proposal without a registered key is stored unkeyed
+and sits outside that constraint.
+
+Tier 0 parses supported structured observations before model extraction.
+Tier 1 validates keys and exact spans (`a wrong span and a hallucinated address
+are rejected; the connector date is the head`). Validation confirms that a
+keyed value sits in the span it cites; a value read the wrong way from a correct
+span is put right by a correction.
+
+Origin follows evidence, and the broker consults it for recognised external
+payload fields (`a page-sourced address is external content; the same address
+from the owner is not`; `an address read off a page is refused as
+untrusted_recipient_origin`). Origin is not permission, and memory correction
+does not undo an external receipt. See [ENGINEERING](ENGINEERING.md).
+
+## Forgetting and restore
+
+Forgetting suppresses eligible recall and old source replay. Source deletion
+and revocation invalidate dependent context; cleanup retries separately.
+Evidence: `forget suppresses old replay, allows fresh explicit evidence, and
+survives an old database snapshot`, `source and space revocation invalidate
+delivered context and block stale serving`, and `deletion hides synchronously,
+cleanup failures retry, and startup refuses a missing journal`.
+
+Deleting a chat keeps what OpenDuet learned from it. The person can choose to
+forget that too: each source the chat's own messages became is removed through
+the same source deletion "forget that" uses, right after the chat goes, so
+nothing captured from it in between is left behind, and a detail another source
+also supports stays. If forgetting cannot be reached, the chat is not deleted. Evidence: `deleting a chat mid-turn stops
+it, withdraws its permission, cancels it and keeps memory` and `asked to,
+deleting a chat also forgets what it taught, through source deletion` in
+[tidy-up.test.ts](../apps/openduet/test/integration/tidy-up.test.ts).
+
+The retained restriction journal records memory removals for replay; actions
+are recorded in Postgres, not in this journal. `restoreMemory` gates spaces
+before replay, then opens eligible spaces. The break test
+`skipping the restriction replay turns the forgetting family red` shows why the
+journal must be retained independently of database rollback.
+
+Cleanup deletes the forgotten content and its index entries from OpenDuet's
+database: a source removed whole loses its text, a span forgotten out of a longer
+message is blanked in place, and repair briefs and owner questions that quote a
+forgotten value go with it (`forgetting a detail erases its text and keeps what
+was said beside it` in
+[memory-forget-quality.test.ts](../apps/openduet/test/integration/memory-forget-quality.test.ts)).
+Removing a source takes only the revisions that rest on it: a detail whose
+current value came from elsewhere keeps it, and when the removed value was the
+current one, the latest remaining value still in force becomes current, or the
+detail is hidden when none is. In the same transaction, rewind snapshots and
+weekly digests drop the removed values, and undoing a rewind never brings one
+back. Memory's own files in a space (`knowledge/k_*.md`) are rewritten from what
+remains and are never committed to the space's Git repository; copies an
+earlier version committed are erased from every commit the first time the
+space is opened, and the old objects are pruned, so the repository's history
+does not keep a forgotten value. Backups taken before that erase, the external
+source account and copies already delivered elsewhere keep what they hold: a
+restored backup brings the old history back until the space is next opened,
+when the erase runs again. Postgres's data files and write-ahead log keep
+deleted rows until that space is reused. Rolling the
+database and the journal back together also rolls back the removals made since,
+so retain the newest journal as [DEPLOYMENT](DEPLOYMENT.md#backup-and-restore)
+describes.
+
+## Startup and active attempts
+
+The default bootstrap provisions authenticated memory scope, initialises a new
+journal only for new storage, calls `startMemoryService` before serving memory
+traffic, mounts `createMemoryRouter`, and applies the `withMemoryRuntime`
+wrapper to the attempt runtime. An application that embeds the modules
+directly must do the same. Evidence for the components: `startup gates serving,
+pg-boss derives scope from work, and background indexing catches up`; `runtime
+adapter discards delivered context and rejects events after an owner
+correction`.
+
+Extraction and view publication use durable work and fenced leases
+(`continuation cursors and queue repair survive lost delivery and an obsolete
+lease holder`). pg-boss runs on the fixture database (`pg-boss uses the embedded
+database`). Each attempt assembles and records its own context at start rather
+than reusing one prepared earlier. Procedure promotion is a separate, scoped
+loop with its own tests ([LEARNING](LEARNING.md)); the memory runner records its
+procedure-transfer scenario as a todo rather than executing it.
+
+An attempt is handed only the details recalled for its latest message. To
+look further, an agent that reads memory has the broker's `memory.search`
+tool, in its first catalog whenever it answers a person, and its instructions
+tell it to search before it says it doesn't know or never had something about
+the person, and to take back an answer only when the person corrects it. A
+search runs the same recall as the attempt's own context, without the profile,
+so a forgotten or blocked detail, a removed source, a public compartment and an
+agent set not to read memory return nothing, and it never returns what was
+learned in a private conversation. The answer says whether anything matched and
+how to speak about either outcome ([memory-search.test.ts](../apps/openduet/test/integration/memory-search.test.ts)).
+A request to forget in the turn is settled before the turn recalls anything,
+and the agent is told to say it forgot the detail as asked, never that it
+never had it.
+
+## Verify
+
+Run from the repository root after dependency installation:
+
+```bash
+bun test apps/openduet/test/integration/memory.test.ts
+bun run conformance:memory
+```
+
+The integration fixture uses disposable Postgres and scripted HTTP extraction.
+The standalone runner covers seven families with ten scenarios and a
+withheld-memory arm. Its eighth family, procedure transfer, holds one scenario
+recorded as a todo and so has no executed case; the learning tests cover
+promotion. See the [memory conformance README](../conformance/memory/README.md)
+for exact scope.
+Both use scripted extraction and answers, so they measure the memory service's
+behaviour rather than a model's reasoning.
+
+`bun run conformance:memory:eval` runs conversations a person might have (in
+`conformance/memory/eval`) through the same service, the chat capture loop
+included, and counts what is stored, what a later attempt is handed, what a
+removal erased from every memory table, what stayed out of a recall, and what
+the conversation was told.

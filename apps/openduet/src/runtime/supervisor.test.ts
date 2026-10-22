@@ -1,0 +1,686 @@
+import { describe, expect, test } from 'bun:test';
+import { spawn } from 'node:child_process';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { type AttemptBundle, EMPTY_SINCE_LAST } from '@openduet/contracts';
+import {
+  API_SERVER_HINT,
+  HERMES_PINNED_COMMIT,
+  renderSoul,
+  SOUL_ENV,
+} from '@openduet/runtime-hermes';
+import { parse } from 'yaml';
+import { EngineRegistry, type ProcessTable, systemProcesses } from './engines.ts';
+import { resolvePython } from './python.ts';
+import {
+  ATTEMPT_ENVIRONMENT_KEYS,
+  attemptEnvironment,
+  DockerRuntimeSupervisor,
+  dockerRunArguments,
+  engineConstants,
+  jobWorkspace,
+  ProcessRuntimeSupervisor,
+  platformEnvironment,
+  type SupervisorOptions,
+  stopProcessTree,
+} from './supervisor.ts';
+
+const bundle: AttemptBundle = {
+  attempt: {
+    id: 'att_01J00000000000000000000000',
+    job_id: 'job_01J00000000000000000000000',
+    epoch: 1,
+    revision: 0,
+    token: 'attempt-secret',
+  },
+  job: {
+    title: 'Test',
+    objective: 'Test',
+    constraints: {},
+    progress_summary: '',
+    unresolved_questions: [],
+    deliverable: {},
+  },
+  since_last: EMPTY_SINCE_LAST,
+  inputs: { new_user_messages: [], approval_results: [], trigger_events: [], repair_briefs: [] },
+  tools: [],
+  skills: [],
+  knowledge: [],
+  transcript: [],
+  workspace: { mount: '/work', files: [] },
+  model: { provider: 'fake', model: 'scripted', fallback: null },
+  budget: { max_turns: 2, max_actions: 1, max_output_tokens: 2000, max_wall_ms: 10000 },
+};
+const options: SupervisorOptions = {
+  workRoot: 'unused',
+  brokerUrl: 'http://openduet:8788',
+  engineRoot: 'unused',
+  python: 'unused',
+  runtimePackage: 'unused',
+  dockerImage: 'openduet-runtime:local',
+  dockerNetwork: 'openduet_internal',
+  dockerWorkVolume: 'openduet_work',
+};
+
+describe('runtime launch boundaries', () => {
+  test('process startup hands the child the rendered engine configuration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-process-config-'));
+    const runtimePackage = join(root, 'runtime');
+    const supervisor = new ProcessRuntimeSupervisor({
+      ...options,
+      engineRoot: join(root, 'engine'),
+      runtimePackage,
+      workRoot: join(root, 'work'),
+      python: resolvePython(),
+      startupTimeoutMs: 5000,
+    });
+    try {
+      await mkdir(join(root, 'engine', '.git'), { recursive: true });
+      await writeFile(join(root, 'engine', '.git', 'HEAD'), HERMES_PINNED_COMMIT);
+      await mkdir(join(runtimePackage, 'patches'), { recursive: true });
+      await mkdir(join(runtimePackage, 'openduet_plugin'));
+      await writeFile(join(runtimePackage, 'patches', 'observer_bridge.py'), '# Fixture only.\n');
+      // A loopback-only stand-in returns the exact configuration the child received.
+      await writeFile(
+        join(runtimePackage, 'process_launcher.py'),
+        `import http.server, json, os, pathlib
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        home = pathlib.Path(os.environ['HERMES_HOME'])
+        data = (
+            (home / 'SOUL.md').read_bytes() if self.path == '/soul'
+            else os.environ.get('HERMES_TIMEZONE', '').encode() if self.path == '/timezone'
+            else (home / 'config.yaml').read_bytes()
+        )
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+address = pathlib.Path(os.environ['OPENDUET_RUNTIME_ADDRESS_FILE'])
+address.with_suffix('.tmp').write_text(json.dumps({'port': server.server_port}))
+os.replace(address.with_suffix('.tmp'), address)
+server.serve_forever()
+`,
+      );
+      const instance = await supervisor.launch(
+        { ...bundle, time_zone: 'Pacific/Chatham' },
+        new AbortController().signal,
+      );
+      const response = await fetch(`${instance.baseUrl}/config`);
+      const config = parse(await response.text());
+      // The engine's workspace is the job's own directory on this path.
+      expect(instance.workspace).toBe(await realpath(join(root, 'work', bundle.attempt.job_id)));
+      // OpenDuet's identity takes the engine's identity slot, and the engine
+      // dates the conversation in the person's zone.
+      expect(await (await fetch(`${instance.baseUrl}/soul`)).text()).toBe(renderSoul());
+      expect(await (await fetch(`${instance.baseUrl}/timezone`)).text()).toBe('Pacific/Chatham');
+      expect(config.provider).toBeUndefined();
+      // The capability sits in both places: the main agent reads the provider
+      // entry, the compaction summary client reads the model section.
+      expect(config.model).toEqual({
+        provider: 'openduet-gateway',
+        default: 'scripted',
+        context_length: 128_000,
+        supports_vision: false,
+        extra_headers: { 'x-openduet-capability': bundle.attempt.token },
+      });
+      expect(Object.keys(config.providers)).toEqual(['openduet-gateway']);
+      expect(config.providers['openduet-gateway']).toMatchObject({
+        base_url: 'http://openduet:8788/providers/fake/v1',
+        key_env: 'OPENDUET_MODEL_KEY',
+        extra_headers: { 'x-openduet-capability': bundle.attempt.token },
+      });
+      // Nothing about this path renders a different engine from the container's.
+      expect(config.memory).toEqual({
+        memory_enabled: false,
+        user_profile_enabled: false,
+        provider: '',
+      });
+      expect(config.agent).toEqual({
+        max_turns: 150,
+        environment_probe: false,
+        host_prompt: false,
+        execution_guidance: false,
+        image_input_mode: 'text',
+      });
+      expect(config.platform_hints.api_server.replace).toBe(API_SERVER_HINT);
+      expect(config.compression.enabled).toBe(true);
+      expect(config.compression.threshold_tokens).toBe(96_000);
+    } finally {
+      await supervisor.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+  test('a stop that fails is retried by close and still removes the engine home', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-process-stop-'));
+    const runtimePackage = join(root, 'runtime');
+    let kills = 0;
+    const supervisor = new ProcessRuntimeSupervisor(
+      {
+        ...options,
+        engineRoot: join(root, 'engine'),
+        runtimePackage,
+        workRoot: join(root, 'work'),
+        python: resolvePython(),
+        startupTimeoutMs: 5000,
+      },
+      async (child) => {
+        kills++;
+        if (kills === 1) throw new Error('Runtime process tree did not stop');
+        await stopProcessTree(child);
+      },
+    );
+    try {
+      await mkdir(join(root, 'engine', '.git'), { recursive: true });
+      await writeFile(join(root, 'engine', '.git', 'HEAD'), HERMES_PINNED_COMMIT);
+      await mkdir(join(runtimePackage, 'patches'), { recursive: true });
+      await mkdir(join(runtimePackage, 'openduet_plugin'));
+      await writeFile(join(runtimePackage, 'patches', 'observer_bridge.py'), '# Fixture only.\n');
+      // A loopback-only stand-in that reports the home it was given.
+      await writeFile(
+        join(runtimePackage, 'process_launcher.py'),
+        `import http.server, json, os, pathlib
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        data = os.environ['HERMES_HOME'].encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+address = pathlib.Path(os.environ['OPENDUET_RUNTIME_ADDRESS_FILE'])
+address.with_suffix('.tmp').write_text(json.dumps({'port': server.server_port}))
+os.replace(address.with_suffix('.tmp'), address)
+server.serve_forever()
+`,
+      );
+      const instance = await supervisor.launch(bundle, new AbortController().signal);
+      const home = await (await fetch(`${instance.baseUrl}/home`)).text();
+      expect(await instance.stop().catch((error: Error) => error.message)).toBe(
+        'Runtime process tree did not stop',
+      );
+      // The home carries the attempt's capability in its engine configuration.
+      expect(await lstat(home).catch(() => null)).toBeNull();
+      // Shutdown tries the kill again instead of reporting the first failure.
+      await supervisor.close();
+      expect(kills).toBe(2);
+    } finally {
+      await supervisor.close().catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+  test('service credentials and inherited home never enter the child environment', () => {
+    expect(
+      platformEnvironment({
+        PATH: 'platform-path',
+        HOME: '/private',
+        DATABASE_URL: 'database-secret',
+        OPENAI_API_KEY: 'provider-secret',
+        OPENDUET_MASTER_KEY: 'master-secret',
+      }),
+    ).toEqual({ PATH: 'platform-path' });
+    const environment = attemptEnvironment(bundle, options.brokerUrl, 'api-secret');
+    expect(environment.OPENDUET_ATTEMPT_TOKEN).toBe('attempt-secret');
+    expect(environment.OPENDUET_MODEL_KEY).toStartWith('openduet-surrogate-');
+    const responses = attemptEnvironment(
+      { ...bundle, model: { provider: 'openai', model: 'gpt-6-astra', fallback: null } },
+      options.brokerUrl,
+      'api-secret',
+    );
+    expect(responses.OPENDUET_MODEL_API_MODE).toBe('codex_responses');
+    // A model that can't view pictures is told so, and the plugin sends it none.
+    const textOnly = attemptEnvironment(
+      {
+        ...bundle,
+        model: { provider: 'fireworks', model: 'text-only', fallback: null, vision: false },
+      },
+      options.brokerUrl,
+      'api-secret',
+    );
+    expect(textOnly.OPENDUET_ENGINE_SUPPORTS_VISION).toBe('0');
+    // The engine is given a zone name in canonical spelling, never an offset.
+    const zone = (time_zone?: string) =>
+      attemptEnvironment({ ...bundle, time_zone }, options.brokerUrl, 'api-secret').HERMES_TIMEZONE;
+    expect(zone('utc')).toBe('UTC');
+    expect(zone('+05:30')).toBe('UTC');
+    expect(zone(undefined)).toBe('UTC');
+    expect(zone('europe/london')).toBe('Europe/London');
+  });
+  test('Docker mounts only this job subdirectory and never passes secrets in arguments', () => {
+    const env = attemptEnvironment(bundle, options.brokerUrl, 'api-secret');
+    const args = dockerRunArguments(bundle, options, 'test-runtime', env);
+    expect(args).toContain(
+      `type=volume,src=openduet_work,dst=/work,volume-subpath=${bundle.attempt.job_id}`,
+    );
+    expect(args).not.toContain('attempt-secret');
+    expect(args).not.toContain('api-secret');
+    expect(args).not.toContain('--publish');
+    expect(args).not.toContain('--privileged');
+    expect(args).toContain('--read-only');
+    for (const [flag, value] of [
+      ['--user', '10001:10001'],
+      ['--cap-drop', 'ALL'],
+      ['--security-opt', 'no-new-privileges:true'],
+      ['--pids-limit', '256'],
+      ['--memory', '2g'],
+    ] as const) {
+      const index = args.indexOf(flag);
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(args[index + 1]).toBe(value);
+    }
+    expect(args.filter((arg) => arg === '--network')).toHaveLength(1);
+    expect(args.join(' ')).toContain(
+      '--log-driver json-file --log-opt max-size=10m --log-opt max-file=5',
+    );
+    expect(() =>
+      dockerRunArguments(
+        bundle,
+        { ...options, dockerWorkVolume: '/host/path' },
+        'test-runtime',
+        env,
+      ),
+    ).toThrow('Invalid Docker work volume');
+  });
+  test('an external Docker network is rejected before a container can start', async () => {
+    const commands: string[][] = [];
+    const supervisor = new DockerRuntimeSupervisor(options, async (args) => {
+      commands.push(args);
+      return JSON.stringify([{ Internal: false }]);
+    });
+    await expect(supervisor.launch(bundle, new AbortController().signal)).rejects.toThrow(
+      'must be internal',
+    );
+    expect(commands).toEqual([['network', 'inspect', 'openduet_internal']]);
+    await supervisor.close();
+  });
+  test('an unpinned Docker image is rejected before a container can start', async () => {
+    const commands: string[][] = [];
+    const supervisor = new DockerRuntimeSupervisor(options, async (args) => {
+      commands.push(args);
+      return JSON.stringify(
+        args[0] === 'network'
+          ? [{ Internal: true }]
+          : [{ Config: { Labels: { 'com.openduet.hermes.commit': 'wrong' } } }],
+      );
+    });
+    await expect(supervisor.launch(bundle, new AbortController().signal)).rejects.toThrow(
+      'pinned Hermes commit',
+    );
+    expect(commands.some((args) => args[0] === 'run')).toBe(false);
+    await supervisor.close();
+  });
+  test("a Docker engine is handed the identity the service renders, not the image's copy", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-supervisor-soul-'));
+    let run: string[] = [];
+    let given: NodeJS.ProcessEnv = {};
+    const supervisor = new DockerRuntimeSupervisor(
+      { ...options, workRoot: root },
+      async (args, environment) => {
+        if (args[0] === 'network') return JSON.stringify([{ Internal: true }]);
+        if (args[0] === 'image')
+          return JSON.stringify([
+            { Config: { Labels: { 'com.openduet.hermes.commit': HERMES_PINNED_COMMIT } } },
+          ]);
+        if (args[0] === 'run') {
+          run = args;
+          given = environment;
+          throw new Error('stopped before the container starts');
+        }
+        return '';
+      },
+    );
+    try {
+      await expect(supervisor.launch(bundle, new AbortController().signal)).rejects.toThrow(
+        'stopped before the container starts',
+      );
+      // By name on the command line; the value travels in the environment.
+      expect(run.join(' ')).toContain(`--env ${SOUL_ENV}`);
+      expect(Buffer.from(given[SOUL_ENV] ?? '', 'base64').toString('utf8')).toBe(renderSoul());
+    } finally {
+      await supervisor.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test('an unpinned process checkout is rejected before spawning', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-supervisor-pin-'));
+    try {
+      await mkdir(join(root, '.git'));
+      await writeFile(join(root, '.git', 'HEAD'), 'wrong');
+      const supervisor = new ProcessRuntimeSupervisor({ ...options, engineRoot: root });
+      await expect(supervisor.launch(bundle, new AbortController().signal)).rejects.toThrow(
+        'must be pinned',
+      );
+      await supervisor.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test('path traversal and a linked job workspace are rejected', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-supervisor-workspace-'));
+    try {
+      await expect(jobWorkspace(root, '../sibling')).rejects.toThrow();
+      const outside = join(root, 'sibling');
+      await mkdir(outside);
+      const link = join(root, bundle.attempt.job_id);
+      await symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+      await expect(jobWorkspace(root, bundle.attempt.job_id)).rejects.toThrow('cannot be a link');
+      // Remove the link itself before cleaning the disposable fixture tree.
+      await rm(link, { recursive: process.platform === 'win32' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test('startup ends the engines a crashed service left, and each launch is recorded until it stops', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'openduet-process-sweep-'));
+    const runtimePackage = join(root, 'runtime');
+    const workRoot = join(root, 'work');
+    // What a crashed service left: a record of an engine still running as the
+    // same process, found through a fake process table.
+    const left = await mkdtemp(join(await realpath(tmpdir()), 'openduet-runtime-'));
+    const killed: number[] = [];
+    const orphaned: ProcessTable = {
+      startedAt: async (pid) =>
+        pid === 4200
+          ? killed.includes(pid)
+            ? null
+            : { stamp: 'boot-1:900', atMs: null }
+          : systemProcesses.startedAt(pid),
+      isEngine: async (pid, home) => pid === 4200 || systemProcesses.isEngine(pid, home),
+      killTree: async (pid) => {
+        if (pid === 4200) killed.push(pid);
+        else await systemProcesses.killTree(pid);
+      },
+    };
+    await new EngineRegistry(workRoot, orphaned).record(
+      'att_01J00000000000000000000042',
+      { pid: 4200, exitCode: null, signalCode: null },
+      left,
+      Date.now(),
+    );
+    const supervisor = new ProcessRuntimeSupervisor({
+      ...options,
+      engineRoot: join(root, 'engine'),
+      runtimePackage,
+      workRoot,
+      python: resolvePython(),
+      startupTimeoutMs: 5000,
+      processes: orphaned,
+    });
+    try {
+      await supervisor.initialize();
+      expect(killed).toEqual([4200]);
+      expect(await lstat(left).catch(() => null)).toBeNull();
+      const records = join(workRoot, '.openduet-engines');
+      expect(await readdir(records)).toEqual([]);
+      await mkdir(join(root, 'engine', '.git'), { recursive: true });
+      await writeFile(join(root, 'engine', '.git', 'HEAD'), HERMES_PINNED_COMMIT);
+      await mkdir(join(runtimePackage, 'patches'), { recursive: true });
+      await mkdir(join(runtimePackage, 'openduet_plugin'));
+      await writeFile(join(runtimePackage, 'patches', 'observer_bridge.py'), '# Fixture only.\n');
+      await writeFile(
+        join(runtimePackage, 'process_launcher.py'),
+        `import http.server, json, os, pathlib
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+address = pathlib.Path(os.environ['OPENDUET_RUNTIME_ADDRESS_FILE'])
+address.with_suffix('.tmp').write_text(json.dumps({'port': server.server_port}))
+os.replace(address.with_suffix('.tmp'), address)
+server.serve_forever()
+`,
+      );
+      const instance = await supervisor.launch(bundle, new AbortController().signal);
+      expect(await readdir(records)).toEqual([`${bundle.attempt.id}.json`]);
+      await instance.stop();
+      expect(await readdir(records)).toEqual([]);
+    } finally {
+      await supervisor.close();
+      await rm(left, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+  test('a spare is handed every value an attempt has that it was not started with', () => {
+    const attempt = attemptEnvironment(bundle, options.brokerUrl, 'api-secret');
+    const constants = engineConstants(options.brokerUrl);
+    const own = Object.keys(attempt).filter((key) => attempt[key] !== constants[key]);
+    // TERMINAL_CWD is the job's directory, set beside the attempt's values.
+    expect([...own, 'TERMINAL_CWD'].sort()).toEqual([...ATTEMPT_ENVIRONMENT_KEYS].sort());
+  });
+  describe('a spare engine', () => {
+    // A stand-in that follows the launcher's spare protocol: it says it is
+    // ready, takes one line naming the attempt, and then serves what it ended
+    // up with, including whether it started as a spare.
+    const launcher = (
+      spare: 'ready' | 'unusable' | 'stuck',
+    ) => `import http.server, json, os, pathlib, sys, time
+was_spare = os.environ.get('OPENDUET_RUNTIME_SPARE') == '1'
+with open(pathlib.Path(__file__).parent / 'starts.log', 'a') as log:
+    log.write('spare\\n' if was_spare else 'cold\\n')
+if was_spare:
+    ${spare === 'ready' ? "print('openduet-spare:ready', flush=True)" : spare === 'stuck' ? 'time.sleep(3600)' : "print('openduet-spare:unusable OPENDUET_ATTEMPT_TOKEN', flush=True); sys.exit(3)"}
+    handoff = json.loads(sys.stdin.readline())
+    os.environ.update(handoff['env'])
+    for key in ('OPENDUET_RUNTIME_SPARE', 'OPENDUET_RUNTIME_SPARE_KEYS'):
+        os.environ.pop(key, None)
+    os.chdir(handoff['cwd'])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        home = pathlib.Path(os.environ['HERMES_HOME'])
+        data = json.dumps({
+            'was_spare': was_spare,
+            'cwd': os.getcwd(),
+            'env': {key: value for key, value in os.environ.items() if key.startswith(('OPENDUET_', 'API_SERVER_', 'HERMES_', 'TERMINAL_'))},
+            'config': (home / 'config.yaml').read_text(),
+        }).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+address = pathlib.Path(os.environ['OPENDUET_RUNTIME_ADDRESS_FILE'])
+address.with_suffix('.tmp').write_text(json.dumps({'port': server.server_port}))
+os.replace(address.with_suffix('.tmp'), address)
+server.serve_forever()
+`;
+    type Seen = {
+      was_spare: boolean;
+      cwd: string;
+      env: Record<string, string>;
+      config: string;
+    };
+    async function fixture(spare: 'ready' | 'unusable' | 'stuck', startupTimeoutMs = 10_000) {
+      const root = await mkdtemp(join(tmpdir(), 'openduet-process-spare-'));
+      const runtimePackage = join(root, 'runtime');
+      await mkdir(join(root, 'engine', '.git'), { recursive: true });
+      await writeFile(join(root, 'engine', '.git', 'HEAD'), HERMES_PINNED_COMMIT);
+      await mkdir(join(runtimePackage, 'patches'), { recursive: true });
+      await mkdir(join(runtimePackage, 'openduet_plugin'));
+      await writeFile(join(runtimePackage, 'patches', 'observer_bridge.py'), '# Fixture only.\n');
+      await writeFile(join(runtimePackage, 'process_launcher.py'), launcher(spare));
+      const supervisor = new ProcessRuntimeSupervisor({
+        ...options,
+        engineRoot: join(root, 'engine'),
+        runtimePackage,
+        workRoot: join(root, 'work'),
+        python: resolvePython(),
+        startupTimeoutMs,
+        prewarm: true,
+      });
+      const seen = async (baseUrl: string) => (await (await fetch(baseUrl)).json()) as Seen;
+      const records = () => readdir(join(root, 'work', '.openduet-engines')).catch(() => []);
+      const starts = async () =>
+        (await readFile(join(runtimePackage, 'starts.log'), 'utf8').catch(() => ''))
+          .split(/\r?\n/)
+          .filter(Boolean);
+      return { root, supervisor, seen, records, starts };
+    }
+
+    test('takes the attempt it was prepared for, as if it had started with it', async () => {
+      const { root, supervisor, seen, records } = await fixture('ready');
+      try {
+        supervisor.warm(bundle.model);
+        const instance = await supervisor.launch(
+          { ...bundle, time_zone: 'Pacific/Chatham' },
+          new AbortController().signal,
+        );
+        const engine = await seen(instance.baseUrl);
+        expect(engine.was_spare).toBe(true);
+        expect(await realpath(engine.cwd)).toBe(instance.workspace);
+        expect(engine.env.TERMINAL_CWD).toBe(instance.workspace);
+        expect(engine.env.OPENDUET_ATTEMPT_TOKEN).toBe(bundle.attempt.token);
+        expect(engine.env.OPENDUET_ATTEMPT_ID).toBe(bundle.attempt.id);
+        expect(engine.env.API_SERVER_KEY).toBe(instance.token);
+        expect(engine.env.HERMES_TIMEZONE).toBe('Pacific/Chatham');
+        expect(engine.env.OPENDUET_RUNTIME_SPARE).toBeUndefined();
+        // The configuration it started from carries this attempt's capability.
+        expect(parse(engine.config).model.extra_headers).toEqual({
+          'x-openduet-capability': bundle.attempt.token,
+        });
+        await instance.stop();
+        // The next attempt's engine is started as this one stops.
+        const next = await supervisor.launch(
+          { ...bundle, attempt: { ...bundle.attempt, id: 'att_01J00000000000000000000001' } },
+          new AbortController().signal,
+        );
+        expect((await seen(next.baseUrl)).was_spare).toBe(true);
+        await next.stop();
+        await supervisor.close();
+        expect(await records()).toEqual([]);
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test('prepared for another model, it is set aside and the attempt starts its own', async () => {
+      const { root, supervisor, seen } = await fixture('ready');
+      try {
+        supervisor.warm({ provider: 'fake', model: 'another', fallback: null });
+        const instance = await supervisor.launch(bundle, new AbortController().signal);
+        expect((await seen(instance.baseUrl)).was_spare).toBe(false);
+        await instance.stop();
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test('one that read its attempt while loading is never used, and no more are started', async () => {
+      const { root, supervisor, seen, records, starts } = await fixture('unusable');
+      try {
+        supervisor.warm(bundle.model);
+        const instance = await supervisor.launch(bundle, new AbortController().signal);
+        expect((await seen(instance.baseUrl)).was_spare).toBe(false);
+        // Stopping asks for a spare; none is started once one could not be used.
+        await instance.stop();
+        await supervisor.close();
+        expect(await starts()).toEqual(['spare', 'cold']);
+        expect(await records()).toEqual([]);
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+    test('one that never finishes loading holds its attempt no longer than an engine start', async () => {
+      const { root, supervisor, seen, records, starts } = await fixture('stuck', 3_000);
+      try {
+        supervisor.warm(bundle.model);
+        const started = Date.now();
+        const instance = await supervisor.launch(bundle, new AbortController().signal);
+        expect((await seen(instance.baseUrl)).was_spare).toBe(false);
+        // Within its own start-up allowance plus a cold start, not forever.
+        expect(Date.now() - started).toBeLessThan(15_000);
+        // Stopping asks for a spare; none is started once one never loaded.
+        await instance.stop();
+        // The spare that never loaded is stopped, not left beside the service.
+        for (let tries = 0; tries < 50 && (await records()).length; tries++) await Bun.sleep(100);
+        expect(await records()).toEqual([]);
+        await supervisor.close();
+        expect(await starts()).toEqual(['spare', 'cold']);
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    test('an attempt cancelled while its spare still loads ends at once', async () => {
+      const { root, supervisor } = await fixture('stuck', 20_000);
+      try {
+        supervisor.warm(bundle.model);
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new Error('cancelled')), 500);
+        const started = Date.now();
+        const failure = await supervisor.launch(bundle, controller.signal).catch((e: unknown) => e);
+        expect(failure).toBeInstanceOf(Error);
+        expect(Date.now() - started).toBeLessThan(5_000);
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 30_000);
+  });
+  test('stopping an owned process also stops its live child', async () => {
+    const parent = spawn(
+      process.execPath,
+      [
+        '-e',
+        `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{windowsHide:true,stdio:'ignore'}); console.log(child.pid); setInterval(()=>{},1000);`,
+      ],
+      {
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let childPid = 0;
+    try {
+      childPid = await new Promise<number>((resolve, reject) => {
+        parent.once('error', reject);
+        parent.stdout?.once('data', (data) => resolve(Number(String(data).trim())));
+      });
+      expect(childPid).toBeGreaterThan(0);
+      expect(() => process.kill(childPid, 0)).not.toThrow();
+      await stopProcessTree(parent);
+      expect(() => process.kill(childPid, 0)).toThrow();
+    } finally {
+      await stopProcessTree(parent);
+    }
+  }, 15_000);
+  test.skipIf(process.platform === 'win32')(
+    'a restrictive service umask cannot remove runtime-group workspace access',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'openduet-supervisor-mode-'));
+      const previous = process.umask(0o077);
+      try {
+        const workspace = await jobWorkspace(root, bundle.attempt.job_id);
+        expect((await lstat(workspace)).mode & 0o070).toBe(0o070);
+      } finally {
+        process.umask(previous);
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+});

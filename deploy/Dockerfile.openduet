@@ -1,0 +1,81 @@
+# The OpenDuet service: API, jobs, broker, gateway, connectors, knowledge, events.
+#
+# One process with separate modules. It sits on `edge` for the API, `database`
+# for Postgres, `cells` to reach openduet-cells, and isolated runtime networks as
+# the cells' only broker/gateway peer. The same image runs openduet-cells, the
+# only holder of the Docker socket, and the database-roles setup step.
+
+FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS promoter-node
+FROM oven/bun:1.3.13-slim@sha256:7e8ed3961db1cdedf17d516dda87948cfedbd294f53bf16462e5b57ed3fff0f1
+
+# The trusted promoter uses Node's process permission boundary without file write grants.
+COPY --from=promoter-node /usr/local/bin/node /usr/local/bin/node
+
+# Used on the host side by the operator's checks; in Compose only openduet-cells holds the socket.
+COPY --from=docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c /usr/local/bin/docker /usr/local/bin/docker
+
+ENV NODE_ENV=production
+# Tells openduet check, doctor and status they run inside this image, where the
+# host's Docker, Compose files and deploy/.env are out of reach.
+ENV OPENDUET_SERVICE_IMAGE=1
+
+WORKDIR /app
+
+# Knowledge spaces are git repositories; git is used by the trusted service.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Manifests first, so a source-only change does not re-resolve dependencies.
+COPY package.json bun.lock ./
+COPY packages/contracts/package.json packages/contracts/
+COPY packages/device/package.json packages/device/
+COPY packages/cli/package.json packages/cli/
+COPY packages/client/package.json packages/client/
+COPY packages/knowledge/package.json packages/knowledge/
+COPY packages/runtime-hermes/package.json packages/runtime-hermes/
+COPY packages/skills/package.json packages/skills/
+COPY apps/openduet/package.json apps/openduet/
+COPY apps/mock-api/package.json apps/mock-api/
+COPY apps/tryit/package.json apps/tryit/
+COPY apps/web/package.json apps/web/
+COPY conformance/package.json conformance/
+COPY evals/package.json evals/
+# Downloads are kept in a BuildKit cache between builds, and a stalled download is cut off
+# and retried rather than holding the build.
+RUN --mount=type=cache,target=/var/cache/bun \
+    export BUN_INSTALL_CACHE_DIR=/var/cache/bun; \
+    for attempt in 1 2 3; do \
+      timeout 300 bun install --frozen-lockfile --production && exit 0; \
+      echo "dependency install attempt $attempt of 3 did not finish" >&2; \
+      [ "$attempt" = 3 ] || sleep $((attempt * 10)); \
+    done; \
+    exit 1
+
+COPY tsconfig.base.json tsconfig.json ./
+COPY packages/ packages/
+# The service and nothing beside it: the mock API, the try-it page and the web
+# client's sources are for development and their own images.
+COPY apps/openduet/ apps/openduet/
+COPY deploy/scripts/memory-restore-proof.ts deploy/scripts/memory-restore-proof.ts
+# What bun run openduet check, doctor, status and browser files read, so they run inside this image.
+COPY deploy/scripts/status.ts deploy/scripts/provider-settings.ts deploy/scripts/compose-check.ts \
+     deploy/scripts/dockerfile-check.ts deploy/scripts/plugin-pin-check.ts \
+     deploy/scripts/removal-digest-check.ts deploy/scripts/
+# Sent to an agent's computer whose image does not carry it.
+COPY deploy/sandbox/openduet-proc deploy/sandbox/openduet-proc
+COPY conformance/ conformance/
+
+# Non-root. The service writes only to the mounted volumes.
+RUN groupadd --gid 10001 runtime-work \
+    && useradd --uid 10002 --create-home --home-dir /home/openduet openduet \
+    && mkdir -p /data/spaces /data/artifacts /data/restrictions /data/database-access /data/cells-key /work/_probe \
+    && chown -R openduet:openduet /data \
+    && chown -R openduet:runtime-work /work \
+    && chmod 2770 /work /work/_probe
+
+USER openduet
+
+EXPOSE 8787 8788
+
+CMD ["bun", "run", "apps/openduet/src/index.ts"]

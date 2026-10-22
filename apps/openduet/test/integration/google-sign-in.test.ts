@@ -1,0 +1,309 @@
+import { afterAll, describe, expect, test } from 'bun:test';
+import {
+  accountSignInAvailability,
+  accountSignInStart,
+  accountSignInStatus,
+  connectionGeneration,
+  connectionListResponse,
+  DRIVE_CONSENT_WORDS,
+} from '@openduet/contracts';
+import { ConnectorFactory, useConnectorFactory } from '../../src/connectors/configured.ts';
+import { EmailConnector } from '../../src/connectors/email.ts';
+import { startFakeGoogle } from '../../src/connectors/fixtures/fake-google.ts';
+import { GOOGLE_DRIVE_SIGN_IN_SCOPE, GOOGLE_SIGN_IN_SCOPE } from '../../src/connectors/google.ts';
+import { GoogleCalendarConnector } from '../../src/connectors/google-calendar.ts';
+import { GoogleDriveConnector } from '../../src/connectors/google-drive.ts';
+import { mailAction, mailContext } from '../../src/connectors/mail-fixtures.ts';
+import { ConnectorRegistry } from '../../src/connectors/registry.ts';
+import { connectionRevocation, sweepUnreferencedSecrets } from '../../src/connectors/revocation.ts';
+import { loadEnv } from '../../src/env.ts';
+import { createApp } from '../../src/index.ts';
+import { PolicyService } from '../../src/jobs/policy.ts';
+import { startQueue } from '../../src/jobs/queue.ts';
+import { JobService } from '../../src/jobs/service.ts';
+import { testDatabase } from '../helpers/database.ts';
+
+const MASTER_KEY = '93'.repeat(32);
+const PUBLIC_URL = 'http://localhost:3000';
+
+const fixture = await testDatabase();
+const queue = fixture ? await startQueue(fixture.url) : null;
+const registry = new ConnectorRegistry();
+const google = await startFakeGoogle();
+const closers: Array<() => Promise<unknown> | unknown> = [() => google.stop()];
+afterAll(async () => {
+  for (const close of closers) await close();
+  await registry.close();
+  await queue?.stop();
+  await fixture?.close();
+}, 30_000);
+
+async function harness() {
+  if (!fixture || !queue) throw new Error('Postgres unavailable');
+  const factory = new ConnectorFactory({
+    sql: fixture.sql,
+    workRoot: 'unused',
+    spacesRoot: 'unused',
+    masterKey: MASTER_KEY,
+    google: { client: google.client, endpoints: google.endpoints },
+  });
+  useConnectorFactory(registry, factory);
+  const jobs = new JobService(fixture.db, queue.boss);
+  const app = createApp({
+    env: loadEnv({
+      NODE_ENV: 'test',
+      OPENDUET_MASTER_KEY: MASTER_KEY,
+      OPENDUET_PUBLIC_URL: PUBLIC_URL,
+    }),
+    db: fixture.db,
+    sql: fixture.sql,
+    registry,
+    jobs,
+    policy: new PolicyService(jobs, undefined, {
+      afterRevoke: connectionRevocation({
+        sql: fixture.sql,
+        secrets: factory.secrets,
+        google: { client: google.client, endpoints: google.endpoints },
+      }),
+    }),
+    checkDatabase: async () => 'ok',
+  });
+  const as = (cookie: string, body?: unknown): RequestInit => ({
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const setup = await app.request(
+    '/setup',
+    as('', { email: 'google-owner@example.test', password: 'google-owner-password' }),
+  );
+  const cookie = setup.headers.get('set-cookie')?.split(';')[0];
+  if (!cookie) throw new Error(`Setup failed: ${setup.status}`);
+  const [space] = await fixture.sql`select id from space where kind = 'personal'`;
+  if (!space) throw new Error('Missing personal space');
+
+  /** Start, approve at the fake consent screen, and return through the callback. */
+  const signIn = async (documents = false) => {
+    const started = await app.request(
+      '/google-sign-ins',
+      as(cookie, documents ? { documents: true } : {}),
+    );
+    expect(started.status).toBe(201);
+    const start = accountSignInStart.parse(await started.json());
+    // Where the person will sign in, and everything asked for, before the browser goes there.
+    expect(start.issuer).toBe(new URL(start.authorize_url).origin);
+    expect(start.scopes.map((item) => item.scope)).toEqual(
+      (documents ? GOOGLE_DRIVE_SIGN_IN_SCOPE : GOOGLE_SIGN_IN_SCOPE).split(' '),
+    );
+    // The Drive step says why it asks, in plain words.
+    expect(start.reason).toBe(documents ? DRIVE_CONSENT_WORDS : undefined);
+    expect(start.scopes.every((item) => Boolean(item.label))).toBe(true);
+    const approved = await fetch(start.authorize_url, { redirect: 'manual' });
+    const back = new URL(approved.headers.get('location') ?? '');
+    expect(`${back.origin}${back.pathname}`).toBe(start.redirect_uri);
+    // The web app forwards /api/* to this service without the prefix.
+    const landed = await app.request(`/oauth/google/callback${back.search}`, as(cookie));
+    const page = await landed.text();
+    const status = accountSignInStatus.parse(
+      await (await app.request(`/google-sign-ins/${start.sign_in_id}`, as(cookie))).json(),
+    );
+    return { landed, page, status, back, start };
+  };
+  return { app, as, cookie, factory, spaceId: space.id as string, sql: fixture.sql, signIn };
+}
+
+const h = fixture ? await harness() : null;
+const withDb = fixture ? describe : describe.skip;
+
+withDb('signing in with Google', () => {
+  test('one sign-in connects Gmail and Google Calendar, with the tokens only sealed', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const availability = accountSignInAvailability.parse(
+      await (await h.app.request('/google-sign-ins', h.as(h.cookie))).json(),
+    );
+    expect(availability).toEqual({
+      available: true,
+      redirect_uri: `${PUBLIC_URL}/api/oauth/google/callback`,
+    });
+
+    const { landed, page, status, back } = await h.signIn();
+    expect(landed.status).toBe(200);
+    expect(page).toContain('connected');
+    if (status.state !== 'connected') throw new Error(`Sign-in ended ${status.state}`);
+    expect(status.connection_ids).toHaveLength(2);
+
+    const listed = connectionListResponse
+      .parse(await (await h.app.request('/connections', h.as(h.cookie))).json())
+      .connections.filter((row) => status.connection_ids.includes(row.id));
+    const mail = listed.find((row) => row.provider === 'imap');
+    const calendar = listed.find((row) => row.provider === 'caldav');
+    expect(mail).toMatchObject({ status: 'active', label: 'Gmail (person@example.test)' });
+    expect(mail?.scopes).toEqual(
+      expect.arrayContaining(['email.search', 'email.read', 'email.send']),
+    );
+    expect(calendar).toMatchObject({ status: 'active' });
+    expect(calendar?.scopes).toContain('calendar.create');
+
+    // The same tools and the same mailer path as a password mailbox.
+    const mailer = h.factory.mailers.get(mail?.id ?? '');
+    expect(mailer).toBeDefined();
+    const gmail = registry.get(mail?.id ?? '');
+    expect(gmail).toBeInstanceOf(EmailConnector);
+    expect(registry.get(calendar?.id ?? '')).toBeInstanceOf(GoogleCalendarConnector);
+    google.deliver(
+      'From: friend@example.test\nTo: person@example.test\nSubject: Lunch\nMessage-ID: <lunch@example.test>\n\nThursday.\n',
+    );
+    const search = mailAction('email.search', { query: '', limit: 5 });
+    const found = await (gmail as EmailConnector).execute(
+      { ...search, connection_id: mail?.id ?? '' },
+      { ...mailContext(), space_id: h.spaceId },
+    );
+    expect(found.outcome).toBe('succeeded');
+
+    const readable =
+      page +
+      JSON.stringify(listed) +
+      JSON.stringify(
+        await h.sql`select label, scopes, configuration from connection
+          where id in ${h.sql(status.connection_ids)}`,
+      );
+    const sealed = await h.sql`select s.ciphertext from connection c join secret s
+      on s.id = c.secret_ref where c.id in ${h.sql(status.connection_ids)}`;
+    for (const token of google.issued) {
+      expect(readable).not.toContain(token);
+      for (const row of sealed) expect(String(row.ciphertext)).not.toContain(token);
+    }
+
+    // The browser's return is spent once.
+    const replayed = await h.app.request(`/oauth/google/callback${back.search}`, h.as(h.cookie));
+    expect(replayed.status).toBe(404);
+  }, 60_000);
+
+  test('signing in again renews the same connections instead of adding more', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const before = await h.sql`select id, secret_ref from connection
+      where configuration->>'account' = 'person@example.test' and status <> 'revoked' order by id`;
+    const { status } = await h.signIn();
+    if (status.state !== 'connected') throw new Error(`Sign-in ended ${status.state}`);
+    expect([...status.connection_ids].sort()).toEqual(before.map((row) => row.id));
+    const after = await h.sql`select id, secret_ref, status from connection
+      where configuration->>'account' = 'person@example.test' and status <> 'revoked' order by id`;
+    expect(after).toHaveLength(2);
+    for (const [index, row] of after.entries()) {
+      expect(row.status).toBe('active');
+      expect(row.secret_ref).not.toBe(before[index]?.secret_ref);
+    }
+    // The replaced sealed copies are gone, not kept beside the new ones.
+    const replaced = before.map((row) => String(row.secret_ref));
+    expect(await h.sql`select id from secret where id = any(${replaced})`).toHaveLength(0);
+  }, 60_000);
+
+  test('the Drive step adds Drive beside an account’s mail and calendar, which keep their ids', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const before = await h.sql`select id, provider from connection
+      where configuration->>'account' = 'person@example.test' and status <> 'revoked' order by id`;
+    expect(before.map((row) => row.provider).sort()).toEqual(['caldav', 'imap']);
+    const { status, start } = await h.signIn(true);
+    if (status.state !== 'connected') throw new Error(`Sign-in ended ${status.state}`);
+    // Google is asked to keep what it granted before, and only Drive is new.
+    expect(new URL(start.authorize_url).searchParams.get('include_granted_scopes')).toBe('true');
+    const after = await h.sql`select id, provider, scopes from connection
+      where configuration->>'account' = 'person@example.test' and status <> 'revoked' order by id`;
+    expect(after.filter((row) => row.provider !== 'drive').map((row) => row.id)).toEqual(
+      before.map((row) => row.id),
+    );
+    const drive = after.find((row) => row.provider === 'drive');
+    expect(drive?.scopes).toEqual(['documents.status']);
+    expect(status.connection_ids).toEqual([drive?.id]);
+    expect(registry.get(String(drive?.id))).toBeInstanceOf(GoogleDriveConnector);
+    // Asked again, the same Drive is renewed rather than a second one made.
+    const again = await h.signIn(true);
+    if (again.status.state !== 'connected') throw new Error('Drive step failed');
+    expect(again.status.connection_ids).toEqual([drive?.id]);
+  }, 60_000);
+
+  test('disconnecting deletes every sealed copy and withdraws the grant once nothing else uses it', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const rows = await h.sql`select id, secret_ref, generation from connection
+      where configuration->>'account' = 'person@example.test' and status <> 'revoked' order by id`;
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    const refs = rows.map((row) => String(row.secret_ref));
+    const sealedCopies = async () =>
+      Number((await h.sql`select count(*)::int as n from secret where id = any(${refs})`)[0]?.n);
+    expect(await sealedCopies()).toBe(rows.length);
+    const disconnect = async (row: (typeof rows)[number]) => {
+      const answer = await h.app.request(
+        `/connections/${row.id}/lifecycle`,
+        h.as(h.cookie, { kind: 'revoke', expected_generation: row.generation }),
+      );
+      expect(answer.status).toBe(200);
+      return connectionGeneration.parse(await answer.json());
+    };
+    // While another connection still signs in as this account, Google's grant stays.
+    for (const row of rows.slice(0, -1)) {
+      const answer = await disconnect(row);
+      expect(answer.status).toBe('revoked');
+      expect(answer.provider_access).toBe('kept_for_other_connections');
+    }
+    expect(google.revoked).toEqual([]);
+    const last = rows.at(-1);
+    if (!last) throw new Error('no connection');
+    const refreshToken = await h.factory.secrets.withSecret(
+      String(last.secret_ref),
+      h.spaceId,
+      async (value) => String(JSON.parse(value).refresh_token),
+    );
+    expect((await disconnect(last)).provider_access).toBe('withdrawn');
+    expect(google.revoked).toEqual([refreshToken]);
+    // No sealed copy of any of them is left, and Google no longer honours the token.
+    expect(await sealedCopies()).toBe(0);
+    const refused = await fetch(google.endpoints.token, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: google.client.clientId,
+        client_secret: google.client.clientSecret,
+      }),
+    });
+    expect(refused.status).toBe(400);
+  }, 60_000);
+
+  test('sealed tokens nothing points at are swept once a day old, and nothing else', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const old = await h.factory.secrets.put(h.spaceId, 'left behind by an old refresh');
+    const fresh = await h.factory.secrets.put(h.spaceId, 'a sign-in still saving its connection');
+    const used = await h.factory.secrets.put(h.spaceId, 'held by a connection');
+    await h.sql`update secret set created_at = now() - interval '2 days' where id = any(${[old, used]})`;
+    const [row] = await h.sql`select id from connection order by id limit 1`;
+    const [previous] = await h.sql`select secret_ref from connection where id = ${row?.id}`;
+    await h.sql`update connection set secret_ref = ${used} where id = ${row?.id}`;
+    try {
+      expect(await sweepUnreferencedSecrets(h.sql)).toBeGreaterThanOrEqual(1);
+      const left = await h.sql`select id from secret where id = any(${[old, fresh, used]})`;
+      expect(left.map((entry) => entry.id).sort()).toEqual([fresh, used].sort());
+    } finally {
+      await h.sql`update connection set secret_ref = ${previous?.secret_ref ?? null} where id = ${row?.id}`;
+    }
+  }, 30_000);
+
+  test('someone who may not install in a space is refused', async () => {
+    if (!h) throw new Error('Postgres unavailable');
+    const member = await h.app.request(
+      '/principals',
+      h.as(h.cookie, { email: 'google-member@example.test', password: 'google-member-password' }),
+    );
+    expect(member.status).toBe(201);
+    const login = await h.app.request(
+      '/login',
+      h.as('', { email: 'google-member@example.test', password: 'google-member-password' }),
+    );
+    const memberCookie = login.headers.get('set-cookie')?.split(';')[0] ?? '';
+    const refused = await h.app.request(
+      '/google-sign-ins',
+      h.as(memberCookie, { space_id: h.spaceId }),
+    );
+    expect(refused.status).toBe(403);
+  }, 30_000);
+});

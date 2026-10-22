@@ -1,0 +1,2603 @@
+import { existsSync, readFileSync } from 'node:fs';
+import * as C from '@openduet/contracts';
+import type { Context, Hono } from 'hono';
+import { ServiceError } from '../../openduet/src/api/errors.ts';
+import { savedFile } from '../../openduet/src/artifact/shown.ts';
+import {
+  AGENT_TEMPLATES,
+  agentValues,
+  mentionedAgent,
+  OPENDUET_AGENT,
+} from '../../openduet/src/experience/agents.ts';
+import { dayGreeting } from '../../openduet/src/experience/home.ts';
+import { scheduleSentence } from '../../openduet/src/experience/planning.ts';
+import {
+  type ActionRow,
+  answerText,
+  appName,
+  plainText,
+  projectActionGroup,
+  projectCards,
+  projectReceipt,
+} from '../../openduet/src/experience/projectors.ts';
+import { pagesVisited, withVisitedLinks } from '../../openduet/src/experience/visited-links.ts';
+import type { AppDeps } from './app.ts';
+import type { MockAttachment } from './attachments.ts';
+import { MockBeliefError, MockBeliefs } from './beliefs.ts';
+import { ComputerMock } from './computer.ts';
+import { DEMO_AGENTS } from './demo-agents.ts';
+import { MockRunError, MockRuns } from './runs.ts';
+import { chooseScenario, type Scenario } from './scenario.ts';
+import { newId } from './store.ts';
+
+type Turn = ReturnType<typeof C.conversationTurn.parse>;
+type Question = ReturnType<typeof C.experienceQuestion.parse>;
+type Plan = ReturnType<typeof C.experiencePlan.parse>;
+type Chat = {
+  view: C.Conversation;
+  turns: Turn[];
+  /** The store seq of each person message, keyed by turn id, so the agent can react to it. */
+  messageSeqs: Map<string, number>;
+  events: C.ExperienceEvent[];
+  cards: C.ResultCard[];
+  receipts: C.ExperienceReceipt[];
+  drafts: C.ExperienceDraft[];
+  script?: Scenario;
+  position: number;
+  pending: { action: ActionRow; connection: { id: string; label: string; provider: string } }[];
+  /** Every tool step's receipt, by turn, for the links an answer gets. */
+  visited: { turn: string | null; kind: string; receipt: unknown; payload: unknown }[];
+  timer?: ReturnType<typeof setTimeout>;
+  paused: boolean;
+  stopped: boolean;
+  /** Effects a scenario proposed, keyed by the scenario's ref, awaiting or holding a decision. */
+  proposals: Map<string, Proposal>;
+  /** The last card a scenario drew, which a following proposal shows as its preview. */
+  lastCard: C.ResultCard | null;
+  /** The tool entry under way, finished when the next step starts or the turn ends. */
+  openTool?: { finished: C.ToolCall; trail: boolean };
+  /**
+   * A company job: the address it writes from, shown on the approval, and the
+   * promise that the script keeps going after the send — the reply, the
+   * follow-up and the ending are steps that come after it. `settle` marks the
+   * ledger item settled when the script completes.
+   */
+  follow?: { from: string; settle?: () => void };
+  /** A command under way on the agent's computer, finished with its tool entry. */
+  openCommand?: () => void;
+  /**
+   * The agent is in the middle of a message: the next text adds to it. Any
+   * work in between ends the message, and the saved answer keeps only the
+   * last one, as the service's does.
+   */
+  saying?: boolean;
+};
+type Proposal = {
+  ref: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  what: string;
+  where: string;
+  decision: 'allow_once' | 'always' | 'deny' | null;
+  onDenied: string | null;
+  permissionId: string | null;
+  /** A spend: allowed only with the person's own confirmation. */
+  money?: boolean;
+  /** The connection the effect goes through; the ledger action names it. */
+  connectionId: string;
+};
+
+/** Human words for the apps a scenario's evidence names. Never a tool name. */
+const SOURCE_APPS: Record<string, string> = {
+  gcal: 'Google Calendar',
+  gmail: 'Gmail',
+  gmaps: 'Google Maps',
+  whatsapp: 'WhatsApp',
+  imessage: 'Messages',
+  slack: 'Slack',
+  notion: 'Notion',
+  gdrive: 'Google Drive',
+  linear: 'Linear',
+  google: 'Google',
+  reddit: 'Reddit',
+  yelp: 'Yelp',
+  youtube: 'YouTube',
+  tripadvisor: 'Tripadvisor',
+  globe: 'Web',
+  web: 'Web',
+};
+const SOURCE_KINDS: Record<string, C.ExperienceSource['kind']> = {
+  gcal: 'event',
+  imessage: 'draft',
+  whatsapp: 'draft',
+  gdrive: 'file',
+  notion: 'page',
+};
+/** What a proposed change is, in the person's words, by the kind of change. */
+const PROPOSAL_WORDS: Record<string, { what: string; where: string; reversible: boolean }> = {
+  'calendar.event.create': {
+    what: 'Add an event to your calendar',
+    where: 'Google Calendar',
+    reversible: true,
+  },
+  'browser.reserve': { what: 'Hold a table through the browser', where: 'Resy', reversible: false },
+  'tasks.create': { what: 'Add a task', where: 'Tasks', reversible: true },
+  'payments.pay': { what: 'Pay a bill', where: 'your card', reversible: false },
+};
+
+/** A run the mock keeps no thread for. */
+const NO_RESULT = { conversation_id: null, turn_id: null, summary: null, reason: null };
+
+class MockExperienceError extends Error {
+  constructor(
+    readonly status: 400 | 401 | 403 | 404 | 409,
+    message: string,
+    readonly code = 'experience_request_refused',
+  ) {
+    super(message);
+  }
+}
+const required = <T>(map: Map<string, T>, id: string): T => {
+  const value = map.get(id);
+  if (!value) throw new MockExperienceError(404, 'This item is no longer available.');
+  return value;
+};
+
+/** Scenario records go through the same deterministic presentation functions as real rows. */
+export class ExperienceMock {
+  readonly agents = new Map<string, C.ExperienceAgent>();
+  /** Deleted agents, kept only to name the turns they answered. */
+  readonly removedAgents = new Map<string, C.ExperienceAgent>();
+  readonly chats = new Map<string, Chat>();
+  /** Files uploaded for messages, sent or not yet. */
+  readonly attachments = new Map<string, MockAttachment>();
+  readonly permissions = new Map<string, C.PermissionCard>();
+  readonly permissionDrafts = new Map<string, string>();
+  readonly decisions = new Map<
+    string,
+    { version: string; result: ReturnType<typeof C.permissionOutcome.parse> }
+  >();
+  readonly sentReceipts = new Map<string, C.ExperienceReceipt>();
+  /** Messages waiting out their hold before sending, by receipt id. */
+  readonly held = new Map<
+    string,
+    {
+      chat: Chat;
+      draft: C.ExperienceDraft;
+      receipt: C.ExperienceReceipt;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  /** What an activity entry's Undo takes back, by entry id. */
+  readonly activityUndo = new Map<string, string>();
+  readonly rules = new Map<string, C.StandingRule>();
+  /** Conversations read public web pages unless this is turned off. */
+  webReads = true;
+  /** Mailboxes and calendars the person turned watching off for; the rest are watched. */
+  readonly unwatched = new Set<string>();
+  /** Settings → Approvals, as the person last saved them. */
+  approvalSettings: C.ApprovalSettings = structuredClone(C.DEFAULT_APPROVAL_SETTINGS);
+  /** The level the person chose for each kind of task, and the card that asked about each. */
+  readonly autonomy = new Map<C.TaskKind, C.AutonomyLevel>();
+  readonly autonomyAsks = new Map<C.TaskKind, { chatId: string; id: string }>();
+  readonly questions = new Map<string, Question>();
+  readonly plans = new Map<string, Plan>();
+  readonly tasks = new Map<string, ReturnType<typeof C.experienceTask.parse>>();
+  readonly automations = new Map<string, ReturnType<typeof C.experienceAutomation.parse>>();
+  /** The agent each routine runs as, by routine id. */
+  readonly routineAgents = new Map<string, string>();
+  /** Each morning brief's news topics, by routine, so a test run reads like one. */
+  readonly briefTopics = new Map<string, string[]>();
+  readonly memories = new Map<string, ReturnType<typeof C.memoryItem.parse>>();
+  /** Whether OpenDuet learns from chats. */
+  private capture = true;
+  /** What the mock believes about the person, with its history and rewinds. */
+  readonly beliefs = new MockBeliefs(
+    () => this.deps.store.now(),
+    () => this.profile.time_zone,
+  );
+  /** Long work in the background, seeded at three stages. */
+  readonly runs = new MockRuns(() => this.deps.store.now());
+  /** Answers given during setup, by key, so the first message can refer to one. */
+  readonly answers = new Map<string, string>();
+  /** Set once the welcome scenario has played; every later message picks by text. */
+  welcomed = false;
+  /** After POST /signout every route but sign-in answers 401 until a link is consumed. */
+  signedOut = false;
+  /** Tasks rooms handed the person, and results waiting for them: shown on Home and with approvals. */
+  handoffsWaiting: () => C.RoomHandoff[] = () => [];
+  readonly submissions = new Map<
+    string,
+    { text: string; result: ReturnType<typeof C.messageAcceptance.parse> }
+  >();
+  profile = C.profileInput.parse({
+    name: 'Alex',
+    time_zone: 'UTC',
+    day_hours: { start: '08:00', end: '22:00' },
+  });
+  /** The address messages leave from, when a mailbox that can send is connected. */
+  sendingAddress: string | null = null;
+  readonly computer: ComputerMock;
+  /** Setup finished or skipped, and a time zone chosen, as the service records them. */
+  onboarded = false;
+  timeZoneConfirmed = false;
+  /** The people in the session's space. Only a shared space has anyone but the person. */
+  readonly members = new Map<string, C.SpaceMember>();
+  /** What deleted chats did in the person's name, newest first. */
+  readonly activity: C.ActivityEntry[] = [];
+  /** Checks and replaces the account's password; set by the account routes. */
+  changePassword: ((current: string, next: string) => boolean) | null = null;
+  /** Checks the account's password for a money move's confirmation; set by the account routes. */
+  checkPassword: ((password: string) => boolean) | null = null;
+  /** Confirmations handed out for money moves: token to permission, spent once. */
+  readonly stepUps = new Map<string, { permissionId: string; expires: number }>();
+  constructor(readonly deps: AppDeps & { experienceSpeed?: number }) {
+    this.computer = new ComputerMock(deps.store, deps.spaceId, deps.computer ?? true, () =>
+      this.now(),
+    );
+    // OpenDuet first, as the service lists it, then the demo space's specialists.
+    // A first run has only OpenDuet, as a new installation does.
+    for (const [made, isDefault] of [
+      [OPENDUET_AGENT, true],
+      ...(deps.firstRun ? [] : DEMO_AGENTS.map((agent) => [agent, false] as const)),
+    ] as const) {
+      const agent = C.experienceAgent.parse({
+        ...made,
+        // The agent every space has goes by the assistant's name, as on the service.
+        ...(isDefault && deps.assistantName ? { name: deps.assistantName } : {}),
+        id: newId('agent'),
+        space_id: deps.spaceId,
+        is_default: isDefault,
+        fixed_reach: isDefault,
+        usage: { conversations: 0, last_used: null, routines: 0 },
+      });
+      this.agents.set(agent.id, agent);
+    }
+    const you = C.spaceMember.parse({
+      principal_id: newId('own'),
+      email: 'jamie.davis@fastmail.example',
+      role: 'owner',
+      you: true,
+    });
+    this.members.set(you.principal_id, you);
+    if (deps.space === 'shared')
+      for (const email of ['sam.okafor@example.com', 'priya.raman@example.com']) {
+        const member = C.spaceMember.parse({
+          principal_id: newId('own'),
+          email,
+          role: 'member',
+          you: false,
+        });
+        this.members.set(member.principal_id, member);
+      }
+    for (const entry of deps.store.knowledge.values()) {
+      if (entry.space_id !== deps.spaceId || entry.frontmatter.status !== 'active') continue;
+      this.memories.set(
+        entry.id,
+        C.memoryItem.parse({
+          id: entry.id,
+          key: plainText(entry.frontmatter.title, 'Saved detail'),
+          value: plainText(entry.body, 'Saved detail'),
+          source: entry.frontmatter.asserted_by === 'user' ? 'conversation' : 'inferred',
+          created: this.now(),
+          last_used: null,
+          editable: true,
+          version: newId('v'),
+        }),
+      );
+    }
+  }
+  /** Permissions raised by scenario proposals, so a decision knows where to go back to. */
+  readonly permissionProposals = new Map<string, { chatId: string; ref: string }>();
+  /** Receipts whose change can still be reversed, by receipt id. */
+  readonly undoable = new Map<string, { chatId: string; what: string }>();
+  /**
+   * Effects the connector never confirmed. They rest in the store's ledger at
+   * `unknown` and are settled through the broker's resolve route; the chat
+   * they belong to waits until then.
+   */
+  readonly unknownActions = new Map<
+    string,
+    { chatId: string; draftId: string | null; resume: boolean }
+  >();
+  /** Calendar events the seed placed, for the home panel. */
+  readonly calendarEvents: ReturnType<typeof C.experienceCalendarEvent.parse>[] = [];
+  now() {
+    return this.deps.store.now().toISOString();
+  }
+  /** The connection scripted evidence is attributed to: the calendar when seeded, else any. */
+  evidenceConnection() {
+    const rows = [...this.deps.store.connections.values()].filter(
+      (row) => row.space_id === this.deps.spaceId,
+    );
+    return rows.find((row) => row.provider === 'caldav') ?? rows[0] ?? null;
+  }
+  isDraftKind(kind: string, payload: Record<string, unknown>) {
+    return (
+      kind === 'email.send' ||
+      kind === 'email.draft' ||
+      (kind === 'test.write' && typeof payload.body === 'string')
+    );
+  }
+  /** Reverse a receipt while its undo is valid. The reversal has its own receipt. */
+  undo(id: string) {
+    // A message still in its hold is cancelled: nothing is sent.
+    const held = this.held.get(id);
+    if (held) {
+      clearTimeout(held.timer);
+      this.held.delete(id);
+      const cancelled = C.experienceReceipt.parse({
+        id,
+        what: 'Cancelled a message before it was sent',
+        where: held.receipt.where,
+        when: this.now(),
+      });
+      held.chat.receipts = held.chat.receipts.map((row) => (row.id === id ? cancelled : row));
+      held.draft.status = 'denied';
+      this.sentReceipts.delete(held.draft.id);
+      this.event(held.chat, { type: 'receipt', receipt: cancelled });
+      return { receipt: cancelled };
+    }
+    const entry = this.undoable.get(id);
+    const chat = entry ? this.chats.get(entry.chatId) : undefined;
+    const receipt = chat?.receipts.find((row) => row.id === id);
+    if (!entry || !chat || !receipt?.undo)
+      return C.unavailable('This change cannot be reversed from here.');
+    if (Date.parse(receipt.undo.valid_until) < Date.now())
+      return C.unavailable('The time to undo this has passed.');
+    this.undoable.delete(id);
+    const reversal = C.experienceReceipt.parse({
+      id: newId('receipt'),
+      what: `Removed again: ${receipt.what.replace(/^Added to your calendar: /, '')}`,
+      where: receipt.where,
+      when: this.now(),
+      reverses: id,
+    });
+    chat.receipts.push(reversal);
+    this.event(chat, { type: 'receipt', receipt: reversal });
+    return { receipt: reversal };
+  }
+  /** Decide a scenario proposal. Returns null when the permission is a draft send. */
+  decideProposal(id: string, input: ReturnType<typeof C.permissionDecision.parse>) {
+    const link = this.permissionProposals.get(id);
+    if (!link) return null;
+    const chat = required(this.chats, link.chatId);
+    const proposal = chat.proposals.get(link.ref);
+    const permission = required(this.permissions, id);
+    if (!proposal) return null;
+    if (permission.step_up && input.option !== 'deny') {
+      // The confirmation counts once, for this card, while it is fresh.
+      const token = input.option === 'allow_once' ? input.step_up_token : undefined;
+      const held = token ? this.stepUps.get(token) : undefined;
+      if (token) this.stepUps.delete(token);
+      if (!held || held.permissionId !== id || held.expires <= Date.now())
+        throw new MockExperienceError(
+          403,
+          'This moves money, so it needs you to confirm it is you, with your password, when you allow it.',
+          'step_up_required',
+        );
+    }
+    let rule: C.StandingRule | null = null;
+    if (input.option === 'always') {
+      if (Date.parse(input.bounds.expires_at) <= Date.now())
+        throw new MockExperienceError(400, 'Choose a future expiry.');
+      rule = C.standingRule.parse({
+        id: newId('rule'),
+        text: `${proposal.what.split(':')[0]} without asking, up to ${input.bounds.count_cap} times before ${input.bounds.expires_at.slice(0, 10)}.`,
+        kind: proposal.kind.startsWith('calendar') ? 'create_event' : 'send_message',
+        connection_id:
+          permission.preview?.source_connection ??
+          this.evidenceConnection()?.id ??
+          this.deps.spaceId,
+        recipient_class: proposal.where,
+        bounds: input.bounds,
+        used: 0,
+        created_at: this.now(),
+      });
+      this.rules.set(rule.id, rule);
+    }
+    proposal.decision = input.option;
+    this.permissions.delete(id);
+    this.decided(chat, 'permission', id, input.option);
+    if (input.option === 'deny') {
+      this.event(chat, { type: 'note', text: 'Nothing was changed.' });
+      const target = proposal.onDenied
+        ? chat.script?.steps.findIndex((step) => step.label === proposal.onDenied)
+        : -1;
+      if (target !== undefined && target >= 0) chat.position = target;
+    }
+    this.state(chat, 'working');
+    this.schedule(chat);
+    return C.permissionOutcome.parse({ status: 'ok', option: input.option, rule });
+  }
+  /** The decision on the same stream as the card it decides, as the service sends it. */
+  decided(
+    chat: Parameters<typeof this.event>[0],
+    kind: C.ExperienceDecision['kind'],
+    id: string,
+    outcome: C.ExperienceDecision['outcome'],
+    answer: string | null = null,
+  ) {
+    this.event(chat, {
+      type: 'decision',
+      decision: C.experienceDecision.parse({ kind, id, outcome, answer, decided_at: this.now() }),
+    });
+  }
+  /** Start a scripted conversation without an HTTP round trip, for seeding. */
+  start(title: string, agentId: string, text: string, planId?: string, scenarioId?: string) {
+    const { conversation } = this.create({ title, agent_id: agentId, plan_id: planId });
+    this.message(required(this.chats, conversation.id), { text }, undefined, scenarioId);
+    return conversation;
+  }
+  /** What the web app needs on first paint. Only the server calls this. */
+  seed() {
+    const store = this.deps.store;
+    const now = store.now();
+    const iso = (d: Date) => d.toISOString();
+    const at = (dayOffset: number, hour: number, minute = 0) => {
+      const d = new Date(now);
+      d.setDate(now.getDate() + dayOffset);
+      d.setHours(hour, minute, 0, 0);
+      return d;
+    };
+    const connection = (provider: 'caldav' | 'web' | 'files', label: string, scopes: string[]) => {
+      const id = newId('conn');
+      store.connections.set(id, {
+        id,
+        space_id: this.deps.spaceId,
+        provider,
+        label,
+        secret_ref: newId('secret'),
+        scopes,
+        status: 'active',
+        health: 'ok',
+        last_checked_at: iso(now),
+        created_at: iso(now),
+      });
+      return id;
+    };
+    const calendar = connection('caldav', 'Google Calendar', ['calendar.read', 'calendar.create']);
+    connection('web', 'Web', ['web.fetch']);
+    connection('files', 'Files', ['files.read']);
+    for (const [offset, hour, minute, title, length] of [
+      [0, 11, 0, 'Deep work · review prep', 60],
+      [0, 19, 30, 'Dinner with Alex & Priya · Luna Trattoria', 90],
+      [1, 7, 0, 'Run club', 45],
+    ] as const) {
+      const starts = at(offset, hour, minute);
+      this.calendarEvents.push(
+        C.experienceCalendarEvent.parse({
+          id: newId('evt'),
+          title,
+          starts_at: iso(starts),
+          ends_at: iso(new Date(starts.getTime() + length * 60_000)),
+          connection_id: calendar,
+        }),
+      );
+    }
+    this.profile = C.profileInput.parse({
+      name: 'Jamie Davis',
+      time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+      day_hours: { start: '08:00', end: '22:00' },
+    });
+    this.onboarded = true;
+    this.timeZoneConfirmed = true;
+    for (const [title, done] of [
+      ['Send Priya the Kyoto list', false],
+      ['Renew passport before Oct 3', false],
+      ['Read 20 pages', false],
+      ['Book the dentist', true],
+    ] as const) {
+      const task = C.experienceTask.parse({
+        id: newId('task'),
+        title,
+        due_at: null,
+        done,
+        created_at: iso(now),
+        updated_at: iso(now),
+      });
+      this.tasks.set(task.id, task);
+    }
+    // One standing rule, as an earlier "always allow" would have left it.
+    const rule = C.standingRule.parse({
+      id: newId('rule'),
+      text: 'Add events to your calendar without asking, up to 10 times before Oct 12.',
+      kind: 'create_event',
+      connection_id: calendar,
+      recipient_class: 'Google Calendar',
+      bounds: { count_cap: 10, expires_at: iso(at(30, 0)), reconsent_after_days: 7 },
+      used: 1,
+      created_at: iso(at(-2, 9)),
+    });
+    this.rules.set(rule.id, rule);
+    const agents = [...this.agents.values()];
+    const nova = agents.find((agent) => agent.name === 'Nova') ?? agents[0];
+    const sage = agents.find((agent) => agent.name === 'Sage') ?? agents[0];
+    const atlas = agents.find((agent) => agent.name === 'Atlas') ?? agents[0];
+    if (!nova || !sage || !atlas) return;
+    // The designed looks, on the seeded agents.
+    Object.assign(nova, {
+      role: 'Concierge',
+      colour: '#4aa3f7',
+      surface: 'blob',
+      eye_colour: '#ffffff',
+      tone: 'Warm',
+      standing_instruction: 'One option first, not five. Confirm before paying.',
+    });
+    Object.assign(sage, {
+      role: 'Coach',
+      colour: '#5ab4a0',
+      surface: 'octagon',
+      eye_colour: '#16181d',
+      tone: 'Direct',
+      standing_instruction: 'Ask how the last run went before suggesting the next.',
+    });
+    Object.assign(atlas, {
+      role: 'Researcher',
+      colour: '#ec8a2b',
+      surface: 'diamond',
+      eye_colour: '#ffffff',
+      tone: 'Direct',
+      standing_instruction: 'Cite every claim. Say when the sources disagree.',
+    });
+    const plan = (
+      title: string,
+      category: string,
+      milestones: [string, boolean, string | null][],
+    ) => {
+      const value = C.experiencePlan.parse({
+        id: newId('plan'),
+        title,
+        category,
+        milestones: milestones.map(([text, done, agentId]) => ({
+          id: newId('mile'),
+          title: text,
+          assignee: agentId ? { kind: 'agent', agent_id: agentId } : { kind: 'person' },
+          done,
+          status: done ? 'done' : 'idle',
+        })),
+        next_step: milestones.find(([, done]) => !done)?.[0] ?? null,
+        progress_percent: Math.round(
+          (milestones.filter(([, done]) => done).length / milestones.length) * 100,
+        ),
+        conversation_ids: [],
+        file_ids: [],
+        updated_at: iso(at(-2, 9)),
+      });
+      this.plans.set(value.id, value);
+      return value;
+    };
+    const japan = plan('Japan, two weeks in October', 'Travel', [
+      ['Pick the dates · Oct 10–24', true, null],
+      ['Set a budget', true, null],
+      ['Book the Kyoto ryokan', false, nova.id],
+      ['Find flights', false, nova.id],
+      ['Plan two days outside the cities', false, null],
+    ]);
+    plan('Run a 10K by November', 'Wellbeing', [
+      ['Get checked out and pick shoes', true, null],
+      ['Weeks 1–4 · run-walk to 3K', true, sage.id],
+      ['Weeks 5–8 · steady 5K', false, sage.id],
+      ['Weeks 9–11 · long runs to 9K', false, sage.id],
+      ['Race day · Nov 15', false, null],
+    ]);
+    plan('Spanish, conversational by spring', 'Learning', [
+      ['Pick a course and a tutor', true, null],
+      ['Learn 100 useful phrases', false, atlas.id],
+      ['First 15-minute conversation', false, null],
+    ]);
+    plan('Three-month emergency fund', 'Finances', [
+      ['Open the savings account', true, null],
+      ['Move 400 into savings on the 1st', false, null],
+      ['Month two', false, null],
+      ['Month three', false, null],
+    ]);
+    for (const [title, cron, enabled, runner] of [
+      ['Morning brief', '30 8 * * 1,2,3,4,5', true, this.defaultAgent().id],
+      ['Expenses on Fridays', '0 16 * * 5', true, nova.id],
+      ['Long-run check-in', '0 7 * * 0', false, sage.id],
+    ] as const) {
+      const routine = C.experienceAutomation.parse({
+        id: newId('routine'),
+        title,
+        schedule: scheduleSentence(cron, this.profile.time_zone),
+        enabled,
+        ended: false,
+        conversation_id: newId('job'),
+        runs: [
+          {
+            ...NO_RESULT,
+            id: newId('run'),
+            status: 'done',
+            started_at: iso(at(0, 8, 30)),
+            finished_at: iso(at(0, 8, 31)),
+            summary:
+              'Three things today: the dentist at 10, lunch with Priya, and the passport form.',
+          },
+          {
+            ...NO_RESULT,
+            id: newId('run'),
+            status: 'done',
+            started_at: iso(at(-1, 8, 30)),
+            finished_at: iso(at(-1, 8, 31)),
+            summary: 'A quiet day: no meetings, and two tasks still open.',
+          },
+          {
+            ...NO_RESULT,
+            id: newId('run'),
+            status: 'failed',
+            started_at: iso(at(-3, 8, 30)),
+            finished_at: iso(at(-3, 8, 32)),
+            reason: 'It failed: the calendar could not be reached.',
+          },
+        ],
+      });
+      this.automations.set(routine.id, routine);
+      this.routineAgents.set(routine.id, runner);
+    }
+    const kyoto = this.start(
+      'Kyoto in October',
+      nova.id,
+      'Help me plan two weeks in Japan, slow pace.',
+      japan.id,
+    );
+    japan.conversation_ids = [kyoto.id];
+    this.start('Passport renewal', atlas.id, 'Which documents do I need to renew in person?');
+    this.beliefs.seed(kyoto.id);
+    this.runs.seed(kyoto.id, nova.id);
+  }
+  /**
+   * Every experience event is also a store event on the conversation's job, so
+   * its seq is a message id the reaction routes accept and the two streams
+   * share one seq space. Streamed text keeps its type; the rest are notices.
+   */
+  /** The level each kind of task starts at in the mock: messages on confidence, the rest drafted. */
+  private autonomyLevel(task: C.TaskKind): C.AutonomyLevel {
+    return this.autonomy.get(task) ?? (task === 'chat_message' ? 'when_confident' : 'draft');
+  }
+
+  private autonomyCard(task: C.TaskKind, id: string): C.AutonomyAsk {
+    return {
+      id,
+      task,
+      title: C.TASK_TITLES[task],
+      explanation: C.AUTONOMY_ASK_EXPLANATION,
+      level: this.autonomyLevel(task),
+      chosen: this.autonomy.get(task) ?? null,
+      choices: [...C.AUTONOMY_CHOICES],
+    };
+  }
+
+  private askAutonomy(chat: Chat, task: C.TaskKind) {
+    if (this.autonomy.has(task) || this.autonomyAsks.has(task)) return;
+    const id = newId('ask');
+    this.autonomyAsks.set(task, { chatId: chat.view.id, id });
+    this.event(chat, { type: 'autonomy', autonomy: this.autonomyCard(task, id) });
+  }
+
+  private autonomyList() {
+    return {
+      tasks: C.TASK_KINDS.map((task) => ({
+        task,
+        title: C.TASK_TITLES[task],
+        level: this.autonomyLevel(task),
+        default_level: (task === 'chat_message' ? 'when_confident' : 'draft') as C.AutonomyLevel,
+        chosen: this.autonomy.has(task),
+      })),
+      choices: [...C.AUTONOMY_CHOICES],
+    };
+  }
+
+  event(chat: Chat, item: C.ExperienceEvent['item']) {
+    const mirrored = this.deps.store.append({
+      type: item.type === 'text_delta' ? 'text_delta' : 'notice',
+      job_id: chat.view.id,
+      payload:
+        item.type === 'text_delta'
+          ? { text: item.text }
+          : { level: 'info', title: item.type, body: '', experience: true },
+    });
+    chat.events.push(
+      C.experienceEvent.parse({
+        seq: mirrored.seq,
+        conversation_id: chat.view.id,
+        turn_id: chat.turns.at(-1)?.id ?? null,
+        created_at: this.now(),
+        item,
+      }),
+    );
+  }
+  state(chat: Chat, status: C.Conversation['status']) {
+    chat.view.status = status;
+    chat.view.composer =
+      status === 'paused'
+        ? 'resume'
+        : ['queued', 'working', 'streaming'].includes(status)
+          ? 'stop'
+          : 'send';
+    chat.view.updated_at = this.now();
+    const turn = chat.turns.at(-1);
+    if (turn) turn.status = status;
+    this.event(chat, { type: 'status', status, composer: chat.view.composer });
+  }
+  /** OpenDuet, the agent every space has. */
+  defaultAgent() {
+    const openduet = [...this.agents.values()].find((agent) => agent.is_default);
+    if (!openduet) throw new Error('OpenDuet is missing from the mock.');
+    return openduet;
+  }
+  create(raw: unknown) {
+    const parsed = C.conversationCreate.parse(raw);
+    const input = { ...parsed, agent_id: parsed.agent_id ?? this.defaultAgent().id };
+    required(this.agents, input.agent_id);
+    if (input.plan_id) required(this.plans, input.plan_id);
+    const view = C.conversation.parse({
+      ...input,
+      id: newId('job'),
+      status: 'idle',
+      composer: 'send',
+      created_at: this.now(),
+      updated_at: this.now(),
+      plan_id: input.plan_id ?? null,
+    });
+    const chat: Chat = {
+      view,
+      turns: [],
+      messageSeqs: new Map(),
+      events: [],
+      cards: [],
+      receipts: [],
+      drafts: [],
+      position: 0,
+      pending: [],
+      visited: [],
+      paused: false,
+      stopped: false,
+      proposals: new Map(),
+      lastCard: null,
+    };
+    this.chats.set(view.id, chat);
+    if (input.plan_id) required(this.plans, input.plan_id).conversation_ids.push(view.id);
+    return { conversation: view };
+  }
+  flush(chat: Chat) {
+    if (!chat.pending.length) return;
+    const group = projectActionGroup(chat.pending);
+    if (group) this.event(chat, group);
+    for (const entry of chat.pending) {
+      // A step that keeps a receipt (a web search does) shows it as the service would.
+      const receipt = projectReceipt(entry.action, entry.connection);
+      if (receipt) {
+        chat.receipts.push(receipt);
+        this.event(chat, { type: 'receipt', receipt });
+      }
+      for (const card of projectCards(entry.action, entry.connection)) {
+        chat.cards.push(card);
+        this.event(chat, { type: 'card', card });
+      }
+    }
+    chat.pending = [];
+  }
+  schedule(chat: Chat) {
+    if (chat.paused || chat.stopped) return;
+    const delay =
+      (chat.script?.steps[chat.position]?.delay_ms ?? 100) * (this.deps.experienceSpeed ?? 1);
+    chat.timer = setTimeout(() => this.step(chat), delay);
+  }
+  /** End the turn. An empty summary means the agent said nothing in words (it reacted instead). */
+  finish(chat: Chat, summary: string) {
+    this.settleTool(chat);
+    this.flush(chat);
+    const turn = chat.turns.at(-1);
+    if (turn && !turn.answer && summary) {
+      turn.answer = summary;
+      this.event(chat, { type: 'text_delta', text: summary });
+    }
+    // Results found on pages it opened are linked, when the answer links none.
+    if (turn?.answer) {
+      const linked = withVisitedLinks(
+        turn.answer,
+        pagesVisited(chat.visited.filter((entry) => entry.turn === turn.id)),
+      );
+      if (linked !== turn.answer) {
+        const added = linked.slice(turn.answer.trimEnd().length);
+        if (linked.startsWith(turn.answer.trimEnd())) {
+          turn.answer = linked;
+          this.event(chat, { type: 'text_delta', text: added });
+        }
+      }
+    }
+    // The resting line counts this turn's sources, not the whole conversation's.
+    const sources = chat.events.flatMap((event) =>
+      event.item.type === 'action' && event.turn_id === (turn?.id ?? null)
+        ? event.item.sources
+        : [],
+    );
+    this.event(chat, {
+      type: 'done',
+      summary: summary || 'Answered with a reaction.',
+      elapsed_ms: Math.max(0, Date.now() - Date.parse(turn?.created_at ?? this.now())),
+      apps: [...new Set(sources.map((source) => source.app))],
+      source_count: sources.length,
+    });
+    this.state(chat, 'done');
+  }
+  /**
+   * One tool entry as the service tells it: a running copy, then a finished one
+   * under the same id, and a trail step when the trail does not already carry it.
+   */
+  tool(
+    chat: Chat,
+    done: Omit<C.ToolCall, 'status' | 'ended_at'>,
+    doing: string,
+    trail = true,
+    status: 'done' | 'failed' | 'needs_approval' = 'done',
+  ) {
+    this.settleTool(chat);
+    const finished = C.toolCall.parse({ ...done, status, ended_at: null });
+    const { output_excerpt: _output, failure: _failure, ...started } = finished;
+    this.event(chat, {
+      type: 'tool',
+      tool: { ...started, title: doing, status: 'running', output_summary: null, detail: null },
+    });
+    chat.openTool = { finished, trail };
+    chat.view.progress = { steps_done: chat.view.progress?.steps_done ?? 0, current: doing };
+  }
+  /** Finish the entry under way: its done copy, its trail step, and one more step done. */
+  settleTool(chat: Chat) {
+    chat.openCommand?.();
+    chat.openCommand = undefined;
+    const open = chat.openTool;
+    if (!open) return;
+    chat.openTool = undefined;
+    const waiting = open.finished.status === 'needs_approval';
+    const finished = C.toolCall.parse({
+      ...open.finished,
+      ended_at: waiting ? null : this.now(),
+    });
+    this.event(chat, { type: 'tool', tool: finished });
+    if (open.trail && !waiting)
+      this.event(chat, {
+        type: 'action',
+        label: finished.title,
+        meta: finished.output_summary?.text ?? '',
+        sources: [],
+        tool: finished,
+      });
+    chat.view.progress = {
+      steps_done: (chat.view.progress?.steps_done ?? 0) + (finished.kind === 'model' ? 0 : 1),
+      current: null,
+    };
+  }
+  /** What memory gave the turn, named by the person's own saved details. */
+  recall(chat: Chat) {
+    // Named the way the service names them: plain labels, three at most, the rest counted.
+    const labels = [...this.memories.values()].map((item) =>
+      plainText(item.key, 'Saved detail', 40),
+    );
+    if (!labels.length) return;
+    const named = labels.slice(0, 3);
+    const more = labels.length - named.length;
+    this.tool(
+      chat,
+      {
+        id: `memory:recall:${newId('att')}`,
+        kind: 'memory_recall',
+        title: `Used what you told me: ${named.join(', ')}${more ? ` and ${more} more` : ''}`.slice(
+          0,
+          C.TOOL_TITLE_LIMIT,
+        ),
+        started_at: this.now(),
+        input_summary: null,
+        output_summary: {
+          text: `${labels.length} saved ${labels.length === 1 ? 'detail' : 'details'}`,
+        },
+        detail: null,
+        parent: null,
+      },
+      'Checking what I remember',
+    );
+  }
+  step(chat: Chat) {
+    if (chat.paused || chat.stopped) return;
+    this.settleTool(chat);
+    if (chat.position === 0) this.recall(chat);
+    const step = chat.script?.steps[chat.position++];
+    if (!step) {
+      this.finish(chat, 'Your request is ready.');
+      return;
+    }
+    if (step.step !== 'text' && step.step !== 'reason' && step.step !== 'react')
+      chat.saying = false;
+    if (step.step === 'tool') {
+      const command = this.computer.command(chat.view.id, step, 'running');
+      if (command) chat.openCommand = () => this.computer.finish(chat.view.id, command, step);
+      const kind: C.ToolKind = step.kind
+        ? step.kind
+        : step.name.startsWith('skills.')
+          ? 'skill'
+          : step.name.startsWith('browser')
+            ? 'browser'
+            : /^(exec|terminal|python)/.test(step.name)
+              ? 'sandbox'
+              : step.name.startsWith('web')
+                ? 'web'
+                : 'connector';
+      const title = plainText(step.title, 'Used a tool', C.TOOL_TITLE_LIMIT);
+      // A screenshot step shows the picture its computer holds now.
+      const shot =
+        step.detail?.type === 'artifact' && step.detail.id === 'screenshot'
+          ? this.computer.shot(chat.view.id)
+          : undefined;
+      const detail =
+        shot === undefined
+          ? (step.detail ?? null)
+          : shot
+            ? { type: 'artifact' as const, id: shot }
+            : null;
+      this.tool(
+        chat,
+        {
+          id: `call:${newId('call')}`,
+          kind,
+          title,
+          started_at: this.now(),
+          input_summary: step.input ?? null,
+          output_summary:
+            step.output ?? (step.meta ? { text: step.meta.slice(0, C.TOOL_SUMMARY_LIMIT) } : null),
+          detail,
+          parent: null,
+          ...(step.input_excerpt ? { input_excerpt: step.input_excerpt } : {}),
+          ...(step.output_excerpt ? { output_excerpt: step.output_excerpt } : {}),
+          ...(step.status === 'failed' ? { failure: step.failure ?? 'error' } : {}),
+        },
+        plainText(step.active_title, title, C.TOOL_TITLE_LIMIT),
+        // Evidence-bearing and connector steps already reach the trail as a grouped action.
+        kind !== 'connector' && kind !== 'web' && !step.sources.length,
+        step.status,
+      );
+    }
+    if (step.step === 'reason') {
+      const text = answerText(this.fill(step.text));
+      if (text) this.event(chat, { type: 'reasoning', text });
+    } else if (step.step === 'say') {
+      this.flush(chat);
+      this.event(chat, {
+        type: 'say',
+        text: plainText(this.fill(step.text), 'Working on it.', 600),
+      });
+    } else if (step.step === 'react') {
+      // The agent answers the person's message with a glyph: a reaction event on
+      // the job stream, by the assistant, on the seq of the message it read.
+      const turn = chat.turns.at(-1);
+      const target = turn ? chat.messageSeqs.get(turn.id) : undefined;
+      if (target !== undefined)
+        this.deps.store.append({
+          type: 'reaction',
+          job_id: chat.view.id,
+          payload: { message_id: String(target), emoji: step.emoji, by: 'assistant' },
+        });
+    } else if (step.step === 'tool' && step.sources.length) {
+      // Scripted evidence with human labels: one action, its sources with their apps.
+      this.flush(chat);
+      const connection = this.evidenceConnection();
+      this.event(chat, {
+        type: 'action',
+        label: plainText(step.title, 'Checked something', 4000),
+        meta: step.meta,
+        sources: step.sources.map((source) =>
+          C.experienceSource.parse({
+            app: SOURCE_APPS[source.app] ?? plainText(source.app, 'Web'),
+            title: plainText(source.label, 'Source'),
+            kind: SOURCE_KINDS[source.app] ?? 'page',
+            connection_id: connection?.id ?? `${this.deps.spaceId}:${source.app}`,
+            ...(source.url ? { url: source.url } : {}),
+          }),
+        ),
+      });
+    } else if (step.step === 'card') {
+      this.flush(chat);
+      const card = C.resultCard.parse({
+        id: `${chat.view.id}:${step.id}`,
+        title: step.title,
+        meta: [step.overline, step.rating ? `★ ${step.rating}` : '', ...step.facts]
+          .filter(Boolean)
+          .join(' · '),
+        facts: [
+          ...(step.description ? [{ label: 'About', value: step.description }] : []),
+          ...step.chips.map((chip) => ({ label: 'When', value: chip })),
+        ].slice(0, 20),
+        primary_action: null,
+        secondary_actions: [],
+        source_connection: this.evidenceConnection()?.id ?? null,
+      });
+      chat.cards.push(card);
+      chat.lastCard = card;
+      this.event(chat, { type: 'card', card });
+    } else if (step.step === 'draft') {
+      this.flush(chat);
+      const connection = this.evidenceConnection();
+      const draft = C.experienceDraft.parse({
+        id: newId('draft'),
+        recipient: step.recipient.name,
+        channel: 'message',
+        body: step.body,
+        connection_id: connection?.id ?? `${this.deps.spaceId}:messages`,
+        status: 'draft',
+      });
+      chat.drafts.push(draft);
+      const card = C.resultCard.parse({
+        id: draft.id,
+        title: `Message to ${draft.recipient}`,
+        meta: `${step.channel_label} · nothing is sent until you confirm`,
+        facts: [{ label: 'Draft', value: draft.body }],
+        primary_action: { label: `Send via ${step.channel_label}`, kind: 'send', handle: draft.id },
+        secondary_actions: [],
+        source_connection: connection?.id ?? null,
+      });
+      chat.cards.push(card);
+      this.event(chat, { type: 'card', card });
+      // The first message to someone asks once how much the agent sends on its own.
+      this.askAutonomy(chat, 'chat_message');
+    } else if (step.step === 'ask') {
+      this.flush(chat);
+      const question = C.experienceQuestion.parse({
+        id: newId('q'),
+        conversation_id: chat.view.id,
+        text: plainText(step.question, 'What should happen next?'),
+        why: [step.why ?? 'Your answer decides the next step.'],
+        if_ignored: 'This conversation waits for your answer.',
+        free_text: true,
+        created_at: this.now(),
+        options: step.options.map((option, index) => ({
+          id: `option-${index + 1}`,
+          label: option.description
+            ? `${option.label} · ${option.description}`.slice(0, 4000)
+            : option.label,
+        })),
+      });
+      this.questions.set(question.id, question);
+      this.event(chat, { type: 'question', question });
+      this.state(chat, 'needs_you');
+      return;
+    } else if (step.step === 'browser') {
+      // The page is shown on the conversation's computer, not in the transcript.
+      this.computer.browser(chat.view.id, step);
+    } else if (step.step === 'propose' && !this.isDraftKind(step.kind, step.payload)) {
+      this.flush(chat);
+      const words = PROPOSAL_WORDS[step.kind] ?? {
+        what: 'Make a change through a connected app',
+        where: 'a connected app',
+        reversible: false,
+      };
+      const title = plainText(step.payload.title, '');
+      const rows = [...this.deps.store.connections.values()].filter(
+        (row) => row.space_id === this.deps.spaceId,
+      );
+      const source =
+        rows.find((row) => row.label === step.connection || row.scopes.includes(step.kind)) ??
+        this.evidenceConnection() ??
+        rows[0];
+      chat.proposals.set(step.ref, {
+        ref: step.ref,
+        kind: step.kind,
+        payload: step.payload,
+        money: step.effect_class === 'spend',
+        what: title ? `${words.what}: ${title}` : words.what,
+        where: words.where,
+        decision: null,
+        onDenied: null,
+        permissionId: null,
+        connectionId: source?.id ?? '',
+      });
+    } else if (step.step === 'await_approval') {
+      const proposal = chat.proposals.get(step.ref);
+      if (proposal && proposal.decision === null) {
+        proposal.onDenied = step.on_denied;
+        const detail = [step.ref, ...Object.entries(proposal.payload)]
+          .slice(1)
+          .map(([key, value]) => `${key}: ${plainText(value, '')}`)
+          .filter((line) => !line.endsWith(': '));
+        const permission = C.permissionCard.parse({
+          id: newId('permission'),
+          conversation_id: chat.view.id,
+          what: proposal.what,
+          // A money move: the person confirms it is them when they allow it,
+          // and it is never allowed for good.
+          why: proposal.money
+            ? ['This moves money, so you confirm it is you before it happens.', ...detail]
+            : detail.length
+              ? detail
+              : ['You asked for this.'],
+          options: proposal.money ? ['allow_once', 'deny'] : ['allow_once', 'always', 'deny'],
+          ...(proposal.money
+            ? {
+                step_up: {
+                  method: 'password',
+                  available: Boolean(this.checkPassword),
+                  reason: 'Enter your password to confirm it is you.',
+                },
+              }
+            : {}),
+          version: newId('v'),
+          preview: chat.lastCard,
+          ...(step.auto_review
+            ? { review: { ...step.auto_review, outcome: 'escalated', reviewed_at: this.now() } }
+            : {}),
+          created_at: this.now(),
+          because: this.beliefs.becauseFor(`${proposal.what} ${proposal.where}`),
+        });
+        proposal.permissionId = permission.id;
+        this.permissions.set(permission.id, permission);
+        this.permissionProposals.set(permission.id, { chatId: chat.view.id, ref: step.ref });
+        this.event(chat, { type: 'permission', permission });
+        this.state(chat, 'needs_you');
+        return;
+      }
+    } else if (step.step === 'dispatch') {
+      const proposal = chat.proposals.get(step.ref);
+      if (proposal && proposal.decision !== 'deny' && step.outcome === 'succeeded') {
+        const words = PROPOSAL_WORDS[proposal.kind];
+        const receipt = C.experienceReceipt.parse({
+          id: newId('receipt'),
+          what: proposal.what
+            .replace(/^Add an event to your calendar/, 'Added to your calendar')
+            .replace(/^Hold a table/, 'Held a table')
+            .replace(/^Add a task/, 'Added a task'),
+          where: proposal.where,
+          when: this.now(),
+          because: this.beliefs.becauseFor(`${proposal.what} ${proposal.where}`),
+          ...(words?.reversible
+            ? {
+                undo: {
+                  handle: newId('undo'),
+                  valid_until: new Date(Date.now() + 10 * 60_000).toISOString(),
+                },
+              }
+            : {}),
+          ...(step.auto_review
+            ? { review: { ...step.auto_review, outcome: 'auto_approved', reviewed_at: this.now() } }
+            : {}),
+        });
+        chat.receipts.push(receipt);
+        this.undoable.set(receipt.id, { chatId: chat.view.id, what: proposal.what });
+        this.event(chat, { type: 'receipt', receipt });
+      } else if (proposal && step.outcome !== 'succeeded') {
+        this.restUnknown(chat, {
+          kind: proposal.kind,
+          connectionId: proposal.connectionId,
+          payload: proposal.payload,
+          draftId: null,
+          what: 'The change',
+          resume: true,
+        });
+        return;
+      }
+    } else if (step.step === 'text') {
+      this.flush(chat);
+      const text = answerText(this.fill(step.text));
+      if (text) {
+        const turn = chat.turns.at(-1);
+        if (turn) turn.answer = chat.saying ? turn.answer + text : text;
+        chat.saying = true;
+        this.event(chat, { type: 'text_delta', text });
+        this.state(chat, 'streaming');
+      }
+    } else if (step.step === 'tool') {
+      const provider = step.name.startsWith('email.')
+        ? 'imap'
+        : step.name.startsWith('calendar.')
+          ? 'caldav'
+          : step.name.split('.')[0];
+      // The web connection is built in, so a space always has one.
+      const source =
+        [...this.deps.store.connections.values()].find(
+          (row) => row.space_id === this.deps.spaceId && row.provider === provider,
+        ) ??
+        (provider === 'web'
+          ? { id: `${this.deps.spaceId}:web`, label: 'Web', provider: 'web' }
+          : undefined);
+      const id = newId('act');
+      // A page it opened, for the links its answer gets, as the service gives them.
+      chat.visited.push({
+        turn: chat.turns.at(-1)?.id ?? null,
+        kind: step.name,
+        receipt: { detail: step.result },
+        payload: step.arguments,
+      });
+      // A file a files action saved is served from a fixture of the same name.
+      const saved = savedFile(step.name, { detail: step.result });
+      const name = saved?.path.split('/').at(-1);
+      if (source && name && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+        const fixture = new URL(`../fixtures/files/${name}`, import.meta.url);
+        if (existsSync(fixture))
+          this.deps.store.savedFiles.set(id, {
+            name,
+            bytes: readFileSync(fixture),
+            savedAt: new Date().toISOString(),
+            chat: { id: chat.view.id, title: chat.view.title },
+          });
+      }
+      if (source)
+        chat.pending.push({
+          connection: source,
+          action: {
+            id,
+            jobId: chat.view.id,
+            attemptId: newId('att'),
+            connectionId: source.id,
+            kind: step.name,
+            effectClass: 'read',
+            canonicalPayload: {},
+            receipt: { detail: step.result },
+            status: 'succeeded',
+            createdAt: new Date(),
+            resolvedAt: new Date(),
+          },
+        });
+    } else if (step.step === 'propose') {
+      this.flush(chat);
+      const source = [...this.deps.store.connections.values()].find(
+        (row) =>
+          row.space_id === this.deps.spaceId &&
+          (row.label === step.connection || row.scopes.includes(step.kind)),
+      );
+      if (!source) {
+        this.finish(chat, 'Connect the app to continue.');
+        return;
+      }
+      if (
+        step.kind === 'email.send' ||
+        step.kind === 'email.draft' ||
+        (step.kind === 'test.write' && typeof step.payload.body === 'string')
+      ) {
+        const to = step.payload.to;
+        const draft = C.experienceDraft.parse({
+          id: newId('draft'),
+          recipient: Array.isArray(to) ? to.join(', ') : plainText(to, 'Recipient'),
+          channel: step.kind === 'test.write' ? 'message' : 'email',
+          body: plainText(step.payload.body, ''),
+          subject: plainText(step.payload.subject, 'Draft'),
+          connection_id: source.id,
+          status: 'draft',
+        });
+        chat.drafts.push(draft);
+        const card = C.resultCard.parse({
+          id: draft.id,
+          title: draft.subject,
+          meta: `To ${draft.recipient}`,
+          facts: [{ label: 'Draft', value: draft.body || 'Empty draft' }],
+          primary_action: { label: 'Review and send', kind: 'send', handle: draft.id },
+          secondary_actions: [],
+          source_connection: source.id,
+        });
+        chat.cards.push(card);
+        this.event(chat, { type: 'card', card });
+        this.finish(chat, 'Your draft is ready to review.');
+        return;
+      }
+      this.finish(chat, 'This scenario needs a supported connection before it can continue.');
+      return;
+    } else if (step.step === 'await_input') {
+      const question = C.experienceQuestion.parse({
+        id: newId('q'),
+        conversation_id: chat.view.id,
+        text: plainText(step.question, 'What should happen next?'),
+        why: ['Your answer is needed to continue.'],
+        if_ignored: 'This conversation waits for your answer.',
+        free_text: true,
+        created_at: this.now(),
+        options: [
+          { id: 'continue', label: 'Continue' },
+          { id: 'stop', label: 'Stop here' },
+        ],
+      });
+      this.questions.set(question.id, question);
+      this.event(chat, { type: 'question', question });
+      this.state(chat, 'needs_you');
+      return;
+    } else if (step.step === 'compact') this.event(chat, { type: 'compacted' });
+    else if (step.step === 'notice')
+      this.event(chat, {
+        type: 'note',
+        text: plainText(step.body || step.title, 'There is an update.'),
+      });
+    else if (step.step === 'complete') {
+      chat.follow?.settle?.();
+      const reacted = chat.script?.steps.some((entry) => entry.step === 'react');
+      this.finish(
+        chat,
+        reacted && !step.answer.trim() ? '' : plainText(step.answer, 'Your request is ready.'),
+      );
+      return;
+    } else if (step.step === 'fail') {
+      this.event(chat, { type: 'note', text: 'This request could not be completed.' });
+      this.state(chat, 'failed');
+      return;
+    }
+    this.schedule(chat);
+  }
+  message(chat: Chat, raw: unknown, key?: string, scenarioId?: string) {
+    const input = C.conversationMessage.parse(raw);
+    const most = C.DEFAULT_ATTACHMENT_LIMITS.per_message;
+    if ((input.attachments?.length ?? 0) > most)
+      throw new MockExperienceError(400, `A message can carry up to ${most} files, each once.`);
+    const fingerprint = `${chat.view.id}:${key}`;
+    const previous = key ? this.submissions.get(fingerprint) : undefined;
+    const files = (input.attachments ?? []).map((id) => {
+      const entry = this.attachments.get(id);
+      if (!entry || (entry.sent && !previous))
+        throw new MockExperienceError(
+          409,
+          'One of the files is no longer available. Remove it and attach it again.',
+        );
+      return entry;
+    });
+    if (previous) {
+      if (previous.text !== input.text)
+        throw new MockExperienceError(
+          409,
+          'That message was already accepted with different text.',
+        );
+      return previous.result;
+    }
+    if (['queued', 'working', 'streaming', 'paused'].includes(chat.view.status))
+      throw new MockExperienceError(409, 'Finish the current request first.');
+    // A new message makes every permission still waiting in this conversation
+    // stale, as the service does: it is replaced, and can never be allowed.
+    this.closePending(chat, 'replaced');
+    // "@Scout find …" hands this one message to Scout, as the service does.
+    const mentioned = mentionedAgent(input.text, [...this.agents.values()]);
+    const turn = C.conversationTurn.parse({
+      id: newId('turn'),
+      conversation_id: chat.view.id,
+      agent_id: mentioned?.id ?? chat.view.agent_id,
+      text: input.text,
+      answer: '',
+      status: 'queued',
+      delivery: null,
+      created_at: this.now(),
+      ...(files.length ? { attachments: files.map((file) => file.view) } : {}),
+    });
+    for (const file of files) file.sent = true;
+    chat.turns.push(turn);
+    chat.view.progress = undefined;
+    // The person's message is an event too, so a reaction can land on it.
+    const spoken = this.deps.store.append({
+      type: 'notice',
+      job_id: chat.view.id,
+      payload: {
+        kind: 'user_message',
+        text: input.text,
+        ...(files.length
+          ? {
+              attachments: files.map(({ view }) => ({
+                id: view.id,
+                name: view.name,
+                media_type: view.media_type,
+                kind: view.kind,
+                size: view.size,
+                pages: view.pages,
+              })),
+            }
+          : {}),
+      },
+    });
+    // The service stores both records in one transaction with the same creation timestamp.
+    turn.created_at = spoken.created_at;
+    chat.messageSeqs.set(turn.id, spoken.seq);
+    // A caller that names the script gets it; everything else is chosen by text.
+    chat.script =
+      (scenarioId ? this.deps.scenarios.find((entry) => entry.id === scenarioId) : undefined) ??
+      chooseScenario(this.deps.scenarios, `${chat.view.title} ${input.text}`);
+    // The first message after setup gets the welcome, which names one setup answer.
+    const welcome = this.deps.scenarios.find((entry) => entry.id === 'welcome');
+    if (!scenarioId && welcome && this.answers.size > 0 && !this.welcomed) {
+      chat.script = welcome;
+      this.welcomed = true;
+    }
+    chat.position = 0;
+    chat.paused = false;
+    chat.stopped = false;
+    const result = C.messageAcceptance.parse({
+      turn_id: turn.id,
+      receipt: { id: newId('sub'), status: 'accepted', received_at: turn.created_at },
+    });
+    if (key) this.submissions.set(fingerprint, { text: input.text, result });
+    this.state(chat, 'working');
+    // A scenario that opens with its own words, or with a glyph, gets no generic opener.
+    const opening = chat.script?.steps[0]?.step;
+    if (opening !== 'say' && opening !== 'react')
+      this.event(chat, {
+        type: 'say',
+        text: 'I’ll check what you need and prepare the next step.',
+      });
+    this.schedule(chat);
+    return result;
+  }
+  findDraft(id: string) {
+    for (const chat of this.chats.values()) {
+      const draft = chat.drafts.find((entry) => entry.id === id);
+      if (draft) return { chat, draft };
+    }
+    throw new MockExperienceError(404, 'This draft is no longer available.');
+  }
+  deliver(chat: Chat, draft: C.ExperienceDraft) {
+    const outcome = chat.script?.steps.find((step) => step.step === 'dispatch');
+    if (outcome?.step === 'dispatch' && outcome.outcome !== 'succeeded') {
+      const proposed = chat.script?.steps.find(
+        (step) => step.step === 'propose' && step.ref === outcome.ref,
+      );
+      this.restUnknown(chat, {
+        kind: proposed?.step === 'propose' ? proposed.kind : 'message.send',
+        connectionId: draft.connection_id,
+        payload:
+          proposed?.step === 'propose'
+            ? proposed.payload
+            : { to: draft.recipient, subject: draft.subject ?? '', body: draft.body },
+        draftId: draft.id,
+        what: 'The send',
+        resume: false,
+      });
+      return null;
+    }
+    draft.status = 'sent';
+    // Undo send: with a hold set, the message waits first and Undo cancels it.
+    const hold = Number(process.env.MOCK_SEND_HOLD_SECONDS ?? 0);
+    if (hold > 0 && !chat.follow) {
+      const until = new Date(Date.now() + hold * 1000).toISOString();
+      const pending = C.experienceReceipt.parse({
+        id: newId('receipt'),
+        what: 'Sending a message',
+        where: 'Mail',
+        when: this.now(),
+        sending_until: until,
+        undo: { handle: newId('undo'), valid_until: until },
+      });
+      chat.receipts.push(pending);
+      this.sentReceipts.set(draft.id, pending);
+      this.event(chat, { type: 'receipt', receipt: pending });
+      const timer = setTimeout(() => {
+        this.held.delete(pending.id);
+        const sent = C.experienceReceipt.parse({
+          id: pending.id,
+          what: `Sent a message to ${draft.recipient}`,
+          where: 'Mail',
+          when: this.now(),
+        });
+        chat.receipts = chat.receipts.map((row) => (row.id === pending.id ? sent : row));
+        this.sentReceipts.set(draft.id, sent);
+        this.event(chat, { type: 'receipt', receipt: sent });
+      }, hold * 1000);
+      timer.unref?.();
+      this.held.set(pending.id, { chat, draft, receipt: pending, timer });
+      this.finish(chat, 'Your message is on its way.');
+      return pending;
+    }
+    const receipt = C.experienceReceipt.parse({
+      id: newId('receipt'),
+      what: `Sent a message to ${draft.recipient}`,
+      where: 'Mail',
+      when: this.now(),
+      // A company job's first message can still be pulled back for a few minutes.
+      ...(chat.follow
+        ? {
+            undo: {
+              handle: newId('undo'),
+              valid_until: new Date(Date.now() + 10 * 60_000).toISOString(),
+            },
+          }
+        : {}),
+    });
+    chat.receipts.push(receipt);
+    this.sentReceipts.set(draft.id, receipt);
+    if (chat.follow) this.undoable.set(receipt.id, { chatId: chat.view.id, what: receipt.what });
+    this.event(chat, { type: 'receipt', receipt });
+    // A company job keeps going after the send: the reply, the follow-up, the ending.
+    if (chat.follow && chat.script && chat.position < chat.script.steps.length) {
+      this.state(chat, 'working');
+      this.schedule(chat);
+    } else this.finish(chat, 'Your message was sent.');
+    return receipt;
+  }
+  /**
+   * Record an effect whose outcome never came back. It rests in the ledger at
+   * `unknown` (GET /actions?job_id=) until a person settles it through
+   * POST /actions/{id}/resolve; nothing is repeated meanwhile.
+   */
+  restUnknown(
+    chat: Chat,
+    input: {
+      kind: string;
+      connectionId: string;
+      payload: Record<string, unknown>;
+      draftId: string | null;
+      what: string;
+      resume: boolean;
+    },
+  ) {
+    const { canonical, hash } = C.canonicalizePayload(input.payload);
+    const now = this.now();
+    const id = newId('act');
+    const action: C.Action = {
+      id,
+      job_id: chat.view.id,
+      attempt_id: newId('att'),
+      connection_id: input.connectionId,
+      kind: input.kind,
+      effect_class: 'write_external',
+      canonical_payload: canonical,
+      payload_hash: hash,
+      intent_key: null,
+      status: 'unknown',
+      authorization_ref: null,
+      budget_reservation: null,
+      idempotency_key: id,
+      dispatched_at: now,
+      receipt: null,
+      resolved_at: null,
+      reconciliation: null,
+      repair_trace: [],
+      repair_counters: {},
+      repair_disposition: null,
+      retry_after_at: null,
+      created_at: now,
+    };
+    this.deps.store.actions.set(id, action);
+    this.unknownActions.set(id, {
+      chatId: chat.view.id,
+      draftId: input.draftId,
+      resume: input.resume,
+    });
+    this.event(chat, {
+      type: 'note',
+      text: `${input.what} could not be confirmed. It has not been repeated.`,
+    });
+    this.state(chat, 'needs_you');
+  }
+  /** The person settled an unknown action through the broker; the chat says so and moves on. */
+  actionResolved(action: C.Action) {
+    const rest = this.unknownActions.get(action.id);
+    const chat = rest ? this.chats.get(rest.chatId) : undefined;
+    if (!rest || !chat) return;
+    const draft = rest.draftId ? chat.drafts.find((entry) => entry.id === rest.draftId) : null;
+    if (action.status === 'unresolved') {
+      this.event(chat, {
+        type: 'note',
+        text: 'Still unconfirmed. Nothing will be repeated until you say what happened.',
+      });
+      return;
+    }
+    this.unknownActions.delete(action.id);
+    if (draft) draft.status = action.status === 'succeeded' ? 'sent' : 'draft';
+    this.event(chat, {
+      type: 'note',
+      text:
+        action.status === 'succeeded'
+          ? 'You said it arrived. Nothing was sent again.'
+          : 'You said it did not arrive. Nothing was sent again; the draft is still yours.',
+    });
+    if (rest.resume && chat.script && chat.position < chat.script.steps.length) {
+      this.state(chat, 'working');
+      this.schedule(chat);
+    } else this.state(chat, 'done');
+  }
+  send(id: string) {
+    const { chat, draft } = this.findDraft(id);
+    const existing = [...this.permissions.values()].find(
+      (permission) => this.permissionDrafts.get(permission.id) === id,
+    );
+    if (draft.status === 'sent')
+      return { draft, permission: null, receipt: this.sentReceipts.get(draft.id) ?? null };
+    if (draft.status === 'awaiting_permission')
+      return existing
+        ? { draft, permission: existing, receipt: null }
+        : C.unavailable('The send could not be confirmed. It has not been repeated.');
+    const rule = [...this.rules.values()].find(
+      (rule) =>
+        rule.connection_id === draft.connection_id &&
+        rule.recipient_class === draft.recipient &&
+        rule.used < rule.bounds.count_cap &&
+        Date.parse(rule.bounds.expires_at) > Date.now() &&
+        Date.parse(rule.created_at) + rule.bounds.reconsent_after_days * 86400000 > Date.now(),
+    );
+    draft.status = 'awaiting_permission';
+    if (rule) {
+      rule.used++;
+      return { draft, permission: null, receipt: this.deliver(chat, draft) };
+    }
+    const permission = C.permissionCard.parse({
+      id: newId('permission'),
+      conversation_id: chat.view.id,
+      what: `Send this draft to ${draft.recipient}`,
+      // A company job says which of the person's addresses it goes from.
+      why: chat.follow
+        ? [
+            'This is the first message to this company. You are asked once.',
+            `From: ${chat.follow.from}`,
+            `To: ${draft.recipient}`,
+          ]
+        : ['You asked to send this reviewed draft.'],
+      options:
+        chat.script?.id === 'approved-send'
+          ? ['allow_once', 'always', 'deny']
+          : ['allow_once', 'deny'],
+      version: newId('v'),
+      draft,
+      preview: chat.cards.find((card) => card.id === id) ?? null,
+      created_at: this.now(),
+    });
+    this.permissions.set(permission.id, permission);
+    this.permissionDrafts.set(permission.id, id);
+    this.event(chat, { type: 'permission', permission });
+    return { draft, permission, receipt: null };
+  }
+  /**
+   * Permissions a later message made stale or a stop withdrew; none of them can
+   * be decided again.
+   */
+  readonly closed = new Map<string, 'replaced' | 'withdrawn'>();
+  /** Close every permission still waiting in a conversation, as the service does. */
+  closePending(chat: Parameters<typeof this.event>[0], outcome: 'replaced' | 'withdrawn') {
+    for (const permission of [...this.permissions.values()]) {
+      if (permission.conversation_id !== chat.view.id) continue;
+      this.permissions.delete(permission.id);
+      this.closed.set(permission.id, outcome);
+      if (permission.draft) {
+        const { draft } = this.findDraft(required(this.permissionDrafts, permission.id));
+        draft.status = 'draft';
+      }
+      this.decided(chat, 'permission', permission.id, outcome);
+    }
+  }
+  decide(id: string, raw: unknown) {
+    const input = C.permissionDecision.parse(raw);
+    const closed = this.closed.get(id);
+    if (closed === 'replaced')
+      throw new MockExperienceError(
+        409,
+        'Your new message replaced this request.',
+        'permission_replaced',
+      );
+    if (closed === 'withdrawn')
+      throw new MockExperienceError(
+        409,
+        'This was withdrawn when you stopped.',
+        'permission_withdrawn',
+      );
+    if (this.permissionProposals.has(id)) {
+      const permission = this.permissions.get(id);
+      if (!permission) throw new MockExperienceError(409, 'This request was already answered.');
+      if (input.version !== permission.version)
+        throw new MockExperienceError(409, 'Review the current permission before deciding.');
+      const outcome = this.decideProposal(id, input);
+      if (outcome) return outcome;
+    }
+    const previous = this.decisions.get(id);
+    if (previous) {
+      if (previous.version !== input.version || previous.result.option !== input.option)
+        throw new MockExperienceError(409, 'This request was already answered.');
+      return previous.result;
+    }
+    const permission = required(this.permissions, id);
+    if (input.version !== permission.version)
+      throw new MockExperienceError(409, 'Review the current permission before deciding.');
+    if (!permission.options.includes(input.option))
+      throw new MockExperienceError(400, 'That choice is not available.');
+    const { chat, draft } = this.findDraft(required(this.permissionDrafts, id));
+    let rule: C.StandingRule | null = null;
+    if (input.option === 'always') {
+      if (Date.parse(input.bounds.expires_at) <= Date.now())
+        throw new MockExperienceError(400, 'Choose a future expiry.');
+      rule = C.standingRule.parse({
+        id: newId('rule'),
+        text: `Send messages to ${draft.recipient}, up to ${input.bounds.count_cap} times before ${input.bounds.expires_at}.`,
+        kind: 'send_message',
+        connection_id: draft.connection_id,
+        recipient_class: draft.recipient,
+        bounds: input.bounds,
+        used: 0,
+        created_at: this.now(),
+      });
+      this.rules.set(rule.id, rule);
+    }
+    this.decided(chat, 'permission', id, input.option);
+    if (input.option === 'deny') {
+      draft.status = 'draft';
+      this.event(chat, { type: 'note', text: 'The message was not sent.' });
+    } else this.deliver(chat, draft);
+    this.permissions.delete(id);
+    const result = C.permissionOutcome.parse({ status: 'ok', option: input.option, rule });
+    this.decisions.set(id, { version: input.version, result });
+    return result;
+  }
+  eventPage(chatId: string | undefined, since: number, limit = 100) {
+    const all = (chatId ? [required(this.chats, chatId)] : [...this.chats.values()])
+      .flatMap((chat) => chat.events)
+      .filter((event) => event.seq > since)
+      .sort((a, b) => a.seq - b.seq);
+    const events = all.slice(0, limit);
+    return { events, next_cursor: events.at(-1)?.seq ?? since, has_more: all.length > limit };
+  }
+  events(c: Context, id?: string) {
+    const cursor = c.req.header('Last-Event-ID') ?? c.req.query('since') ?? '0';
+    if (!/^\d+$/.test(cursor) || !Number.isSafeInteger(Number(cursor)))
+      throw new MockExperienceError(400, 'Choose a valid position.');
+    let since = Number(cursor);
+    const page = this.eventPage(id, since, Number(c.req.query('limit') ?? 100));
+    if (!c.req.header('Accept')?.includes('text/event-stream')) return page;
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let close: (() => void) | undefined;
+    const stop = () => {
+      clearInterval(timer);
+      c.req.raw.signal.removeEventListener('abort', stop);
+      close?.();
+      close = undefined;
+    };
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        const push = () => {
+          // A deleted chat's stream ends; there is nothing more to follow.
+          if (id && !this.chats.has(id)) {
+            stop();
+            return;
+          }
+          for (const event of this.eventPage(id, since).events) {
+            since = event.seq;
+            controller.enqueue(
+              encoder.encode(
+                `id: ${event.seq}\nevent: ${event.item.type}\ndata: ${JSON.stringify(event)}\n\n`,
+              ),
+            );
+          }
+        };
+        close = () => controller.close();
+        push();
+        timer = setInterval(() => {
+          if ((controller.desiredSize ?? 0) > 0) push();
+        }, 50);
+        c.req.raw.signal.addEventListener('abort', stop, { once: true });
+      },
+      cancel: () => {
+        close = undefined;
+        stop();
+      },
+    });
+    return new Response(body, {
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+    });
+  }
+  connections() {
+    return [...this.deps.store.connections.values()]
+      .filter((row) => row.space_id === this.deps.spaceId && row.status !== 'revoked')
+      .map((row) =>
+        C.experienceConnection.parse({
+          id: row.id,
+          app:
+            row.provider === 'smtp'
+              ? 'Mail'
+              : appName({ ...row, configuration: this.catalogOf(row.id) }),
+          label: plainText(row.label, 'Connected app'),
+          status: row.status === 'active' && row.health !== 'failing' ? 'connected' : 'error',
+          access: row.scopes.some((scope) => /send|create|write/.test(scope))
+            ? 'asks_before_acting'
+            : 'read_only',
+          ...(row.provider === 'imap' || row.provider === 'caldav'
+            ? { watching: !this.unwatched.has(row.id) }
+            : {}),
+          ...(row.status !== 'active' || row.health === 'failing'
+            ? {
+                problem: {
+                  kind: 'failing' as const,
+                  detail: 'Its last check failed. Press Test to check it again, or reconnect it.',
+                },
+              }
+            : {}),
+          ...(this.deps.store.connectionCatalog.has(row.id)
+            ? { catalog_id: this.deps.store.connectionCatalog.get(row.id) }
+            : {}),
+        }),
+      );
+  }
+  /** What appName reads to tell a catalog app by its name. */
+  private catalogOf(id: string): Record<string, unknown> {
+    const catalog = this.deps.store.connectionCatalog.get(id);
+    return catalog ? { catalog } : {};
+  }
+  automation(raw: unknown) {
+    const parsed = C.automationCreate.parse(raw);
+    const input = { ...parsed, agent_id: parsed.agent_id ?? this.defaultAgent().id };
+    required(this.agents, input.agent_id);
+    const [hour, minute] = input.at.split(':');
+    const value = C.experienceAutomation.parse({
+      id: newId('routine'),
+      title: input.title,
+      enabled: true,
+      ended: false,
+      schedule: scheduleSentence(
+        `${Number(minute)} ${Number(hour)} * * ${[...new Set(input.weekdays)].sort().join(',')}`,
+        this.profile.time_zone,
+      ),
+      conversation_id: newId('job'),
+      runs: [],
+    });
+    this.automations.set(value.id, value);
+    this.routineAgents.set(value.id, input.agent_id);
+    return { automation: value };
+  }
+  /**
+   * A test run of the morning brief, from what this scenario has: the weather
+   * always, the calendar and open tasks when there are any, and the news line.
+   */
+  briefSummary(topics: readonly string[]) {
+    const today = new Date().toDateString();
+    const events = this.calendarEvents.filter(
+      (event) => new Date(event.starts_at).toDateString() === today,
+    );
+    const open = [...this.tasks.values()].filter((task) => !task.done);
+    return [
+      'Clear this morning, 18° rising to 23° by the afternoon.',
+      events.length ? `On your calendar: ${events.map((event) => event.title).join('; ')}.` : null,
+      open.length ? `Open tasks: ${open.map((task) => task.title).join('; ')}.` : null,
+      `News${topics.length ? ` on ${topics.join(', ')}` : ''}: the day’s headlines, each with its source.`,
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+  /** The label a key shows under, matching the service's own wording. */
+  keyLabel(key: string) {
+    const [kind, subject, field] = key.split('.');
+    const name = (subject ?? '').replaceAll('-', ' ');
+    const leaf = (field ?? '').replaceAll('-', ' ');
+    if (kind === 'contact') return `${name}'s ${leaf}`;
+    if (kind === 'event') return `${name} ${leaf}`;
+    return `${name}: ${leaf}`;
+  }
+  /** Placeholders the welcome scenario fills from setup. */
+  profileView() {
+    return {
+      ...this.profile,
+      voice: this.profile.voice ?? C.DEFAULT_REPLY_VOICE,
+      onboarded: this.onboarded || [...this.agents.values()].some((agent) => !agent.is_default),
+      time_zone_confirmed: this.timeZoneConfirmed,
+      sending_address: this.sendingAddress,
+      role: 'owner' as const,
+    };
+  }
+  fill(text: string) {
+    return text
+      .replaceAll('{{openduet_calls_you}}', this.profile.name.split(' ')[0] ?? this.profile.name)
+      .replaceAll('{{this_month}}', this.answers.get('pref.focus.this-month') ?? 'this month');
+  }
+  handle(key: string, c: Context, input: Record<string, unknown>): unknown {
+    if (this.signedOut && !key.startsWith('POST /signin'))
+      throw new MockExperienceError(401, 'A session is required.');
+    const id = c.req.param('id') ?? '';
+    try {
+      const answered = this.beliefs.handle(key, id, input, c.req.query());
+      if (answered !== undefined) return answered;
+    } catch (error) {
+      if (error instanceof MockBeliefError)
+        throw new MockExperienceError(error.status, error.message);
+      throw error;
+    }
+    try {
+      const answered = this.runs.handle(key, id, input, c.req.query());
+      if (answered !== undefined) return answered;
+    } catch (error) {
+      if (error instanceof MockRunError) throw new MockExperienceError(error.status, error.message);
+      throw error;
+    }
+    switch (key) {
+      case 'GET /agents/templates': {
+        const taken = [...this.agents.values()].map((agent) => agent.name);
+        return {
+          templates: AGENT_TEMPLATES.templates.map((template) => ({
+            ...template,
+            agent: { ...template.agent, name: C.freeAgentName(template.agent.name, taken) },
+          })),
+        };
+      }
+      case 'GET /agents':
+        return {
+          removed: [...this.removedAgents.values()],
+          agents: [...this.agents.values()].map((agent) => ({
+            ...agent,
+            usage: {
+              conversations: [...this.chats.values()].filter(
+                (chat) => chat.view.agent_id === agent.id,
+              ).length,
+              last_used:
+                [...this.chats.values()].filter((chat) => chat.view.agent_id === agent.id).at(-1)
+                  ?.view.updated_at ?? null,
+              routines: [...this.routineAgents.values()].filter((runner) => runner === agent.id)
+                .length,
+            },
+          })),
+        };
+      case 'POST /agents':
+      case 'PATCH /agents/{id}': {
+        const existing = id ? required(this.agents, id) : null;
+        try {
+          agentValues(input, existing?.is_default === true);
+        } catch (error) {
+          if (error instanceof ServiceError) throw new MockExperienceError(400, error.message);
+          throw error;
+        }
+        const parsed = C.agentInput.parse(input);
+        if (!existing || !C.sameAgentName(existing.name, parsed.name)) {
+          const taken = [...this.agents.values()]
+            .filter((agent) => agent.id !== id)
+            .map((agent) => agent.name);
+          if (taken.some((name) => C.sameAgentName(name, parsed.name)))
+            throw new MockExperienceError(
+              409,
+              `You already have an agent called ${parsed.name.trim()}. Try ${C.freeAgentName(parsed.name, taken)}.`,
+              'name_taken',
+            );
+        }
+        const allowed = parsed.allowed_connection_ids ?? [];
+        if (allowed.some((id) => !this.connections().some((connection) => connection.id === id)))
+          throw new MockExperienceError(400, 'Choose connections from this space.');
+        const agent = C.experienceAgent.parse({
+          ...input,
+          id: id || newId('agent'),
+          space_id: this.deps.spaceId,
+          is_default: existing?.is_default === true,
+          fixed_reach: existing?.fixed_reach === true,
+          usage: { conversations: 0, last_used: null, routines: 0 },
+        });
+        this.agents.set(agent.id, agent);
+        return { agent };
+      }
+      case 'DELETE /agents/{id}': {
+        const target = required(this.agents, id);
+        if (target.is_default) throw new MockExperienceError(400, 'OpenDuet is always here.');
+        const openduet = this.defaultAgent();
+        if (
+          [...this.chats.values()].some(
+            (chat) =>
+              chat.view.agent_id === id &&
+              ['queued', 'working', 'streaming', 'needs_you', 'paused'].includes(chat.view.status),
+          )
+        )
+          throw new MockExperienceError(
+            409,
+            `${target.name} is in the middle of something. Try again when it finishes.`,
+            'agent_busy',
+          );
+        // The turns it answered keep its name.
+        let conversations = 0;
+        for (const chat of this.chats.values())
+          if (chat.view.agent_id === id) {
+            chat.view.agent_id = openduet.id;
+            conversations += 1;
+          }
+        for (const plan of this.plans.values())
+          for (const step of plan.milestones)
+            if (step.assignee.kind === 'agent' && step.assignee.agent_id === id)
+              step.assignee = { kind: 'agent', agent_id: openduet.id };
+        let routines = 0;
+        for (const [routine, runner] of this.routineAgents)
+          if (runner === id) {
+            this.routineAgents.set(routine, openduet.id);
+            routines += 1;
+          }
+        this.agents.delete(id);
+        this.removedAgents.set(id, target);
+        return { id, moved_to: openduet.id, conversations, routines, routines_paused: 0 };
+      }
+      case 'GET /conversations': {
+        // Most recently active first, a page at a time, as the service answers.
+        const query = C.conversationListQuery.parse(c.req.query());
+        const after = query.cursor ? C.decodeConversationCursor(query.cursor) : null;
+        if (query.cursor && !after)
+          throw new MockExperienceError(400, 'Start the list again from the top.');
+        const position = (view: C.Conversation) => `${view.updated_at}|${view.id}`;
+        const views = [...this.chats.values()]
+          .map((chat) => chat.view)
+          .sort((a, b) => position(b).localeCompare(position(a)))
+          .filter((view) => !after || position(view) < `${after.updated_at}|${after.id}`);
+        const page = views.slice(0, query.limit);
+        const last = page.at(-1);
+        return {
+          conversations: page,
+          next_cursor:
+            views.length > query.limit && last
+              ? C.encodeConversationCursor({ updated_at: last.updated_at, id: last.id })
+              : null,
+        };
+      }
+      case 'POST /conversations':
+        return this.create(input);
+      case 'GET /conversations/{id}':
+        return { conversation: required(this.chats, id).view };
+      case 'PATCH /conversations/{id}': {
+        const chat = required(this.chats, id);
+        chat.view.title = C.conversationRename.parse(input).title;
+        return { conversation: chat.view };
+      }
+      case 'DELETE /conversations/{id}': {
+        const chat = required(this.chats, id);
+        // Stopped first, its permissions withdrawn, as the service does.
+        clearTimeout(chat.timer);
+        const stopped = ['queued', 'working', 'streaming'].includes(chat.view.status);
+        const withdrawn = [...this.permissions.values()].filter(
+          (permission) => permission.conversation_id === id,
+        ).length;
+        chat.stopped = true;
+        this.closePending(chat, 'withdrawn');
+        for (const [key, question] of this.questions)
+          if (question.conversation_id === id) this.questions.delete(key);
+        for (const plan of this.plans.values())
+          plan.conversation_ids = plan.conversation_ids.filter((entry) => entry !== id);
+        // What the chat did outside OpenDuet stays on record after it goes.
+        for (const receipt of chat.receipts) {
+          const undoable = receipt.undo && this.undoable.has(receipt.id);
+          const entry = C.activityEntry.parse({
+            id: newId('act'),
+            what: receipt.what,
+            where: receipt.where,
+            destination: null,
+            reference: null,
+            outcome: 'succeeded',
+            source: chat.view.title,
+            happened_at: receipt.when,
+            // Undo stays on offer after the chat goes, for what can still be taken back.
+            ...(undoable && receipt.undo
+              ? { undo: { valid_until: receipt.undo.valid_until } }
+              : {}),
+          });
+          this.activity.unshift(entry);
+          if (undoable) this.activityUndo.set(entry.id, receipt.id);
+        }
+        this.chats.delete(id);
+        // The mock keeps no record of which saved details came from which chat.
+        return { id, stopped, withdrawn, forgotten: 0, computer_files: { removed: 0, kept: 0 } };
+      }
+      case 'PATCH /conversations/{id}/agent': {
+        const chat = required(this.chats, id);
+        required(this.agents, String(input.agent_id));
+        chat.view.agent_id = String(input.agent_id);
+        return { conversation: chat.view };
+      }
+      case 'GET /conversations/{id}/messages':
+        return { turns: required(this.chats, id).turns };
+      case 'POST /conversations/{id}/messages':
+        return this.message(required(this.chats, id), input, c.req.header('Idempotency-Key'));
+      case 'GET /conversations/{id}/events':
+        return this.events(c, id);
+      case 'GET /conversations/{id}/cards':
+        return { cards: required(this.chats, id).cards };
+      case 'GET /conversations/{id}/receipts':
+        return { receipts: required(this.chats, id).receipts };
+      case 'GET /conversations/{id}/computer':
+        return this.computer.view(required(this.chats, id).view.id);
+      case 'GET /conversations/{id}/drafts':
+        return { drafts: required(this.chats, id).drafts };
+      case 'POST /conversations/{id}/pause':
+      case 'POST /conversations/{id}/resume':
+      case 'POST /conversations/{id}/stop': {
+        const chat = required(this.chats, id);
+        clearTimeout(chat.timer);
+        if (key.endsWith('/resume')) {
+          chat.paused = false;
+          this.state(chat, 'working');
+          this.schedule(chat);
+        } else if (key.endsWith('/pause')) {
+          chat.paused = true;
+          this.state(chat, 'paused');
+        } else {
+          chat.stopped = true;
+          this.state(chat, 'stopped');
+          this.closePending(chat, 'withdrawn');
+        }
+        return { conversation: chat.view };
+      }
+      case 'GET /permissions':
+        return { permissions: [...this.permissions.values()], handoffs: this.handoffsWaiting() };
+      case 'POST /permissions/{id}':
+        return this.decide(id, input);
+      case 'POST /permissions/{id}/step-up': {
+        const permission = required(this.permissions, id);
+        const { password } = C.permissionStepUpRequest.parse(input);
+        if (!permission.step_up)
+          throw new MockExperienceError(409, 'This does not need you to confirm it is you.');
+        if (!this.checkPassword?.(password))
+          throw new MockExperienceError(400, 'That password is not right.', 'wrong_password');
+        const token = newId('stepup') + newId('t');
+        const expires = Date.now() + 2 * 60_000;
+        this.stepUps.set(token, { permissionId: id, expires });
+        return { step_up_token: token, expires_at: new Date(expires).toISOString() };
+      }
+      case 'GET /rules':
+        return { rules: [...this.rules.values()] };
+      case 'GET /approval-settings':
+        return { settings: this.approvalSettings, reviewer_available: true };
+      case 'GET /autonomy':
+        return this.autonomyList();
+      case 'PUT /autonomy': {
+        const update = C.taskAutonomyUpdate.parse(input);
+        this.autonomy.set(update.task, update.level);
+        // The card that asked shows the choice, wherever it was made.
+        const asked = this.autonomyAsks.get(update.task);
+        const chat = asked ? this.chats.get(asked.chatId) : undefined;
+        if (asked && chat)
+          this.event(chat, {
+            type: 'autonomy',
+            autonomy: this.autonomyCard(update.task, asked.id),
+          });
+        return this.autonomyList();
+      }
+      case 'PUT /approval-settings':
+        this.approvalSettings = C.approvalSettings.parse(input);
+        return { settings: this.approvalSettings, reviewer_available: true };
+      case 'DELETE /rules/{id}':
+        required(this.rules, id);
+        this.rules.delete(id);
+        return { status: 'ok' };
+      case 'POST /drafts/{id}/send':
+        return this.send(id);
+      case 'POST /receipts/{id}/undo':
+        return this.undo(id);
+      case 'GET /quick-answers':
+        return { questions: [...this.questions.values()] };
+      case 'POST /quick-answers/{id}': {
+        const question = required(this.questions, id);
+        const answer = C.quickAnswerRequest.parse(input);
+        const chosen =
+          'option_id' in answer
+            ? question.options.find((choice) => choice.id === answer.option_id)
+            : undefined;
+        if ('option_id' in answer ? !chosen : !question.free_text)
+          throw new MockExperienceError(400, 'Choose an offered answer.');
+        this.questions.delete(id);
+        if (question.conversation_id) {
+          const chat = required(this.chats, question.conversation_id);
+          this.decided(
+            chat,
+            'question',
+            id,
+            'answered',
+            'text' in answer ? answer.text : (chosen?.label ?? null),
+          );
+          if (input.option_id === 'stop') {
+            chat.stopped = true;
+            this.state(chat, 'stopped');
+          } else this.schedule(chat);
+        }
+        return { status: 'ok' };
+      }
+      case 'GET /memory/settings':
+        return { capture: this.capture };
+      case 'PUT /memory/settings':
+        this.capture = C.memorySettings.parse(input).capture;
+        return { capture: this.capture };
+      case 'POST /quick-answers/{id}/dismiss': {
+        const question = this.questions.get(id);
+        if (!question) return { status: 'ok' };
+        this.questions.delete(id);
+        if (question.conversation_id)
+          this.decided(required(this.chats, question.conversation_id), 'question', id, 'withdrawn');
+        return { status: 'ok' };
+      }
+      case 'GET /memory/items':
+        return { items: [...this.memories.values()] };
+      case 'POST /memory/items': {
+        // One key, one current value: a second answer on a key replaces the first.
+        const create = C.memoryItemCreate.parse(input);
+        if (C.memoryKeyValue(create.key) !== 'text')
+          throw new MockExperienceError(
+            409,
+            'This key is maintained from source evidence. Correct its saved item instead.',
+            'extractor_owned_key',
+          );
+        const label = this.keyLabel(create.key);
+        const existing = [...this.memories.values()].find((entry) => entry.key === label);
+        const item = C.memoryItem.parse({
+          id: existing?.id ?? newId('mem'),
+          key: label,
+          value: create.value,
+          source: 'onboarding',
+          created: existing?.created ?? this.now(),
+          last_used: existing?.last_used ?? null,
+          editable: true,
+          version: newId('v'),
+        });
+        this.memories.set(item.id, item);
+        this.answers.set(create.key, create.value);
+        return { item };
+      }
+      case 'POST /signout':
+        this.signedOut = true;
+        return { status: 'ok' };
+      case 'POST /signin/magic-link':
+        // The mock sends no mail; the link is any token consumed below.
+        return { status: 'ok' };
+      case 'POST /signin/magic-link/check':
+        // Any link works here, and checking one spends nothing.
+        return { status: 'ok', masked_email: 'y•••@example.com' };
+      case 'POST /signin/magic-link/consume':
+        this.signedOut = false;
+        return { status: 'ok' };
+      case 'POST /signin/chatgpt':
+        return C.unavailable('This installation hasn’t set up ChatGPT sign-in yet.');
+      case 'PATCH /memory/items/{id}': {
+        const item = required(this.memories, id);
+        if (input.version !== item.version)
+          throw new MockExperienceError(409, 'This detail has changed.');
+        item.value = String(input.value);
+        item.version = newId('v');
+        return { status: 'ok' };
+      }
+      case 'DELETE /memory/items/{id}':
+        required(this.memories, id);
+        this.memories.delete(id);
+        return { status: 'ok' };
+      case 'GET /memory/items/{id}/why': {
+        const item = required(this.memories, id);
+        return { reasons: [`You saved this detail: ${item.value}`], output: null, used_at: null };
+      }
+      case 'GET /profile':
+        return { profile: this.profileView() };
+      case 'PATCH /profile': {
+        const next = C.profileInput.parse(input);
+        this.onboarded ||= Boolean(next.onboarded);
+        this.timeZoneConfirmed ||=
+          Boolean(next.time_zone_confirmed) || next.time_zone !== this.profile.time_zone;
+        this.profile = C.profileInput.parse({
+          name: next.name,
+          time_zone: next.time_zone,
+          day_hours: next.day_hours,
+          voice: next.voice ?? this.profile.voice,
+        });
+        return { profile: this.profileView() };
+      }
+      case 'POST /account/password': {
+        const value = C.passwordChange.parse(input);
+        if (!this.changePassword) return C.unavailable('Passwords are not kept in this scenario.');
+        if (!this.changePassword(value.current_password, value.new_password))
+          throw new MockExperienceError(
+            400,
+            'Your current password is not right.',
+            'wrong_password',
+          );
+        return { status: 'ok' };
+      }
+      case 'POST /password-reset':
+        return C.unavailable(
+          'This OpenDuet can’t email you a reset link. Ask whoever set up your account to send you one.',
+        );
+      case 'GET /account/sessions':
+        return {
+          sessions: [
+            {
+              id: 'ses_this_browser',
+              label: 'This browser',
+              created_at: this.now(),
+              expires_at: new Date(Date.parse(this.now()) + 30 * 86_400_000).toISOString(),
+              current: true,
+            },
+          ],
+          computers: [],
+          notifications: [],
+          assistants: [],
+        };
+      case 'DELETE /account/sessions/{id}':
+        throw new MockExperienceError(404, 'That session has already ended.', 'not_found');
+      case 'POST /account/sessions/revoke-others':
+        return { status: 'ok' };
+      case 'GET /home': {
+        const tasks = [...this.tasks.values()].filter((task) => !task.done);
+        return {
+          ...dayGreeting(this.profile, this.deps.store.now()),
+          upcoming: this.calendarEvents.length
+            ? this.calendarEvents.filter((event) => Date.parse(event.ends_at) > Date.now())
+            : C.unavailable('No calendar is connected in this scenario.'),
+          tasks,
+          open_task_count: tasks.length,
+          routine_results: [],
+          handoffs: this.handoffsWaiting(),
+        };
+      }
+      case 'GET /tasks':
+        return { tasks: [...this.tasks.values()] };
+      case 'POST /tasks':
+      case 'PATCH /tasks/{id}': {
+        const previous = id ? required(this.tasks, id) : undefined;
+        const task = C.experienceTask.parse({
+          ...input,
+          id: id || newId('task'),
+          created_at: previous?.created_at ?? this.now(),
+          updated_at: this.now(),
+        });
+        this.tasks.set(task.id, task);
+        return { task };
+      }
+      case 'DELETE /tasks/{id}':
+        required(this.tasks, id);
+        this.tasks.delete(id);
+        return { status: 'ok' };
+      case 'GET /plans':
+        return { plans: [...this.plans.values()] };
+      case 'POST /plans': {
+        const value = C.planCreate.parse(input);
+        for (const milestone of value.milestones)
+          if (milestone.assignee.kind === 'agent')
+            required(this.agents, milestone.assignee.agent_id);
+        const plan = C.experiencePlan.parse({
+          ...value,
+          id: newId('plan'),
+          milestones: value.milestones.map((item) => ({
+            ...item,
+            id: newId('mile'),
+            done: false,
+            status: 'idle',
+          })),
+          next_step: value.milestones[0]?.title ?? null,
+          progress_percent: 0,
+          conversation_ids: [],
+          file_ids: [],
+          updated_at: this.now(),
+        });
+        this.plans.set(plan.id, plan);
+        return { plan };
+      }
+      case 'GET /plans/{id}':
+        return { plan: required(this.plans, id) };
+      case 'DELETE /plans/{id}': {
+        required(this.plans, id);
+        this.plans.delete(id);
+        // Chats started from the plan stay, no longer linked to it.
+        for (const chat of this.chats.values())
+          if (chat.view.plan_id === id) chat.view.plan_id = null;
+        return { status: 'ok' };
+      }
+      case 'PATCH /plans/{id}/milestones/{milestoneId}': {
+        const plan = required(this.plans, id);
+        const step = plan.milestones.find((item) => item.id === c.req.param('milestoneId'));
+        if (!step) throw new MockExperienceError(404, 'Step not found.');
+        if (step.assignee.kind === 'agent')
+          return C.unavailable('This step is completed when the assigned assistant finishes it.');
+        step.done = Boolean(input.done);
+        step.status = step.done ? 'done' : 'idle';
+        plan.next_step = plan.milestones.find((item) => !item.done)?.title ?? null;
+        plan.progress_percent = Math.round(
+          (plan.milestones.filter((item) => item.done).length / plan.milestones.length) * 100,
+        );
+        return { plan };
+      }
+      case 'POST /plans/{id}/conversation':
+        return this.create({
+          title: required(this.plans, id).title,
+          agent_id: input.agent_id,
+          plan_id: id,
+        });
+      case 'POST /plans/{id}/share':
+        required(this.plans, id);
+        return C.unavailable('Sharing is not available yet.');
+      case 'GET /automations':
+        return { automations: [...this.automations.values()] };
+      case 'POST /automations':
+        return this.automation(input);
+      case 'POST /automations/morning-brief': {
+        const { topics, ...when } = C.morningBriefCreate.parse(input);
+        const made = this.automation({
+          ...when,
+          title: C.MORNING_BRIEF_TITLE,
+          instruction: C.morningBriefInstruction(topics),
+          weekdays: [0, 1, 2, 3, 4, 5, 6],
+        });
+        this.briefTopics.set(made.automation.id, topics ?? []);
+        return made;
+      }
+      case 'POST /automations/{id}/test':
+        required(this.automations, id).runs.unshift({
+          ...NO_RESULT,
+          id: newId('run'),
+          status: 'done',
+          started_at: this.now(),
+          finished_at: this.now(),
+          summary: this.briefTopics.has(id)
+            ? this.briefSummary(this.briefTopics.get(id) ?? [])
+            : 'Nothing new since the last run.',
+        });
+        return { status: 'ok' };
+      case 'POST /automations/{id}/pause':
+      case 'POST /automations/{id}/resume': {
+        const routine = required(this.automations, id);
+        routine.enabled = key.endsWith('/resume');
+        return { automation: routine };
+      }
+      case 'POST /automations/{id}/restart': {
+        const ended = required(this.automations, id);
+        if (!ended.ended)
+          throw new MockExperienceError(
+            409,
+            'This routine has not ended. Resume it instead of starting it again.',
+            'routine_not_ended',
+          );
+        const routine = C.experienceAutomation.parse({
+          ...ended,
+          id: newId('routine'),
+          enabled: true,
+          ended: false,
+          conversation_id: newId('job'),
+          runs: [],
+        });
+        this.automations.delete(id);
+        this.automations.set(routine.id, routine);
+        const runner = this.routineAgents.get(id);
+        this.routineAgents.delete(id);
+        if (runner) this.routineAgents.set(routine.id, runner);
+        return { automation: routine };
+      }
+      case 'DELETE /automations/{id}':
+        required(this.automations, id);
+        this.automations.delete(id);
+        this.routineAgents.delete(id);
+        return { status: 'ok' };
+      case 'GET /experience/connections':
+        return { connections: this.connections() };
+      case 'PUT /experience/connections/{id}/watching': {
+        const row = this.connections().find((entry) => entry.id === id);
+        if (!row) throw new MockExperienceError(404, 'Connection not found.');
+        if (row.watching === undefined)
+          throw new MockExperienceError(
+            400,
+            'Only a mailbox or a calendar can be watched for changes.',
+          );
+        if (C.connectionWatching.parse(input).on) this.unwatched.delete(id);
+        else this.unwatched.add(id);
+        return { connections: this.connections() };
+      }
+      case 'GET /web/settings':
+        return { enabled: this.webReads, available: true };
+      case 'PUT /web/settings':
+        this.webReads = input.enabled === true;
+        return { enabled: this.webReads, available: true };
+      case 'GET /activity':
+        return { activity: this.activity };
+      case 'POST /activity/{id}/undo': {
+        const index = this.activity.findIndex((entry) => entry.id === id);
+        const entry = this.activity[index];
+        if (!entry) throw new MockExperienceError(404, 'That item is not here.');
+        if (entry.undone_at) return { entry };
+        if (!entry.undo || !this.activityUndo.has(id))
+          return C.unavailable('This change has no saved reversal.');
+        if (Date.parse(entry.undo.valid_until) < Date.now())
+          return C.unavailable('The time to undo this change has passed.');
+        this.activityUndo.delete(id);
+        const { undo: _undo, ...rest } = entry;
+        const undone = C.activityEntry.parse({ ...rest, undone_at: this.now() });
+        this.activity[index] = undone;
+        return { entry: undone };
+      }
+      case 'GET /space/members':
+        return {
+          space: {
+            id: this.deps.spaceId,
+            name: this.deps.space === 'shared' ? 'Household' : 'Personal',
+            kind: this.deps.space === 'shared' ? 'shared' : 'personal',
+            role: 'owner',
+          },
+          members: [...this.members.values()],
+        };
+      case 'DELETE /space/members/{id}': {
+        const member = required(this.members, id);
+        if (this.deps.space !== 'shared' || member.role === 'owner')
+          throw new MockExperienceError(403, 'A shared-space owner may remove a member.');
+        this.members.delete(id);
+        return { status: 'ok' };
+      }
+      case 'GET /search': {
+        const q = (c.req.query('q') ?? '').toLowerCase();
+        const results = [
+          ...[...this.chats.values()].map((chat) => ({
+            id: chat.view.id,
+            kind: 'conversation',
+            title: chat.view.title,
+            meta: 'Conversation',
+            conversation_id: chat.view.id,
+          })),
+          ...[...this.plans.values()].map((plan) => ({
+            id: plan.id,
+            kind: 'plan',
+            title: plan.title,
+            meta: plan.category,
+            conversation_id: null,
+          })),
+          ...[...this.tasks.values()].map((task) => ({
+            id: task.id,
+            kind: 'task',
+            title: task.title,
+            meta: 'Task',
+            conversation_id: null,
+          })),
+          ...this.connections().map((connection) => ({
+            id: connection.id,
+            kind: 'connection',
+            title: connection.label,
+            meta: connection.app,
+            conversation_id: null,
+          })),
+          ...[...this.chats.values()].flatMap((chat) =>
+            chat.events.flatMap((event) =>
+              event.item.type === 'action'
+                ? [
+                    {
+                      id: String(event.seq),
+                      kind: 'action',
+                      title: event.item.label,
+                      meta: event.item.meta,
+                      conversation_id: chat.view.id,
+                    },
+                  ]
+                : [],
+            ),
+          ),
+        ];
+        return {
+          results: results
+            .filter((row) => `${row.title} ${row.meta}`.toLowerCase().includes(q))
+            .slice(0, 100),
+        };
+      }
+      default:
+        return C.unavailable(
+          key.includes('signin')
+            ? 'Use the mock password session; this scenario does not send sign-in mail.'
+            : key.includes('browser')
+              ? 'Browser tasks are not connected yet.'
+              : 'This feature is not connected yet.',
+        );
+    }
+  }
+}
+
+export function mountExperienceMock(
+  app: Hono,
+  deps: AppDeps & { experienceSpeed?: number },
+): ExperienceMock {
+  const experience = new ExperienceMock(deps);
+  for (const [key, operation] of Object.entries(C.experienceOperations)) {
+    const [method, path] = key.split(' ') as [string, string];
+    app.on(method, path.replace(/\{([^}]+)\}/g, ':$1'), async (c) => {
+      let input: Record<string, unknown> = {};
+      if ('request' in operation) {
+        // An empty body is none, which only a request that may be left out accepts.
+        const parsed = operation.request.safeParse(await c.req.json().catch(() => undefined));
+        if (!parsed.success)
+          return c.json(
+            { error: { code: 'invalid_request', message: 'Check the information and try again.' } },
+            400,
+          );
+        input = parsed.data ?? {};
+      }
+      if ('query' in operation && !operation.query.safeParse(c.req.query()).success)
+        return c.json(
+          { error: { code: 'invalid_request', message: 'Check the request and try again.' } },
+          400,
+        );
+      try {
+        const body = experience.handle(key, c, input);
+        return body instanceof Response
+          ? body
+          : c.json(C.experienceResult(operation.response).parse(body));
+      } catch (error) {
+        if (!(error instanceof MockExperienceError)) throw error;
+        return c.json({ error: { code: error.code, message: error.message } }, error.status);
+      }
+    });
+  }
+  app.get('/events', (c, next) =>
+    c.req.query('view') === 'experience'
+      ? (() => {
+          const result = experience.events(c);
+          return result instanceof Response ? result : c.json(result);
+        })()
+      : next(),
+  );
+  return experience;
+}

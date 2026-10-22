@@ -1,0 +1,596 @@
+# Every check here also runs locally with the same command; see CONTRIBUTING.md,
+# "Set up and verify". Nothing is pushed, published or deployed,
+# and no secret is read. deploy/scripts/ci-workflow.test.ts checks this file.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Typecheck, lint and Compose checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Lint
+        run: bun run lint
+      - name: Compose boundary checks
+        run: |
+          bun run compose:check
+          bun run browser:compose:check
+          bun run tailscale:compose:check
+
+  test:
+    name: Test suite and runtime plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      # The embedded Postgres binary does not start on current Linux, so the
+      # fixtures create their disposable databases on this server instead. The
+      # image's bootstrap role is a superuser; the password guards nothing but
+      # this job's own loopback port.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openduet_test
+          POSTGRES_PASSWORD: openduet_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openduet_test -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      # The blob store suites run against this S3-compatible service as well as
+      # a local directory. Pinned by digest; its keys guard nothing but this
+      # job's own loopback port. The image is a frozen archive that gets no
+      # updates; move to a maintained MinIO image when one is published.
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+        env:
+          MINIO_ROOT_USER: openduet_test
+          MINIO_ROOT_PASSWORD: openduet_test_minio
+          MINIO_DEFAULT_BUCKETS: openduet-test
+        ports:
+          - 9000:9000
+    env:
+      DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+      OPENDUET_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      OPENDUET_TEST_S3_BUCKET: openduet-test
+      OPENDUET_TEST_S3_ACCESS_KEY_ID: openduet_test
+      OPENDUET_TEST_S3_SECRET_ACCESS_KEY: openduet_test_minio
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # The learning gate starts Node with --permission.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.11.6"
+          enable-cache: false
+      - name: Install the Postgres client library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq5
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      # Names a missing prerequisite once: a non-root user, a writable temporary
+      # directory, DATABASE_URL on Linux, and uv.
+      - name: Check test prerequisites
+        run: |
+          test "$(id -u)" -ne 0
+          bun run doctor
+      - name: Wait for the S3-compatible store
+        run: |
+          for _ in $(seq 60); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Test suite
+        run: bun run test
+      - name: Runtime plugin suite
+        run: bun run test:plugin
+
+  capability-evals:
+    name: Capability evaluations with the scripted provider
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      # The light engine's disposable database, on the same server image as the test job.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openduet_test
+          POSTGRES_PASSWORD: openduet_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openduet_test -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      # The real broker, gateway, ledger and fixture destinations around the light engine,
+      # with a scripted model: no provider and no secret. A key scenario that stops passing
+      # fails the job against the stored scripted baseline. A scenario that needs something
+      # this runner lacks, such as Chromium for the browser scenario, is skipped by name.
+      - name: Run the capability suite against its baseline
+        run: |
+          bun run evals -- --engine light --provider scripted --suite capability --runs 1             --workers 3 --campaign ci-capability --out-dir "$RUNNER_TEMP/evals"             --baseline evals/baselines/scripted.json
+
+  browser-sandbox:
+    name: Prove the browser renderer sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Report the Docker versions
+        run: |
+          docker version
+          docker compose version
+      # Chromium gives each renderer a user namespace of its own. A runner that refuses to make
+      # one fails this job by name: a quiet skip here is how the sandbox came to be off before.
+      - name: Check this runner allows unprivileged user namespaces
+        run: |
+          maximum=$(cat /proc/sys/user/max_user_namespaces)
+          unprivileged=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)
+          # Ubuntu 24.04 can also restrict them through AppArmor. That is judged inside the
+          # container by the proof itself, but a failure needs the host's setting beside it.
+          restricted=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+          echo "user.max_user_namespaces=$maximum kernel.unprivileged_userns_clone=$unprivileged kernel.apparmor_restrict_unprivileged_userns=$restricted"
+          if [ "$maximum" -lt 1 ] || [ "$unprivileged" = "0" ]; then
+            echo "::error::this runner refuses unprivileged user namespaces, which Chromium's renderer sandbox requires; the proof cannot run here"
+            exit 1
+          fi
+      # The same tag the proof runs, so its own build is a cache hit rather than a second build.
+      - name: Build the browser image
+        run: docker build -t openduet-browser-sandbox-proof -f deploy/Dockerfile.browser .
+      - name: Prove the renderer is sandboxed inside the container
+        env:
+          OPENDUET_BROWSER_SANDBOX_PROOF: '1'
+        run: bun test apps/openduet/test/integration/browser-sandbox.test.ts --max-concurrency=1
+
+  browser-sign-out:
+    name: Prove signing out of a site in a real browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      # The signed-in sites list lives in Postgres, on the same server image as the test job.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openduet_test
+          POSTGRES_PASSWORD: openduet_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openduet_test -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # The browser worker runs as a Node process beside the service.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install the Postgres client library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq5
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Report the Docker versions
+        run: docker version
+      # The same tag the proof runs, so its own build is a cache hit rather than a second build.
+      - name: Build the browser image
+        run: docker build -t openduet-browser-forget-proof -f deploy/Dockerfile.browser .
+      # A missing Docker engine or image fails this step rather than skipping the proof.
+      - name: Prove signing out clears one site from the profile inside the browser image
+        env:
+          OPENDUET_BROWSER_FORGET_PROOF: '1'
+        run: bun test apps/openduet/test/integration/browser-forget-site.test.ts --max-concurrency=1
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+      # The worker launches Chromium with its own renderer sandbox, which needs a user namespace.
+      # Ubuntu 24.04 lets only programs with an AppArmor profile make one, and the downloaded
+      # Chromium has none, so this runner allows it as the worker container does.
+      - name: Let Chromium on this runner make its sandbox's user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # A missing browser or database fails this step rather than skipping the proof.
+      - name: Prove the signed-in sites list follows a sign-out
+        env:
+          OPENDUET_BROWSER_SITES_PROOF: '1'
+        run: bun test apps/openduet/test/integration/browser-sites.test.ts --max-concurrency=1
+
+  app-isolation:
+    name: Prove app isolation in real browsers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Install Chromium and Firefox
+        run: bunx playwright install --with-deps chromium firefox
+      # A missing browser fails this job rather than skipping the proof.
+      - name: Prove a published app stays inside its frame
+        env:
+          OPENDUET_APP_ISOLATION_PROOF: '1'
+        run: bun test apps/openduet/test/browser/app-isolation.test.ts --max-concurrency=1
+      - name: Prove a preview of a server in an agent's computer stays inside its frame and its port
+        env:
+          OPENDUET_APP_ISOLATION_PROOF: '1'
+        run: bun test apps/openduet/test/browser/preview-isolation.test.ts --max-concurrency=1
+
+  mcp-stdio:
+    name: Stdio MCP servers in their own containers (conformance 10)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      # The scenario runs in a container with the Docker socket, as the service does, because a
+      # server with named destinations reaches them through the proxy in that container.
+      - name: Start real servers through the Docker launcher
+        run: |
+          docker version
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            -e OPENDUET_CONFORMANCE_DOCKER=1 \
+            "oven/bun:$(cat .bun-version)" \
+            bun test conformance/scenarios/10-stdio-mcp.test.ts --timeout=300000
+
+  images:
+    name: Build the shipped images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report the Docker versions
+        run: |
+          docker version
+          docker compose version
+      - name: Build the service image
+        run: docker build -t openduet-service:ci -f deploy/Dockerfile.openduet .
+      - name: Build the web image
+        run: docker build -t openduet-web:ci -f deploy/Dockerfile.web .
+      - name: Build the runtime image
+        run: docker build -t openduet-runtime:ci -f packages/runtime-hermes/Dockerfile packages/runtime-hermes
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      # The image just built: a spare engine loads without its attempt, takes it over its
+      # port and serves with its capability, sooner than an engine started with it.
+      - name: Hand a spare engine its attempt
+        env:
+          OPENDUET_RUNTIME_LIVE: docker
+          OPENDUET_RUNTIME_LIVE_IMAGE: openduet-runtime:ci
+        run: bun test apps/openduet/src/runtime/docker-spare.live.test.ts --timeout=400000
+
+  docker-sandbox:
+    name: Docker sandboxes on a real engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      # The workspace suite records sessions; the same disposable server as the test job.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: openduet_test
+          POSTGRES_PASSWORD: openduet_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openduet_test -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Report the Docker versions
+        run: docker version
+      - name: Build the sandbox image
+        run: docker build -t openduet-sandbox:local -f deploy/Dockerfile.sandbox .
+      # On the runner itself the adapter offers deny-all only: the shared sandbox and workspace
+      # suites, the container's own limits, a real task, the idle stop and the desktop.
+      - name: Run the adapter against the engine
+        env:
+          OPENDUET_SANDBOX_LIVE: docker
+          OPENDUET_SANDBOX_LIVE_OUT: sandbox-shots
+          DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+        run: |
+          mkdir -p sandbox-shots
+          bun test apps/openduet/src/sandbox/adapters/docker.live.test.ts --timeout=300000 --max-concurrency=1
+      # Background processes through the service's whole path: a three-minute process
+      # started in one attempt, read in a second and seen to finish in a third.
+      - name: Keep background processes across attempts
+        env:
+          OPENDUET_SANDBOX_LIVE: docker
+          DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+        run: bun test apps/openduet/src/sandbox/adapters/docker-processes.live.test.ts --timeout=900000 --max-concurrency=1
+      # A job waiting on a background process is woken by the line it waits for, with no
+      # attempt in between.
+      - name: Wake a waiting job from its background process
+        env:
+          OPENDUET_SANDBOX_LIVE: docker
+          DATABASE_URL: postgres://openduet_test:openduet_test@127.0.0.1:5432/postgres
+        run: bun test apps/openduet/src/sandbox/adapters/docker-process-wakes.live.test.ts --timeout=300000 --max-concurrency=1
+      # Open egress needs the caller in a container on the same engine, as the service is in
+      # the Compose deployment, so it can join each sandbox's network as its only way out.
+      # git serves the GitHub test repository the computer clones and pushes through the relay.
+      # moto stands in for AWS (S3, STS and IAM) and checks every signature once the test has
+      # made its user, key, role and bucket with the six calls it lets through unsigned.
+      - name: Reach the internet only through the service
+        run: |
+          docker run -d --name openduet-moto -e INITIAL_NO_AUTH_ACTION_COUNT=6 \
+            motoserver/moto:5.2.3@sha256:91fd602a21f49cf9eb82fdf474015a3c131d40104c8297ea6a2ca920708ae32c
+          moto_ip=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' openduet-moto)
+          for i in $(seq 1 60); do curl -sf -o /dev/null "http://$moto_ip:5000/moto-api/" && break; sleep 1; done
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            -e OPENDUET_SANDBOX_LIVE=docker \
+            -e OPENDUET_SANDBOX_LIVE_OUT=/repo/sandbox-shots \
+            -e OPENDUET_LIVE_MOTO="http://$moto_ip:5000" \
+            "oven/bun:$(cat .bun-version)" \
+            sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null \
+              && bun test apps/openduet/src/sandbox/adapters/docker.live.test.ts --timeout=300000 --test-name-pattern 'open egress'"
+      # GitLab and npm accounts through the relay, from a computer's own git, glab and npm:
+      # the test serves the GitLab git repository and API, and a Verdaccio registry pinned by
+      # digest stands in for registry.npmjs.org. Its account's token stays in the service.
+      - name: Use GitLab and npm accounts only through the service
+        run: |
+          cat > "$RUNNER_TEMP/verdaccio.yaml" <<'EOF'
+          storage: /verdaccio/storage/data
+          auth:
+            htpasswd:
+              file: /verdaccio/storage/htpasswd
+          packages:
+            '**':
+              access: $all
+              publish: $authenticated
+              unpublish: $authenticated
+          log: { type: stdout, format: pretty, level: warn }
+          EOF
+          docker run -d --name openduet-verdaccio -p 4873:4873 \
+            -e VERDACCIO_PUBLIC_URL=https://registry.npmjs.org/ \
+            -v "$RUNNER_TEMP/verdaccio.yaml":/verdaccio/conf/config.yaml:ro \
+            verdaccio/verdaccio:6.10.4@sha256:43c4067288b050422265407ea2fe747e511fcd0c407a85ec90ab9a326d9400cd
+          for attempt in $(seq 1 60); do
+            curl -sf http://127.0.0.1:4873/-/ping >/dev/null && break
+            sleep 1
+          done
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            --add-host=host.docker.internal:host-gateway \
+            -e OPENDUET_SANDBOX_LIVE=docker \
+            -e OPENDUET_LIVE_NPM_REGISTRY=http://host.docker.internal:4873 \
+            "oven/bun:$(cat .bun-version)" \
+            sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null \
+              && bun test apps/openduet/src/sandbox/adapters/docker-command-line.live.test.ts --timeout=400000"
+      # Two people's computers on one installation, from a container as the service runs: neither
+      # reaches the other over the network, through the service, with the other's token or
+      # account, or on disk, even with every private range opened to the computers.
+      - name: Keep two people's computers apart
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            -e OPENDUET_SANDBOX_LIVE=docker \
+            "oven/bun:$(cat .bun-version)" \
+            bun test apps/openduet/src/sandbox/adapters/docker-isolation.live.test.ts --timeout=300000 --max-concurrency=1
+      # What the sandbox desktop showed: the test page after the agent's input, and a public
+      # page reached through the service.
+      - name: Keep the desktop screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandbox-desktop-${{ github.run_id }}
+          path: sandbox-shots/
+          if-no-files-found: warn
+          retention-days: 7

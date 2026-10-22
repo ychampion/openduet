@@ -1,0 +1,913 @@
+"""The plugin against a fake broker.
+
+The fake is a real HTTP server on loopback, not a stubbed client, so the URL
+building, the bearer header, the JSON bodies and the error bodies are all
+exercised rather than assumed. It contacts nothing else and needs no container.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Dict, List
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime_support"))
+
+from openduet_plugin import TOOLSET, build_handler, register, tool_schema  # noqa: E402
+from openduet_plugin.broker import BrokerClient, BrokerError  # noqa: E402
+from openduet_plugin.results import (  # noqa: E402
+    END_TURN_INSTRUCTION,
+    OWN_COMPUTER_INSTRUCTION,
+    UNCERTAIN_INSTRUCTION,
+)
+
+CONNECTION = "con_01J0000000000000000000000A"
+ACTION = "act_01J0000000000000000000000B"
+APPROVAL = "apr_01J0000000000000000000000C"
+HASH = "a" * 64
+
+CATALOG: List[Dict[str, Any]] = [
+    {
+        "name": "email.send",
+        "description": "Send an email from the owner's mailbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "array", "items": {"type": "string"}},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["to", "subject", "body"],
+        },
+        "effect_class": "write_external",
+        "connection_id": CONNECTION,
+    },
+    {
+        "name": "email.search",
+        "description": "Search the owner's mailbox.",
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "effect_class": "read",
+        "connection_id": CONNECTION,
+    },
+]
+
+
+class FakeBroker:
+    """One attempt's worth of broker, with scripted answers."""
+
+    def __init__(self) -> None:
+        self.catalog: List[Dict[str, Any]] = list(CATALOG)
+        self.propose_response: Dict[str, Any] = {
+            "action_id": ACTION,
+            "status": "succeeded",
+            "effect_class": "read",
+            "payload_hash": HASH,
+            "canonical_payload": {},
+            "requires_approval": False,
+            "approval_id": None,
+        }
+        self.action_record: Dict[str, Any] = {"id": ACTION, "receipt": {"external_ref": "mid-1"}}
+        self.status_code = 200
+        self.error_body: Dict[str, Any] | None = None
+        self.requests: List[Dict[str, Any]] = []
+        #: Screenshot pictures the broker reads for the runtime, by action id.
+        self.screenshots: Dict[str, Any] = {}
+
+    # -- the HTTP surface, matching apps/openduet/src/broker/http.ts -------------
+    def handle(self, method: str, path: str, body: Dict[str, Any] | None, auth: str | None):
+        self.requests.append({"method": method, "path": path, "body": body, "auth": auth})
+        if self.error_body is not None:
+            return self.status_code, self.error_body
+        if method == "GET" and path == "/tools":
+            return 200, {"tools": self.catalog}
+        if method == "POST" and path == "/reactions":
+            return 201, body
+        if method == "POST" and path == "/actions":
+            return 201, self.propose_response
+        if method == "POST" and path == f"/actions/{ACTION}/resume":
+            return 200, self.propose_response
+        if method == "POST" and path == "/tools/search":
+            return 200, {"tools": [{"name": "email.search", "description": "Search mail"}]}
+        if method == "POST" and path == "/tools/load":
+            return 200, {"tool": CATALOG[1], "schema_fingerprint": HASH}
+        if method == "POST" and path == "/tools/call":
+            return 200, {"body": "Use the broker for every action."}
+        if method == "POST" and path == "/tools/learning/propose":
+            return 200, {"status": "candidate_pending", "episode_id": "ep_recorded"}
+        if method == "GET" and path.startswith("/actions/") and path.endswith("/screenshot"):
+            picture = self.screenshots.get(path.split("/")[2])
+            if isinstance(picture, str):
+                # A paired computer that keeps its screen from cloud models.
+                return 200, {"withheld": True, "reason": picture}
+            if picture is None:
+                return 404, {"error": {"code": "action_not_found", "message": "no such screenshot"}}
+            return 200, {"media_type": "image/png", "data": base64.b64encode(picture).decode("ascii")}
+        if method == "GET" and path.startswith("/actions/"):
+            return 200, {"action": self.action_record}
+        return 404, {"error": {"code": "not_found", "message": "no such route"}}
+
+
+@pytest.fixture()
+def broker():
+    state = FakeBroker()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence the default stderr chatter
+            return
+
+        def _respond(self, method: str):
+            length = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            body = json.loads(raw) if raw else None
+            status, payload = state.handle(
+                method, self.path, body, self.headers.get("authorization")
+            )
+            encoded = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+            self._respond("GET")
+
+        def do_POST(self):  # noqa: N802
+            self._respond("POST")
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state.base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture()
+def client(broker):
+    return BrokerClient(base_url=broker.base_url, token="cap-token", timeout=5)
+
+
+class RecordingContext:
+    """Stands in for Hermes's PluginContext with the one method we use."""
+
+    def __init__(self) -> None:
+        self.tools: List[Dict[str, Any]] = []
+        self.hooks: Dict[str, Any] = {}
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+    def register_tool(self, **kwargs: Any) -> None:
+        self.tools.append(kwargs)
+
+
+# -- registration -------------------------------------------------------------
+
+
+def test_registers_one_tool_per_catalog_entry(client, broker):
+    ctx = RecordingContext()
+    names = register(ctx, client)
+
+    assert names == ["email.send", "email.search"]
+    assert [t["name"] for t in ctx.tools] == ["email.send", "email.search"]
+    assert {t["toolset"] for t in ctx.tools} == {TOOLSET}
+    assert broker.requests[0]["path"] == "/tools"
+    assert broker.requests[0]["auth"] == "Bearer cap-token"
+
+
+def test_schema_is_the_openai_function_body_without_the_name():
+    schema = tool_schema(CATALOG[0])
+    # Hermes merges {"name": entry.name} over this, so a "name" here would be
+    # redundant; "parameters" is what the provider actually reads.
+    assert set(schema) == {"description", "parameters"}
+    assert schema["parameters"] == CATALOG[0]["input_schema"]
+
+
+def test_registered_handler_keeps_runtime_context_out_of_admission_and_returns_json(client, broker):
+    ctx = RecordingContext()
+    register(ctx, client)
+    handler = ctx.tools[1]["handler"]
+    result = handler({"query": "invoice"}, task_id="runtime-task", session_id="runtime-session", user_task="find it")
+    assert isinstance(result, str), "the pinned Hermes registry requires a JSON string"
+    assert json.loads(result)["status"] == "succeeded"
+    proposal = next(request for request in broker.requests if request["method"] == "POST")
+    assert proposal["body"]["payload"] == {"query": "invoice"}
+
+
+def test_registered_handler_preserves_broker_result_in_hermes_text_contract(client, broker):
+    broker.propose_response = {
+        "action_id": ACTION, "status": "needs_approval", "requires_approval": True,
+        "approval_id": APPROVAL, "payload_hash": HASH,
+    }
+    ctx = RecordingContext()
+    register(ctx, client)
+    result = ctx.tools[0]["handler"]({"to": ["a@example.com"], "subject": "hi", "body": "hello"})
+    assert isinstance(result, str)
+    assert json.loads(result)["status"] == "needs_approval"
+    assert json.loads(result)["instruction"] == END_TURN_INSTRUCTION
+    assert broker.requests[-1]["body"]["kind"] == "email.send"
+
+
+def test_a_tool_with_no_schema_still_gets_a_valid_parameters_object():
+    assert tool_schema({"name": "x"})["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_registration_is_refused_without_a_broker_url():
+    assert register(RecordingContext(), BrokerClient(base_url="", token="t")) == []
+
+
+def test_registration_is_refused_without_an_attempt_token(broker):
+    assert register(RecordingContext(), BrokerClient(base_url=broker.base_url, token="")) == []
+
+
+def test_an_engine_loaded_before_its_attempt_registers_the_tools_once_it_has_one(broker, monkeypatch):
+    import openduet_runtime_hooks
+
+    monkeypatch.setenv("OPENDUET_RUNTIME_SPARE", "1")
+    monkeypatch.setenv("OPENDUET_BROKER_URL", broker.base_url)
+    monkeypatch.delenv("OPENDUET_ATTEMPT_TOKEN", raising=False)
+    ctx = RecordingContext()
+    # Loaded ahead of the attempt: the observers are in place, nothing is fetched.
+    assert register(ctx) == []
+    assert ctx.hooks
+    assert ctx.tools == []
+    assert broker.requests == []
+    # Handed its attempt, the engine registers that attempt's tools under its capability.
+    monkeypatch.delenv("OPENDUET_RUNTIME_SPARE")
+    monkeypatch.setenv("OPENDUET_ATTEMPT_TOKEN", "cap-token")
+    openduet_runtime_hooks.attempt_arrived()
+    assert [tool["name"] for tool in ctx.tools] == ["email.send", "email.search"]
+    assert broker.requests[0]["auth"] == "Bearer cap-token"
+    # Nothing is held twice.
+    openduet_runtime_hooks.attempt_arrived()
+    assert len(ctx.tools) == 2
+
+
+def test_an_engine_started_with_its_attempt_registers_at_once(broker, monkeypatch):
+    monkeypatch.delenv("OPENDUET_RUNTIME_SPARE", raising=False)
+    monkeypatch.setenv("OPENDUET_BROKER_URL", broker.base_url)
+    monkeypatch.setenv("OPENDUET_ATTEMPT_TOKEN", "cap-token")
+    ctx = RecordingContext()
+    assert register(ctx) == ["email.send", "email.search"]
+
+
+def test_an_empty_catalog_registers_nothing_but_does_not_raise(client, broker):
+    broker.catalog = []
+    assert register(RecordingContext(), client) == []
+
+
+def test_a_refused_catalog_registers_nothing(client, broker):
+    broker.status_code = 403
+    broker.error_body = {"error": {"code": "stale_epoch", "message": "fenced"}}
+    assert register(RecordingContext(), client) == []
+
+
+def test_discovery_registers_only_broker_returned_schemas(client, broker):
+    broker.catalog = [
+        {"name": "search_tools", "description": "Find tools", "connection_id": None},
+        {"name": "load_tool", "description": "Load tools", "connection_id": None},
+    ]
+    ctx = RecordingContext()
+    register(ctx, client)
+    found = json.loads(ctx.tools[0]["handler"]({"query": "mail"}, task_id="engine", session_id="session"))
+    assert found["tools"][0]["name"] == "email.search"
+    result = json.loads(ctx.tools[1]["handler"]({"name": "email.search"}, user_task="engine metadata"))
+    # No run is being served, so the tool cannot join a running agent: the
+    # result carries the mark that tells the adapter to continue in a new run.
+    assert result["status"] == "tools_loaded"
+    assert result["error"] == "continues_in_a_new_run"
+    assert [tool["name"] for tool in ctx.tools] == ["search_tools", "load_tool", "email.search"]
+    ctx.tools[2]["handler"]({"query": "invoices"})
+    assert broker.requests[-2]["path"] == "/actions"
+    assert broker.requests[-2]["body"]["connection_id"] == CONNECTION
+    assert all(request["auth"] == "Bearer cap-token" for request in broker.requests)
+    assert broker.requests[1]["body"] == {"query": "mail"}
+    assert broker.requests[2]["body"] == {"name": "email.search"}
+    ctx.tools[1]["handler"]({"name": "email.search"})
+    assert len(ctx.tools) == 3
+
+
+class _LiveAgent:
+    """Stands in for the engine's running agent: a tool list and its names."""
+
+    def __init__(self, names):
+        self.valid_tool_names = set(names)
+
+
+def _engine_refresh(monkeypatch, refresh):
+    """Installs a stand-in for the engine module the live refresh calls."""
+    import types
+
+    module = types.ModuleType("tools.mcp_tool_agent")
+    module.refresh_agent_mcp_tools = refresh
+    package = types.ModuleType("tools")
+    package.mcp_tool_agent = module
+    monkeypatch.setitem(sys.modules, "tools", package)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_agent", module)
+
+
+def test_a_loaded_tool_joins_the_running_agent_without_a_new_run(client, broker, monkeypatch):
+    import openduet_runtime_hooks
+
+    agent = _LiveAgent(["search_tools", "load_tool"])
+    calls = []
+
+    def refresh(target, **options):
+        calls.append(options)
+        # The engine reads the live registry; the plugin has just registered the tool.
+        target.valid_tool_names.add("email.search")
+        return {"email.search"}
+
+    _engine_refresh(monkeypatch, refresh)
+    openduet_runtime_hooks.bind_agent(agent)
+    try:
+        broker.catalog = [
+            {"name": "search_tools", "description": "Find tools", "connection_id": None},
+            {"name": "load_tool", "description": "Load tools", "connection_id": None},
+        ]
+        ctx = RecordingContext()
+        register(ctx, client)
+        result = json.loads(ctx.tools[1]["handler"]({"name": "email.search"}))
+    finally:
+        openduet_runtime_hooks.bind_agent(object())
+    assert result["status"] == "loaded"
+    assert "error" not in result
+    assert result["instruction"] == "email.search is in your tools now. Call it directly."
+    # The engine's own refresh, keeping the earlier tools where they were.
+    assert calls == [{"quiet_mode": True, "preserve_prefix": True}]
+    assert [tool["name"] for tool in ctx.tools] == ["search_tools", "load_tool", "email.search"]
+
+
+def test_a_refresh_that_fails_or_misses_the_tool_falls_back_to_a_new_run(client, broker, monkeypatch, capsys):
+    import openduet_runtime_hooks
+
+    def broken(target, **options):
+        raise RuntimeError("engine refresh failed")
+
+    _engine_refresh(monkeypatch, broken)
+    agent = _LiveAgent([])
+    openduet_runtime_hooks.bind_agent(agent)
+    try:
+        assert openduet_runtime_hooks.refresh_live_tools("email.search") is False
+        assert "the engine refresh failed (RuntimeError)" in capsys.readouterr().err
+        _engine_refresh(monkeypatch, lambda target, **options: set())
+        assert openduet_runtime_hooks.refresh_live_tools("email.search") is False
+        assert "does not offer it" in capsys.readouterr().err
+    finally:
+        openduet_runtime_hooks.bind_agent(object())
+    # A finished run's agent is not kept alive by the reference.
+    del agent
+    import gc
+
+    gc.collect()
+    assert openduet_runtime_hooks.refresh_live_tools("email.search") is False
+
+
+def test_denied_load_cannot_register_a_handler(client, broker):
+    ctx = RecordingContext()
+    broker.catalog = [{"name": "load_tool", "description": "Load", "connection_id": None}]
+    register(ctx, client)
+    broker.status_code = 403
+    broker.error_body = {"error": {"code": "scope_denied", "message": "not granted"}}
+    answer = json.loads(ctx.tools[0]["handler"]({"name": "email.send"}))
+    assert answer["error"]["code"] == "scope_denied"
+    assert len(ctx.tools) == 1
+
+
+def test_native_skill_execution_stays_at_the_broker(client, broker):
+    answer = build_handler(client, {"name": "skills.inspect", "connection_id": None})({})
+    assert answer["body"] == "Use the broker for every action."
+    assert broker.requests[0]["path"] == "/tools/call"
+    assert broker.requests[0]["body"] == {"name": "skills.inspect", "arguments": {}}
+
+
+def test_compose_is_forwarded_to_the_broker_native_gate(client, broker):
+    arguments = {"reads": [{"as": "rows", "name": "email.search"}], "script": "return rows;"}
+    build_handler(client, {"name": "compose", "connection_id": None})(arguments)
+    assert broker.requests[0]["body"] == {"name": "compose", "arguments": arguments}
+
+
+def test_a_chase_follow_up_is_forwarded_to_the_broker_native_gate(client, broker):
+    build_handler(client, {"name": "chase.follow_up", "connection_id": None})({})
+    assert broker.requests[0]["path"] == "/tools/call"
+    assert broker.requests[0]["body"] == {"name": "chase.follow_up", "arguments": {}}
+
+
+def test_keeping_what_the_person_wants_is_forwarded_to_the_broker_native_gate(client, broker):
+    arguments = {"title": "Book a table for the family birthday", "kind": "booking"}
+    build_handler(client, {"name": "intent.capture", "connection_id": None})(arguments)
+    assert broker.requests[0]["path"] == "/tools/call"
+    assert broker.requests[0]["body"] == {"name": "intent.capture", "arguments": arguments}
+
+
+def test_a_memory_search_is_forwarded_to_the_broker_native_gate(client, broker):
+    arguments = {"query": "Lena's birthday"}
+    build_handler(client, {"name": "memory.search", "connection_id": None})(arguments)
+    assert broker.requests[0]["path"] == "/tools/call"
+    assert broker.requests[0]["body"] == {"name": "memory.search", "arguments": arguments}
+
+
+def test_a_question_for_the_person_is_forwarded_to_the_broker_native_gate(client, broker):
+    arguments = {"question": "Which day suits you?", "choices": ["Tuesday", "Thursday"]}
+    build_handler(client, {"name": "ask_person", "connection_id": None})(arguments)
+    assert broker.requests[0]["path"] == "/tools/call"
+    assert broker.requests[0]["body"] == {"name": "ask_person", "arguments": arguments}
+
+
+# -- calling ------------------------------------------------------------------
+
+
+def test_learning_handler_forwards_to_the_proposal_endpoint_and_returns_its_reply(client, broker):
+    result = build_handler(client, {"name": "learning.propose", "connection_id": None})({})
+    assert result == {"status": "candidate_pending", "episode_id": "ep_recorded"}
+    assert broker.requests == [{
+        "method": "POST", "path": "/tools/learning/propose", "body": {}, "auth": "Bearer cap-token"
+    }]
+
+
+def test_a_dispatched_call_returns_the_receipt(client, broker):
+    handler = build_handler(client, CATALOG[1])
+    result = handler(query="invoices")
+
+    assert result["status"] == "succeeded"
+    assert result["action_id"] == ACTION
+    assert result["receipt"] == {"external_ref": "mid-1"}
+    proposal = broker.requests[0]
+    assert proposal["path"] == "/actions"
+    assert proposal["body"]["kind"] == "email.search"
+    # The connection comes from the catalog, never from the model's arguments.
+    assert proposal["body"]["connection_id"] == CONNECTION
+    assert proposal["body"]["payload"] == {"query": "invoices"}
+    assert proposal["body"]["client_ref"]
+
+
+def test_a_parked_action_tells_the_model_to_stop(client, broker):
+    broker.propose_response = {
+        "action_id": ACTION,
+        "status": "needs_approval",
+        "effect_class": "write_external",
+        "payload_hash": HASH,
+        "canonical_payload": {},
+        "requires_approval": True,
+        "approval_id": APPROVAL,
+    }
+    handler = build_handler(client, CATALOG[0])
+    result = handler(to=["a@example.com"], subject="hi", body="hello")
+
+    assert result == {
+        "status": "needs_approval",
+        "action_id": ACTION,
+        "approval_id": APPROVAL,
+        "payload_hash": HASH,
+        "instruction": END_TURN_INSTRUCTION,
+    }
+    # No receipt read: nothing has happened yet, so there is nothing to read.
+    assert [r["path"] for r in broker.requests] == ["/actions"]
+
+
+@pytest.mark.parametrize("name", ["ask_person", "say", "react", "job.wait", "search_tools", "load_tool",
+                                  "run.start", "run.delegate", "run.try", "intent.capture"])
+def test_a_helper_is_refused_the_parent_only_tools_and_the_parent_is_not(client, broker, monkeypatch, name):
+    """A delegated helper reports what the person needs; the parent decides."""
+    import openduet_runtime_hooks
+
+    monkeypatch.setattr(openduet_runtime_hooks, "in_helper", lambda: True)
+    refused = build_handler(client, {"name": name, "connection_id": None})({"text": "hello"})
+    assert refused["error"]["code"] == "parent_only"
+    assert broker.requests == []
+    monkeypatch.setattr(openduet_runtime_hooks, "in_helper", lambda: False)
+    if name == "say":
+        build_handler(client, {"name": name, "connection_id": None})({"text": "hello"})
+        assert broker.requests
+
+
+def test_a_helper_may_still_use_the_parents_other_broker_tools(client, broker, monkeypatch):
+    import openduet_runtime_hooks
+
+    monkeypatch.setattr(openduet_runtime_hooks, "in_helper", lambda: True)
+    assert build_handler(client, CATALOG[1])(query="invoices")["status"] == "succeeded"
+
+
+def test_an_action_a_helper_parks_goes_back_to_the_parent_and_the_helper_asks_nobody(client, broker, monkeypatch):
+    import openduet_runtime_hooks
+    from openduet_plugin import HELPER_PARKED_INSTRUCTION
+
+    broker.propose_response = {
+        "action_id": ACTION, "status": "needs_approval", "effect_class": "write_external",
+        "payload_hash": HASH, "canonical_payload": {}, "requires_approval": True, "approval_id": APPROVAL,
+    }
+    monkeypatch.setattr(openduet_runtime_hooks, "in_helper", lambda: True)
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="hi", body="hello")
+    assert result["status"] == "needs_approval"
+    assert result["instruction"] == HELPER_PARKED_INSTRUCTION
+    assert "ask_person" not in result["instruction"]
+    attached = json.loads(openduet_runtime_hooks.attach_helper_parked(json.dumps({"results": []})))
+    assert attached["awaiting_approval"] == [{"action_id": ACTION, "tool": "email.send"}]
+    assert "NOT happened" in attached["awaiting_approval_note"]
+    # Taken once: the next delegation starts with nothing parked.
+    assert openduet_runtime_hooks.attach_helper_parked("{}") == "{}"
+
+
+def test_requires_approval_alone_is_enough_to_park(client, broker):
+    broker.propose_response = {
+        "action_id": ACTION,
+        "status": "proposed",
+        "requires_approval": True,
+        "approval_id": APPROVAL,
+        "payload_hash": HASH,
+    }
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+    assert result["status"] == "needs_approval"
+
+
+def test_an_unknown_dispatch_is_never_presented_as_either_outcome(client, broker):
+    broker.propose_response = {"action_id": ACTION, "status": "unknown"}
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+
+    assert result["status"] == "unknown"
+    assert result["instruction"] == UNCERTAIN_INSTRUCTION
+    assert "receipt" not in result
+
+
+def test_an_unknown_step_on_its_own_computer_is_checked_not_put_to_the_owner(client, broker):
+    broker.propose_response = {"action_id": ACTION, "status": "unknown", "own_computer": True}
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+
+    assert result["status"] == "unknown"
+    assert result["instruction"] == OWN_COMPUTER_INSTRUCTION
+    assert "Check first" in result["instruction"] and "not asked" in result["instruction"]
+
+
+def test_a_failed_dispatch_says_so(client, broker):
+    broker.propose_response = {"action_id": ACTION, "status": "failed"}
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+    assert result["status"] == "failed"
+    assert "did not happen" in result["instruction"]
+
+
+def test_a_failed_or_denied_step_carries_the_brokers_reason(client, broker):
+    for status, message in (
+        ("failed", "This read failed: the mailbox refused the sign-in. It changed nothing."),
+        ("denied", "You denied this effect. It was not sent, and it will not be."),
+    ):
+        broker.propose_response = {"action_id": ACTION, "status": status, "message": message}
+        result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+        assert result["status"] == status
+        assert result["message"] == message
+        assert "did not happen" in result["instruction"]
+
+
+def test_a_broker_refusal_keeps_the_brokers_own_code(client, broker):
+    broker.status_code = 403
+    broker.error_body = {"error": {"code": "scope_denied", "message": "out of scope"}}
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+
+    assert result["status"] == "failed"
+    assert result["error"] == {"code": "scope_denied", "message": "out of scope"}
+
+
+def test_an_unreachable_broker_is_uncertain_not_failed():
+    # Nothing is listening on this port, so the request never got an answer and
+    # the plugin cannot say whether the effect happened.
+    client = BrokerClient(base_url="http://127.0.0.1:1", token="t", timeout=2)
+    result = build_handler(client, CATALOG[0])(to=["a@example.com"], subject="s", body="b")
+
+    assert result["status"] == "unknown"
+    assert result["instruction"] == UNCERTAIN_INSTRUCTION
+
+
+def test_a_catalog_entry_without_a_connection_is_refused(client):
+    handler = build_handler(client, {"name": "email.send", "connection_id": None})
+    assert handler(to=["a@example.com"])["error"]["code"] == "unknown_connection"
+
+
+def test_an_unreadable_receipt_does_not_turn_success_into_failure(client, broker, monkeypatch):
+    def explode(_action_id: str):
+        raise BrokerError("http_500", "receipt read failed")
+
+    monkeypatch.setattr(client, "action", explode)
+    result = build_handler(client, CATALOG[1])(query="x")
+    assert result["status"] == "succeeded"
+    assert "receipt" not in result
+
+
+def test_the_same_arguments_produce_the_same_client_ref(client, broker):
+    handler = build_handler(client, CATALOG[1])
+    handler(query="same")
+    handler(query="same")
+    handler(query="different")
+    refs = [r["body"]["client_ref"] for r in broker.requests if r["path"] == "/actions"]
+    assert refs[0] == refs[1]
+    assert refs[2] != refs[0]
+
+
+def test_the_handler_takes_the_arguments_as_one_positional_dict(client, broker):
+    # Hermes dispatches as handler(args, **kwargs) with the model's arguments in
+    # one positional dict (tools/registry.py:822). A keyword-only signature
+    # raises TypeError before the broker is called, and the model is told the
+    # tool is broken. The real engine caught this; the fake broker could not.
+    handler = build_handler(client, CATALOG[1])
+    result = handler({"query": "positional"})
+    assert result["status"] == "succeeded"
+    assert broker.requests[0]["body"]["payload"] == {"query": "positional"}
+
+
+def test_engine_execution_context_is_not_part_of_the_proposed_payload(client, broker):
+    # Pinned Hermes model_tools.py:758-767 passes model args separately from
+    # task/session ids and user_task. These kwargs are execution context, not
+    # fields of the tool's input schema or the content an owner approves.
+    handler = build_handler(client, CATALOG[1])
+    handler(
+        {"query": "positional", "session_id": "explicit-tool-argument"},
+        task_id="engine-job",
+        session_id="engine-session",
+        user_task=None,
+    )
+    assert broker.requests[0]["body"]["payload"] == {
+        "query": "positional",
+        "session_id": "explicit-tool-argument",
+    }
+
+
+def test_an_empty_argument_dict_does_not_forward_engine_context(client, broker):
+    build_handler(client, CATALOG[1])(
+        {}, task_id="engine-job", session_id="engine-session", user_task=None
+    )
+    assert broker.requests[0]["body"]["payload"] == {}
+
+
+def test_execution_context_cannot_change_a_proposal_reference(client, broker, monkeypatch):
+    monkeypatch.setenv("OPENDUET_JOB_ID", "same-durable-job")
+    handler = build_handler(client, CATALOG[1])
+    handler({"query": "same"}, task_id="first", session_id="first", user_task=None)
+    handler({"query": "same"}, task_id="second", session_id="second", user_task="different")
+    proposals = [r["body"] for r in broker.requests if r["path"] == "/actions"]
+    assert proposals[0]["payload"] == proposals[1]["payload"] == {"query": "same"}
+    assert proposals[0]["client_ref"] == proposals[1]["client_ref"]
+
+
+def test_the_handler_still_accepts_keyword_arguments(client, broker):
+    build_handler(client, CATALOG[1])(query="keyword")
+    assert broker.requests[0]["body"]["payload"] == {"query": "keyword"}
+
+
+def test_the_client_opens_no_socket_without_configuration():
+    with pytest.raises(BrokerError) as caught:
+        BrokerClient(base_url="", token="t").tools()
+    assert caught.value.code == "not_configured"
+
+
+@pytest.mark.parametrize("reason", ["stale_epoch", "budget_exceeded"])
+def test_admission_before_execution(client, broker, tmp_path, monkeypatch, reason):
+    monkeypatch.setenv("OPENDUET_WORK_DIR", str(tmp_path))
+    # The catalog was already delivered; fencing or budget exhaustion happened later.
+    tool = {"name": "exec.python", "connection_id": CONNECTION, "execution": "in_cell"}
+    handler = build_handler(client, tool)
+    broker.status_code = 403
+    broker.error_body = {"error": {"code": reason, "message": "refused before execution"}}
+    result = handler(code="open('marker', 'w').write('ran')")
+    assert result["error"]["code"] == reason
+    assert not (tmp_path / "marker").exists(), "command ran before admission"
+
+
+def test_admission_reserves_stable_intent_then_settles(client, broker, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENDUET_WORK_DIR", str(tmp_path))
+    broker.propose_response = {"action_id": ACTION, "status": "admitted"}
+    previous = broker.handle
+    claimed = False
+
+    def handle(method, path, body, auth):
+        nonlocal claimed
+        if path.endswith("/execution/start"):
+            execute = not claimed
+            claimed = True
+            return 200, {"execute": execute}
+        if path.endswith("/execution/settle"):
+            assert (tmp_path / "marker").read_text() == "ran"
+            broker.settled = body["record"]
+            return 200, {"action": {"status": "succeeded", "receipt": {"recorded": True}}}
+        assert not (tmp_path / "marker").exists() or claimed
+        return previous(method, path, body, auth)
+
+    broker.handle = handle
+    handler = build_handler(client, {"name": "exec.python", "connection_id": CONNECTION, "execution": "in_cell"})
+    args = {"code": "open('marker', 'a').write('ran')"}
+    assert handler(args)["status"] == "succeeded"
+    handler(args)
+    assert (tmp_path / "marker").read_text() == "ran"
+    assert broker.settled["exit_code"] == 0
+    proposals = [r["body"] for r in broker.requests if r["path"] == "/actions"]
+    assert proposals[0]["payload"] == {"intent": args}
+    assert proposals[0]["client_ref"] == proposals[1]["client_ref"]
+
+
+def test_registered_react_forwards_to_reactions_with_the_attempt_token(client, broker):
+    broker.catalog = [{
+        "name": "react", "description": "Acknowledge a message", "effect_class": "read",
+        "connection_id": None,
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}, "emoji": {"type": "string"}},
+        },
+    }]
+    ctx = RecordingContext()
+    assert register(ctx, client) == ["react"]
+    arguments = {"message_id": "42", "emoji": "👍"}
+    # The pinned Hermes registry consumes JSON text, so the broker result is a string.
+    result = json.loads(ctx.tools[0]["handler"](arguments))
+    assert result == {"status": "succeeded", "reaction": arguments}
+    assert broker.requests[-1] == {
+        "method": "POST", "path": "/reactions", "body": arguments, "auth": "Bearer cap-token",
+    }
+    assert [request["path"] for request in broker.requests] == ["/tools", "/reactions"]
+
+
+def test_react_preserves_the_brokers_same_job_refusal(client, broker):
+    broker.status_code = 404
+    broker.error_body = {"error": {"code": "action_not_found", "message": "No such message"}}
+    result = build_handler(client, {"name": "react", "connection_id": None})(
+        {"message_id": "99", "emoji": "👍"}
+    )
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "action_not_found"
+    assert broker.requests[0]["path"] == "/reactions"
+
+
+def test_invalid_schema_stops_repeated_broker_requests(client, broker):
+    broker.status_code = 409
+    broker.error_body = {"error": {"code": "schema_invalid", "message": "Tool schema cannot compile"}}
+    handler = build_handler(client, CATALOG[1])
+    first = handler(query="first")
+    second = handler(query="different arguments cannot repair a schema")
+    assert first == second
+    assert first["retryable"] is False
+    assert "Do not retry" in first["instruction"]
+    assert len(broker.requests) == 1
+
+
+RESUME_TOOL = {
+    "name": "resume_action",
+    "description": "Carry out an approved action.",
+    "effect_class": "write_external",
+    "connection_id": None,
+    "input_schema": {"type": "object", "properties": {"action_id": {"type": "string"}}},
+}
+
+
+def test_resume_sends_only_the_action_id_and_returns_the_receipt(client, broker):
+    result = build_handler(client, RESUME_TOOL)({"action_id": ACTION, "body": "retyped bytes"})
+
+    assert result == {
+        "status": "succeeded",
+        "action_id": ACTION,
+        "receipt": {"external_ref": "mid-1"},
+    }
+    resumed = broker.requests[0]
+    assert resumed["method"] == "POST"
+    assert resumed["path"] == f"/actions/{ACTION}/resume"
+    # Nothing the model typed can travel: the broker replays the bytes it stored.
+    assert resumed["body"] == {}
+    assert [r["path"] for r in broker.requests] == [f"/actions/{ACTION}/resume", f"/actions/{ACTION}"]
+
+
+def test_resume_reports_an_undecided_or_unconfirmed_action_as_it_stands(client, broker):
+    handler = build_handler(client, RESUME_TOOL)
+    broker.propose_response = {
+        "action_id": ACTION, "status": "needs_approval", "requires_approval": True,
+        "approval_id": APPROVAL, "payload_hash": HASH,
+    }
+    assert handler({"action_id": ACTION})["instruction"] == END_TURN_INSTRUCTION
+    broker.propose_response = {"action_id": ACTION, "status": "unknown"}
+    assert handler({"action_id": ACTION})["instruction"] == UNCERTAIN_INSTRUCTION
+
+
+def test_resume_keeps_the_brokers_refusal_and_needs_an_action_id(client, broker):
+    handler = build_handler(client, RESUME_TOOL)
+    missing = handler({})
+    assert missing["error"]["code"] == "payload_invalid"
+    assert broker.requests == []
+    broker.status_code = 403
+    broker.error_body = {"error": {"code": "revision_mismatch", "message": "The job changed"}}
+    refused = handler({"action_id": ACTION})
+    assert refused["status"] == "failed"
+    assert refused["error"]["code"] == "revision_mismatch"
+
+
+def test_a_sandbox_command_waits_for_the_brokers_whole_budget():
+    """terminal.run is run by the broker before it answers; the ordinary
+    round-trip timeout would give up while the command still runs."""
+    from openduet_plugin.terminal_backend import ANSWER_SLACK_SECONDS, SESSION_MARGIN_SECONDS
+
+    class Recording:
+        def __init__(self) -> None:
+            self.calls: List[Dict[str, Any]] = []
+
+        def propose(self, **call: Any) -> Dict[str, Any]:
+            self.calls.append(call)
+            return {"action_id": "act_1", "status": "failed", "message": "no"}
+
+        def action(self, action_id: str) -> Dict[str, Any]:
+            return {}
+
+    recording = Recording()
+    tool = {"name": "terminal.run", "connection_id": "con_sandbox", "effect_class": "write_reversible"}
+    handler = build_handler(recording, tool)  # type: ignore[arg-type]
+    handler({"command": "bun install"})
+    handler({"command": "make", "timeout_ms": 540_000})
+    default, asked = (call["timeout"] for call in recording.calls)
+    assert default == 300 + SESSION_MARGIN_SECONDS + ANSWER_SLACK_SECONDS
+    assert asked == 540 + SESSION_MARGIN_SECONDS + ANSWER_SLACK_SECONDS
+
+    other = Recording()
+    build_handler(other, {"name": "email.send", "connection_id": "con_mail"})({"to": "a"})  # type: ignore[arg-type]
+    # Past the broker's own default deadline, so its recorded outcome comes back.
+    assert other.calls[0]["timeout"] == 30 + ANSWER_SLACK_SECONDS
+
+
+def test_every_call_waits_for_its_tools_deadline_and_no_longer_than_the_brokers_limit():
+    from openduet_plugin import action_wait_seconds
+    from openduet_plugin.terminal_backend import ANSWER_SLACK_SECONDS
+
+    search = {"name": "web.search", "connection_id": "con_web", "deadline_ms": 90_000}
+    assert action_wait_seconds(search, {}) == 90 + ANSWER_SLACK_SECONDS
+    # A call that names its own timeout may take that long as well.
+    run = {"name": "device.run", "connection_id": "con_pc", "deadline_ms": 50_000}
+    assert action_wait_seconds(run, {"timeout_ms": 120_000}) == 120 + ANSWER_SLACK_SECONDS
+    # Nonsense never shortens the wait below the broker's default, nor stretches it past its limit.
+    assert action_wait_seconds({"deadline_ms": True}, {"timeout_ms": -5}) == 30 + ANSWER_SLACK_SECONDS
+    assert action_wait_seconds({"deadline_ms": 10**9}, {}) == 15 * 60 + ANSWER_SLACK_SECONDS
+
+
+class _NoAnswer:
+    """A broker that never answered in time."""
+
+    def __init__(self, code: str = "timed_out") -> None:
+        self.code = code
+
+    def propose(self, **_call: Any) -> Dict[str, Any]:
+        raise BrokerError(self.code, "No answer came within 60 seconds.")
+
+
+@pytest.mark.parametrize("code", ["timed_out", "unreachable"])
+def test_a_read_with_no_answer_changed_nothing_and_may_be_tried_again(code):
+    from openduet_plugin.results import NO_ANSWER_READ_INSTRUCTION
+
+    result = build_handler(_NoAnswer(code), CATALOG[1])({"query": "x"})  # type: ignore[arg-type]
+    assert result["status"] == "failed"
+    assert result["retryable"] is True
+    assert result["error"]["code"] == code
+    assert result["instruction"] == NO_ANSWER_READ_INSTRUCTION
+
+
+def test_a_step_with_an_effect_that_timed_out_is_unconfirmed_and_not_repeated():
+    from openduet_plugin.results import NO_ANSWER_INSTRUCTION
+
+    handler = build_handler(_NoAnswer(), CATALOG[0])  # type: ignore[arg-type]
+    result = handler({"to": ["a@example.com"], "subject": "s", "body": "b"})
+    assert result["status"] == "unknown"
+    assert result["error"]["code"] == "timed_out"
+    assert result["instruction"] == NO_ANSWER_INSTRUCTION
+    assert "Do NOT repeat it" in NO_ANSWER_INSTRUCTION
+
+
+def test_a_broker_slower_than_the_wait_is_reported_as_timed_out(broker):
+    import time
+
+    original = broker.handle
+
+    def slow(*args: Any):
+        time.sleep(1.0)
+        return original(*args)
+
+    broker.handle = slow
+    client = BrokerClient(base_url=broker.base_url, token="t", timeout=0.2)
+    with pytest.raises(BrokerError) as raised:
+        client.tools()
+    assert raised.value.code == "timed_out"
+
+
+def test_what_the_model_is_told_calls_them_the_person_never_the_owner():
+    from openduet_plugin import results
+
+    told = [
+        results.END_TURN_INSTRUCTION,
+        results.FAILURE_INSTRUCTION,
+        results.UNCERTAIN_INSTRUCTION,
+        results.OWN_COMPUTER_INSTRUCTION,
+        results.NO_ANSWER_INSTRUCTION,
+        results.NO_ANSWER_READ_INSTRUCTION,
+    ]
+    for text in told:
+        assert "owner" not in text.lower()
+    assert "person" in results.END_TURN_INSTRUCTION

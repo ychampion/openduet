@@ -1,0 +1,4490 @@
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  type Action,
+  type ActionStatus,
+  type ApprovalDecisionRequest,
+  BROKER_TIMEOUT_MS,
+  type CapabilityClaims,
+  type ConnectorFault,
+  type ConnectorTool,
+  canonicalizePayload,
+  type DispatchResult,
+  dispatchResult,
+  type EffectProposalResponse,
+  type ExecutionSettlement,
+  executionIntent,
+  findTool,
+  hashOriginWarnings,
+  humanText,
+  INTENT_CAPTURE_TOOL,
+  intentKey,
+  isTrustGatedEffect,
+  type JsonObject,
+  jobConstraints,
+  MEMORY_SEARCH_TOOL,
+  type OriginWarning,
+  originWarnings,
+  type ProposeActionRequest,
+  type ReactRequest,
+  type Receipt,
+  RUN_TOOLS,
+  reactRequest,
+  repairCounters,
+  repairTrace,
+  type ToolSpec,
+  type VerifyResult,
+  verifyResult,
+} from '@openduet/contracts';
+import { Ajv, type ValidateFunction } from 'ajv';
+import { Ajv2020 } from 'ajv/dist/2020.js';
+import type { PgBoss } from 'pg-boss';
+import type { ParameterOrJSON, Sql, TransactionSql } from 'postgres';
+import { ZodError } from 'zod';
+import { ServiceError } from '../api/errors.ts';
+import { asksAfterResponses } from '../apps/response-guard.ts';
+import { REACT_TOOL, supersededExecution } from '../connectors/catalog.ts';
+import {
+  asConnectorFault,
+  type ConnectorDescription,
+  type RepairAttemptContext,
+  unclassifiedFault,
+} from '../connectors/faults.ts';
+import { checkConnectionGeneration } from '../connectors/generation.ts';
+import {
+  type Connector,
+  type ConnectorContext,
+  connectorAllowsAudience,
+} from '../connectors/types.ts';
+import { databaseUnreachable, failureMessage } from '../db/sweep-failure.ts';
+import { isEgressTool } from '../egress/adapters/types.ts';
+import { agentAccess, computerTool, directSend } from '../experience/access.ts';
+import { plainText, tooLongToAsk } from '../experience/projectors.ts';
+import { appendToolTrace, heldSearchCall, suggestedStepCall } from '../experience/tools.ts';
+import { turnSpoke } from '../gateway/turn-notes.ts';
+import { type AttemptWake, attemptQueue } from '../jobs/queue.ts';
+import { connectionServesJob, jobConnectionAudience } from '../jobs/scopes.ts';
+import { UNSETTLED_OPTIONS } from '../jobs/unsettled.ts';
+import { OUTDATED_NOTE } from '../jobs/withdraw.ts';
+import { assistantName, instanceName } from '../names.ts';
+import { PathRefusal, routeEffect, unsettledBefore } from '../paths/gate.ts';
+import { recordPathOutcome, taskKindOf } from '../paths/registry.ts';
+import { jobVisibleTo } from '../principals/authority.ts';
+import { mayDecide, roomAuthorityOf } from '../rooms/approvals.ts';
+import type { SandboxRun, TrySandbox } from '../runs/try.ts';
+import { closedComputerStep } from '../sandbox/closed-step.ts';
+import {
+  connectorDenied,
+  connectorRefusal,
+  spaceRulesFor,
+  toolDenied,
+  toolRefusal,
+} from '../spaces/policy.ts';
+import { storageRefusal } from '../storage/per-person.ts';
+import { recordGeneratedArtifact } from './artifacts.ts';
+import { ASK_PERSON_TOOL, requestPersonQuestion } from './ask-person.ts';
+import {
+  bindEffect,
+  type EffectAuthorityResolver,
+  loadBinding,
+  requireMatchingBinding,
+  resolveEffectAuthority,
+  saveBinding,
+} from './authority.ts';
+import {
+  AUTO_REVIEW_DEFAULTS,
+  type AutoReviewOptions,
+  actionReviewView,
+  CHANGES_EXISTING_EVENT,
+  changesPersonFiles,
+  deciding,
+  escalationReason,
+  loadApprovalSettings,
+  OUTSIDE_SEND_REASON,
+  reachesOnlyPublisher,
+  recordReview,
+  reviewerApproves,
+  reviewInput,
+  reviewLimit,
+  reviewTier,
+  submitRisk,
+  type TierDecision,
+} from './auto-review.ts';
+import {
+  type AutonomyLevel,
+  askOnce,
+  defaultLevels,
+  draftKindOf,
+  keepSaidLevels,
+  LEVEL_NAMES,
+  levelsFor,
+  personOf,
+  roomWork,
+  sendKindOf,
+  sendsFromChat,
+  TASK_NAMES,
+  type TaskKind,
+  type TaskLevel,
+} from './autonomy.ts';
+import { type ReservationRequest, reserveLocked } from './budget.ts';
+import {
+  type CalendarCheck,
+  calendarConcern,
+  OWN_CALENDAR_CHANGES,
+  spansOf,
+  windowOf,
+} from './calendar-check.ts';
+import {
+  type CatalogOptions,
+  MAX_DISPATCH_BUDGET_MS,
+  resolveToolAlias,
+  SKILL_READ_TOOL,
+  ToolCatalog,
+} from './catalog.ts';
+import { CHASE_FOLLOW_UP_TOOL, type ChaseFollowUpPort } from './chase.ts';
+import { COMPOSE_TOOL, type ComposeExecutor, ComposeService } from './compose.ts';
+import { grantsConnectionScopes } from './connection-scopes.ts';
+import { actionKinds, type DontMatch, dontRulesFor, matchDontRule } from './dont-rules.ts';
+import { BrokerFault, inputProblem } from './errors.ts';
+import type { BrokerOperations } from './http.ts';
+import { humanPayload, typedInConversation } from './human-payload.ts';
+import { type MoneyMove, moneyMove } from './money.ts';
+import {
+  actionWords,
+  type Confidence,
+  gatherEvidence,
+  judge,
+  type MessagesToOthers,
+  PROACTIVE_DEFAULT_THRESHOLD,
+  proactiveAttempt,
+  reaches,
+} from './proactive.ts';
+import {
+  actionFromRow,
+  appendEvent,
+  checkAttempt,
+  type LockedJob,
+  loadAction,
+  lockJob,
+  type Query,
+  recordId,
+} from './records.ts';
+import { type MappingProposal, type RepairPorts, type RepairRun, runRepair } from './repair.ts';
+import { RESUME_ACTION_TOOL } from './resume.ts';
+import { eventBefore, heldKind, heldUntil, reversibleProposal } from './reversals.ts';
+import { toldToSend } from './told.ts';
+
+/** Why a message went without a card: the person's own words in this turn. */
+const TOLD_TO_SEND = 'You said to send it in your message.';
+
+/** Which level for a kind of task applied, in one sentence for its receipt. */
+function levelLine(level: TaskLevel): string {
+  const name = `“${LEVEL_NAMES[level.level].short}”`;
+  return level.chosen
+    ? `Your setting for ${TASK_NAMES[level.kind].said}: ${name}.`
+    : `The default for ${TASK_NAMES[level.kind].said}: ${name}.`;
+}
+
+/** A judgement whose reason also says which level applied. */
+const withSetting = (confidence: Confidence, setting: string): Confidence => ({
+  ...confidence,
+  reason: `${confidence.reason} ${setting}`,
+});
+
+import { type ReviewInput, type ReviewVerdict, reviewWithin } from './reviewer.ts';
+import { RUNTIME_WAIT_TOOL, requestRuntimeWait } from './runtime-wait.ts';
+import { OWN_COMPUTER_PICTURE_TOOLS, readScreenshot, SCREENSHOT_TOOLS } from './screenshots.ts';
+import { STEP_UP_NEEDED, spendStepUp, stepUpHolds } from './step-up.ts';
+import {
+  collectOriginFields,
+  createTableTrustResolver,
+  resolveOriginWarnings,
+  type TrustResolver,
+} from './trust.ts';
+
+type ConnectorResolver = { get(connectionId: string): Connector | undefined };
+/** What a runtime is told instead of a paired computer's picture it may not show. */
+export const DEVICE_SCREEN_WITHHELD =
+  'The screenshot was taken and is kept private: this computer does not let cloud models see its screen (Settings > Devices). It is not a file you can open. Say what you could not see; do not guess at it or look for it.';
+
+/** A screenshot's picture for a runtime, or why it is kept from the model. */
+export type ScreenshotPicture =
+  | { media_type: 'image/png'; data: string }
+  | { withheld: true; reason: string };
+
+export type BrokerOptions = {
+  sql: Sql;
+  connectors: ConnectorResolver;
+  /**
+   * Where job workspaces live, as the service sees them. A screenshot the
+   * runtime asks for is read from here by the service, so it does not depend
+   * on the runtime's own view of the files.
+   */
+  workRoot?: string;
+  /** The started queue shares this Postgres; its send joins the state transaction. */
+  boss?: PgBoss;
+  dispatchTimeoutMs?: number;
+  /** Trusted connector pricing, never a cost supplied by the model. */
+  estimateSpend?: (action: Action) => number;
+  resolveAuthority?: EffectAuthorityResolver;
+  /**
+   * Called inside the transaction that persists a successful receipt, with the
+   * receipt already written. This is where a file that declared an expectation
+   * becomes an artifact row with its validation results beside it. Optional:
+   * a broker with no recorder still dispatches, it just records nothing extra.
+   */
+  recordArtifact?: (
+    tx: Query,
+    input: { job: LockedJob; action: Action; receipt: Receipt },
+  ) => Promise<void>;
+  /**
+   * The most one person may keep, in bytes (`OPENDUET_STORAGE_PER_PERSON_MB`).
+   * Left out or null, no step is refused for it; what each step keeps is
+   * recorded either way.
+   */
+  storagePerPerson?: number | null;
+  /**
+   * Where the values in a payload came from. Start-up passes the memory core's
+   * resolver; without one the broker asks nobody and warns about nothing.
+   */
+  resolveTrust?: TrustResolver;
+  /**
+   * Whether a standing grant already covers this effect. v0.1 ships none, so
+   * the default is no grant and every external send is approved once. A grant
+   * only ever removes the approval when nothing about the payload is in doubt.
+   */
+  resolveStandingGrant?: StandingGrantResolver;
+  /**
+   * A grant the person gave inside one job, for values they have already seen
+   * and approved there: a chase's follow-ups to the address its first message
+   * went to. It is the only grant asked when a payload carries doubts, and it
+   * is told what they are.
+   */
+  resolveScopedGrant?: ScopedGrantResolver;
+  /** Called in the transaction that records an action as succeeded. */
+  recordStandingScope?: (tx: Query, action: Action) => Promise<void>;
+  /** A chase's covered follow-up, offered as `chase.follow_up` while its scope holds. */
+  chaseFollowUp?: ChaseFollowUpPort;
+  /** Long work's tools, offered to the jobs whose kind they belong to. */
+  runs?: {
+    call(claims: CapabilityClaims, name: string, input: unknown): Promise<unknown>;
+    /** `run.try`: the commands run through `sandbox`, the record is written from their output. */
+    measure?(claims: CapabilityClaims, input: unknown, sandbox: TrySandbox): Promise<unknown>;
+  };
+  /** Keeping hold of what the person wants done, offered to their conversations. */
+  intents?: {
+    capture(claims: CapabilityClaims, input: unknown): Promise<unknown>;
+  };
+  /**
+   * `memory.search`: everything memory keeps about the person, searched under
+   * the attempt's own memory rules. Left out, the tool is not offered.
+   */
+  memorySearch?: (claims: CapabilityClaims, input: unknown) => Promise<unknown>;
+  /** Approval lifetime is service policy, never a value supplied by a tool caller. */
+  approvalTtlMs?: number;
+  /**
+   * Re-open an output that failed its own validation and produce a revised
+   * payload, or nothing. Absent, a bad output stops at `needs_input`: a file
+   * existing is never a delivery, and nothing here invents a revision.
+   */
+  reviseOutput?: (input: { action: Action; fault: ConnectorFault }) => Promise<JsonObject | null>;
+  catalog?: Pick<CatalogOptions, 'coreTokenBudget' | 'skills'>;
+  /** The execution cell supplies this; omission keeps composition unavailable. */
+  composeExecutor?: ComposeExecutor;
+  /** The service runner must finalize its attempt before changing the job state. */
+  deferApprovalWaitToRunner?: boolean;
+  /**
+   * Auto-review: the person's approval settings decide which actions go ahead
+   * without asking them. Absent, every action that needs approval asks, as
+   * before; the service always passes it.
+   */
+  autoReview?: AutoReviewOptions;
+  /**
+   * How long a message waits after it is cleared to go, so the person can
+   * still cancel it (undo send). Zero sends at once. The service sets it from
+   * `OPENDUET_SEND_HOLD_SECONDS`.
+   */
+  sendHoldMs?: number;
+  /**
+   * Work nobody is waiting on that would reach someone outside OpenDuet goes
+   * ahead on its own from this confidence (0 to 1) and is otherwise left as a
+   * suggestion (`proactive.ts`). `OPENDUET_PROACTIVE_CONFIDENCE`, 0.6 by default.
+   */
+  proactiveThreshold?: number;
+  /**
+   * Whether such work may send a chat app's message to others on that
+   * confidence, or keeps it a suggestion always. `OPENDUET_MESSAGES_TO_OTHERS`.
+   */
+  messagesToOthers?: MessagesToOthers;
+};
+
+export type StandingGrantInput = {
+  job: LockedJob;
+  action: Action;
+  tool: ConnectorTool;
+  phase: 'proposal' | 'admission' | 'execution';
+  /** The doubts about the payload's values; only a scoped grant ever sees any. */
+  warnings?: OriginWarning[];
+};
+export type StandingGrantResolver = (tx: Query, input: StandingGrantInput) => Promise<boolean>;
+/**
+ * A grant scoped to one job answers with the approval that authorizes the
+ * effect: the person's decision on values they already saw, whose recorded
+ * doubts must be exactly this payload's. Null is no grant.
+ */
+export type ScopedGrantResolver = (tx: Query, input: StandingGrantInput) => Promise<string | null>;
+
+/** What admission decided about one action before it reserved anything. */
+type Admissibility = {
+  warnings: OriginWarning[];
+  warnings_hash: string;
+  standing_grant: boolean;
+  requires_approval: boolean;
+  /** The approval a scoped grant rests on, which admission records as the authorization. */
+  authorized_by: string | null;
+  /**
+   * What auto-review makes of an action that would ask the person: approved by
+   * a fixed rule (the sandbox's, or the one for publishing apps), put to the
+   * reviewer, or left for the person to decide. Null when auto-review is off or
+   * the action asks nobody anyway.
+   */
+  auto: { tier: TierDecision; outcome: 'policy_approved' | 'review' | 'person' } | null;
+  /**
+   * Why the action moves money, or null. A money move always asks, nothing
+   * covers it, and its Allow counts only with the person's step-up.
+   */
+  money: MoneyMove | null;
+  /** The person's own don't-rule this action goes against, which its card quotes. */
+  dont: DontMatch | null;
+  /**
+   * For work nobody is waiting on that reaches someone outside OpenDuet: how
+   * likely the person wants it, from what they said before, and whether that
+   * lets it go. Null for anything else.
+   */
+  proactive: Confidence | null;
+  /**
+   * For a plain send to someone outside: its kind of task and the person's
+   * level for it, which decided whether it went on its own (`autonomy.ts`).
+   */
+  task: (TaskLevel & { personId: string | null }) | null;
+};
+
+/** The first-time card for a kind of task, when this proposal should ask it. */
+type TaskAsk = { personId: string | null; kind: TaskKind; level: AutonomyLevel };
+
+/**
+ * Proactive work that is not likely enough to be wanted: nothing is sent, no
+ * card is put in front of the person, and the conversation keeps it as a
+ * quiet suggestion.
+ */
+export class ProactiveHold extends BrokerFault {
+  constructor(
+    readonly confidence: Confidence,
+    /** The kind of task, to ask the person about once if they have not chosen. */
+    readonly ask: TaskAsk | null = null,
+  ) {
+    super(
+      'scope_denied',
+      `Not done: nobody asked for this now, and what the person said before does not make it likely they want it (confidence ${confidence.score.toFixed(2)}; it goes ahead on its own from ${confidence.threshold.toFixed(2)}). It is left for them as a suggestion. Do not try it another way.`,
+    );
+  }
+}
+
+/** A review to run once the proposal's transaction has committed. */
+type PendingReview = {
+  action_id: string;
+  job_id: string;
+  space_id: string;
+  tier: TierDecision;
+  input: ReviewInput;
+};
+
+const question = `${assistantName()} cannot confirm whether this was sent. Check the destination, then mark it.`;
+/** What resuming an approved change from the command line says instead of sending it. */
+export const EGRESS_RERUN =
+  'Approved. This change is made by a command in your computer, not resent from here: run the same command again, unchanged, and it goes through once.';
+/**
+ * A dispatch that ended without an answer. A read changes nothing, so it simply
+ * failed and can be tried again; anything else may have landed and is unknown.
+ */
+const uncertainResult = (
+  readOnly: boolean,
+  reason: string,
+  unknownReason = reason,
+): DispatchResult =>
+  readOnly
+    ? { outcome: 'failed', reason, retryable: true }
+    : { outcome: 'unknown', reason: unknownReason };
+
+/** Settled by the owner's answer rather than by evidence, so later evidence still counts. */
+const ownerAnswered = (action: Action) =>
+  ['succeeded', 'failed'].includes(action.status) &&
+  (action.reconciliation as Record<string, unknown> | null)?.decided_by === 'owner';
+
+/** The sandbox tool a measured try's commands are proposed as. */
+const TRY_TOOL_KIND = 'terminal.run';
+
+/** What a person's answer was recorded as before answers named the person. */
+const LEGACY_PERSON_DECISION = 'owner';
+
+/** The principal a job belongs to; one from before principals is the setup owner's. */
+async function jobPrincipal(tx: Query, job: LockedJob): Promise<string> {
+  if (job.principal_id) return job.principal_id;
+  const [row] = await tx`select id from owner limit 1`;
+  return String(row?.id ?? LEGACY_PERSON_DECISION);
+}
+
+/** Whether a space is one person's own, rather than a room everyone in it shares. */
+async function personalSpace(tx: Query, spaceId: string): Promise<boolean> {
+  const [row] = await tx`select kind from space where id = ${spaceId}`;
+  return row?.kind === 'personal';
+}
+
+/** Job states after which none of the job's actions can run. */
+const ENDED_JOB_STATES = new Set(['cancelled', 'failed', 'completed']);
+
+/**
+ * Refusals that leave an approved action unable ever to run: the binding or
+ * the job revision moved, or the approval expired. Each needs a newly reviewed
+ * action. A scope refusal is left out: access can come back.
+ */
+const SPENT_APPROVAL_FAULTS: ReadonlySet<string> = new Set([
+  'approval_hash_mismatch',
+  'approval_required',
+  'revision_mismatch',
+]);
+/** The longest classification waits for a calendar to say who an event's guests are. */
+const EXISTING_GUESTS_TIMEOUT_MS = 5_000;
+/** How long a connector's read before a proposal may take; see `readAhead`. */
+const AHEAD_TIMEOUT_MS = 10_000;
+/** `work`, or a rejection once `ms` have passed. */
+async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+/**
+ * What a calendar change's own calendar says, taken before a job lock (see
+ * `guestsAhead`): the guests of the event it rewrites, and what the time it
+ * touches holds. A change missing from `calendar` was not checked; one mapped
+ * to null could not be.
+ */
+type GuestCounts = {
+  guests: ReadonlyMap<string, number>;
+  calendar: ReadonlyMap<string, CalendarCheck | null>;
+};
+const NO_GUESTS: GuestCounts = { guests: new Map(), calendar: new Map() };
+/** One calendar change: its connection, its event and the times it names. */
+const changeKey = (connectionId: string, payload: unknown) => {
+  const value = (payload ?? {}) as Record<string, unknown>;
+  return `${connectionId}:${JSON.stringify([value.uid ?? null, value.etag ?? null, value.start ?? null, value.end ?? null])}`;
+};
+/** One event of one calendar connection: the change's connection and the uid it rewrites. */
+const guestKey = (connectionId: string, payload: unknown) =>
+  `${connectionId}:${JSON.stringify((payload as { uid?: unknown } | null)?.uid ?? null)}`;
+/** The limits a caller set, so an unset one keeps its default. */
+const definedOnly = (options: AutoReviewOptions) => ({
+  ...(options.hourlyLimit === undefined ? {} : { hourlyLimit: options.hourlyLimit }),
+  ...(options.breakerRun === undefined ? {} : { breakerRun: options.breakerRun }),
+  ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+});
+const needsApproval = (tool: ConnectorTool) =>
+  tool.requires_approval || tool.effect_class === 'write_external' || tool.effect_class === 'spend';
+
+const untrustedOrigin = (warnings: OriginWarning[]) =>
+  `This effect uses ${warnings.length === 1 ? 'a value' : 'values'} ${assistantName()} cannot vouch for: ` +
+  `${warnings.map((warning) => `${warning.field} (${warning.origin_trust})`).join(', ')}. ` +
+  'It needs your approval with that in front of you, whatever was agreed before.';
+
+/**
+ * The sentence a tool result carries. Built from the record, so a second
+ * proposal of a send that already happened names the receipt, and a second
+ * proposal of a send nobody can confirm says exactly that instead of retrying.
+ */
+/** What the agent is told about a step on its own computer whose outcome is not known. */
+export const OWN_COMPUTER_UNKNOWN =
+  "Its result did not come back from the agent's own computer, so whether it happened is not known. It was not run again, and the person is not asked. Check before trying again: take a screenshot, read the page, or look for the files or output the command would have left.";
+
+export function dispositionMessage(
+  action: Action,
+  repeated: boolean,
+  /** The action ran on the agent's own computer, so the agent checks an open outcome itself. */
+  ownComputer = false,
+  /** The action is a message waiting out its hold. */
+  held = false,
+): string {
+  const receiptRef = (action.receipt?.external_ref as string | null | undefined) ?? action.id;
+  const already = repeated ? 'already ' : '';
+  switch (action.status) {
+    case 'proposed':
+      return `Proposed. Nothing has left ${instanceName()} yet.`;
+    case 'needs_approval':
+      return `This effect is ${already}waiting for your approval. Nothing has been sent.`;
+    case 'approved':
+      return `This effect is ${already}approved and waiting to be admitted. Nothing has been sent.`;
+    case 'denied':
+      return 'You denied this effect. It was not sent, and it will not be.';
+    case 'admitted':
+      // A message waits a few seconds before it goes, so the person can cancel it.
+      if (held)
+        return `This message is ${already}held and sends at ${action.retry_after_at} unless the person cancels it first. Nothing has left ${instanceName()} yet; do not send it again.`;
+      return `This effect is ${already}admitted and has not been dispatched yet.`;
+    case 'dispatched':
+      return `This effect was ${already}dispatched and the result has not come back yet.`;
+    case 'succeeded':
+      return `This effect ${already}succeeded at ${action.resolved_at ?? action.created_at}, receipt ${receiptRef}. Nothing was sent again.`;
+    case 'failed': {
+      // The reason is written by the broker or the connector, never by the model,
+      // and without it a model can only guess why and retry blind.
+      const { reason, retryable } =
+        (action.reconciliation as { reason?: unknown; retryable?: unknown } | null) ?? {};
+      const why = typeof reason === 'string' && reason ? `: ${reason}` : '';
+      if (action.effect_class === 'read')
+        return `This read ${already}failed${why}. It changed nothing, so it can be tried again or done another way.`;
+      const again = retryable === true ? ' It did not take effect, so it can be tried again.' : '';
+      return `This effect ${already}failed at ${action.resolved_at ?? action.created_at}${why}. Nothing was sent again.${again}`;
+    }
+    case 'unknown':
+      if (ownComputer) return OWN_COMPUTER_UNKNOWN;
+      return `${question} It was ${already}attempted at ${action.dispatched_at ?? action.created_at} and was not sent again.`;
+    case 'unresolved':
+      if (ownComputer) return OWN_COMPUTER_UNKNOWN;
+      return `${question} Verification could not decide, and it was not sent again.`;
+  }
+}
+
+export class BrokerService implements BrokerOperations {
+  readonly sql: Sql;
+  readonly discovery: ToolCatalog;
+  readonly compose?: ComposeService;
+  private readonly validator = new Ajv({ strict: false, allErrors: false, addUsedSchema: false });
+  private readonly validator2020 = new Ajv2020({
+    strict: false,
+    allErrors: false,
+    addUsedSchema: false,
+  });
+  private readonly dispatchTimeoutMs: number;
+  /** Dispatches this process sent and is still waiting on, by action id. */
+  private readonly inFlight = new Set<string>();
+  /**
+   * Hand the work to the person in the agent's browser, when the path policy
+   * sends a browser submit to them rather than trying it again.
+   */
+  onHandToPerson?: (
+    scope: { space_id: string; job_id: string },
+    sessionId: string,
+    input: { reason: 'path'; service: string; operation: string },
+  ) => Promise<unknown>;
+
+  constructor(private readonly options: BrokerOptions) {
+    this.sql = options.sql;
+    this.discovery = new ToolCatalog({
+      sql: options.sql,
+      connectors: options.connectors,
+      ...options.catalog,
+      nativeTools: [
+        REACT_TOOL,
+        RUNTIME_WAIT_TOOL,
+        ASK_PERSON_TOOL,
+        RESUME_ACTION_TOOL,
+        SKILL_READ_TOOL,
+        ...(options.composeExecutor ? [COMPOSE_TOOL] : []),
+        ...(options.chaseFollowUp ? [CHASE_FOLLOW_UP_TOOL] : []),
+        ...(options.runs ? RUN_TOOLS : []),
+        ...(options.intents ? [INTENT_CAPTURE_TOOL] : []),
+        ...(options.memorySearch ? [MEMORY_SEARCH_TOOL] : []),
+      ],
+      ...(options.chaseFollowUp ? { followable: options.chaseFollowUp.available } : {}),
+      taskLevels: (tx, jobId) => this.taskLevels(tx, jobId),
+    });
+    if (options.composeExecutor) {
+      this.compose = new ComposeService({
+        broker: this,
+        catalog: (claims) => this.discovery.available(claims),
+        executor: options.composeExecutor,
+      });
+    }
+    this.dispatchTimeoutMs = options.dispatchTimeoutMs ?? BROKER_TIMEOUT_MS;
+    if (
+      options.approvalTtlMs !== undefined &&
+      (!Number.isSafeInteger(options.approvalTtlMs) || options.approvalTtlMs <= 0)
+    )
+      throw new Error('approvalTtlMs must be a positive integer');
+  }
+
+  /** Whether an independent reviewer is configured for auto-review. */
+  get reviewerAvailable(): boolean {
+    return Boolean(this.options.autoReview?.reviewer);
+  }
+
+  async authorize(claims: CapabilityClaims): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+    });
+  }
+
+  /** The owner adapter asks the same origin resolver as admission, inside its decision lock. */
+  async origins(tx: Query, job: LockedJob, action: Action) {
+    const warnings = await resolveOriginWarnings(
+      tx,
+      this.options.resolveTrust ?? createTableTrustResolver({}),
+      {
+        space_id: job.space_id,
+        job_id: job.id,
+        connection_id: action.connection_id,
+        kind: action.kind,
+        effect_class: action.effect_class,
+        canonical_payload: action.canonical_payload,
+        fields: this.originFields(action),
+      },
+    );
+    // The same forgiveness admission applies, so the two agree on what was in doubt.
+    return this.forgiveOwnEvent(tx, job, action, warnings);
+  }
+
+  /**
+   * The fields whose origin decides admission: every one `collectOriginFields`
+   * finds, less the resource fields the action's connector proved itself.
+   */
+  /**
+   * A change to an event this very task created names it by the action that
+   * created it. That id is still checked for where it came from like any other
+   * value; only when the resolver cannot say (`unknown`, never `external_content`
+   * or `inferred`) and OpenDuet's own records show the event was created by this
+   * job, or by the conversation this undo or command belongs to, on this
+   * calendar, is the doubt about it set aside. An id that reached the agent
+   * from an invitation or an email still asks.
+   */
+  private async forgiveOwnEvent(
+    tx: Query,
+    job: Pick<LockedJob, 'id' | 'space_id'>,
+    action: Pick<Action, 'connection_id' | 'kind' | 'canonical_payload'>,
+    warnings: OriginWarning[],
+  ): Promise<OriginWarning[]> {
+    const uid = (action.canonical_payload as { uid?: unknown }).uid;
+    if (!CHANGES_EXISTING_EVENT.has(action.kind) || typeof uid !== 'string') return warnings;
+    const doubt = warnings.find((warning) => warning.field === 'uid');
+    if (!doubt || doubt.origin_trust !== 'unknown') return warnings;
+    const [made] = await tx`select 1 from action a join job j on j.id = a.job_id
+      where a.id = ${uid} and a.kind = 'calendar.create' and a.status = 'succeeded'
+        and a.connection_id = ${action.connection_id} and j.space_id = ${job.space_id}
+        and a.receipt->'detail'->>'uid' = ${uid}
+        and (a.job_id = ${job.id} or a.job_id = (select experience_parent_id from job
+          where id = ${job.id}))`;
+    return made ? warnings.filter((warning) => warning !== doubt) : warnings;
+  }
+
+  private originFields(
+    action: Pick<Action, 'connection_id' | 'kind' | 'canonical_payload'>,
+    kind?: string,
+  ) {
+    const fields = collectOriginFields(action.canonical_payload, kind);
+    const verified = new Set(
+      this.options.connectors.get(action.connection_id)?.verifiedFields?.(action) ?? [],
+    );
+    return verified.size
+      ? fields.filter((field) => field.category !== 'resource' || !verified.has(field.path))
+      : fields;
+  }
+
+  private async tool(
+    tx: Query,
+    job: LockedJob,
+    claims: CapabilityClaims,
+    connectionId: string,
+    kind: string,
+  ) {
+    const access = await agentAccess(tx, job.id);
+    if (
+      access.paused ||
+      (access.allowed && !access.allowed.includes(connectionId)) ||
+      access.missingAgent ||
+      (access.chat && !access.agentId)
+    )
+      throw new BrokerFault('scope_denied');
+    const [connection] =
+      await tx`select c.provider, c.scopes, c.status, c.shared_use, s.audience from connection c
+      join space s on s.id = c.space_id
+      where c.id = ${connectionId} and c.space_id = ${job.space_id} for share`;
+    if (connection?.status !== 'active') throw new BrokerFault('unknown_connection');
+    await this.checkConnectionUse(tx, job, String(connection.shared_use));
+    await this.checkExecutionBackend(tx, job.space_id, String(connection.provider));
+    const connector = this.options.connectors.get(connectionId);
+    if (
+      !connector ||
+      connector.manifest.provider !== connection.provider ||
+      connector.capability?.available === false
+    )
+      throw new BrokerFault('connector_unavailable');
+    if (!connectorAllowsAudience(connector, job.constraints, connection.audience))
+      throw new BrokerFault('scope_denied');
+    const tool = resolveToolAlias(connector, connectionId, kind);
+    if (!tool) throw new BrokerFault('unknown_tool');
+    // The space's rules refuse what they leave out, whatever the catalog offered.
+    const rules = await spaceRulesFor(tx, job.space_id);
+    if (connectorDenied(rules, String(connection.provider)))
+      throw new BrokerFault('scope_denied', connectorRefusal(String(connection.provider)));
+    if (toolDenied(rules, tool.name)) throw new BrokerFault('scope_denied', toolRefusal(tool.name));
+    // An agent set not to use the computer is refused it here, whatever the catalog offered.
+    if (!access.usesComputer && computerTool(tool.name)) throw new BrokerFault('scope_denied');
+    const required = new Set([...tool.required_scopes, tool.name]);
+    if (!grantsConnectionScopes(claims, connection.scopes, [...required])) {
+      throw new BrokerFault('scope_denied');
+    }
+    const scopes = (connection.scopes ?? []) as string[];
+    // Every tool this job may use on this connection, for a connector that
+    // shows less to a job that may not read what it would show.
+    const granted = scopes.filter((scope) => grantsConnectionScopes(claims, scopes, [scope]));
+    return { tool, connector, granted };
+  }
+
+  /**
+   * Answer a message with a glyph. It writes one event on this job's own
+   * stream, touches nothing outside the installation, and is refused for a
+   * message belonging to another job: a reaction is still a statement about
+   * something, and the runtime may only speak about its own responsibility.
+   * With no target it lands on the owner's latest message on this job, since no
+   * attempt input shows an event seq; a job with no owner message has none.
+   */
+  async react(claims: CapabilityClaims, request: ReactRequest) {
+    const value = reactRequest.parse(request);
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+      const [target] = value.message_id
+        ? await tx`select seq, job_id, type from event where seq = ${Number(value.message_id)}`
+        : await tx`select seq, job_id, type from event where job_id = ${job.id}
+            and type = 'notice' and payload->>'kind' = 'user_message'
+            order by seq desc limit 1`;
+      if (!target || target.job_id !== job.id || target.type === 'reaction')
+        throw new BrokerFault('action_not_found');
+      const messageId = String(target.seq);
+      await appendEvent(
+        tx,
+        job.id,
+        claims.attempt_id,
+        'reaction',
+        { message_id: messageId, emoji: value.emoji, by: 'assistant' },
+        `reaction:${messageId}:assistant:${value.emoji}`,
+      );
+      return { message_id: messageId, emoji: value.emoji };
+    });
+  }
+
+  requestWait(claims: CapabilityClaims, input: unknown) {
+    return requestRuntimeWait(this.sql, claims, input);
+  }
+
+  askPerson(claims: CapabilityClaims, input: unknown) {
+    return requestPersonQuestion(this.sql, claims, input);
+  }
+
+  /**
+   * A run tool. The service writes the record and decides between shifts; a
+   * refusal comes back as a broker fault the model can read and correct.
+   */
+  async runTool(claims: CapabilityClaims, name: string, input: unknown): Promise<unknown> {
+    if (!this.options.runs) throw new BrokerFault('unknown_tool');
+    try {
+      if (name === 'run.try') {
+        const runs = this.options.runs;
+        if (!runs.measure) throw new BrokerFault('unknown_tool');
+        if (!claims.scopes.includes(name)) throw new BrokerFault('scope_denied');
+        const connectionId = await this.trySandbox(claims);
+        return await runs.measure(claims, input, (command) =>
+          this.runInSandbox(claims, connectionId, command),
+        );
+      }
+      return await this.options.runs.call(claims, name, input);
+    } catch (error) {
+      if (error instanceof ZodError) throw new BrokerFault('payload_invalid', inputProblem(error));
+      if (error instanceof ServiceError)
+        throw new BrokerFault(
+          ['stale_epoch', 'scope_denied', 'revision_mismatch'].includes(error.code)
+            ? (error.code as 'stale_epoch' | 'scope_denied' | 'revision_mismatch')
+            : 'payload_invalid',
+          error.message,
+        );
+      throw error;
+    }
+  }
+
+  /**
+   * `intent.capture`. The service reads the person's words itself and marks
+   * every detail's origin; a refusal comes back as a fault the model can read.
+   */
+  async intentTool(claims: CapabilityClaims, input: unknown): Promise<unknown> {
+    if (!this.options.intents) throw new BrokerFault('unknown_tool');
+    try {
+      return await this.options.intents.capture(claims, input);
+    } catch (error) {
+      if (error instanceof ZodError) throw new BrokerFault('payload_invalid', inputProblem(error));
+      if (error instanceof ServiceError)
+        throw new BrokerFault(
+          ['stale_epoch', 'scope_denied', 'revision_mismatch'].includes(error.code)
+            ? (error.code as 'stale_epoch' | 'scope_denied' | 'revision_mismatch')
+            : 'payload_invalid',
+          error.message,
+        );
+      throw error;
+    }
+  }
+
+  /** `memory.search`. Memory decides what the attempt may read; bad arguments come back as a fault. */
+  async memorySearch(claims: CapabilityClaims, input: unknown): Promise<unknown> {
+    if (!this.options.memorySearch) throw new BrokerFault('unknown_tool');
+    try {
+      return await this.options.memorySearch(claims, input);
+    } catch (error) {
+      if (error instanceof ZodError) throw new BrokerFault('payload_invalid', inputProblem(error));
+      throw error;
+    }
+  }
+
+  /** The space's sandbox a measured try runs in, or a refusal the model can act on. */
+  private async trySandbox(claims: CapabilityClaims): Promise<string> {
+    const rows = await this.sql`select id from connection
+      where space_id = ${claims.space_id} and provider = 'sandbox' and status = 'active'
+      order by id`;
+    const found = rows
+      .map((row) => String(row.id))
+      .find((id) =>
+        this.options.connectors.get(id)?.manifest.tools.some((tool) => tool.name === TRY_TOOL_KIND),
+      );
+    if (!found)
+      throw new BrokerFault(
+        'connector_unavailable',
+        'This space has no sandbox to run tries in. Do the work with your usual tools and record each try with run.log kind "experiment", citing the action that shows its value.',
+      );
+    return found;
+  }
+
+  /**
+   * One command of a measured try, proposed exactly as the model's own
+   * terminal command is: the same admission, approval rules, egress, receipt
+   * and sandbox settings. Each try is named afresh, so running the same
+   * command again measures again; a command still waiting on the person is
+   * picked up again by its exact payload rather than asked a second time.
+   */
+  private async runInSandbox(
+    claims: CapabilityClaims,
+    connectionId: string,
+    command: { command: string; timeout_ms: number },
+  ): Promise<SandboxRun> {
+    const [waiting] = await this.sql`select canonical_payload from action
+      where job_id = ${claims.job_id} and connection_id = ${connectionId}
+        and kind = ${TRY_TOOL_KIND} and status in ('needs_approval', 'approved')
+        and canonical_payload->>'command' = ${command.command}
+        and (canonical_payload->>'timeout_ms')::int = ${command.timeout_ms}
+        and canonical_payload->>'run' like 'try-%'
+      order by created_at desc limit 1`;
+    const payload = (waiting?.canonical_payload as JsonObject | undefined) ?? {
+      command: command.command,
+      timeout_ms: command.timeout_ms,
+      run: `try-${randomBytes(12).toString('hex')}`,
+    };
+    const proposed = await this.propose(claims, {
+      connection_id: connectionId,
+      kind: TRY_TOOL_KIND,
+      payload,
+    });
+    const action = await loadAction(this.sql, proposed.action_id);
+    if (['proposed', 'needs_approval', 'approved'].includes(action.status))
+      return { status: 'waiting', action_id: action.id, message: proposed.message };
+    const detail = (action.receipt?.detail ?? {}) as Record<string, unknown>;
+    if (action.status !== 'succeeded' || typeof detail.output !== 'string')
+      return { status: 'failed', action_id: action.id, reason: proposed.message };
+    return {
+      status: 'ran',
+      action_id: action.id,
+      exit_code: typeof detail.exit_code === 'number' ? detail.exit_code : null,
+      timed_out: detail.timed_out === true,
+      duration_ms: typeof detail.duration_ms === 'number' ? detail.duration_ms : 0,
+      output: detail.output,
+      truncated: detail.truncated === true,
+    };
+  }
+
+  /**
+   * Send the chase's next covered follow-up. The service builds the message;
+   * it is proposed like any other send, so admission, the scope and the
+   * execution fence all decide it the same way, and it is a tool entry.
+   */
+  async followUp(claims: CapabilityClaims): Promise<EffectProposalResponse> {
+    const port = this.options.chaseFollowUp;
+    const next = port
+      ? await this.sql.begin(async (tx) => {
+          const job = await lockJob(tx, claims.job_id);
+          await checkAttempt(tx, job, claims);
+          return port.next(tx, job, claims.attempt_id);
+        })
+      : null;
+    if (!next) throw new BrokerFault('unknown_tool', 'This chase has no follow-up to send.');
+    // The follow-up is the approved message, word for word (`chase-scope.ts`).
+    return this.propose(claims, next, false, true);
+  }
+
+  async catalog(claims: CapabilityClaims): Promise<ToolSpec[]> {
+    return this.discovery.catalog(claims);
+  }
+
+  /**
+   * The picture a succeeded screenshot of this attempt's job saved, as base64.
+   * Only for a screenshot tool and only for its own job. The agent's own
+   * computer's is read from the path its receipt names inside that job's
+   * workspace; a paired computer's from the service's own store, and only when
+   * that computer lets cloud models see its screen (its own switch, or the
+   * privacy setting when it has none). Otherwise the answer says it is kept
+   * private, and the model is given the receipt alone. Either picture is served
+   * only while it is the one the receipt recorded.
+   */
+  async screenshot(claims: CapabilityClaims, id: string): Promise<ScreenshotPicture> {
+    const action = await this.get(claims, id);
+    const workRoot = this.options.workRoot;
+    if (!workRoot || !SCREENSHOT_TOOLS.includes(action.kind) || action.status !== 'succeeded')
+      throw new BrokerFault('action_not_found');
+    if (
+      !OWN_COMPUTER_PICTURE_TOOLS.includes(action.kind) &&
+      !(await this.deviceScreenShared(action))
+    )
+      return { withheld: true, reason: DEVICE_SCREEN_WITHHELD };
+    const bytes = await readScreenshot(workRoot, action);
+    if (!bytes) throw new BrokerFault('action_not_found');
+    return { media_type: 'image/png', data: bytes.toString('base64') };
+  }
+
+  /** Whether a paired computer's screenshot may be shown to a cloud model. */
+  private async deviceScreenShared(action: Action): Promise<boolean> {
+    const [row] = await this.sql`select d.id as device_id, d.cloud_screenshots,
+        coalesce(ps.settings->>'screenshots_paired_devices', '') = 'true' as by_default
+      from action a
+      join job j on j.id = a.job_id
+      left join paired_device d on d.connection_id = a.connection_id and d.space_id = j.space_id
+      left join privacy_settings ps on ps.space_id = j.space_id
+      where a.id = ${action.id}`;
+    if (!row || typeof row.device_id !== 'string') return false;
+    return typeof row.cloud_screenshots === 'boolean'
+      ? row.cloud_screenshots
+      : row.by_default === true;
+  }
+
+  async get(claims: CapabilityClaims, id: string): Promise<Action> {
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+      const action = await loadAction(tx, id);
+      if (action.job_id !== job.id) throw new BrokerFault('action_not_found');
+      await this.tool(tx, job, claims, action.connection_id, action.kind);
+      return action;
+    });
+  }
+
+  /**
+   * In-cell intents validate the arguments before execution. Legacy completed
+   * records retain their schema, and settlement uses it for the later result.
+   * An in-cell connector must declare that record schema so neither proposal
+   * form nor settlement can admit an unchecked shape.
+   */
+  private validatePayload(tool: ConnectorTool, payload: Action['canonical_payload']) {
+    if (tool.execution === 'in_cell' && !tool.record_schema)
+      throw new BrokerFault('payload_invalid', 'An in-cell tool must declare a record schema');
+    const intent = tool.execution === 'in_cell' ? executionIntent.safeParse(payload) : null;
+    if (intent?.success) {
+      this.compiled(tool.input_schema)(intent.data.intent);
+      return;
+    }
+    const schema = tool.execution === 'in_cell' ? tool.record_schema : tool.input_schema;
+    if (!schema) throw new BrokerFault('payload_invalid');
+    this.compiled(schema)(payload);
+  }
+
+  /**
+   * A tool schema the broker cannot compile is an operator fault, not a model
+   * one: changing the arguments cannot repair it, so it is refused as such.
+   */
+  private compiled(schema: ConnectorTool['input_schema']) {
+    let validate: ValidateFunction;
+    try {
+      const validator =
+        schema.$schema === 'https://json-schema.org/draft/2020-12/schema'
+          ? this.validator2020
+          : this.validator;
+      validate = validator.compile(schema);
+    } catch {
+      throw new BrokerFault(
+        'schema_invalid',
+        'Tool schema cannot compile; operator repair is required',
+      );
+    }
+    if ('$async' in validate && validate.$async)
+      throw new BrokerFault('schema_invalid', 'Asynchronous tool schemas are unsupported');
+    return (payload: unknown) => {
+      if (validate(payload) !== true) throw new BrokerFault('payload_invalid');
+    };
+  }
+
+  /**
+   * The tool result's sentence. An action auto-review sent to the person says
+   * why, and tells the agent to wait rather than find another way round.
+   */
+  private async reviewedMessage(action: Action, repeated: boolean): Promise<string> {
+    const message = dispositionMessage(
+      action,
+      repeated,
+      await this.ownComputer(this.sql, action),
+      (await heldUntil(this.sql, action)) !== null,
+    );
+    if (action.status !== 'needs_approval' || !this.options.autoReview) return message;
+    const review = await actionReviewView(this.sql, action.id);
+    if (review?.outcome !== 'escalated') return message;
+    return `Auto-review sent this to the person to decide: ${review.reason} ${message} Wait for their answer; do not try another way to do the same thing.`;
+  }
+
+  private async proposalView(
+    action: Action,
+    key: string,
+    repeated: boolean,
+  ): Promise<EffectProposalResponse> {
+    const [approval] = await this
+      .sql`select id, decision, origin_warnings from approval where action_id = ${action.id}
+      and payload_hash = ${action.payload_hash}`;
+    return {
+      action_id: action.id,
+      status: action.status,
+      effect_class: action.effect_class,
+      payload_hash: action.payload_hash,
+      canonical_payload: action.canonical_payload,
+      requires_approval: action.status === 'needs_approval' && !approval?.decision,
+      approval_id: approval?.id ?? null,
+      intent_key: action.intent_key ?? key,
+      repeated,
+      message: await this.reviewedMessage(action, repeated),
+      origin_warnings: originWarnings.parse(approval?.origin_warnings ?? []),
+      own_computer: await this.ownComputer(this.sql, action),
+    };
+  }
+
+  /**
+   * What admission would decide about this action right now: where its values
+   * came from, whether a standing grant covers it, and therefore whether a
+   * person still has to answer. Recomputed at every phase, because the answer
+   * is about the world at that moment and not about what a proposal believed.
+   */
+  private async classify(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    tool: ConnectorTool,
+    phase: StandingGrantInput['phase'] = 'proposal',
+    guests: GuestCounts = NO_GUESTS,
+  ): Promise<Admissibility> {
+    const access = await agentAccess(tx, job.id);
+    const settings = this.options.autoReview ? await loadApprovalSettings(tx, job.space_id) : null;
+    const money = this.moneyOf(action, tool);
+    // A message the person said to send in this turn goes out on its own, held
+    // for undo and with a receipt. Anything else that sends stays with them.
+    const told = !money && directSend(tool.name) && (await toldToSend(tx, action.attempt_id));
+    const changes =
+      tool.effect_class !== 'read' && tool.name !== 'email.draft' && tool.name !== 'email.discard';
+    const agentAsks = Boolean(access.agentId && access.asksBeforeActing);
+    // The person's own don't-rule, from their memory, the agent's instructions
+    // or this conversation: the one thing besides money a card is asked for.
+    const said = changes ? await dontRulesFor(tx, job, action.attempt_id) : null;
+    const dont = said
+      ? matchDontRule({
+          rules: said.rules,
+          kind: tool.name,
+          payload: action.canonical_payload,
+          movesMoney: money !== null,
+          current: said.current,
+        })
+      : null;
+    const provider = this.options.connectors.get(action.connection_id)?.manifest.provider ?? '';
+    // A hand-off from a room puts a task in front of a person, who reads it
+    // whole and runs or declines it: their answer is the approval, so the
+    // agent's own "ask before acting" does not ask again. "Ask me for
+    // everything" still does.
+    const handsOff = tool.name === 'room.handoff' && provider === 'room';
+    // The connector itself says the person decides this one, whatever the settings.
+    const connectorAsks =
+      this.options.connectors.get(action.connection_id)?.asksFirst?.(action) === true;
+    // Kept in the person's own space, where they can delete it: the tool's
+    // own question about reaching outside does not apply to this one. A room's
+    // space is everyone's in it, so a new file there goes by the room's rule.
+    const inSpace =
+      !connectorAsks &&
+      !money &&
+      this.options.connectors.get(action.connection_id)?.staysInSpace?.(action, job.space_id) ===
+        true &&
+      (await personalSpace(tx, job.space_id));
+    const toolAsks = needsApproval(tool) && !inSpace;
+    const tierOf = (
+      doubts: OriginWarning[],
+      existingGuests?: number | null,
+      calendar?: CalendarCheck | null,
+    ): TierDecision =>
+      inSpace && doubts.length === 0
+        ? {
+            tier: 'sandbox',
+            actionClass: 'sandbox',
+            reason: 'It stays in your own space, where you can delete it.',
+          }
+        : reviewTier({
+            tool,
+            provider,
+            payload: action.canonical_payload,
+            doubts,
+            existingGuests,
+            calendar,
+          });
+    // A conversation that read responses to an app asks before changing a file an app shows.
+    const afterResponses = changes && (await asksAfterResponses(tx, job.id, action));
+    const requiresApproval =
+      money !== null ||
+      dont !== null ||
+      toolAsks ||
+      connectorAsks ||
+      afterResponses ||
+      (agentAsks && changes && !handsOff) ||
+      // The person's own Files are not the agent's workspace. A new file there
+      // stays in their space and goes through like other work; saving over one
+      // of theirs or taking one out is asked, or reviewed when the person lets
+      // reviewed app changes go.
+      (changesPersonFiles(tool.name, action.canonical_payload) && !inSpace) ||
+      // "Ask me for everything": every change waits for the person.
+      (settings?.mode === 'ask' && changes) ||
+      // With the sandbox switch off, work in the agent's own workspace asks too,
+      // and so does deleting what the agent made there, which its tier alone
+      // (a delete is the person's tier) would otherwise let through unasked.
+      (settings?.mode === 'auto_review' &&
+        !settings.classes.sandbox &&
+        changes &&
+        (tierOf([]).tier === 'sandbox' || tool.name === 'files.delete'));
+    const gated = isTrustGatedEffect(tool.effect_class);
+    const fields = gated ? this.originFields(action, action.kind) : [];
+    const resolved = await resolveOriginWarnings(
+      tx,
+      gated
+        ? (this.options.resolveTrust ??
+            (this.options.resolveStandingGrant ? createTableTrustResolver({}) : undefined))
+        : undefined,
+      {
+        space_id: job.space_id,
+        job_id: job.id,
+        connection_id: action.connection_id,
+        kind: action.kind,
+        effect_class: tool.effect_class,
+        canonical_payload: action.canonical_payload,
+        fields,
+      },
+    );
+    const warnings = await this.forgiveOwnEvent(tx, job, action, resolved);
+    // A grant is only ever a shortcut past a question nobody needs to ask. A
+    // standing grant never covers a value whose origin OpenDuet cannot vouch for;
+    // only a grant scoped to this job, over values the person approved in it,
+    // is asked when there are doubts, and it is told exactly what they are.
+    const input = { job, action, tool, phase, warnings };
+    // A room's work is answered by the people its rule names, each time: no
+    // standing rule or scope, made by anyone for their own work, answers for it.
+    const roomWork = requiresApproval && (await roomAuthorityOf(tx, job.id)) !== null;
+    // A money move is never covered by anything but the person's own step-up.
+    const authorizedBy =
+      requiresApproval &&
+      !money &&
+      !dont &&
+      !roomWork &&
+      warnings.length > 0 &&
+      this.options.resolveScopedGrant
+        ? await this.options.resolveScopedGrant(tx, input)
+        : null;
+    const granted =
+      authorizedBy !== null ||
+      (requiresApproval &&
+        !money &&
+        !dont &&
+        !roomWork &&
+        warnings.length === 0 &&
+        this.options.resolveStandingGrant !== undefined &&
+        (await this.options.resolveStandingGrant(tx, input)));
+    let auto: Admissibility['auto'] = null;
+    let proactive: Confidence | null = null;
+    let task: Admissibility['task'] = null;
+    if (settings?.mode === 'auto_review' && requiresApproval && !granted) {
+      // Silence about an origin is `unknown`, which keeps the action with the person.
+      const doubts = await resolveOriginWarnings(
+        tx,
+        this.options.resolveTrust ?? createTableTrustResolver({}),
+        {
+          space_id: job.space_id,
+          job_id: job.id,
+          connection_id: action.connection_id,
+          kind: action.kind,
+          effect_class: tool.effect_class,
+          canonical_payload: action.canonical_payload,
+          fields: deciding(action.canonical_payload, action.kind),
+        },
+      );
+      // A change to an existing event is the person's own only if the event has
+      // no guests now. Asked only when the answer could let it be reviewed.
+      // Counted before the job lock was taken (see `guestsAhead`); a count
+      // that was not taken leaves the change with the person.
+      const existingGuests =
+        CHANGES_EXISTING_EVENT.has(tool.name) &&
+        (settings.classes.calendar || settings.classes.own_calendar) &&
+        !agentAsks
+          ? (guests.guests.get(guestKey(action.connection_id, action.canonical_payload)) ?? null)
+          : null;
+      const checked = changeKey(action.connection_id, action.canonical_payload);
+      const base = tierOf(
+        [...doubts, ...warnings],
+        existingGuests,
+        guests.calendar.has(checked) ? guests.calendar.get(checked) : undefined,
+      );
+      // Asked for in so many words, to people whose addresses OpenDuet can vouch
+      // for: a recipient planted in something the agent read still asks. Being
+      // told to send settles only the send itself: a send that also deletes,
+      // carries a password or invites guests asks as it did before.
+      const sendsAsTold =
+        told &&
+        !dont &&
+        !connectorAsks &&
+        !afterResponses &&
+        !roomWork &&
+        doubts.length === 0 &&
+        warnings.length === 0 &&
+        (base.tier !== 'person' || base.reason === OUTSIDE_SEND_REASON);
+      // A plain send or post to someone outside OpenDuet goes by the person's
+      // level for its kind of task (`autonomy.ts`). Only what would otherwise
+      // wait for them as a plain send is judged so: one that also deletes or
+      // carries a password, a don't-rule, a connector's own question, room
+      // work and an agent set to ask before acting stay as they were. Doubts
+      // about a recipient are weighed below, so the send is read without them.
+      const plain =
+        doubts.length + warnings.length > 0
+          ? tierOf(
+              [],
+              existingGuests,
+              guests.calendar.has(checked) ? guests.calendar.get(checked) : undefined,
+            )
+          : base;
+      // Set when the person's level lets this go on its own: why, for the receipt.
+      let onItsOwn: string | null = null;
+      if (
+        tool.effect_class === 'write_external' &&
+        !money &&
+        !dont &&
+        !connectorAsks &&
+        !afterResponses &&
+        !roomWork &&
+        !agentAsks &&
+        plain.tier === 'person' &&
+        plain.reason === OUTSIDE_SEND_REASON
+      ) {
+        const kind = sendKindOf(tool.name);
+        const personId = await personOf(tx, job.id);
+        const level = (
+          await levelsFor(tx, personId, defaultLevels(this.options.messagesToOthers))
+        ).get(kind) as TaskLevel;
+        task = { ...level, personId };
+        if (!sendsAsTold) {
+          const doubted = doubts.length > 0 || warnings.length > 0;
+          // Work nobody is waiting on is never asked about by default: when it
+          // does not go on its own, it is left as a suggestion.
+          const woke = await proactiveAttempt(tx, action.attempt_id);
+          const setting = levelLine(level);
+          const threshold = this.options.proactiveThreshold ?? PROACTIVE_DEFAULT_THRESHOLD;
+          if (level.level === 'always') {
+            if (!doubted) onItsOwn = `Sent on its own. ${setting}`;
+            // A recipient OpenDuet cannot vouch for is never sent to on its own.
+            else if (woke)
+              proactive = withSetting(judge([], { threshold, doubted: true }), setting);
+          } else if (
+            level.level === 'when_confident' ||
+            // An invite kept as a draft is asked about as before, whatever a routine says.
+            (woke && kind !== 'calendar_invite')
+          ) {
+            const evidence = await gatherEvidence(tx, {
+              job,
+              action,
+              words: actionWords(tool.name, actionKinds(tool.name, false)),
+            });
+            // Choosing "when confident" is not itself evidence: the score is
+            // what the person said and did before, the same as by default, so
+            // confirming the default on the card changes nothing.
+            const confidence = withSetting(
+              judge(evidence, {
+                threshold,
+                doubted,
+                // The operator's older `draft_only` keeps chat apps' messages
+                // out of proactive work, as before, until the person chooses.
+                draftOnly:
+                  kind === 'chat_message' &&
+                  !level.chosen &&
+                  this.options.messagesToOthers === 'draft_only',
+                ...(level.level === 'draft'
+                  ? {
+                      needsInstruction: `${TASK_NAMES[kind].one} goes out on its own only when your routine or its instructions say to send it`,
+                    }
+                  : {}),
+              }),
+              setting,
+            );
+            if (woke) proactive = confidence;
+            else if (confidence.act) onItsOwn = confidence.reason;
+          }
+        }
+      }
+      const tier: TierDecision = dont
+        ? { tier: 'person', actionClass: null, reason: dont.reason }
+        : money
+          ? { tier: 'person', actionClass: null, reason: money.reason }
+          : sendsAsTold
+            ? { tier: 'person', actionClass: null, reason: TOLD_TO_SEND }
+            : proactive
+              ? { tier: 'person', actionClass: null, reason: proactive.reason }
+              : onItsOwn
+                ? { tier: 'person', actionClass: null, reason: onItsOwn }
+                : base;
+      const allowed = tier.actionClass !== null && settings.classes[tier.actionClass];
+      auto = {
+        tier,
+        // The connector's own question, and a write a viewer's response may have
+        // steered to a file an app shows, are the person's: never policy's or the reviewer's.
+        // A room's permission is answered by the people its rule names, never by
+        // the reviewer or a publishing policy; work in the room's own workspace
+        // stays under the sandbox rule, as it does for a person.
+        outcome:
+          money || dont || connectorAsks || afterResponses
+            ? 'person'
+            : sendsAsTold || proactive?.act || onItsOwn
+              ? 'policy_approved'
+              : proactive
+                ? 'person'
+                : tier.tier === 'sandbox' && allowed && !toolAsks
+                  ? 'policy_approved'
+                  : // Publishing an app that reaches nobody new. An agent set to ask before
+                    // acting promises that publishes to other people wait; an app only the
+                    // person can open reaches nobody, so it goes ahead. A conversation that
+                    // read an app's responses asks before changing what an app shows.
+                    tier.tier === 'apps' &&
+                      allowed &&
+                      (!agentAsks || reachesOnlyPublisher(tool.name, action.canonical_payload)) &&
+                      !afterResponses &&
+                      !roomWork
+                    ? 'policy_approved'
+                    : // An event on the person's own calendar that touches nothing important
+                      // and can be undone. An agent set to ask before acting still asks.
+                      tier.tier === 'own_calendar' && allowed && !agentAsks && !roomWork
+                      ? 'policy_approved'
+                      : // An agent set to ask before acting promises that sends, bookings and payments
+                        // wait for the person, so its calendar changes do. A reversible app change is
+                        // none of those, and the person switched that class on themselves.
+                        tier.tier === 'reviewable' &&
+                          allowed &&
+                          !roomWork &&
+                          (!agentAsks || tier.actionClass === 'app_changes')
+                        ? 'review'
+                        : 'person',
+      };
+    }
+    const policyApproved = auto?.outcome === 'policy_approved';
+    return {
+      warnings,
+      warnings_hash: hashOriginWarnings(warnings),
+      standing_grant: granted,
+      requires_approval: requiresApproval && !granted && !policyApproved,
+      authorized_by: authorizedBy,
+      auto,
+      money,
+      dont,
+      proactive,
+      task,
+    };
+  }
+
+  /**
+   * The first-time card for this action's kind of task, when the person has
+   * not chosen a level for it and has not been asked yet. Recorded with the
+   * proposal, so a proposal refused for another reason asks nothing.
+   */
+  private taskAsk(classified: Admissibility): TaskAsk | null {
+    const task = classified.task;
+    return task && !task.chosen && !task.asked
+      ? { personId: task.personId, kind: task.kind, level: task.level }
+      : null;
+  }
+
+  /**
+   * The first-time card for a draft of a send, when its kind of task is not
+   * chosen and not asked about yet: in a conversation a drafted kind is
+   * drafted, never sent, so this is the first time it comes up.
+   */
+  private async draftAsk(tx: Query, jobId: string, toolName: string): Promise<TaskAsk | null> {
+    const kind = draftKindOf(toolName);
+    if (!kind) return null;
+    const level = (await this.taskLevels(tx, jobId)).get(kind);
+    return level && !level.chosen && !level.asked
+      ? { personId: await personOf(tx, jobId), kind, level: level.level }
+      : null;
+  }
+
+  /**
+   * Whether a chat may send this directly now: the person said to send in the
+   * turn being answered, or their level for its kind of task is not a draft.
+   * Each send is still judged on its own (`classify`).
+   */
+  private async sendsFromChatNow(
+    tx: Query,
+    jobId: string,
+    attemptId: string | null | undefined,
+    kind: string,
+  ): Promise<boolean> {
+    if (await toldToSend(tx, attemptId)) return true;
+    // A room's work keeps its own rule: only what the person said to send.
+    if (await roomWork(tx, jobId)) return false;
+    const levels = await levelsFor(
+      tx,
+      await personOf(tx, jobId),
+      defaultLevels(this.options.messagesToOthers),
+    );
+    return sendsFromChat(kind, false, levels);
+  }
+
+  /** The levels a job's person chose, with the operator's defaults, for the tool catalog. */
+  async taskLevels(tx: Query, jobId: string) {
+    return levelsFor(tx, await personOf(tx, jobId), this.taskDefaults());
+  }
+
+  /** The level each kind of task starts at on this install. */
+  taskDefaults() {
+    return defaultLevels(this.options.messagesToOthers);
+  }
+
+  /** Whether an action moves money, judged on its connector's tool as it stands now. */
+  async movesMoneyNow(action: Action): Promise<boolean> {
+    const connector = this.options.connectors.get(action.connection_id);
+    const tool = connector && findTool(connector.manifest, action.kind);
+    // A tool that cannot be found any more cannot be shown not to move money.
+    if (!tool) return true;
+    return this.moneyOf(action, tool) !== null;
+  }
+
+  /** Why this action moves money, or null (`money.ts`), judged on its own connector's declaration. */
+  private moneyOf(
+    action: Pick<Action, 'connection_id' | 'canonical_payload'>,
+    tool: ConnectorTool,
+  ) {
+    const connector = this.options.connectors.get(action.connection_id);
+    const rawName = connector?.rawToolName?.(tool.name);
+    return moneyMove({
+      tool,
+      provider: connector?.manifest.provider ?? '',
+      payload: action.canonical_payload,
+      metered: connector?.capability?.kind === tool.name,
+      ...(rawName ? { rawName } : {}),
+      page: connector?.personPaysPage?.(tool.name) ?? null,
+    });
+  }
+
+  /**
+   * What a calendar change's own calendar says now: how many guests the event
+   * it rewrites has (keyed by `guestKey`), and what the time it touches holds
+   * (keyed by `changeKey`), or nothing when the connector cannot say. Asked of
+   * the calendar before the job lock is taken, at every classification, so
+   * guests added or a meeting booked after a review still send the change to
+   * the person at admission. Never under the lock: the connector reaches the
+   * provider and its sign-in and secret stores on connections of its own, and
+   * a holder of the event order lock must never wait for one.
+   */
+  private async guestsAhead(
+    jobId: string,
+    change:
+      | string
+      | (Pick<Action, 'connection_id' | 'kind' | 'canonical_payload'> & { id?: string }),
+  ): Promise<GuestCounts> {
+    if (!this.options.autoReview) return NO_GUESTS;
+    // An action not found here is refused under the lock, in its usual order.
+    const [row] =
+      typeof change === 'string' ? await this.sql`select * from action where id = ${change}` : [];
+    const action = typeof change === 'string' ? (row ? actionFromRow(row) : null) : change;
+    if (!action) return NO_GUESTS;
+    const connector = this.options.connectors.get(action.connection_id);
+    const tool = connector && findTool(connector.manifest, action.kind);
+    if (!connector || !tool || !OWN_CALENDAR_CHANGES.has(tool.name)) return NO_GUESTS;
+    const source = connector.signals?.stream === 'calendar' ? connector.signals : null;
+    const countsGuests = Boolean(connector.existingGuests) && CHANGES_EXISTING_EVENT.has(tool.name);
+    if (!source && !countsGuests) return NO_GUESTS;
+    const [job] = await this.sql<LockedJob[]>`select * from job where id = ${jobId}`;
+    if (!job) return NO_GUESTS;
+    const settings = await loadApprovalSettings(this.sql, job.space_id);
+    if (
+      settings.mode !== 'auto_review' ||
+      !(settings.classes.calendar || settings.classes.own_calendar)
+    )
+      return NO_GUESTS;
+    // A proposal has no id yet; the connector only checks that the two agree.
+    const id = action.id ?? 'proposed';
+    const asked = {
+      ...action,
+      kind: tool.name,
+      id,
+      job_id: job.id,
+      idempotency_key: id,
+    } as Action;
+    const guests = new Map<string, number>();
+    if (countsGuests && connector.existingGuests) {
+      try {
+        const count = await connector.existingGuests(asked, {
+          ...this.context(job, asked),
+          signal: AbortSignal.timeout(EXISTING_GUESTS_TIMEOUT_MS),
+        });
+        if (Number.isInteger(count) && count >= 0)
+          guests.set(guestKey(action.connection_id, action.canonical_payload), count);
+      } catch {
+        // Nobody could say, so the change stays with the person.
+      }
+    }
+    const calendar = new Map<string, CalendarCheck | null>();
+    if (source)
+      calendar.set(
+        changeKey(action.connection_id, action.canonical_payload),
+        await this.calendarCheck(job.space_id, asked, source),
+      );
+    return { guests, calendar };
+  }
+
+  /**
+   * Whether the time a calendar change touches holds anything important, and
+   * whether the change could be undone; null when the calendar could not be
+   * read in time.
+   */
+  private async calendarCheck(
+    spaceId: string,
+    action: Action,
+    source: Extract<NonNullable<Connector['signals']>, { stream: 'calendar' }>,
+  ): Promise<CalendarCheck | null> {
+    try {
+      const reversible = await reversibleProposal(this.sql, spaceId, action);
+      const before =
+        action.kind === 'calendar.create' ? null : await eventBefore(this.sql, spaceId, action);
+      const spans = spansOf(action.kind, action.canonical_payload, before);
+      const window = windowOf(spans);
+      if (!window)
+        return { concern: `${assistantName()} could not tell when this event is.`, reversible };
+      // Every calendar the person has connected here, not only the one written:
+      // a clash on another calendar matters as much. One that cannot be read
+      // leaves the change with the person.
+      const others = await this.sql`select id from connection
+        where space_id = ${spaceId} and status = 'active' and id <> ${action.connection_id}
+        order by id`;
+      const sources: { connectionId: string; source: typeof source }[] = [
+        { connectionId: action.connection_id, source },
+      ];
+      for (const row of others) {
+        const signals = this.options.connectors.get(String(row.id))?.signals;
+        if (signals?.stream === 'calendar')
+          sources.push({ connectionId: String(row.id), source: signals });
+      }
+      const reads = await Promise.all(
+        sources.map(async ({ connectionId, source: calendar }) => ({
+          connectionId,
+          read: await withDeadline(calendar.occurrences(window), EXISTING_GUESTS_TIMEOUT_MS),
+        })),
+      );
+      // Whether OpenDuet made an event is what its own records say: a create that
+      // succeeded under that id, on that calendar, in this space.
+      const claimed = [
+        ...new Set(
+          reads.flatMap(({ read }) =>
+            read.items.flatMap((item) => (item.openduet_uid ? [item.openduet_uid] : [])),
+          ),
+        ),
+      ];
+      const made = claimed.length
+        ? await this.sql`select a.id, a.connection_id from action a join job j on j.id = a.job_id
+            where a.id = any(${claimed}) and a.kind = 'calendar.create' and a.status = 'succeeded'
+              and j.space_id = ${spaceId}`
+        : [];
+      const own = new Set(made.map((row) => `${row.connection_id}:${row.id}`));
+      const items = reads.flatMap(({ connectionId, read }) =>
+        read.items.map((item) => ({
+          ...item,
+          openduet: Boolean(item.openduet_uid) && own.has(`${connectionId}:${item.openduet_uid}`),
+        })),
+      );
+      const [profile] = await this.sql`select time_zone from experience_profile
+        where space_id = ${spaceId} and time_zone_confirmed_at is not null`;
+      return {
+        concern: calendarConcern({
+          spans,
+          read: { items, complete: reads.every(({ read }) => read.complete) },
+          now: Date.now(),
+          zones: profile ? [String(profile.time_zone)] : [],
+        }),
+        reversible,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The checks a proposal must pass before anything reads the destination on
+   * its behalf: the attempt is live, the connection is in the job's space,
+   * active and usable by this job, the tool (an account alias resolved) is one
+   * it offers, and the job holds its grants. Made in a short transaction of
+   * its own, holding no job lock; the proposal's own transaction makes them
+   * all again. Null when any fails, and then nothing is read ahead: the
+   * proposal itself is refused with the reason.
+   */
+  private async authorizedAhead(
+    claims: CapabilityClaims,
+    request: Pick<ProposeActionRequest, 'connection_id' | 'kind'>,
+  ): Promise<{
+    job: LockedJob;
+    tool: ConnectorTool;
+    connector: Connector;
+    granted: string[];
+  } | null> {
+    try {
+      return await this.sql.begin(async (tx) => {
+        const [job] = await tx<LockedJob[]>`select * from job where id = ${claims.job_id}`;
+        if (!job) return null;
+        await checkAttempt(tx, job, claims);
+        const access = await agentAccess(tx, job.id);
+        if (
+          access.chat &&
+          directSend(request.kind) &&
+          !(await this.sendsFromChatNow(tx, job.id, claims.attempt_id, request.kind))
+        )
+          return null;
+        return { job, ...(await this.tool(tx, job, claims, request.connection_id, request.kind)) };
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * What a connector reads from the destination before a proposal is
+   * admitted (`Connector.ahead`), outside every lock, only once the proposal
+   * is authorized, and within a deadline that stops the read itself. Null
+   * when the connector reads nothing, the read failed or ran out of time;
+   * `prepare` binds that, and dispatch checks again.
+   */
+  private async readAhead(
+    authorized: NonNullable<Awaited<ReturnType<BrokerService['authorizedAhead']>>>,
+    request: Pick<ProposeActionRequest, 'connection_id' | 'payload'>,
+  ): Promise<JsonObject | null> {
+    const { job, tool, connector, granted } = authorized;
+    if (!connector.ahead) return null;
+    const signal = AbortSignal.timeout(AHEAD_TIMEOUT_MS);
+    const deadline = new Promise<null>((resolve) =>
+      signal.addEventListener('abort', () => resolve(null), { once: true }),
+    );
+    try {
+      return await Promise.race([
+        connector.ahead(
+          { kind: tool.name, canonical_payload: request.payload as JsonObject },
+          {
+            job_id: job.id,
+            space_id: job.space_id,
+            idempotency_key: '',
+            constraints: jobConstraints.parse(job.constraints),
+            signal,
+            granted,
+          },
+          this.sql,
+        ),
+        deadline,
+      ]);
+    } catch {
+      return null;
+    }
+  }
+
+  private approvalRow(row: Record<string, unknown>) {
+    return {
+      id: row.id as string,
+      decision: (row.decision ?? null) as 'approved' | 'denied' | null,
+      decided_by: (row.decided_by ?? null) as string | null,
+      job_revision: row.job_revision as number,
+      expires_at: (row.expires_at ?? null) as string | Date | null,
+      origin_warnings: originWarnings.parse(row.origin_warnings ?? []),
+    };
+  }
+
+  private async askOwner(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    approvalId: string,
+    classified: Admissibility,
+    escalated?: string,
+  ) {
+    await appendEvent(tx, job.id, action.attempt_id, 'approval_requested', {
+      action_id: action.id,
+      approval_id: approvalId,
+      origin_warnings: classified.warnings,
+      origin_warnings_hash: classified.warnings_hash,
+      ...(escalated ? { auto_review: { outcome: 'escalated', reason: escalated } } : {}),
+    });
+    if (job.state === 'running' && !this.options.deferApprovalWaitToRunner)
+      await this.moveJob(tx, job, 'waiting_for_approval', {
+        kind: 'approval',
+        action_ids: [action.id],
+      });
+  }
+
+  /**
+   * An approval the reviewer gave for an action that is no longer the
+   * reviewer's to decide: the person's settings changed, or the action now
+   * reads as one that always asks. The approval is withdrawn and the person
+   * asked, and admission then refuses on the undecided approval.
+   */
+  private async withdrawReviewApproval(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    approvalId: string,
+    classified: Admissibility,
+  ) {
+    const reason = 'Auto-review no longer covers this action, so it is yours to decide.';
+    const [row] = await tx`update approval set decision = null, decided_at = null,
+      decided_by = null, requested_at = now() where id = ${approvalId} returning *`;
+    if (!row) throw new Error('Approval update returned no record');
+    await tx`update action_review set outcome = 'escalated', reason = ${reason}
+      where action_id = ${action.id}`;
+    await this.setStatus(tx, action, 'needs_approval');
+    await this.askOwner(tx, job, action, approvalId, classified, reason);
+    return this.approvalRow(row);
+  }
+
+  /**
+   * The live question attached to this action. A decision is bound to the set
+   * of doubts it was taken against: when that set changes the answer stops
+   * counting, the action goes back to needs_approval, and the person is asked
+   * again with the new doubts attached. The superseded answer stays in the
+   * event log, which is where the history of a decision belongs.
+   */
+  private async holdApproval(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    existing: Record<string, unknown> | undefined,
+    classified: Admissibility,
+  ) {
+    const warnings = JSON.stringify(classified.warnings);
+    if (!existing) {
+      // The binding fixes the expiry; a later approval cannot extend it.
+      const stored = await loadBinding(tx, action);
+      const expiresAt = (stored.tuple.expires_at ?? null) as string | null;
+      const approvalId = recordId('apr');
+      const [row] = await tx`insert into approval
+        (id, action_id, job_revision, payload_hash, expires_at, origin_warnings, step_up_required)
+        values (${approvalId}, ${action.id}, ${job.revision}, ${action.payload_hash},
+          ${expiresAt}, ${warnings}::jsonb, ${classified.money !== null}) returning *`;
+      if (!row) throw new Error('Approval insert returned no record');
+      if (action.status !== 'needs_approval') await this.setStatus(tx, action, 'needs_approval');
+      await this.askOwner(tx, job, action, approvalId, classified);
+      return this.approvalRow(row);
+    }
+    const held = this.approvalRow(existing);
+    if (hashOriginWarnings(held.origin_warnings) === classified.warnings_hash) return held;
+    const [row] = await tx`update approval set decision = null, decided_at = null,
+      decided_by = null, requested_at = now(), origin_warnings = ${warnings}::jsonb
+      where id = ${held.id} returning *`;
+    if (!row) throw new Error('Approval update returned no record');
+    await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+      action_id: action.id,
+      approval_id: held.id,
+      phase: 'approval_superseded',
+      reason: 'untrusted_recipient_origin',
+      superseded_decision: held.decision,
+      superseded_origin_warnings: held.origin_warnings,
+    });
+    if (action.status !== 'needs_approval') await this.setStatus(tx, action, 'needs_approval');
+    await this.askOwner(tx, job, action, held.id, classified);
+    return this.approvalRow(row);
+  }
+
+  /**
+   * The review this action is waiting for, or null when the person is asked
+   * now. Null too when this space or job has used up its reviews, or the
+   * installation runs no reviewer: those go to the person with the reason.
+   */
+  private async pendingReview(
+    tx: Query,
+    context: { job: LockedJob; action: Action; tool: ConnectorTool; claims: CapabilityClaims },
+    classified: Admissibility,
+    connector: Connector,
+  ): Promise<PendingReview | null> {
+    const options = this.options.autoReview;
+    if (!options?.reviewer || classified.auto?.outcome !== 'review') return null;
+    const { job, action, tool } = context;
+    if (
+      await reviewLimit(
+        tx,
+        { space_id: job.space_id, job_id: job.id },
+        { ...AUTO_REVIEW_DEFAULTS, ...definedOnly(options) },
+      )
+    )
+      return null;
+    const input = await reviewInput(tx, {
+      job,
+      action,
+      tool,
+      app: connector.manifest.name,
+      resolver: this.options.resolveTrust ?? createTableTrustResolver({}),
+    });
+    // The record of a review under way, so one a crash interrupts is found and sent on.
+    await appendEvent(tx, job.id, context.claims.attempt_id, 'notice', {
+      kind: 'auto_review_started',
+      action_id: action.id,
+      tier: classified.auto.tier.tier,
+      action_class: classified.auto.tier.actionClass,
+    });
+    return {
+      action_id: action.id,
+      job_id: job.id,
+      space_id: job.space_id,
+      tier: classified.auto.tier,
+      input,
+    };
+  }
+
+  /**
+   * An action auto-review would have put to the reviewer but cannot, or a
+   * calendar change it sent to the person because of what it touches: the
+   * reason goes on record and on the card. Returns the reason, or undefined.
+   */
+  private async recordPolicyEscalation(
+    tx: Query,
+    context: { job: LockedJob; action: Action; claims: CapabilityClaims },
+    classified: Admissibility,
+  ): Promise<string | undefined> {
+    const options = this.options.autoReview;
+    const { job, action } = context;
+    // The person's own rule, quoted on the card with where it came from.
+    if (classified.dont) {
+      await recordReview(tx, {
+        action_id: action.id,
+        job_id: job.id,
+        space_id: job.space_id,
+        attempt_id: context.claims.attempt_id,
+        tier: 'person',
+        action_class: null,
+        decided_by: 'policy',
+        outcome: 'escalated',
+        risk: null,
+        reason: classified.dont.reason,
+      });
+      return classified.dont.reason;
+    }
+    // A change on the person's own calendar that touches something important
+    // says what, on its card, so they know why they are asked.
+    if (
+      options &&
+      classified.auto?.outcome === 'person' &&
+      classified.auto.tier.tier === 'person' &&
+      OWN_CALENDAR_CHANGES.has(action.kind)
+    ) {
+      await recordReview(tx, {
+        action_id: action.id,
+        job_id: job.id,
+        space_id: job.space_id,
+        attempt_id: context.claims.attempt_id,
+        tier: 'person',
+        action_class: 'own_calendar',
+        decided_by: 'policy',
+        outcome: 'escalated',
+        risk: null,
+        reason: classified.auto.tier.reason,
+      });
+      return classified.auto.tier.reason;
+    }
+    if (!options || classified.auto?.outcome !== 'review') return undefined;
+    const reason = !options.reviewer
+      ? 'No reviewer is set up on this installation, so this one is yours to decide.'
+      : ((await reviewLimit(
+          tx,
+          { space_id: job.space_id, job_id: job.id },
+          { ...AUTO_REVIEW_DEFAULTS, ...definedOnly(options) },
+        )) ?? undefined);
+    if (!reason) return undefined;
+    await recordReview(tx, {
+      action_id: action.id,
+      job_id: job.id,
+      space_id: job.space_id,
+      attempt_id: context.claims.attempt_id,
+      tier: classified.auto.tier.tier,
+      action_class: classified.auto.tier.actionClass,
+      decided_by: 'policy',
+      outcome: 'escalated',
+      risk: null,
+      reason,
+    });
+    return reason;
+  }
+
+  /**
+   * Ask the reviewer with nothing locked, then settle its answer under the job
+   * lock. The answer counts only if nothing else decided the action meanwhile
+   * and the action is still one the person lets the reviewer decide; otherwise
+   * the person is asked. A timeout, a failure or an unreadable answer asks the
+   * person too. Returns the action as it stands afterwards.
+   */
+  private async settleReview(claims: CapabilityClaims, pending: PendingReview): Promise<Action> {
+    const options = this.options.autoReview;
+    const started = Date.now();
+    const verdict: ReviewVerdict = options?.reviewer
+      ? await reviewWithin(
+          options.reviewer,
+          pending.input,
+          options.timeoutMs ?? AUTO_REVIEW_DEFAULTS.timeoutMs,
+          { spaceId: pending.space_id, jobId: pending.job_id },
+        )
+      : ({ verdict: 'none', failure: 'unavailable', reason: 'No reviewer is set up.' } as const);
+    const latency = Date.now() - started;
+    const guests = await this.guestsAhead(pending.job_id, pending.action_id);
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, pending.job_id);
+      const action = await loadAction(tx, pending.action_id, true);
+      const [asked] = await tx`select id from approval where action_id = ${action.id}`;
+      if (action.status !== 'proposed' || asked) return action;
+      await checkAttempt(tx, job, claims);
+      const { tool } = await this.tool(tx, job, claims, action.connection_id, action.kind);
+      const classified = await this.classify(tx, job, action, tool, 'proposal', guests);
+      if (!classified.requires_approval) return action;
+      const approved = reviewerApproves(verdict) && classified.auto?.outcome === 'review';
+      const reason = approved
+        ? verdict.verdict === 'approve'
+          ? verdict.reason
+          : ''
+        : classified.auto?.outcome === 'review'
+          ? escalationReason(verdict)
+          : // What changed is the action's own standing (a guest added, a value
+            // no longer vouched for), or else the person's settings.
+            classified.auto?.tier.tier === 'person'
+            ? classified.auto.tier.reason
+            : 'Your approval settings changed while this was being reviewed.';
+      const stored = await loadBinding(tx, action);
+      const approvalId = recordId('apr');
+      await tx`insert into approval
+        (id, action_id, job_revision, payload_hash, expires_at, origin_warnings, step_up_required,
+          decision, decided_at, decided_by)
+        values (${approvalId}, ${action.id}, ${job.revision}, ${action.payload_hash},
+          ${(stored.tuple.expires_at ?? null) as string | null},
+          ${JSON.stringify(classified.warnings)}::jsonb, ${classified.money !== null},
+          ${approved ? 'approved' : null}, ${approved ? new Date().toISOString() : null},
+          ${approved ? 'auto_review' : null})`;
+      await recordReview(tx, {
+        action_id: action.id,
+        job_id: job.id,
+        space_id: job.space_id,
+        attempt_id: claims.attempt_id,
+        tier: pending.tier.tier,
+        action_class: pending.tier.actionClass,
+        decided_by: 'reviewer',
+        outcome: approved ? 'approved' : 'escalated',
+        risk: verdict.verdict === 'none' ? null : verdict.risk,
+        reason,
+        model: verdict.model ?? options?.reviewer?.model ?? null,
+        latency_ms: latency,
+      });
+      if (approved) await this.setStatus(tx, action, 'approved');
+      else {
+        await this.setStatus(tx, action, 'needs_approval');
+        await this.askOwner(tx, job, action, approvalId, classified, reason);
+      }
+      return loadAction(tx, action.id);
+    });
+  }
+
+  /**
+   * A review a crash interrupted: the action is still `proposed`, nobody was
+   * asked, and the review's own time is long past. It goes to the person.
+   * Called by the recovery sweep. A job that has ended since (cancelled,
+   * failed or completed) is left alone: nothing of it can run any more, so a
+   * card for it would only ask a question whose answer changes nothing.
+   */
+  async escalateStaleReviews(olderThanMs = 60_000): Promise<number> {
+    const stale = await this.sql`select a.id from action a
+      join job j on j.id = a.job_id
+      join event e on e.job_id = a.job_id and e.type = 'notice'
+        and e.payload->>'kind' = 'auto_review_started' and e.payload->>'action_id' = a.id
+      where a.status = 'proposed'
+        and j.state not in ('cancelled', 'failed', 'completed')
+        and not exists (select 1 from approval p where p.action_id = a.id)
+        and not exists (select 1 from action_review r where r.action_id = a.id)
+        and e.created_at < clock_timestamp() - make_interval(secs => ${olderThanMs / 1000})
+      limit 50`;
+    let sent = 0;
+    for (const row of stale) {
+      try {
+        const original = await loadAction(this.sql, String(row.id));
+        sent += await this.sql.begin(async (tx) => {
+          const job = await lockJob(tx, original.job_id);
+          const action = await loadAction(tx, original.id, true);
+          const [asked] = await tx`select id from approval where action_id = ${action.id}`;
+          if (action.status !== 'proposed' || asked || ENDED_JOB_STATES.has(job.state)) return 0;
+          const reason = 'The review did not finish, so this one is yours to decide.';
+          const stored = await loadBinding(tx, action);
+          const approvalId = recordId('apr');
+          await tx`insert into approval
+          (id, action_id, job_revision, payload_hash, expires_at, origin_warnings)
+          values (${approvalId}, ${action.id}, ${job.revision}, ${action.payload_hash},
+            ${(stored.tuple.expires_at ?? null) as string | null}, '[]'::jsonb)`;
+          await recordReview(tx, {
+            action_id: action.id,
+            job_id: job.id,
+            space_id: job.space_id,
+            attempt_id: action.attempt_id,
+            tier: 'reviewable',
+            action_class: null,
+            decided_by: 'policy',
+            outcome: 'escalated',
+            risk: null,
+            reason,
+          });
+          await this.setStatus(tx, action, 'needs_approval');
+          await appendEvent(tx, job.id, action.attempt_id, 'approval_requested', {
+            action_id: action.id,
+            approval_id: approvalId,
+            origin_warnings: [],
+            origin_warnings_hash: hashOriginWarnings([]),
+            auto_review: { outcome: 'escalated', reason },
+          });
+          if (job.state === 'running' && !this.options.deferApprovalWaitToRunner)
+            await this.moveJob(tx, job, 'waiting_for_approval', {
+              kind: 'approval',
+              action_ids: [action.id],
+            });
+          return 1;
+        });
+      } catch (error) {
+        // One that cannot be escalated is logged and left; the rest still go to the person.
+        if (databaseUnreachable(error)) throw error;
+        process.stderr.write(
+          `broker: stale review ${String(row.id)} not escalated: ${failureMessage(error)}\n`,
+        );
+      }
+    }
+    return sent;
+  }
+
+  async propose(
+    claims: CapabilityClaims,
+    request: ProposeActionRequest,
+    readOnly = false,
+    /** The service wrote this payload from words the person approved: no pass rewrites it. */
+    verbatim = false,
+  ): Promise<EffectProposalResponse> {
+    // Nothing is read from a destination for a proposal that is not authorized.
+    // Only a connector that reads ahead needs the checks made early.
+    const reader = this.options.connectors.get(request.connection_id);
+    const authorized =
+      reader?.ahead || reader?.existingGuests ? await this.authorizedAhead(claims, request) : null;
+    const guests = authorized
+      ? await this.guestsAhead(claims.job_id, {
+          connection_id: request.connection_id,
+          kind: authorized.tool.name,
+          canonical_payload: request.payload as Action['canonical_payload'],
+        })
+      : NO_GUESTS;
+    const ahead = authorized ? await this.readAhead(authorized, request) : null;
+    const proposal = await this.sql
+      .begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        // A level the person set in the message being answered counts from here.
+        await keepSaidLevels(tx, claims.attempt_id);
+        const access = await agentAccess(tx, job.id);
+        if (
+          access.chat &&
+          directSend(request.kind) &&
+          !(await this.sendsFromChatNow(tx, job.id, claims.attempt_id, request.kind))
+        )
+          throw new BrokerFault(
+            'scope_denied',
+            'In a chat the person sends a draft from its draft card. Say the draft is ready.',
+          );
+        const { tool, connector, granted } = await this.tool(
+          tx,
+          job,
+          claims,
+          request.connection_id,
+          request.kind,
+        );
+        if (readOnly && (tool.effect_class !== 'read' || tool.requires_approval))
+          throw new BrokerFault(
+            'scope_denied',
+            'Composition may invoke only auto-admitted read tools',
+          );
+        // A presentation alias binds one granted account; the durable intent and
+        // connector dispatch keep the original verb, including after a restart.
+        request = { ...request, kind: tool.name };
+        // A draft or message the model wrote reads as the person would write
+        // it, before it is hashed, so what is approved is what is sent
+        // (`human-payload.ts`). An owner command, and a follow-up made of words
+        // the person approved, carry someone's exact words and go as they are.
+        if (!verbatim && !job.experience_command_key) {
+          const passed = humanPayload(tool.name, request.payload);
+          if (passed !== request.payload)
+            request = {
+              ...request,
+              payload: humanPayload(
+                tool.name,
+                request.payload,
+                await typedInConversation(tx, job.id),
+              ),
+            };
+        }
+        let canonical = canonicalizePayload(request.payload);
+        this.validatePayload(tool, canonical.canonical);
+        const proposing: ConnectorContext = {
+          job_id: job.id,
+          space_id: job.space_id,
+          idempotency_key: '',
+          constraints: jobConstraints.parse(job.constraints),
+          ahead,
+          granted,
+        };
+        if (connector.prepare) {
+          canonical = canonicalizePayload(
+            await connector.prepare(canonical.canonical, proposing, tx, request.kind),
+          );
+          this.validatePayload(tool, canonical.canonical);
+        }
+        // The identity of the effect itself, independent of which attempt is
+        // alive. A runtime that died between proposing and hearing back proposes
+        // the same key and is handed the action it already made.
+        const effectKey = intentKey({
+          job_id: job.id,
+          job_revision: job.revision,
+          connection_id: request.connection_id,
+          kind: request.kind,
+          payload_hash: canonical.hash,
+          ...(access.turnId ? { turn_id: access.turnId } : {}),
+        });
+        // Repeated reads reuse their observation within an attempt; later attempts
+        // observe the current source. External effects retain durable job identity.
+        const scope = tool.effect_class === 'read' ? claims.attempt_id : job.id;
+        const key =
+          tool.effect_class === 'read'
+            ? createHash('sha256').update(`${effectKey}:${scope}`).digest('hex')
+            : effectKey;
+        const refBase =
+          request.client_ref === undefined
+            ? null
+            : `broker:proposal:${scope}:${createHash('sha256')
+                .update(
+                  access.turnId ? `${access.turnId}:${request.client_ref}` : request.client_ref,
+                )
+                .digest('hex')}`;
+        const ref = refBase ? `${refBase}:revision:${job.revision}` : null;
+        if (refBase) {
+          // LIKE treats '_' in every job id as a wildcard unless escaped.
+          const refPattern = `${refBase.replace(/[\\%_]/g, '\\$&')}:revision:%`;
+          const [event] = await tx`select payload from event where job_id = ${job.id}
+          and (dedup_key = ${refBase} or dedup_key like ${refPattern})
+          order by seq desc limit 1`;
+          if (event) {
+            const existing = await loadAction(tx, event.payload.action_id);
+            const currentEffectIdentity = intentKey({
+              job_id: job.id,
+              job_revision: job.revision,
+              connection_id: existing.connection_id,
+              kind: existing.kind,
+              payload_hash: existing.payload_hash,
+              ...(access.turnId ? { turn_id: access.turnId } : {}),
+            });
+            const currentIdentity =
+              tool.effect_class === 'read'
+                ? createHash('sha256').update(`${currentEffectIdentity}:${scope}`).digest('hex')
+                : currentEffectIdentity;
+            const obsoleteUnadmitted =
+              existing.intent_key !== currentIdentity &&
+              ['proposed', 'needs_approval', 'approved', 'denied'].includes(existing.status);
+            if (obsoleteUnadmitted) {
+              // A correction revokes an unadmitted approval. Preserve the old
+              // record, refuse its dispatch, and create a binding for this revision.
+              if (['proposed', 'needs_approval', 'approved'].includes(existing.status))
+                await this.rejectDispatch(tx, job, existing, 'job_revision_changed');
+            } else {
+              if (
+                existing.payload_hash !== canonical.hash ||
+                existing.kind !== request.kind ||
+                existing.connection_id !== request.connection_id
+              ) {
+                throw new BrokerFault(
+                  'approval_hash_mismatch',
+                  'A retried proposal must use the same content',
+                );
+              }
+              return { action: existing, key, repeated: true, pending: null };
+            }
+          }
+        }
+        // A conversation goes on after a turn that left an effect uncertain, and
+        // the same effect asked for from a later turn is that one: it is not sent
+        // again, nor asked for again, until the person has settled it.
+        if (tool.effect_class !== 'read') {
+          const [uncertain] = await tx`select * from action where job_id = ${job.id}
+          and connection_id = ${request.connection_id} and kind = ${request.kind}
+          and payload_hash = ${canonical.hash}
+          and status in ('dispatched', 'unknown', 'unresolved')
+          order by created_at desc limit 1 for update`;
+          if (uncertain) return { action: actionFromRow(uncertain), key, repeated: true };
+        }
+        // The unique index is the durable half of this; the job row lock is what
+        // makes two live attempts take their turn rather than race.
+        const [prior] = await tx`select * from action where intent_key = ${key} for update`;
+        if (prior) return { action: actionFromRow(prior), key, repeated: true, pending: null };
+        // A new step that would save past what its person may keep is refused
+        // before anyone is asked, with what they use and how to free space. A
+        // repeat was handed the action it already made above, never refused.
+        const full = await storageRefusal(tx, this.options.storagePerPerson, {
+          kind: request.kind,
+          jobId: job.id,
+          spaceId: job.space_id,
+          payload: canonical.canonical,
+        });
+        if (full) throw new BrokerFault('payload_invalid', full);
+        // Only a proposal that is new is checked against what was read ahead:
+        // a repeat is handed the action it already made, never refused over it.
+        await connector.checkAhead?.(
+          { kind: request.kind, canonical_payload: canonical.canonical },
+          proposing,
+        );
+        // Which way this effect reaches its service, decided by the path policy,
+        // never the model: a connected app before the browser, and nothing at
+        // all while an earlier effect there may have landed unconfirmed.
+        const route =
+          tool.effect_class === 'read'
+            ? null
+            : await routeEffect(tx, {
+                job,
+                claims,
+                allowed: access.allowed ?? null,
+                connectors: this.options.connectors,
+                connector,
+                connectionId: request.connection_id,
+                kind: request.kind,
+                key,
+                payload: canonical.canonical,
+              });
+        const id = recordId('act');
+        const [row] = await tx`insert into action
+        (id, job_id, attempt_id, connection_id, kind, effect_class, canonical_payload, payload_hash,
+          idempotency_key, intent_key, path, service_key, operation_key, operation_intent,
+          stands_in_for)
+        values (${id}, ${job.id}, ${claims.attempt_id}, ${request.connection_id}, ${request.kind},
+          ${tool.effect_class}, ${canonical.json}::jsonb, ${canonical.hash}, ${id}, ${key},
+          ${route?.path ?? null}, ${route?.service ?? null}, ${route?.operation ?? null},
+          ${route?.intent ?? null}, ${route?.standsInFor ?? null}) returning *`;
+        // The receipt says which way it went and why.
+        if (route)
+          await appendEvent(tx, job.id, claims.attempt_id, 'notice', {
+            action_id: id,
+            phase: 'path_chosen',
+            path: route.path,
+            service: route.service,
+            reason: route.reason,
+            ...(route.standsInFor ? { stands_in_for: route.standsInFor } : {}),
+          });
+        if (!row) throw new Error('Action insert returned no record');
+        const created = actionFromRow(row);
+        const classified = await this.classify(tx, job, created, tool, 'proposal', guests);
+        // Proactive work not likely enough to be wanted: nothing is recorded or
+        // sent, no card is raised, and it is left as a suggestion (below).
+        if (classified.proactive && !classified.proactive.act)
+          throw new ProactiveHold(classified.proactive, this.taskAsk(classified));
+        // What the person approves is shown to them whole: a command too long
+        // for its card is refused here, and nothing of it is recorded.
+        const hidden = classified.requires_approval
+          ? tooLongToAsk(created.kind, created.canonical_payload)
+          : null;
+        if (hidden) throw new BrokerFault('payload_invalid', hidden);
+        const expiresAt = classified.requires_approval
+          ? new Date(Date.now() + (this.options.approvalTtlMs ?? 86_400_000)).toISOString()
+          : null;
+        const authority = await resolveEffectAuthority(
+          tx,
+          { job, action: created, phase: 'proposal' },
+          this.options.resolveAuthority,
+        );
+        await saveBinding(tx, created, bindEffect(created, job, authority, expiresAt));
+        await appendEvent(
+          tx,
+          job.id,
+          claims.attempt_id,
+          'action_requested',
+          { action_id: id, kind: request.kind, payload_hash: canonical.hash, intent_key: key },
+          ref ?? undefined,
+        );
+        // The first task of a kind the person has not chosen for asks them once,
+        // beside the work, which goes on at the default meanwhile.
+        const asking = this.taskAsk(classified) ?? (await this.draftAsk(tx, job.id, tool.name));
+        if (asking) await askOnce(tx, { ...asking, jobId: job.id, attemptId: claims.attempt_id });
+        const review = { job, action: created, tool, claims };
+        if (classified.requires_approval) {
+          // A reviewable action waits as `proposed`, with no card, while the
+          // reviewer is asked outside this transaction; anything else asks now.
+          const pending = await this.pendingReview(tx, review, classified, connector);
+          if (pending) return { action: await loadAction(tx, id), key, repeated: false, pending };
+          const approvalId = recordId('apr');
+          await tx`insert into approval
+          (id, action_id, job_revision, payload_hash, expires_at, origin_warnings, step_up_required)
+          values (${approvalId}, ${id}, ${job.revision}, ${canonical.hash}, ${expiresAt},
+            ${JSON.stringify(classified.warnings)}::jsonb, ${classified.money !== null})`;
+          await this.setStatus(tx, created, 'needs_approval');
+          const escalated = await this.recordPolicyEscalation(tx, review, classified);
+          await this.askOwner(tx, job, created, approvalId, classified, escalated);
+        } else if (classified.auto?.outcome === 'policy_approved')
+          await recordReview(tx, {
+            action_id: id,
+            job_id: job.id,
+            space_id: job.space_id,
+            attempt_id: claims.attempt_id,
+            tier: classified.auto.tier.tier,
+            action_class: classified.auto.tier.actionClass,
+            decided_by: 'policy',
+            outcome: 'approved',
+            risk: null,
+            reason: classified.auto.tier.reason,
+          });
+        return { action: await loadAction(tx, id), key, repeated: false, pending: null };
+      })
+      .catch(async (error: unknown) => {
+        // The policy sent the work to the person: they are handed the browser
+        // with what is done and what is left, and this turn ends.
+        if (error instanceof PathRefusal && error.handTo && this.onHandToPerson)
+          await this.onHandToPerson(
+            { space_id: claims.space_id, job_id: claims.job_id },
+            error.handTo.sessionId,
+            { reason: 'path', service: error.handTo.service, operation: error.handTo.operation },
+          ).catch(() => {});
+        // A search refused before it left records no action; the conversation
+        // still shows that it was held back.
+        if (
+          error instanceof BrokerFault &&
+          error.code === 'scope_denied' &&
+          request.kind === 'web.search'
+        )
+          await this.traceHeldSearch(claims, request.payload, error.message);
+        if (error instanceof ProactiveHold) await this.leaveSuggestion(claims, request, error);
+        if (error instanceof BrokerFault) await this.traceRefusal(claims, request.kind, error);
+        throw error;
+      });
+    const { key, repeated } = proposal;
+    const action = proposal.pending
+      ? await this.settleReview(claims, proposal.pending)
+      : proposal.action;
+    // Repeated proposals retrieve the durable disposition; unknown is never replayed.
+    if (action.status === 'proposed' || action.status === 'approved') {
+      await this.admitOnce(claims, action.id, action.payload_hash, repeated);
+      return this.proposalView(await this.dispatch(action.id), key, repeated);
+    }
+    // A crash between the two durable steps has not sent anything yet.
+    if (action.status === 'admitted')
+      return this.proposalView(await this.dispatch(action.id), key, repeated);
+    return this.proposalView(action, key, repeated);
+  }
+
+  /**
+   * A step refused before any action was recorded leaves a note on its attempt,
+   * so what the run made of its steps counts it as held back rather than as one
+   * that worked. A fenced attempt has nothing to note. Like the search trace,
+   * writing it is never worth more than the refusal itself.
+   */
+  private async traceRefusal(claims: CapabilityClaims, kind: string, error: BrokerFault) {
+    if (error.code === 'stale_epoch' || error.code === 'revision_mismatch') return;
+    try {
+      await this.sql.begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        await appendEvent(tx, job.id, claims.attempt_id, 'notice', {
+          phase: 'proposal_refused',
+          kind,
+          code: error.code,
+          reason: error.message.slice(0, 500),
+        });
+      });
+    } catch (failure) {
+      process.stderr.write(
+        `broker: could not note a refused step: ${failure instanceof Error ? failure.message : String(failure)}\n`,
+      );
+    }
+  }
+
+  /**
+   * The row a held-back search leaves in its conversation. Writing it is never
+   * worth more than the refusal: if it cannot be written, the model still hears
+   * why the search did not run.
+   */
+  /**
+   * Proactive work left as a suggestion: a quiet entry in the conversation
+   * saying what was not done and why, and the evidence behind the score. Never
+   * a card and never a notification. Like the other traces, writing it is
+   * never worth more than the refusal itself.
+   */
+  private async leaveSuggestion(
+    claims: CapabilityClaims,
+    request: Pick<ProposeActionRequest, 'kind' | 'payload'>,
+    hold: ProactiveHold,
+  ) {
+    const { confidence } = hold;
+    try {
+      await this.sql.begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        const payload = canonicalizePayload(request.payload);
+        await appendToolTrace(
+          tx,
+          job.id,
+          claims.attempt_id,
+          suggestedStepCall({
+            attemptId: claims.attempt_id,
+            kind: request.kind,
+            payloadHash: payload.hash,
+            to: reaches(payload.canonical, request.kind),
+            why: confidence.reason,
+            at: new Date(),
+          }),
+        );
+        await appendEvent(tx, job.id, claims.attempt_id, 'notice', {
+          phase: 'proactive_suggestion',
+          kind: request.kind,
+          payload_hash: payload.hash,
+          confidence: confidence.score,
+          threshold: confidence.threshold,
+          evidence: confidence.evidence,
+          missing: confidence.missing,
+        });
+        // The first time a kind of task comes up, it is asked about here too.
+        if (hold.ask)
+          await askOnce(tx, { ...hold.ask, jobId: job.id, attemptId: claims.attempt_id });
+      });
+    } catch (error) {
+      process.stderr.write(
+        `broker: could not leave a suggestion: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
+  private async traceHeldSearch(claims: CapabilityClaims, payload: unknown, reason: string) {
+    const query = (payload as { query?: unknown } | null)?.query;
+    try {
+      await this.sql.begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        await appendToolTrace(
+          tx,
+          job.id,
+          claims.attempt_id,
+          heldSearchCall({
+            attemptId: claims.attempt_id,
+            query: typeof query === 'string' ? query : '',
+            reason,
+            at: new Date(),
+          }),
+        );
+      });
+    } catch (error) {
+      process.stderr.write(
+        `broker: could not show a held-back search: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
+  /**
+   * Carry out an approved action by id. The caller supplies no payload: the
+   * stored canonical bytes go through the same admission and dispatch a
+   * byte-identical proposal would reach, under this attempt's authority, so the
+   * payload-hash and revision binding, the budget reservation and the fence are
+   * the ones that already exist. Any other status reads back its durable
+   * disposition, which is why an unknown outcome is never sent again.
+   */
+  async resume(claims: CapabilityClaims, id: string): Promise<EffectProposalResponse> {
+    const action = await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+      const stored = await loadAction(tx, id);
+      if (stored.job_id !== job.id) throw new BrokerFault('action_not_found');
+      const access = await agentAccess(tx, job.id);
+      if (
+        access.chat &&
+        directSend(stored.kind) &&
+        !(await this.sendsFromChatNow(tx, job.id, claims.attempt_id, stored.kind))
+      )
+        throw new BrokerFault(
+          'scope_denied',
+          'In a chat the person sends a draft from its draft card. Say the draft is ready.',
+        );
+      const { tool } = await this.tool(tx, job, claims, stored.connection_id, stored.kind);
+      // An in-cell intent is executed by the runtime that proposes it, not replayed here.
+      if (tool.execution === 'in_cell' && ['approved', 'admitted'].includes(stored.status))
+        throw new BrokerFault(
+          'action_not_admissible',
+          'This approved action runs inside the runtime. Propose the same tool again with the approved arguments.',
+        );
+      return stored;
+    });
+    const key = action.intent_key ?? '';
+    // The bytes of a change from the command line live in the computer, so
+    // nothing is replayed from here: the command is run again, and its request
+    // is admitted against this approval once.
+    if (isEgressTool(action.kind) && ['approved', 'admitted'].includes(action.status))
+      return { ...(await this.proposalView(action, key, false)), message: EGRESS_RERUN };
+    if (action.status === 'approved') {
+      await this.admit(claims, action.id, action.payload_hash);
+      return this.proposalView(await this.dispatch(action.id), key, false);
+    }
+    // A crash between the two durable steps has not sent anything yet.
+    if (action.status === 'admitted')
+      return this.proposalView(await this.dispatch(action.id), key, false);
+    return this.proposalView(action, key, true);
+  }
+
+  proposeRead(claims: CapabilityClaims, request: ProposeActionRequest) {
+    return this.propose(claims, request, true);
+  }
+
+  async say(claims: CapabilityClaims, text: string, ref: string): Promise<void> {
+    const safe = plainText(text, '', 600);
+    if (
+      !safe ||
+      safe !== text.trim() ||
+      !/^(I\b|I['â€™]m\b|I['â€™]ll\b)/i.test(safe) ||
+      (safe.match(/[.!?](?:\s|$)/g)?.length ?? 0) > 2
+    )
+      throw new BrokerFault('payload_invalid', 'Use one or two plain first-person sentences.');
+    // A line the person reads mid-turn reads like the reply around it.
+    const said = humanText(safe);
+    await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      await checkAttempt(tx, job, claims);
+      await appendEvent(
+        tx,
+        job.id,
+        claims.attempt_id,
+        'notice',
+        { kind: 'experience_say', text: said },
+        `say:${claims.attempt_id}:${createHash('sha256').update(ref).digest('hex')}`,
+      );
+    });
+    // The person was told something: a later quiet stretch is counted from now.
+    turnSpoke(claims.attempt_id);
+  }
+
+  /**
+   * A person's answer to a permission, recorded as theirs: `decidedBy` is the
+   * principal who answered. Left out, as on the service's own approval route,
+   * the answer is the job's principal's, the only person a job asks. A room's
+   * work is answered only by the people its rule names (`rooms/approvals.ts`),
+   * whichever route the answer came by.
+   */
+  async decide(
+    id: string,
+    request: ApprovalDecisionRequest,
+    guard?: (
+      tx: Query,
+      job: LockedJob,
+      action: Action,
+      approval: Record<string, unknown>,
+    ) => Promise<void>,
+    decidedBy?: string,
+  ) {
+    const original = await loadAction(this.sql, id);
+    const result = await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, original.job_id);
+      const action = await loadAction(tx, id, true);
+      const decider = decidedBy ?? (await jobPrincipal(tx, job));
+      // A room's request is the room's job, so its own principal names nobody
+      // who can answer: the room's rule for this action does (its team-account
+      // rule when the action goes through one of the room's own accounts). Checked first, before any answer
+      // is recorded (a Deny included), with the roster as it is now.
+      const room = await roomAuthorityOf(tx, job.id, { connectionId: action.connection_id });
+      if (room && !(await mayDecide(tx, room, decider)))
+        throw new BrokerFault('scope_denied', 'Only the people this room names can answer this.');
+      const [approval] = await tx`select * from approval where action_id = ${id}
+        and payload_hash = ${request.payload_hash} for update`;
+      if (
+        !approval ||
+        action.payload_hash !== request.payload_hash ||
+        canonicalizePayload(action.canonical_payload).hash !== request.payload_hash
+      ) {
+        throw new BrokerFault('approval_hash_mismatch');
+      }
+      // The request changed before this was answered. A Deny is still the
+      // person's refusal and is recorded as theirs. An Allow is refused, since
+      // the person never saw what the work asks for now, and the question is
+      // withdrawn rather than left open forever.
+      const changed =
+        approval.decided_by === OUTDATED_NOTE ||
+        (!approval.decision &&
+          (approval.job_revision !== job.revision || action.status !== 'needs_approval'));
+      // The person's own Deny, pressed again.
+      if (
+        request.decision === 'denied' &&
+        approval.decision === 'denied' &&
+        [decider, LEGACY_PERSON_DECISION].includes(String(approval.decided_by))
+      )
+        return {
+          approval_id: approval.id as string,
+          action_id: id,
+          decision: 'denied' as const,
+          payload_hash: approval.payload_hash as string,
+          decided_at: new Date(approval.decided_at).toISOString(),
+        };
+      if (changed && !approval.decision && request.decision === 'denied') {
+        const decidedAt = new Date().toISOString();
+        await tx`update approval set decision = 'denied', decided_at = ${decidedAt},
+          decided_by = ${decider} where id = ${approval.id}`;
+        if (action.status === 'needs_approval') await this.setStatus(tx, action, 'denied');
+        await appendEvent(tx, job.id, action.attempt_id, 'approval_decided', {
+          action_id: id,
+          approval_id: approval.id,
+          decision: 'denied',
+          note: request.note ?? null,
+        });
+        return {
+          approval_id: approval.id as string,
+          action_id: id,
+          decision: 'denied' as const,
+          payload_hash: approval.payload_hash as string,
+          decided_at: decidedAt,
+        };
+      }
+      if (changed) {
+        await this.withdrawOutdated(tx, job, action);
+        const [closed] = await tx`select decided_at from approval where id = ${approval.id}`;
+        return {
+          approval_id: approval.id as string,
+          action_id: id,
+          decision: 'denied' as const,
+          payload_hash: approval.payload_hash as string,
+          decided_at: new Date(closed?.decided_at ?? Date.now()).toISOString(),
+          withdrawn: true,
+        };
+      }
+      if (approval.job_revision !== job.revision) throw new BrokerFault('revision_mismatch');
+      if (approval.expires_at && new Date(approval.expires_at).getTime() <= Date.now())
+        throw new BrokerFault('approval_required', 'Approval expired');
+      const authority = await resolveEffectAuthority(
+        tx,
+        { job, action, phase: 'decision' },
+        this.options.resolveAuthority,
+      );
+      requireMatchingBinding(
+        await loadBinding(tx, action),
+        bindEffect(
+          action,
+          job,
+          authority,
+          approval.expires_at ? new Date(approval.expires_at).toISOString() : null,
+        ),
+      );
+      if (['cancelled', 'completed', 'failed'].includes(job.state))
+        throw new BrokerFault('stale_epoch');
+      await guard?.(tx, job, action, approval);
+      if (approval.decision) {
+        if (approval.decision !== request.decision) throw new BrokerFault('action_not_admissible');
+        return {
+          approval_id: approval.id,
+          action_id: id,
+          decision: approval.decision,
+          payload_hash: approval.payload_hash,
+          decided_at: new Date(approval.decided_at).toISOString(),
+        };
+      }
+      if (action.status !== 'needs_approval') throw new BrokerFault('action_not_admissible');
+      // A money move is allowed only with the person's own step-up, made for
+      // this approval and these bytes and spent here, once.
+      let stepUp: string | null = null;
+      if (
+        request.decision === 'approved' &&
+        (approval.step_up_required === true || (await this.movesMoneyNow(action)))
+      ) {
+        stepUp = await spendStepUp(tx, {
+          token: request.step_up_token,
+          principalId: decider,
+          approvalId: String(approval.id),
+          actionId: id,
+          payloadHash: action.payload_hash,
+        });
+        if (!stepUp) throw new BrokerFault('approval_required', STEP_UP_NEEDED);
+      }
+      const decidedAt = new Date().toISOString();
+      await tx`update approval set decision = ${request.decision}, decided_at = ${decidedAt},
+        decided_by = ${decider}, step_up_id = ${stepUp} where id = ${approval.id}`;
+      await this.setStatus(tx, action, request.decision);
+      await appendEvent(tx, job.id, action.attempt_id, 'approval_decided', {
+        action_id: id,
+        approval_id: approval.id,
+        decision: request.decision,
+        note: request.note ?? null,
+      });
+      // Asks made together are answered together: the work goes on once the
+      // last of them is answered, so its next attempt is told every answer.
+      // Woken at the first, that attempt would carry out only the one it knew
+      // of, and the rest, answered while it ran, would be left approved and
+      // never carried out.
+      if (job.state === 'waiting_for_approval' && !(await this.stillAsking(tx, job, id)))
+        await this.wake(tx, job, 'approval');
+      return {
+        approval_id: approval.id,
+        action_id: id,
+        decision: request.decision,
+        payload_hash: approval.payload_hash,
+        decided_at: decidedAt,
+      };
+    });
+    // Thrown once the withdrawal is committed, so the card still closes.
+    if ('withdrawn' in result && request.decision !== 'denied')
+      throw new BrokerFault(
+        'revision_mismatch',
+        'The request changed before it was answered, so it was withdrawn.',
+      );
+    return result;
+  }
+
+  /**
+   * Whether the job still waits on the person for another of its asks: an
+   * unanswered approval, at the job's revision, on an action still needing
+   * one, that has not run out. The same asks the runtime parks the job on.
+   */
+  private async stillAsking(tx: Query, job: LockedJob, answered: string): Promise<boolean> {
+    const [open] = await tx`select 1 from approval p join action a on a.id = p.action_id
+      where a.job_id = ${job.id} and a.id <> ${answered} and a.status = 'needs_approval'
+        and p.decision is null and p.job_revision = ${job.revision}
+        and (p.expires_at is null or p.expires_at > now())
+      limit 1`;
+    return Boolean(open);
+  }
+
+  /**
+   * Wake the work whose asks have all been answered or have run out, when
+   * the last of them ran out rather than being answered: an answer wakes the
+   * work only once no other ask is waiting, and running out answers nothing,
+   * so without this the asks answered first would wait for good. Called by
+   * the recovery sweep. Only work the person answered something of is woken;
+   * work none of whose asks was answered stays as it was.
+   */
+  async wakeAnswered(): Promise<number> {
+    const waiting = await this.sql`select j.id from job j
+      where j.state = 'waiting_for_approval'
+        and exists (select 1 from approval p join action a on a.id = p.action_id
+          where a.job_id = j.id and p.job_revision = j.revision and p.decision is not null)
+        and exists (select 1 from approval p join action a on a.id = p.action_id
+          where a.job_id = j.id and p.job_revision = j.revision and p.decision is null
+            and a.status = 'needs_approval' and p.expires_at <= now())
+        and not exists (select 1 from approval p join action a on a.id = p.action_id
+          where a.job_id = j.id and p.job_revision = j.revision and p.decision is null
+            and a.status = 'needs_approval'
+            and (p.expires_at is null or p.expires_at > now()))
+      limit 50`;
+    let woken = 0;
+    for (const row of waiting) {
+      try {
+        woken += await this.sql.begin(async (tx) => {
+          const job = await lockJob(tx, String(row.id));
+          if (job.state !== 'waiting_for_approval' || (await this.stillAsking(tx, job, '')))
+            return 0;
+          await this.wake(tx, job, 'approval');
+          return 1;
+        });
+      } catch (error) {
+        // One that cannot be woken is logged and left; the rest still go on.
+        if (databaseUnreachable(error)) throw error;
+        process.stderr.write(
+          `broker: answered job ${String(row.id)} not woken: ${failureMessage(error)}\n`,
+        );
+      }
+    }
+    return woken;
+  }
+
+  async admit(claims: CapabilityClaims, id: string, expectedHash: string): Promise<Action> {
+    return this.admitOnce(claims, id, expectedHash, false);
+  }
+
+  /**
+   * Admission itself. A repeated proposal reads its action before the first
+   * proposer has admitted it, so both can reach here for the same action. The
+   * job lock puts them in turn, and the one that comes second, finding the
+   * action already past admission, is handed that action rather than refused:
+   * it is the same effect, admitted once and sent at most once.
+   */
+  private async admitOnce(
+    claims: CapabilityClaims,
+    id: string,
+    expectedHash: string,
+    repeated: boolean,
+  ): Promise<Action> {
+    const guests = await this.guestsAhead(claims.job_id, id);
+    const result = await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, claims.job_id);
+      // Set once the caller and the stored bytes are known good: a refusal
+      // after that is about the approval itself, not about who asked.
+      let judgingApproval = false;
+      try {
+        await checkAttempt(tx, job, claims);
+        const action = await loadAction(tx, id, true);
+        if (action.job_id !== job.id) throw new BrokerFault('action_not_found');
+        const { tool, connector } = await this.tool(
+          tx,
+          job,
+          claims,
+          action.connection_id,
+          action.kind,
+        );
+        await connector.validateBinding?.(action, this.context(job, action), tx);
+        if (
+          canonicalizePayload(action.canonical_payload).hash !== action.payload_hash ||
+          action.payload_hash !== expectedHash ||
+          tool.effect_class !== action.effect_class
+        ) {
+          throw new BrokerFault('approval_hash_mismatch');
+        }
+        this.validatePayload(tool, action.canonical_payload);
+        if (action.status === 'denied') throw new BrokerFault('approval_denied');
+        if (repeated && !['proposed', 'approved'].includes(action.status))
+          return { action, error: null };
+        // Something on the same service may have landed since this was asked
+        // for, on any path: it is settled first, and this waits.
+        if (['proposed', 'approved'].includes(action.status)) {
+          const waiting = await unsettledBefore(tx, id);
+          if (waiting) throw waiting;
+        }
+        judgingApproval = true;
+        const classified = await this.classify(tx, job, action, tool, 'admission', guests);
+        let authorization: string | null = null;
+        let expiresAt: string | null = null;
+        if (classified.requires_approval) {
+          const [row] = await tx`select * from approval where action_id = ${id}
+            and payload_hash = ${action.payload_hash} for update`;
+          // Proactive work that was likely enough when proposed but is not now
+          // ends here, with no card, as it would have at proposal.
+          if (!row && classified.proactive && !classified.proactive.act) {
+            await this.rejectDispatch(tx, job, action, 'proactive_hold');
+            throw new ProactiveHold(classified.proactive);
+          }
+          let approval = await this.holdApproval(tx, job, action, row, classified);
+          if (
+            approval.decided_by === 'auto_review' &&
+            approval.decision === 'approved' &&
+            classified.auto?.outcome !== 'review'
+          )
+            approval = await this.withdrawReviewApproval(tx, job, action, approval.id, classified);
+          // A doubt about where a value came from is refused in its own words,
+          // before the bookkeeping states get a chance to answer instead.
+          if (
+            classified.warnings.length > 0 &&
+            (approval.decision !== 'approved' ||
+              action.status !== 'approved' ||
+              hashOriginWarnings(approval.origin_warnings) !== classified.warnings_hash)
+          ) {
+            throw new BrokerFault(
+              'untrusted_recipient_origin',
+              untrustedOrigin(classified.warnings),
+            );
+          }
+          if (!['proposed', 'approved'].includes(action.status))
+            throw new BrokerFault('action_not_admissible');
+          if (approval.decision !== 'approved' || action.status !== 'approved')
+            throw new BrokerFault('approval_required');
+          if (approval.job_revision !== job.revision) throw new BrokerFault('revision_mismatch');
+          if (approval.expires_at && new Date(approval.expires_at).getTime() <= Date.now())
+            throw new BrokerFault('approval_required', 'Approval expired');
+          // Checked here as well as when the person answered: an Allow written
+          // any way but with their step-up moves no money.
+          if (classified.money && !(await stepUpHolds(tx, approval.id, action)))
+            throw new BrokerFault('approval_required', STEP_UP_NEEDED);
+          authorization = approval.id;
+          expiresAt = approval.expires_at ? new Date(approval.expires_at).toISOString() : null;
+        } else {
+          authorization = classified.authorized_by;
+          // The expiry was bound when the action was proposed. A setting that
+          // stopped asking since then changes nothing the binding covers: the
+          // payload, destination and revision are still the ones that were shown.
+          const stored = await loadBinding(tx, action);
+          expiresAt = (stored.tuple.expires_at ?? null) as string | null;
+        }
+        if (!['proposed', 'approved'].includes(action.status))
+          throw new BrokerFault('action_not_admissible');
+        const authority = await resolveEffectAuthority(
+          tx,
+          { job, action, phase: 'admission' },
+          this.options.resolveAuthority,
+        );
+        const binding = bindEffect(action, job, authority, expiresAt);
+        requireMatchingBinding(await loadBinding(tx, action), binding);
+        const requests: ReservationRequest[] = [{ kind: 'calls', amount: 1 }];
+        // A metered capability reserves what it costs the installation. A money
+        // move is the person's own transaction, authorized by their step-up,
+        // and has no installation cost to reserve.
+        if (tool.effect_class === 'spend' && !classified.money) {
+          const cost = this.options.estimateSpend?.(action);
+          if (cost === undefined || !Number.isFinite(cost) || cost < 0)
+            throw new BrokerFault('budget_exceeded', 'Trusted spend estimate required');
+          requests.push({ kind: 'usd_est', amount: cost });
+        }
+        const reservations = await reserveLocked(tx, job, claims, id, requests);
+        await tx`update action set authorization_ref = ${authorization},
+          budget_reservation = ${reservations[0]?.id ?? null}, attempt_id = ${claims.attempt_id}
+          where id = ${id}`;
+        await this.setStatus(tx, { ...action, attempt_id: claims.attempt_id }, 'admitted');
+        // Undo send: a message waits before it goes, under the same id, so a
+        // restart in the meantime still sends it once and a cancel sends nothing.
+        const hold = this.options.sendHoldMs ?? 0;
+        if (hold > 0 && heldKind(action.kind, this.options.connectors.get(action.connection_id))) {
+          // The database's clock, which every instance shares, sets and ends the hold.
+          const [timed] = await tx`update action
+            set retry_after_at = clock_timestamp() + make_interval(secs => ${hold / 1000})
+            where id = ${id} returning retry_after_at`;
+          const until = new Date(timed?.retry_after_at as string | Date).toISOString();
+          await appendEvent(
+            tx,
+            job.id,
+            claims.attempt_id,
+            'notice',
+            { action_id: id, phase: 'send_held', until },
+            `broker:held:${id}`,
+          );
+        }
+        await appendEvent(
+          tx,
+          job.id,
+          claims.attempt_id,
+          'notice',
+          {
+            action_id: id,
+            phase: 'execution_authorized',
+            ...binding,
+            standing_grant: classified.standing_grant,
+            origin_warnings_hash: classified.warnings_hash,
+          },
+          `broker:execution:${id}`,
+        );
+        return { action: await loadAction(tx, id), error: null };
+      } catch (error) {
+        if (!(error instanceof BrokerFault)) throw error;
+        // Return instead of throwing inside the transaction, so the refusal is durable.
+        await appendEvent(tx, job.id, null, 'notice', {
+          action_id: id,
+          phase: 'admission_rejected',
+          code: error.code,
+          reason: error.message,
+        });
+        // An approval that can no longer be spent ends its action. Left
+        // `approved`, it could never run and never settle, and every later
+        // attempt of the job would end on an action still in flight.
+        const current = judgingApproval ? await loadAction(tx, id) : null;
+        if (current?.status === 'approved' && SPENT_APPROVAL_FAULTS.has(error.code))
+          await this.rejectDispatch(tx, job, current, `approval_no_longer_applies:${error.code}`);
+        return { action: null, error };
+      }
+    });
+    if (result.error) throw result.error;
+    if (!result.action) throw new Error('Admission returned no action');
+    this.releaseWhenDue(result.action);
+    return result.action;
+  }
+
+  /**
+   * Send a held message the moment its hold ends. The periodic resume does the
+   * same after a restart, when this timer is gone; the action's own status
+   * decides which of them sends it, so it is sent once.
+   */
+  private releaseWhenDue(action: Action) {
+    if (action.status !== 'admitted' || !action.retry_after_at) return;
+    const wait = Math.max(0, Date.parse(action.retry_after_at) - Date.now()) + 25;
+    const timer = setTimeout(() => {
+      void this.dispatch(action.id).catch(() => {
+        process.stderr.write('held message release failed\n');
+      });
+    }, wait);
+    timer.unref?.();
+  }
+
+  /**
+   * Whether a change to an existing event would reach its guests: true when
+   * the calendar says it has some, and when nobody could say.
+   */
+  async reachesGuests(actionId: string): Promise<boolean> {
+    const action = await loadAction(this.sql, actionId);
+    if (!CHANGES_EXISTING_EVENT.has(action.kind)) return false;
+    const connector = this.options.connectors.get(action.connection_id);
+    const [job] = await this.sql<LockedJob[]>`select * from job where id = ${action.job_id}`;
+    if (!connector?.existingGuests || !job) return true;
+    try {
+      const count = await connector.existingGuests(action, {
+        ...this.context(job, action),
+        signal: AbortSignal.timeout(EXISTING_GUESTS_TIMEOUT_MS),
+      });
+      return !(Number.isInteger(count) && count === 0);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Cancel a message that is still held: it ends as failed, with nothing sent
+   * and its budget returned. Null when it is not held any more, because it was
+   * sent, is being sent, or never waited.
+   */
+  async cancelHeld(id: string): Promise<Action | null> {
+    const original = await loadAction(this.sql, id);
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, original.job_id);
+      const action = await loadAction(tx, id, true);
+      if (!(await heldUntil(tx, action))) return null;
+      await this.setStatus(tx, action, 'failed');
+      await tx`update action set resolved_at = now(), retry_after_at = null,
+        reconciliation = ${JSON.stringify({ reason: 'cancelled before it was sent; nothing left OpenDuet', retryable: false, cancelled: true })}::jsonb
+        where id = ${id}`;
+      await tx`update budget_ledger set settled = 0 where action_id = ${id} and settled is null`;
+      await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+        action_id: id,
+        phase: 'send_cancelled',
+      });
+      return loadAction(tx, id);
+    });
+  }
+
+  /** A connection serves only the jobs the shared-use rule gives it to; see `jobs/scopes.ts`. */
+  private async checkConnectionUse(tx: Query, job: LockedJob, sharedUse: string) {
+    const audience = await jobConnectionAudience(tx, job.id);
+    if (!audience || !connectionServesJob(audience, sharedUse))
+      throw new BrokerFault('scope_denied');
+  }
+
+  /**
+   * Everything that has to be true for these bytes to leave, re-asked.
+   *
+   * The connection is still this connection and still active, the generation
+   * the admission reviewed is still current, the tool and its scopes are still
+   * held, the effect binding still matches, and the origins are still the ones
+   * the approval was given against. It returns a fenced reason when the world
+   * has moved and throws a `BrokerFault` when authority was never there.
+   *
+   * A dispatch asks this once before it marks the action dispatched. A repair
+   * asks it again before every further execution, because a revocation during a
+   * backoff is exactly the case a retry must not out-run.
+   */
+  /** The cell's exec connection, refused in a space that runs its commands in a sandbox. */
+  private async checkExecutionBackend(tx: Query, spaceId: string, provider: string) {
+    if (provider !== 'exec') return;
+    const active = await tx`select provider from connection
+      where space_id = ${spaceId} and status = 'active'`;
+    if (
+      supersededExecution(
+        provider,
+        active.map((row) => String(row.provider)),
+      )
+    )
+      throw new BrokerFault(
+        'connector_unavailable',
+        'This space runs its commands in its sandbox connection.',
+      );
+  }
+
+  private async checkAuthority(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    guests: GuestCounts,
+  ): Promise<string | null> {
+    // The agent binding: a paused conversation, a persona
+    // whose allowed connections exclude this one, a missing persona, or a chat
+    // turn without an agent sends nothing; a chat sends directly only when the
+    // person said to send in the turn being answered.
+    const access = await agentAccess(tx, job.id);
+    if (
+      access.paused ||
+      (access.allowed && !access.allowed.includes(action.connection_id)) ||
+      access.missingAgent ||
+      (access.chat &&
+        (!access.agentId ||
+          (directSend(action.kind) &&
+            !(await this.sendsFromChatNow(tx, job.id, action.attempt_id, action.kind)))))
+    )
+      throw new BrokerFault('scope_denied');
+    const [connection] =
+      await tx`select c.status, c.provider, c.scopes, c.shared_use, s.audience from connection c
+      join space s on s.id = c.space_id
+      where c.id = ${action.connection_id} and c.space_id = ${job.space_id} for share`;
+    if (connection) await this.checkConnectionUse(tx, job, String(connection.shared_use));
+    // Admitted before the space had a sandbox connection is not enough: the
+    // command still runs where the space runs commands now.
+    if (connection) await this.checkExecutionBackend(tx, job.space_id, String(connection.provider));
+    const stored = await loadBinding(tx, action);
+    const authority = await resolveEffectAuthority(
+      tx,
+      { job, action, phase: 'execution' },
+      this.options.resolveAuthority,
+    );
+    const fenced = checkConnectionGeneration(
+      stored.connection_generation,
+      authority.connectionGeneration,
+      connection?.status === 'active',
+    );
+    if (fenced) return fenced.reason;
+    const connector = this.options.connectors.get(action.connection_id);
+    const tool = connector && findTool(connector.manifest, action.kind);
+    if (
+      !connector ||
+      connector.manifest.provider !== connection?.provider ||
+      !connectorAllowsAudience(connector, job.constraints, connection.audience) ||
+      !tool ||
+      tool.effect_class !== action.effect_class ||
+      ![tool.name, ...tool.required_scopes].every((scope) => connection.scopes.includes(scope))
+    )
+      throw new BrokerFault('scope_denied');
+    // Repair retries must recheck the same artifact and mailbox binding as
+    // initial dispatch, since either can change during a backoff.
+    await connector.validateBinding?.(action, this.context(job, action), tx);
+    requireMatchingBinding(
+      stored,
+      bindEffect(action, job, authority, stored.tuple.expires_at as string | null),
+    );
+    // Admission authorized these origins. If the world has since learned that
+    // one of them came from somewhere else, nothing leaves.
+    const classified = await this.classify(tx, job, action, tool, 'execution', guests);
+    if (classified.requires_approval && !action.authorization_ref)
+      throw new BrokerFault(
+        'approval_required',
+        'The standing permission no longer covers this action.',
+      );
+    // Every send of a money move, a retry included, rests on the person's step-up.
+    if (classified.money && !(await stepUpHolds(tx, action.authorization_ref, action)))
+      throw new BrokerFault('approval_required', STEP_UP_NEEDED);
+    const [authorizing] = action.authorization_ref
+      ? await tx`select origin_warnings, action_id from approval where id = ${action.authorization_ref}`
+      : [];
+    // An approval lent by a scope, rather than given to this action, holds only
+    // while the scope still lends that same approval now.
+    if (
+      authorizing &&
+      authorizing.action_id !== action.id &&
+      classified.authorized_by !== action.authorization_ref
+    )
+      throw new BrokerFault(
+        'approval_required',
+        'The standing permission no longer covers this action.',
+      );
+    const authorized = originWarnings.parse(authorizing?.origin_warnings ?? []);
+    if (hashOriginWarnings(authorized) !== classified.warnings_hash) {
+      throw new BrokerFault(
+        'untrusted_recipient_origin',
+        classified.warnings.length > 0
+          ? untrustedOrigin(classified.warnings)
+          : 'The origins of this effect no longer match the ones that were approved.',
+      );
+    }
+    return null;
+  }
+
+  /**
+   * The same question, asked outside the dispatch transaction and answered as a
+   * reason rather than an exception, so the repair policy can stop without
+   * sending instead of learning about it from a thrown error.
+   */
+  private async authorityLost(action: Action): Promise<string | null> {
+    try {
+      const guests = await this.guestsAhead(action.job_id, action);
+      return await this.sql.begin(async (tx) => {
+        const job = await lockJob(tx, action.job_id);
+        const current = await loadAction(tx, action.id, true);
+        return this.checkAuthority(tx, job, current, guests);
+      });
+    } catch (error) {
+      if (error instanceof BrokerFault) return error.message;
+      throw error;
+    }
+  }
+
+  private context(job: LockedJob, action: Action): ConnectorContext {
+    return {
+      job_id: job.id,
+      space_id: job.space_id,
+      idempotency_key: action.id,
+      constraints: jobConstraints.parse(job.constraints),
+    };
+  }
+
+  /**
+   * `now` is the instant the due check is made against. The recovery scan
+   * supplies the same instant it selected with, so a parked action is never
+   * chosen by one clock and refused by another; everything else takes the wall
+   * clock and never notices.
+   */
+  async dispatch(
+    id: string,
+    now = Date.now(),
+    cellClaim?: { claims: CapabilityClaims; claimed: () => void },
+  ): Promise<Action> {
+    const original = await loadAction(this.sql, id);
+    const guests = await this.guestsAhead(original.job_id, original);
+    // Marked before the row can read `dispatched`, so recovery never takes a
+    // dispatch this process is about to send, or is still waiting on, for one
+    // whose sender is gone. Cleared once the connector's answer is recorded, a
+    // late answer included.
+    const prior = this.inFlight.has(id);
+    this.inFlight.add(id);
+    const release = () => {
+      if (!prior) this.inFlight.delete(id);
+    };
+    let prepared: { action: Action; context: ConnectorContext | null };
+    try {
+      prepared = await this.sql.begin(async (tx) => {
+        const job = await lockJob(tx, original.job_id);
+        const action = await loadAction(tx, id, true);
+        if (cellClaim) {
+          await checkAttempt(tx, job, cellClaim.claims);
+          if (
+            action.job_id !== cellClaim.claims.job_id ||
+            action.attempt_id !== cellClaim.claims.attempt_id
+          )
+            throw new BrokerFault('action_not_found');
+        }
+        if (action.status !== 'admitted') return { action, context: null };
+        // A parked action is admitted and not yet due. The row lock is what makes
+        // this a decision rather than a race: a wake, a repeated proposal and a
+        // queue redelivery all serialize on it, and a destination that asked to
+        // be left alone for a minute is left alone for a minute.
+        if (action.retry_after_at && Date.parse(action.retry_after_at) > now) {
+          return { action, context: null };
+        }
+        // A held message ends its hold by the database's clock, never by this
+        // instance's, so a clock running ahead cannot shorten the time to cancel.
+        const held = (await heldUntil(tx, action)) !== null;
+        if (held) {
+          const [due] =
+            await tx`select ${action.retry_after_at}::timestamptz <= clock_timestamp() as due`;
+          if (!due?.due) return { action, context: null };
+        }
+        // A conversation that was stopped sends nothing more, however long an
+        // action of it waited for its destination. A held message was cleared to
+        // go before its task finished; only stopping the task takes it back.
+        if (['cancelled', 'failed'].includes(job.state) || (job.state === 'completed' && !held))
+          return {
+            action: await this.rejectDispatch(tx, job, action, 'the conversation was stopped'),
+            context: null,
+          };
+        // The person's approval of this action has its own expiry. An action that
+        // waited past it for its destination is refused, not sent on an old yes.
+        const [given] = action.authorization_ref
+          ? await tx`select expires_at from approval
+            where id = ${action.authorization_ref} and action_id = ${action.id}`
+          : [];
+        // What the effect itself does, whoever let it through: one of the risks
+        // only the person lets through, or none.
+        const risk = action.kind === 'browser.submit' ? submitRisk(action.canonical_payload) : null;
+        if (given?.expires_at && new Date(given.expires_at).getTime() <= Date.now())
+          return {
+            action: await this.rejectDispatch(
+              tx,
+              job,
+              action,
+              'its approval expired while it waited',
+            ),
+            context: null,
+          };
+        const inCell =
+          this.options.connectors
+            .get(action.connection_id)
+            ?.manifest.tools.some(
+              (tool) => tool.name === action.kind && tool.execution === 'in_cell',
+            ) && executionIntent.safeParse(action.canonical_payload).success;
+        if (cellClaim && !inCell) throw new BrokerFault('unknown_tool');
+        if (inCell && !cellClaim) return { action, context: null };
+        try {
+          const fenced = await this.checkAuthority(tx, job, action, guests);
+          if (fenced)
+            return {
+              action: await this.rejectDispatch(tx, job, action, fenced),
+              context: null,
+            };
+        } catch (error) {
+          if (!(error instanceof BrokerFault)) throw error;
+          return {
+            action: await this.rejectDispatch(tx, job, action, error.message),
+            context: null,
+          };
+        }
+        // Admission authorizes these bytes only. A storage mutation must not reach a connector.
+        if (canonicalizePayload(action.canonical_payload).hash !== action.payload_hash) {
+          await this.setStatus(tx, action, 'failed');
+          await tx`update budget_ledger set settled = 0 where action_id = ${id} and settled is null`;
+          await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+            action_id: id,
+            phase: 'dispatch_rejected',
+            code: 'approval_hash_mismatch',
+          });
+          return { action: await loadAction(tx, id), context: null };
+        }
+        await tx`update action set dispatched_at = now() where id = ${id}`;
+        await this.setStatus(tx, action, 'dispatched');
+        // Nobody agreed to this one because its name was unused when it was
+        // checked; the connector keeps it to a new file (`only_new`). Only a
+        // personal space lets one through unasked: `checkAuthority` classified
+        // it again above, and in a room's space it needs the room's answer.
+        const onlyNew =
+          !action.authorization_ref &&
+          this.options.connectors
+            .get(action.connection_id)
+            ?.staysInSpace?.(action, job.space_id) === true;
+        return {
+          action: await loadAction(tx, id),
+          context: {
+            ...this.context(job, action),
+            ...(onlyNew ? { only_new: true } : {}),
+            ...(risk ? { risk: risk.risk } : {}),
+          },
+        };
+      });
+    } catch (error) {
+      release();
+      throw error;
+    }
+    const connector = prepared.context
+      ? this.options.connectors.get(prepared.action.connection_id)
+      : undefined;
+    // Nothing is sent from here on any of these paths: a cell runs its own
+    // command and reports it, and a missing connector settles at once.
+    if (!prepared.context || cellClaim || !connector) release();
+    if (!prepared.context) return prepared.action;
+    if (cellClaim) {
+      cellClaim.claimed();
+      return prepared.action;
+    }
+    const readOnly = await this.plainRead(prepared.action);
+    if (!connector)
+      return this.recordResult(
+        id,
+        uncertainResult(readOnly, 'Connector disappeared after dispatch admission'),
+      );
+    const controller = new AbortController();
+    const budgetMs = this.dispatchBudget(connector, prepared.action);
+    const execution = Promise.resolve().then(() =>
+      runRepair(
+        prepared.action.canonical_payload,
+        this.repairPorts(prepared, connector, controller),
+        {
+          classify: (error) =>
+            asConnectorFault(error) ?? unclassifiedFault(error, prepared.action.effect_class),
+          readOnly,
+          // An approved send keeps the hash the person read, so a revision of one
+          // is refused rather than sent under an approval it no longer matches.
+          trustGated: isTrustGatedEffect(prepared.action.effect_class),
+          operation: prepared.action.kind,
+          // The dispatch timeout is the repair budget too: a retry that cannot
+          // finish inside it is not attempted at all.
+          deadlineAt: Date.now() + budgetMs,
+        },
+      ),
+    );
+    // The mark stays until the connector's answer is recorded, not merely
+    // received: between the two the row still reads `dispatched`, and an
+    // abandoned-action sweep in that gap would settle a delivered action as
+    // unknown.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), budgetMs);
+    });
+    let result: Awaited<typeof execution> | 'timeout';
+    try {
+      result = await Promise.race([execution, timeout]);
+    } catch (error) {
+      release();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (result === 'timeout') {
+      controller.abort();
+      try {
+        const unknown = await this.recordResult(
+          id,
+          uncertainResult(readOnly, 'timed out', question),
+        );
+        // A cooperative abort is not proof of non-delivery; a later receipt is still a fact.
+        void execution
+          .then((late) => this.settleRepair(prepared.action, late))
+          .catch(() => {})
+          .finally(release);
+        return unknown;
+      } catch (error) {
+        void execution.finally(release).catch(() => {});
+        throw error;
+      }
+    }
+    try {
+      return await this.settleRepair(prepared.action, result);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * What the policy is allowed to do to this destination. Every port is a
+   * capability the connector declared; a connector that cannot describe itself
+   * simply cannot be repaired that way, and the policy stops instead.
+   */
+  private repairPorts(
+    prepared: { action: Action; context: ConnectorContext | null },
+    connector: Connector,
+    controller: AbortController,
+  ): RepairPorts {
+    const action = prepared.action;
+    const base = prepared.context as ConnectorContext;
+    const ctx = (repair?: RepairAttemptContext): ConnectorContext => ({
+      ...base,
+      signal: controller.signal,
+      ...(repair ? { repair } : {}),
+    });
+    // The action is never rewritten. A repaired attempt sends the same identity,
+    // the same hash and the same approval, with the payload the policy chose.
+    const wire = (payload: JsonObject): Action => ({ ...action, canonical_payload: payload });
+    return {
+      // Asked before every execution, including the first: the dispatch
+      // transaction committed a moment ago and the world can move in a moment.
+      authorityLost: () => this.authorityLost(action),
+      execute: async ({ payload, route, mapping, attempt }) =>
+        dispatchResult.parse(
+          await connector.execute(wire(payload), ctx({ attempt, route, mapping })),
+        ),
+      verify: async () => verifyResult.parse(await connector.verify(action, ctx())),
+      ...(connector.reconnect
+        ? {
+            reconnect: async () => {
+              if (await this.authorityLost(action)) return;
+              await (connector.reconnect as NonNullable<Connector['reconnect']>)(action, ctx());
+            },
+          }
+        : {}),
+      ...(connector.describe
+        ? {
+            describe: () =>
+              (connector.describe as NonNullable<Connector['describe']>)(action, ctx()),
+          }
+        : {}),
+      ...(connector.refreshCredential
+        ? {
+            refreshCredential: async () => {
+              if (await this.authorityLost(action)) return false;
+              const refreshed = await (
+                connector.refreshCredential as NonNullable<Connector['refreshCredential']>
+              )(action, ctx());
+              // A fresh token is not a grant. The connection row decides.
+              return refreshed && (await this.grantPermits(action));
+            },
+          }
+        : {}),
+      ...(connector.routes
+        ? { routes: () => (connector.routes as NonNullable<Connector['routes']>)(action, ctx()) }
+        : {}),
+      ...(this.options.reviseOutput
+        ? {
+            revise: (fault) =>
+              (this.options.reviseOutput as NonNullable<BrokerOptions['reviseOutput']>)({
+                action,
+                fault,
+              }),
+          }
+        : {}),
+      recordCandidate: async ({ fault, proposal, description, evaluation }) =>
+        this.recordCandidate(action, fault, proposal, description, evaluation),
+    };
+  }
+
+  /** A refreshed credential only helps if the connection still permits the call. */
+  private async grantPermits(action: Action): Promise<boolean> {
+    const [connection] = await this
+      .sql`select status, scopes from connection where id = ${action.connection_id}`;
+    if (connection?.status !== 'active') return false;
+    const scopes = (connection.scopes ?? []) as string[];
+    return scopes.includes(action.kind);
+  }
+
+  /**
+   * Write a drift mapping down as a proposal. It is a record before it is ever
+   * a change, and it becomes `applied` only where a passing test says it may.
+   */
+  private async recordCandidate(
+    action: Action,
+    fault: ConnectorFault,
+    proposal: MappingProposal,
+    description: ConnectorDescription,
+    evaluation: { passed: boolean; detail: string },
+  ): Promise<{ id: string }> {
+    const state = !proposal.safe ? 'rejected' : evaluation.passed ? 'evaluated' : 'rejected';
+    const [row] = await this.sql`
+      insert into repair_candidate
+        (id, action_id, job_id, connection_id, kind, fault_kind, state, observed_schema,
+         proposed_mapping, test, evaluation, safe)
+      values (${recordId('rpc')}, ${action.id}, ${action.job_id}, ${action.connection_id},
+        ${action.kind}, ${fault.kind}, ${state},
+        ${JSON.stringify(description.schema ?? { required: description.required })}::jsonb,
+        ${JSON.stringify(proposal.mapping)}::jsonb, ${JSON.stringify(proposal.test)}::jsonb,
+        ${JSON.stringify({ ...evaluation, evaluated_at: new Date().toISOString() })}::jsonb,
+        ${proposal.safe})
+      on conflict (action_id, proposed_mapping) do update
+        set state = excluded.state, evaluation = excluded.evaluation,
+            observed_schema = excluded.observed_schema, safe = excluded.safe, updated_at = now()
+      returning id`;
+    return { id: row?.id as string };
+  }
+
+  /**
+   * Persist what the policy did, then let the action come to rest.
+   *
+   * The trace is written first and unconditionally, so an escalation that fails
+   * still leaves the evidence of what was tried behind it.
+   */
+  private async settleRepair(action: Action, run: RepairRun): Promise<Action> {
+    const id = action.id;
+    // A parked action comes back on a later wake, and what it met before the
+    // wait is the reason it waited. Appending rather than replacing keeps a
+    // recurring rate limit visible on the record that completed.
+    const [stored] = await this
+      .sql`select repair_trace, repair_counters from action where id = ${id}`;
+    const trace = [...repairTrace.parse(stored?.repair_trace ?? []), ...run.trace];
+    const counters = { ...repairCounters.parse(stored?.repair_counters ?? {}) };
+    for (const [kind, count] of Object.entries(run.counters)) {
+      counters[kind] = (counters[kind] ?? 0) + count;
+    }
+    await this.sql`update action set repair_trace = ${JSON.stringify(trace)}::jsonb,
+      repair_counters = ${JSON.stringify(counters)}::jsonb,
+      repair_disposition = ${run.disposition},
+      retry_after_at = ${run.retry_after_at}
+      where id = ${id}`;
+    if (run.disposition === 'parked_until_retry') return this.park(action, run);
+    // A mapping that carried the send is only `applied` once the send landed.
+    if (run.disposition === 'completed') {
+      await this.sql`update repair_candidate set state = 'applied', updated_at = now()
+        where action_id = ${id} and state = 'evaluated' and safe = true`;
+    }
+    const settled = await this.recordResult(id, run.result as DispatchResult);
+    // A step on the agent's own computer that never answered is for the agent
+    // to check, not a question for the person.
+    const ownStep =
+      run.disposition === 'needs_reconciliation' && (await this.ownComputer(this.sql, action));
+    if (run.question && !ownStep) await this.escalate(settled, run);
+    return settled;
+  }
+
+  /**
+   * Whether the action ran on the agent's own computer, so an outcome left open
+   * is the agent's to check (a screenshot, the page, what a command left
+   * behind) and never a question put to the person.
+   */
+  private async ownComputer(
+    q: Query,
+    action: Pick<Action, 'id' | 'connection_id'>,
+  ): Promise<boolean> {
+    const connector = this.options.connectors.get(action.connection_id);
+    if (connector?.ownComputer !== true) return false;
+    if (connector.staysInside === true) return true;
+    // A computer with network access may have reached outside it; only one that
+    // could reach nothing keeps an open step the agent's alone.
+    return closedComputerStep(q, action.id);
+  }
+
+  /** What the person is asked about an effect nobody could confirm. */
+  private reconcileQuestion(action: Action): string {
+    if (this.options.connectors.get(action.connection_id)?.ownComputer !== true) return question;
+    const command = (action.canonical_payload as { command?: unknown }).command;
+    const what =
+      typeof command === 'string'
+        ? `The command \`${command.length > 200 ? `${command.slice(0, 200)}…` : command}\``
+        : `A ${action.kind} step`;
+    return `${what} ran on the agent's computer and its result did not come back. That computer had network access, so the command may have reached outside it, for example by sending or uploading something. Check what it may have changed, then mark it.`;
+  }
+
+  /**
+   * A rate limit releases the worker. The action goes back to admitted with the
+   * instant it may be approached again, and the job waits on a timer, so a
+   * destination that asked for a minute is not asked again for a minute.
+   */
+  private async park(action: Action, run: RepairRun): Promise<Action> {
+    const wakeAt = run.retry_after_at ?? new Date().toISOString();
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, action.job_id);
+      const current = await loadAction(tx, action.id, true);
+      if (current.status !== 'dispatched') return current;
+      await tx`update action set dispatched_at = null where id = ${action.id}`;
+      await this.setStatus(tx, current, 'admitted');
+      await appendEvent(tx, job.id, current.attempt_id, 'notice', {
+        action_id: action.id,
+        phase: 'repair_parked',
+        retry_after_at: wakeAt,
+      });
+      if (['cancelled', 'failed', 'completed'].includes(job.state))
+        return loadAction(tx, action.id);
+      await this.moveJob(tx, job, 'waiting_for_event_or_time', { kind: 'timer', wake_at: wakeAt });
+      await tx`update job set next_wake_at = ${wakeAt},
+        substrate_disposition = 'timer_or_event' where id = ${job.id}`;
+      await this.releaseAttempt(tx, job, current.attempt_id, wakeAt);
+      return loadAction(tx, action.id);
+    });
+  }
+
+  /**
+   * End the attempt the wait belongs to, the way the jobs module ends one.
+   *
+   * A job that waits while its attempt still holds a lease is a worker nobody
+   * will ever reclaim: the runner's recovery sweep only fences attempts whose
+   * job is still `running`, so a lease left open here is left open forever, and
+   * the heartbeat that would renew it belongs to a process that has moved on.
+   */
+  private async releaseAttempt(
+    tx: Query,
+    job: LockedJob,
+    attemptId: string,
+    wakeAt: string,
+  ): Promise<void> {
+    const outcome = {
+      kind: 'waiting_for_event_or_time',
+      wait: { kind: 'timer', wake_at: wakeAt },
+      summary: 'The destination asked to be left alone, so this waits on a timer.',
+    };
+    await tx`update attempt set outcome = 'waiting_for_event_or_time',
+      outcome_detail = ${JSON.stringify(outcome)}::jsonb, ended_at = now(),
+      lease_status = 'ended', lease_expires_at = null
+      where id = ${attemptId} and ended_at is null`;
+    await appendEvent(tx, job.id, attemptId, 'attempt_ended', { outcome }, `${attemptId}:ended`);
+  }
+
+  /**
+   * One diagnosis, with the progress that was made, in the owner's one queue.
+   * The database holds a single open question per responsibility, so a job that
+   * keeps failing the same way asks once and not once per attempt.
+   */
+  private async escalate(action: Action, run: RepairRun): Promise<void> {
+    const reconnect = run.disposition === 'needs_reconnect';
+    const uncertain = run.disposition === 'needs_reconciliation';
+    const text = reconnect
+      ? `This connection no longer permits the send. Reconnect it and ${assistantName()} will carry on from here.`
+      : uncertain
+        ? (run.question as string)
+        : `${assistantName()} could not finish this and stopped rather than guess. ${run.question}`;
+    const because = [
+      `${action.kind} stopped at ${run.disposition.replace(/_/g, ' ')} after ${run.executions} ${
+        run.executions === 1 ? 'attempt' : 'attempts'
+      }.`,
+      uncertain
+        ? 'The destination never acknowledged it, so nobody can say whether it arrived.'
+        : 'Nothing was sent twice and nothing was changed to make it go through.',
+    ];
+    await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, action.job_id);
+      if (['cancelled', 'completed'].includes(job.state)) return;
+      // An uncertain outcome is answered with the person's choices: wait, check, or say which.
+      const [row] = await tx`insert into question
+          (id, source, job_id, attempt_id, text, because, if_ignored, blocks_external_effect, options)
+        values (${recordId('qst')}, 'job', ${job.id}, ${action.attempt_id}, ${text},
+          ${JSON.stringify(because)}::jsonb,
+          'This responsibility stays where it is until you answer, and nothing is sent in the meantime.',
+          true, ${JSON.stringify(uncertain ? UNSETTLED_OPTIONS : [])}::jsonb)
+        on conflict (job_id) where state = 'open' do nothing
+        returning id`;
+      await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+        action_id: action.id,
+        phase: 'repair_escalated',
+        disposition: run.disposition,
+        question_id: (row?.id as string) ?? null,
+      });
+    });
+  }
+
+  /**
+   * Bring back the actions a rate limit parked. Only an admitted action with a
+   * due `retry_after_at` is resumed, under its own id, so the destination sees
+   * the same request it declined to take a minute ago.
+   */
+  async resumeParked(now = Date.now()): Promise<number> {
+    const due = new Date(now).toISOString();
+    const rows = await this.sql`select id from action
+      where status = 'admitted' and retry_after_at is not null and retry_after_at <= ${due}
+      order by retry_after_at`;
+    for (const row of rows) {
+      try {
+        await this.dispatch(row.id as string, now);
+      } catch (error) {
+        // One that cannot be resumed is logged and left; the rest still go out.
+        if (databaseUnreachable(error)) throw error;
+        process.stderr.write(
+          `broker: parked action ${String(row.id)} not resumed: ${failureMessage(error)}\n`,
+        );
+      }
+    }
+    return rows.length;
+  }
+
+  async startExecution(claims: CapabilityClaims, id: string): Promise<{ execute: boolean }> {
+    let execute = false;
+    await this.dispatch(id, Date.now(), {
+      claims,
+      claimed: () => {
+        execute = true;
+      },
+    });
+    return { execute };
+  }
+
+  async settleExecution(
+    claims: CapabilityClaims,
+    id: string,
+    result: ExecutionSettlement,
+  ): Promise<Action> {
+    const action = await loadAction(this.sql, id);
+    // Settlement accepts late evidence. This read supplies identity and context
+    // without a transaction lock; recordResult holds the job and action locks
+    // together inside the transaction that persists the receipt.
+    const [job] = await this.sql<LockedJob[]>`select * from job where id = ${action.job_id}`;
+    if (
+      !job ||
+      action.job_id !== claims.job_id ||
+      job.space_id !== claims.space_id ||
+      action.attempt_id !== claims.attempt_id
+    )
+      throw new BrokerFault('action_not_found');
+    const connector = this.options.connectors.get(action.connection_id);
+    const tool = connector && findTool(connector.manifest, action.kind);
+    const proposed = executionIntent.safeParse(action.canonical_payload);
+    if (!connector || tool?.execution !== 'in_cell' || !proposed.success)
+      throw new BrokerFault('unknown_tool');
+    if (!['dispatched', 'unknown', 'unresolved'].includes(action.status)) {
+      if (['succeeded', 'failed'].includes(action.status)) return action;
+      throw new BrokerFault('action_not_admissible');
+    }
+    if ('error' in result)
+      return this.recordResult(id, { outcome: 'failed', reason: result.error, retryable: false });
+    const { record } = result;
+    const intent = proposed.data.intent;
+    if (
+      record.command !== (intent.code ?? intent.command) ||
+      record.cwd !== (intent.cwd ?? '.') ||
+      record.language !== (action.kind === 'exec.python' ? 'python' : 'shell')
+    )
+      throw new BrokerFault(
+        'payload_invalid',
+        'Execution result does not match the admitted command',
+      );
+    if (!tool.record_schema || !this.validator.validate(tool.record_schema, record))
+      throw new BrokerFault('payload_invalid');
+    // The immutable intent stays on the action; the connector validates the
+    // separate result and records it on the receipt, including late receipts.
+    const checked = await connector.execute(
+      { ...action, canonical_payload: record },
+      this.context(job, action),
+    );
+    return this.recordResult(id, checked);
+  }
+
+  async recordResult(id: string, result: DispatchResult): Promise<Action> {
+    result = dispatchResult.parse(result);
+    const original = await loadAction(this.sql, id);
+    // A read changed nothing outside, so its outcome is never in doubt: one that
+    // did not answer failed and can be tried again. It never asks the person.
+    const plainRead = await this.plainRead(original);
+    if (plainRead && result.outcome === 'unknown')
+      result = { outcome: 'failed', reason: result.reason, retryable: true };
+    if (!plainRead || result.outcome !== 'succeeded') return this.landResult(id, original, result);
+    try {
+      return await this.landResult(id, original, result);
+    } catch (error) {
+      // An answer the record cannot keep leaves the read failed rather than
+      // dispatched, where it would wait to be called unknown.
+      if (error instanceof BrokerFault) throw error;
+      return this.landResult(id, original, {
+        outcome: 'failed',
+        reason: 'the result could not be recorded',
+        retryable: false,
+      });
+    }
+  }
+
+  /**
+   * A read whose outcome is never put to the person: one from a built-in
+   * connector, or from an MCP server that declares the tool read-only. An MCP
+   * tool the installer's policy calls a read, with no such declaration from
+   * its server, is asked about like any other effect.
+   */
+  private async plainRead(action: Pick<Action, 'effect_class' | 'connection_id' | 'kind'>) {
+    if (action.effect_class !== 'read') return false;
+    const connector = this.options.connectors.get(action.connection_id);
+    if (connector?.catalog?.source === 'mcp')
+      return connector.readOnlyDeclared?.(action.kind) === true;
+    if (connector) return true;
+    const [row] = await this
+      .sql`select provider from connection where id = ${action.connection_id}`;
+    return row?.provider !== 'mcp';
+  }
+
+  private async landResult(id: string, original: Action, result: DispatchResult): Promise<Action> {
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, original.job_id);
+      const action = await loadAction(tx, id, true);
+      const owned = ownerAnswered(action);
+      if (!owned && !['dispatched', 'unknown', 'unresolved'].includes(action.status)) return action;
+      const [attempt] = await tx`select epoch from attempt where id = ${action.attempt_id}`;
+      const late = attempt?.epoch !== job.lease_epoch;
+      if (owned) {
+        if (result.outcome === 'failed')
+          return this.landAfterOwner(
+            tx,
+            job,
+            action,
+            { outcome: 'failed', reason: result.reason },
+            late,
+          );
+        if (
+          result.outcome === 'succeeded' &&
+          result.receipt.action_id === id &&
+          result.receipt.connection_id === action.connection_id
+        )
+          return this.landAfterOwner(
+            tx,
+            job,
+            action,
+            { outcome: 'succeeded', receipt: result.receipt },
+            late,
+          );
+        return action;
+      }
+      const wasUncertain = action.status === 'unknown' || action.status === 'unresolved';
+      let receipt: Receipt | null = null;
+      if (result.outcome === 'succeeded') {
+        if (
+          result.receipt.action_id !== id ||
+          result.receipt.connection_id !== action.connection_id
+        ) {
+          result = {
+            outcome: 'unknown',
+            reason: 'Receipt identity did not match the dispatched action',
+          };
+        } else
+          receipt = await recordGeneratedArtifact(tx, job, action, { ...result.receipt, late });
+      }
+      if (wasUncertain && result.outcome === 'unknown') return action;
+      await this.setStatus(tx, action, result.outcome);
+      await tx`update action set receipt = ${receipt ? JSON.stringify(receipt) : null}::jsonb,
+        resolved_at = ${result.outcome === 'unknown' ? null : new Date().toISOString()},
+        reconciliation = ${JSON.stringify(
+          result.outcome === 'unknown'
+            ? {
+                reason: question,
+                detail: result.reason,
+                late,
+                ...(result.evidence ? { evidence: result.evidence } : {}),
+              }
+            : result.outcome === 'failed'
+              ? {
+                  reason: result.reason,
+                  retryable: result.retryable,
+                  late,
+                  ...(result.evidence ? { evidence: result.evidence } : {}),
+                }
+              : {
+                  late,
+                  ...(wasUncertain ? { decision: 'succeeded', source: 'authentic_receipt' } : {}),
+                },
+        )}::jsonb
+        where id = ${id}`;
+      if (result.outcome !== 'unknown') {
+        await tx`update budget_ledger set settled = reserved where action_id = ${id} and settled is null`;
+      }
+      await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+        action_id: id,
+        phase: 'receipt',
+        outcome: result.outcome,
+        late,
+      });
+      // A receipt that carries a declared artifact becomes rows here, in the
+      // same transaction, so an artifact never exists without the receipt that
+      // produced it and a validation never exists without its artifact.
+      if (receipt && this.options.recordArtifact) {
+        await this.options.recordArtifact(tx, { job, action, receipt });
+      }
+      if (
+        result.outcome === 'unknown' &&
+        !late &&
+        !(await this.ownComputer(tx, action)) &&
+        !['cancelled', 'failed', 'completed'].includes(job.state)
+      ) {
+        await this.moveJob(tx, job, 'needs_reconciliation', {
+          kind: 'user_input',
+          question: this.reconcileQuestion(action),
+        });
+      }
+      // A read settled from uncertain takes with it the "did it arrive?"
+      // question it raised, in this same transaction: nothing is left to ask.
+      if (wasUncertain && result.outcome !== 'unknown' && action.effect_class === 'read') {
+        const asked = await tx`select distinct payload->>'question_id' as id from event
+          where job_id = ${job.id} and type = 'notice'
+            and payload->>'phase' = 'repair_escalated' and payload->>'action_id' = ${id}
+            and payload->>'question_id' is not null`;
+        for (const entry of asked) {
+          const [closed] = await tx`update question set state = 'withdrawn', answer = null,
+              answer_submission_id = null, answered_at = now()
+            where id = ${entry.id} and job_id = ${job.id} and state = 'open' returning id`;
+          if (closed)
+            await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+              kind: 'question_closed',
+              question_id: closed.id,
+              state: 'withdrawn',
+              reason: 'read_settled',
+              submission_id: null,
+            });
+        }
+      }
+      if (
+        wasUncertain &&
+        result.outcome !== 'unknown' &&
+        !late &&
+        job.state === 'needs_reconciliation'
+      ) {
+        const [pending] =
+          await tx`select count(*)::int as count from action where job_id = ${job.id}
+          and status in ('unknown', 'unresolved', 'dispatched')`;
+        if (pending?.count === 0) await this.wake(tx, job, 'recovery');
+      }
+      return loadAction(tx, id);
+    });
+  }
+
+  async verify(id: string): Promise<Action> {
+    const action = await loadAction(this.sql, id);
+    if (!ownerAnswered(action) && !['unknown', 'unresolved'].includes(action.status)) return action;
+    const [job] = await this.sql<LockedJob[]>`select * from job where id = ${action.job_id}`;
+    if (!job) throw new BrokerFault('action_not_found');
+    const connector = this.options.connectors.get(action.connection_id);
+    const tool = connector && findTool(connector.manifest, action.kind);
+    let result: VerifyResult;
+    try {
+      result =
+        !connector || !tool?.verify
+          ? { decision: 'unsupported', reason: question }
+          : verifyResult.parse(await connector.verify(action, this.context(job, action)));
+    } catch {
+      result = { decision: 'undecided', reason: question };
+    }
+    return this.sql.begin(async (tx) => {
+      const currentJob = await lockJob(tx, job.id);
+      const current = await loadAction(tx, id, true);
+      const owned = ownerAnswered(current);
+      if (!owned && !['unknown', 'unresolved'].includes(current.status)) return current;
+      const [attempt] = await tx`select epoch from attempt where id = ${current.attempt_id}`;
+      const late = attempt?.epoch !== currentJob.lease_epoch;
+      if (owned) {
+        if (result.decision === 'failed')
+          return this.landAfterOwner(
+            tx,
+            currentJob,
+            current,
+            { outcome: 'failed', reason: 'The provider reported it did not happen.' },
+            late,
+          );
+        if (
+          result.decision === 'succeeded' &&
+          result.receipt &&
+          result.receipt.action_id === id &&
+          result.receipt.connection_id === current.connection_id
+        )
+          return this.landAfterOwner(
+            tx,
+            currentJob,
+            current,
+            { outcome: 'succeeded', receipt: result.receipt },
+            late,
+          );
+        return current;
+      }
+      if (
+        result.decision === 'succeeded' &&
+        result.receipt &&
+        (result.receipt.action_id !== id || result.receipt.connection_id !== current.connection_id)
+      ) {
+        result = { decision: 'undecided', reason: 'Verification receipt identity mismatch' };
+      }
+      const resolved = result.decision === 'succeeded' || result.decision === 'failed';
+      const status = resolved ? (result.decision as 'succeeded' | 'failed') : 'unresolved';
+      await this.setStatus(tx, current, status);
+      const receipt =
+        result.decision === 'succeeded' && result.receipt
+          ? await recordGeneratedArtifact(tx, currentJob, current, { ...result.receipt, late })
+          : null;
+      await tx`update action set reconciliation = ${JSON.stringify({ ...result, question: resolved ? null : question, late })}::jsonb,
+        resolved_at = ${resolved ? new Date().toISOString() : null},
+        receipt = coalesce(${receipt ? JSON.stringify(receipt) : null}::jsonb, receipt) where id = ${id}`;
+      if (resolved) {
+        await tx`update budget_ledger set settled = reserved where action_id = ${id} and settled is null`;
+        const [pending] =
+          await tx`select count(*)::int as count from action where job_id = ${job.id}
+          and status in ('unknown', 'unresolved', 'dispatched')`;
+        if (pending?.count === 0 && !late && currentJob.state === 'needs_reconciliation')
+          await this.wake(tx, currentJob, 'recovery');
+      } else if (
+        !late &&
+        !(await this.ownComputer(tx, current)) &&
+        !['cancelled', 'failed', 'completed'].includes(currentJob.state)
+      ) {
+        await this.moveJob(tx, currentJob, 'needs_reconciliation', {
+          kind: 'user_input',
+          question: this.reconcileQuestion(current),
+        });
+      }
+      return loadAction(tx, id);
+    });
+  }
+
+  /**
+   * The owner says what happened to an effect OpenDuet could not confirm. The
+   * answer settles it as `verify` would, recorded as the owner's, and the
+   * action is never dispatched again. Only the job's own principal, in a space
+   * they can still see, may answer; authentic provider evidence that arrives
+   * later still lands (see `landAfterOwner`).
+   */
+  async resolveByOwner(
+    actorId: string,
+    id: string,
+    input: { resolution: 'succeeded' | 'failed' | 'unresolved'; note?: string },
+  ): Promise<
+    { status: 'resolved'; action: Action } | { status: 'not_found' } | { status: 'not_awaiting' }
+  > {
+    const action = await loadAction(this.sql, id).catch(() => null);
+    if (!action) return { status: 'not_found' };
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, action.job_id);
+      if (!(await jobVisibleTo(tx, job.id, actorId))) return { status: 'not_found' as const };
+      const current = await loadAction(tx, id, true);
+      if (!['unknown', 'unresolved'].includes(current.status))
+        return { status: 'not_awaiting' as const };
+      const resolved = input.resolution !== 'unresolved';
+      const decidedAt = new Date().toISOString();
+      const [attempt] = await tx`select epoch from attempt where id = ${current.attempt_id}`;
+      const late = attempt?.epoch !== job.lease_epoch;
+      await this.setStatus(tx, current, input.resolution);
+      await tx`update action set reconciliation = ${JSON.stringify({
+        decided_by: 'owner',
+        decided_at: decidedAt,
+        resolution: input.resolution,
+        note: input.note ?? '',
+        late,
+      })}::jsonb, resolved_at = ${resolved ? decidedAt : null} where id = ${id}`;
+      await appendEvent(tx, job.id, current.attempt_id, 'notice', {
+        action_id: id,
+        phase: 'owner_resolved',
+        resolution: input.resolution,
+        late,
+      });
+      if (resolved) {
+        await tx`update budget_ledger set settled = reserved where action_id = ${id} and settled is null`;
+        const [pending] =
+          await tx`select count(*)::int as count from action where job_id = ${job.id}
+          and status in ('unknown', 'unresolved', 'dispatched')`;
+        if (pending?.count === 0 && !late && job.state === 'needs_reconciliation')
+          await this.wake(tx, job, 'recovery');
+      }
+      return { status: 'resolved' as const, action: await loadAction(tx, id) };
+    });
+  }
+
+  /**
+   * Evidence a provider sends after the owner answered for it. The owner's
+   * answer stood in for evidence nobody had; authentic evidence is what
+   * happened. A provider success over an owner's "failed" moves the action to
+   * succeeded. A provider failure never undoes a success the owner reported,
+   * since the effect may have happened by another route. Either way the
+   * owner's answer is kept beside the provider's, and a disagreement is told.
+   */
+  private async landAfterOwner(
+    tx: TransactionSql,
+    job: LockedJob,
+    action: Action,
+    evidence: { outcome: 'succeeded'; receipt: Receipt } | { outcome: 'failed'; reason: string },
+    late: boolean,
+  ): Promise<Action> {
+    const owner = (action.reconciliation ?? {}) as Record<string, unknown>;
+    const provider =
+      evidence.outcome === 'succeeded'
+        ? { decision: 'succeeded', source: 'authentic_receipt', late }
+        : { decision: 'failed', reason: evidence.reason, late };
+    const already = (owner.provider_answer ?? {}) as Record<string, unknown>;
+    if (already.decision === provider.decision) return action;
+    const overturned = evidence.outcome === 'succeeded' && action.status === 'failed';
+    const receipt =
+      evidence.outcome === 'succeeded'
+        ? await recordGeneratedArtifact(tx, job, action, { ...evidence.receipt, late })
+        : null;
+    if (overturned) await this.setStatus(tx, action, 'succeeded');
+    await tx`update action set
+      receipt = coalesce(${receipt ? JSON.stringify(receipt) : null}::jsonb, receipt),
+      reconciliation = ${JSON.stringify(
+        overturned
+          ? { ...provider, superseded_owner_answer: owner }
+          : { ...owner, provider_answer: provider },
+      )}::jsonb
+      where id = ${action.id}`;
+    if (receipt && this.options.recordArtifact)
+      await this.options.recordArtifact(tx, { job, action, receipt });
+    if (evidence.outcome !== action.status)
+      await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+        action_id: action.id,
+        phase: 'provider_evidence',
+        outcome: evidence.outcome,
+        owner_answer: action.status,
+        status: overturned ? 'succeeded' : action.status,
+        late,
+      });
+    return loadAction(tx, action.id);
+  }
+
+  /**
+   * Only uncertain dispositions are recovered. This path never invokes execute().
+   *
+   * A dispatch is waited on for its whole budget while its sender may still
+   * answer. One whose attempt has ended or stopped heartbeating, and that this
+   * process is not waiting on, has no sender left: the service stopped or
+   * restarted under it. That one is settled now rather than after its budget,
+   * so the next attempt is not refused over an action nobody will finish.
+   */
+  async recoverDispatched(now = Date.now()): Promise<number> {
+    const cutoff = new Date(now - this.dispatchTimeoutMs).toISOString();
+    const rows = await this.sql`select a.id, a.connection_id, a.kind, a.effect_class,
+        a.canonical_payload, a.dispatched_at,
+        not exists (select 1 from attempt t where t.id = a.attempt_id and t.ended_at is null
+          and (t.lease_expires_at is null or t.lease_expires_at > now())) as orphaned
+      from action a where a.status = 'dispatched'`;
+    let recovered = 0;
+    for (const row of rows) {
+      try {
+        const orphaned = row.orphaned === true && !this.inFlight.has(row.id as string);
+        const connector = this.options.connectors.get(row.connection_id);
+        if (!orphaned) {
+          if (new Date(row.dispatched_at).getTime() > Date.parse(cutoff)) continue;
+          // A dispatch its connector gave longer than the default is still inside
+          // its own budget, and calling it unknown now would be a guess.
+          const budgetMs = connector
+            ? this.dispatchBudget(connector, {
+                kind: row.kind,
+                canonical_payload: row.canonical_payload,
+              })
+            : this.dispatchTimeoutMs;
+          if (new Date(row.dispatched_at).getTime() > now - budgetMs) continue;
+        }
+        const fallback = uncertainResult(
+          await this.plainRead(
+            row as unknown as Pick<Action, 'effect_class' | 'connection_id' | 'kind'>,
+          ),
+          orphaned
+            ? 'The service stopped before this dispatch answered'
+            : 'Dispatch ended without a durable receipt',
+        );
+        let result: DispatchResult = fallback;
+        if (orphaned && connector?.abandoned) {
+          try {
+            const action = await loadAction(this.sql, row.id as string);
+            const [job] = await this.sql<
+              LockedJob[]
+            >`select * from job where id = ${action.job_id}`;
+            if (job) result = await connector.abandoned(action, this.context(job, action));
+          } catch {
+            result = fallback;
+          }
+        }
+        await this.recordResult(row.id, result);
+        recovered += 1;
+      } catch (error) {
+        // One that cannot be settled is logged and left; the rest are still recovered.
+        if (databaseUnreachable(error)) throw error;
+        process.stderr.write(
+          `broker: dispatched action ${String(row.id)} not recovered: ${failureMessage(error)}\n`,
+        );
+      }
+    }
+    // A read left uncertain before reads always settled is settled now: it
+    // changed nothing, so it failed, and the person is no longer asked. Its
+    // "did it arrive?" question goes in the same transaction.
+    const reads = await this.sql`select id, connection_id, kind, effect_class from action
+      where effect_class = 'read' and status in ('unknown', 'unresolved')`;
+    for (const row of reads) {
+      const read = row as unknown as Pick<Action, 'effect_class' | 'connection_id' | 'kind'>;
+      try {
+        if (!(await this.plainRead(read))) continue;
+        await this.recordResult(row.id as string, {
+          outcome: 'failed',
+          reason: 'This read never answered; it changed nothing and can be tried again',
+          retryable: true,
+        });
+        recovered += 1;
+      } catch (error) {
+        if (databaseUnreachable(error)) throw error;
+        process.stderr.write(
+          `broker: unanswered read ${String(row.id)} not settled: ${failureMessage(error)}\n`,
+        );
+      }
+    }
+    return recovered;
+  }
+
+  /**
+   * Settle what an attempt left dispatched once its runtime has stopped
+   * waiting. An action this process is still sending is left to finish and
+   * settle itself. Any other one has no sender: a command the cell claimed and
+   * never reported, or a call whose waiter gave up. It is recorded as unknown
+   * with the reason, so the attempt can end on it instead of waiting for a
+   * recovery sweep. A result that
+   * arrives later still lands on the record.
+   */
+  async settleAbandoned(attemptId: string): Promise<number> {
+    const rows = await this.sql`select id from action
+      where attempt_id = ${attemptId} and status = 'dispatched'`;
+    let settled = 0;
+    for (const row of rows) {
+      if (this.inFlight.has(row.id as string)) continue;
+      // Unknown, since only a verify that shows it never started may call it
+      // failed; a read, which changed nothing, is recorded as failed instead.
+      await this.recordResult(row.id as string, {
+        outcome: 'unknown',
+        reason: 'The tool call ended before this action reported back',
+      });
+      settled += 1;
+    }
+    return settled;
+  }
+
+  /** The broker's own timeout, or longer where the connector says this action needs it. */
+  private dispatchBudget(
+    connector: Connector,
+    action: Pick<Action, 'kind' | 'canonical_payload'>,
+  ): number {
+    const asked = connector.dispatchBudgetMs?.(action);
+    return typeof asked === 'number' && Number.isFinite(asked)
+      ? Math.max(this.dispatchTimeoutMs, Math.min(asked, MAX_DISPATCH_BUDGET_MS))
+      : this.dispatchTimeoutMs;
+  }
+
+  /** The service layer may use its own cancel transaction; both serialize on the same job row. */
+  async cancel(jobId: string): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, jobId);
+      if (['cancelled', 'completed', 'failed'].includes(job.state)) return;
+      await tx`update job set lease_epoch = lease_epoch + 1 where id = ${jobId}`;
+      await this.moveJob(tx, job, 'cancelled', { kind: 'none' });
+    });
+  }
+
+  private async setStatus(tx: Query, action: Action, status: ActionStatus) {
+    await tx`update action set status = ${status} where id = ${action.id}`;
+    await appendEvent(tx, action.job_id, action.attempt_id, 'action_status_changed', {
+      action_id: action.id,
+      from: action.status,
+      to: status,
+    });
+    await this.notePath(tx, action, status);
+    if (status === 'succeeded') await this.options.recordStandingScope?.(tx, action);
+  }
+
+  /**
+   * Feed OpenDuet's record of what works at a service: an outcome that came back
+   * from a dispatch, or an unknown one settled since. A refusal before
+   * dispatch says nothing about the path, so it is not counted.
+   */
+  private async notePath(tx: Query, action: Action, status: ActionStatus) {
+    const sent = action.status === 'dispatched';
+    const settling = action.status === 'unknown' || action.status === 'unresolved';
+    if (!sent && !settling) return;
+    if (settling && status !== 'succeeded' && status !== 'failed') return;
+    if (!['succeeded', 'failed', 'unknown', 'unresolved'].includes(status)) return;
+    const [row] = await tx`select a.path, a.service_key, a.operation_key, j.space_id from action a
+      join job j on j.id = a.job_id where a.id = ${action.id}`;
+    if (!row?.path || !row.service_key || !row.operation_key) return;
+    await recordPathOutcome(tx, {
+      spaceId: String(row.space_id),
+      service: String(row.service_key),
+      operation: String(row.operation_key),
+      taskKind: await taskKindOf(tx, action.job_id),
+      path: row.path === 'browser' ? 'browser' : 'api',
+      outcome: status === 'unresolved' ? 'unknown' : (status as 'succeeded' | 'failed' | 'unknown'),
+      attempt: sent,
+      fault: status === 'succeeded' ? null : `${action.kind} ${status}`,
+    });
+  }
+
+  /**
+   * A person handed back a browser they were handed this job's work in. A
+   * submit whose outcome was in doubt is read back from the page first: a
+   * page that settles it settles it and the work goes on; one that does not
+   * leaves the person to say what happened, as for any unconfirmed effect.
+   * Anything else handed over simply goes on. Nothing is sent again here.
+   */
+  async handedBack(
+    jobId: string,
+    sessionId: string,
+    /** Whose takeover's wait a hand-back with no card ends: the browser's or the computer's. */
+    parkedBy: 'Browser control:' | 'Computer control:' = 'Browser control:',
+  ): Promise<'resumed' | 'asked' | 'none'> {
+    // Every submit from this browser still in doubt is read back, whether or
+    // not the work is still waiting on the person.
+    const doubts = await this.sql`select id from action where job_id = ${jobId}
+      and kind = 'browser.submit' and status in ('unknown', 'unresolved')
+      and canonical_payload->>'session_id' = ${sessionId} order by created_at, id`;
+    for (const row of doubts) await this.verify(String(row.id)).catch(() => null);
+    const [held] = await this.sql`select wait from job where id = ${jobId}`;
+    const card = (
+      held?.wait as {
+        handoff?: { take_over?: { session_id?: string }; action_id?: string | null };
+      } | null
+    )?.handoff;
+    // A person who took the browser (or the computer) over with no card,
+    // mid-task, handed it back: the work they paused goes on, from a fresh look.
+    if (card?.take_over?.session_id !== sessionId)
+      return (await this.resumeAfterControl(jobId, parkedBy)) ? 'resumed' : 'none';
+    const doubted = typeof card.action_id === 'string' ? card.action_id : null;
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, jobId);
+      const [now] = await tx`select wait from job where id = ${jobId}`;
+      const wait = now?.wait as { handoff?: { take_over?: { session_id?: string } } } | null;
+      if (job.state !== 'waiting_for_input' || wait?.handoff?.take_over?.session_id !== sessionId)
+        return 'none';
+      const action = doubted ? await loadAction(tx, doubted) : null;
+      await appendEvent(tx, job.id, null, 'notice', {
+        kind: 'handed_back',
+        session_id: sessionId,
+        ...(action ? { action_id: action.id, status: action.status } : {}),
+        fresh_observation_required: true,
+      });
+      if (action && ['unknown', 'unresolved', 'dispatched'].includes(action.status)) {
+        await this.moveJob(tx, job, 'needs_reconciliation', {
+          kind: 'user_input',
+          question: this.reconcileQuestion(action),
+        });
+        return 'asked';
+      }
+      await this.wake(tx, job, 'recovery');
+      return 'resumed';
+    });
+  }
+
+  /**
+   * Wake a job a person's takeover parked, once they hand control back. Only
+   * the takeover's own wait is ended (its question starts with `parkedBy`); a
+   * job waiting on anything else, or settling an unconfirmed effect, stays as
+   * it is. True when the job was woken.
+   */
+  async resumeAfterControl(
+    jobId: string,
+    parkedBy: 'Browser control:' | 'Computer control:',
+  ): Promise<boolean> {
+    return this.sql.begin(async (tx) => {
+      const job = await lockJob(tx, jobId);
+      const [held] = await tx`select wait from job where id = ${jobId}`;
+      const question = (held?.wait as { question?: unknown } | null)?.question;
+      if (
+        job.state !== 'waiting_for_input' ||
+        typeof question !== 'string' ||
+        !question.startsWith(parkedBy)
+      )
+        return false;
+      await this.wake(tx, job, 'recovery');
+      return true;
+    });
+  }
+
+  private async rejectDispatch(
+    tx: Query,
+    job: LockedJob,
+    action: Action,
+    reason: string,
+  ): Promise<Action> {
+    await this.setStatus(tx, action, 'failed');
+    await tx`update action set resolved_at = now(), reconciliation = ${JSON.stringify({ reason, retryable: false })}::jsonb where id = ${action.id}`;
+    await tx`update budget_ledger set settled = 0 where action_id = ${action.id} and settled is null`;
+    await appendEvent(tx, job.id, action.attempt_id, 'notice', {
+      action_id: action.id,
+      phase: 'dispatch_rejected',
+      outcome: 'fenced',
+      reason,
+    });
+    // A question nobody answered goes with it, so no card is left asking about
+    // an action that can no longer run.
+    await this.withdrawOutdated(tx, job, { ...action, status: 'failed' });
+    return loadAction(tx, action.id);
+  }
+
+  /**
+   * Withdraw the unanswered approval on an action whose request changed
+   * before anyone answered: the job's revision moved on, or the action ended.
+   * It is closed with a note that says why, so the card closes, the approval
+   * lists drop it and the next attempt is told nothing was refused. An action
+   * still waiting is denied with it, so it can never be allowed afterwards.
+   */
+  private async withdrawOutdated(tx: Query, job: LockedJob, action: Action) {
+    const closed = await tx`update approval set decision = 'denied', decided_at = now(),
+      decided_by = ${OUTDATED_NOTE}
+      where action_id = ${action.id} and decision is null returning id`;
+    if (closed.length === 0) return;
+    if (action.status === 'needs_approval') await this.setStatus(tx, action, 'denied');
+    for (const row of closed)
+      await appendEvent(
+        tx,
+        job.id,
+        action.attempt_id,
+        'approval_decided',
+        {
+          approval_id: row.id,
+          action_id: action.id,
+          decision: 'denied',
+          note: OUTDATED_NOTE,
+          payload_hash: action.payload_hash,
+        },
+        `${row.id}:decision`,
+      );
+  }
+
+  private async moveJob(tx: Query, job: LockedJob, state: string, wait: Record<string, unknown>) {
+    await tx`update job set state = ${state}, wait = ${JSON.stringify(wait)}::jsonb,
+      state_version = state_version + 1, updated_at = now() where id = ${job.id}`;
+    await appendEvent(tx, job.id, null, 'job_state_changed', { from: job.state, to: state });
+    job.state = state;
+  }
+
+  private async wake(tx: TransactionSql, job: LockedJob, reason: 'approval' | 'recovery') {
+    await this.moveJob(tx, job, 'queued', { kind: 'none' });
+    const [current] = await tx`update job set next_wake_at = now() where id = ${job.id}
+      returning lease_epoch, state_version, scheduling_class, next_wake_at`;
+    if (!current) throw new Error('Wake update returned no job');
+    if (this.options.boss) {
+      const wake: AttemptWake = {
+        job_id: job.id,
+        expected_epoch: current.lease_epoch,
+        expected_version: current.state_version,
+        reason,
+      };
+      await this.options.boss.send(attemptQueue(current.scheduling_class), wake, {
+        startAfter: current.next_wake_at,
+        retryLimit: 0,
+        expireInSeconds: 1800,
+        db: {
+          executeSql: async (text, values) => ({
+            rows: await tx.unsafe(text, values as ParameterOrJSON<never>[] | undefined),
+          }),
+        },
+      });
+    }
+  }
+}

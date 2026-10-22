@@ -1,0 +1,1197 @@
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { type AttemptBundle, EMPTY_SINCE_LAST, type RuntimeEvent } from '@openduet/contracts';
+import {
+  brokerParkedActions,
+  coalesceDeltas,
+  type FetchLike,
+  HermesRuntimeAdapter,
+  plainEngineNotice,
+} from './adapter.ts';
+import { MODEL_SILENCE_MS, quietAllowanceMs, STALL_MARGIN_MS, stepDeadlineMs } from './liveness.ts';
+
+const SUFFIX = '01J8ZP3QWABCDEFGHJKMNPQRST';
+const ATTEMPT = `att_${SUFFIX}`;
+const JOB = `job_${SUFFIX}`;
+const ACTION = `act_${SUFFIX}`;
+
+const bundle: AttemptBundle = {
+  attempt: { id: ATTEMPT, job_id: JOB, epoch: 1, revision: 0, token: 'capability.jwt' },
+  job: {
+    title: 'Chase the lease renewal',
+    objective: 'Get a signed renewal before the end of the month.',
+    constraints: {},
+    progress_summary: '',
+    unresolved_questions: [],
+    deliverable: {},
+  },
+  inputs: { new_user_messages: [], approval_results: [], trigger_events: [], repair_briefs: [] },
+  since_last: EMPTY_SINCE_LAST,
+  transcript: [],
+  tools: [],
+  skills: [],
+  knowledge: [],
+  workspace: { mount: '/work', files: [] },
+  budget: { max_turns: 8, max_output_tokens: 4000, max_wall_ms: 120_000, max_actions: 3 },
+  model: { provider: 'custom', model: 'fake-scripted-v1', fallback: null },
+};
+
+const RECORDED = readFileSync(join(import.meta.dir, 'fixtures', 'run-events.sse'), 'utf8');
+
+const capabilitiesBody = (durable = true) => ({
+  object: 'hermes.api_server.capabilities',
+  platform: 'hermes-agent',
+  model: 'fake-scripted-v1',
+  features: {
+    run_submission: true,
+    run_events_sse: true,
+    run_stop: true,
+    run_approval_response: true,
+    runs_idempotency: { supported: true, durable, retention_seconds: 86_400 },
+  },
+});
+
+class Collector {
+  readonly events: RuntimeEvent[] = [];
+  async emit(event: RuntimeEvent) {
+    this.events.push(event);
+  }
+}
+
+/** Serves the recorded stream in several chunks, so the parser is exercised. */
+function streamOf(text: string, chunks = 5): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const size = Math.ceil(text.length / chunks);
+  const pieces: string[] = [];
+  for (let at = 0; at < text.length; at += size) pieces.push(text.slice(at, at + size));
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const piece = pieces.shift();
+      if (piece === undefined) controller.close();
+      else controller.enqueue(encoder.encode(piece));
+    },
+  });
+}
+
+type Call = { url: string; init?: RequestInit };
+
+function harness(
+  options: { sse?: string; durable?: boolean; startStatus?: number; eventsStatus?: number } = {},
+) {
+  const calls: Call[] = [];
+  const fetch: FetchLike = async (url, init) => {
+    calls.push({ url, init });
+    const path = new URL(url).pathname;
+    if (path === '/v1/capabilities') {
+      return Response.json(capabilitiesBody(options.durable ?? true));
+    }
+    if (path === '/v1/runs' && init?.method === 'POST') {
+      if (options.startStatus && options.startStatus >= 400) {
+        return new Response('no', { status: options.startStatus });
+      }
+      return Response.json(
+        { run_id: 'run_fixture_1', status: 'started', replayed: false },
+        { status: 202 },
+      );
+    }
+    if (path.endsWith('/events')) {
+      if (options.eventsStatus && options.eventsStatus >= 400) {
+        return new Response('gone', { status: options.eventsStatus });
+      }
+      return new Response(streamOf(options.sse ?? RECORDED), {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }
+    return Response.json({ ok: true });
+  };
+  return { calls, fetch };
+}
+
+const adapterWith = (fetch: FetchLike, parked: string[] | Error = []): HermesRuntimeAdapter =>
+  new HermesRuntimeAdapter({
+    baseUrl: 'http://runtime:8790',
+    parkedActions: async () => {
+      if (parked instanceof Error) throw parked;
+      return parked;
+    },
+    fetch,
+    streamIdleMs: 2_000,
+  });
+
+describe('capabilities', () => {
+  test('reports what the engine says it supports', async () => {
+    const { fetch } = harness();
+    const capabilities = await adapterWith(fetch).capabilities();
+    expect(capabilities.streaming).toBe(true);
+    expect(capabilities.interrupt).toBe(true);
+    expect(capabilities.version).toContain('hermes@v2026.9.7');
+  });
+
+  test('refuses an engine whose run idempotency is not durable', async () => {
+    const { fetch } = harness({ durable: false });
+    // Without it a restart between the start request and its answer turns a
+    // retry into a second run, which is a second set of effects.
+    expect(adapterWith(fetch).capabilities()).rejects.toThrow(/durable run idempotency/);
+  });
+});
+
+describe('lifecycle hook bridge', () => {
+  const hook = (name: string, capture = 0, event = 'hook.event') => ({
+    event,
+    attempt_id: ATTEMPT,
+    capture_id: `${ATTEMPT}:hook:${capture}`,
+    name,
+    tool_name: 'test.read',
+    timing: { captured_at: '2026-09-12T00:00:00.000Z', duration_ms: 12 },
+    outcome: event === 'hook.error' ? 'failed' : 'observed',
+    redacted_args_digest: 'a'.repeat(64),
+    ...(event === 'hook.error' ? { error_code: 'observer_failed' } : {}),
+  });
+  const frames = (...events: object[]) =>
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
+
+  test('ordered observations share the event sequencer and replayed captures consume no new id', async () => {
+    const first = hook('on_session_start');
+    const { fetch } = harness({
+      sse: frames(
+        first,
+        first,
+        hook('pre_tool_call', 1),
+        hook('post_tool_call', 2),
+        hook('on_compaction', 3),
+        hook('on_session_end', 4),
+        { event: 'run.completed', output: 'Done' },
+      ),
+    });
+    const sink = new Collector();
+    const outcome = await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+    expect(outcome.kind).toBe('completed');
+    expect(
+      sink.events.filter((event) => event.type === 'hook_event').map((event) => event.name),
+    ).toEqual([
+      'on_session_start',
+      'pre_tool_call',
+      'post_tool_call',
+      'on_compaction',
+      'on_session_end',
+    ]);
+    expect(sink.events.map((event) => event.dedup_key)).toEqual(
+      sink.events.map((_, seq) => `${ATTEMPT}:${seq}`),
+    );
+  });
+
+  test('a throwing observer is a durable hook_error and the run still completes', async () => {
+    const { fetch } = harness({
+      sse: frames(hook('pre_tool_call', 0, 'hook.error'), {
+        event: 'run.completed',
+        output: 'Done',
+      }),
+    });
+    const sink = new Collector();
+    expect((await adapterWith(fetch).start(bundle, sink, new AbortController().signal)).kind).toBe(
+      'completed',
+    );
+    expect(sink.events[1]?.type).toBe('hook_error');
+    expect(sink.events[1]).toHaveProperty('error_code', 'observer_failed');
+  });
+
+  test('mismatched identity and changed replay bytes are gaps, never accepted observations', async () => {
+    for (const sse of [
+      frames({ ...hook('pre_tool_call'), attempt_id: 'att_someone_else' }),
+      frames(hook('pre_tool_call'), { ...hook('pre_tool_call'), outcome: 'failed' }),
+    ]) {
+      const { fetch } = harness({ sse });
+      const outcome = await adapterWith(fetch).start(
+        bundle,
+        new Collector(),
+        new AbortController().signal,
+      );
+      expect(outcome.kind).toBe('failed');
+      if (outcome.kind === 'failed') expect(outcome.reason).toContain('transcript is incomplete');
+    }
+  });
+
+  test("a compaction's allow-listed scalars reach the ledger and nothing beside them does", async () => {
+    const { fetch } = harness({
+      sse: frames(
+        {
+          ...hook('on_compaction'),
+          outcome: 'succeeded',
+          detail: { compression_count: 2, in_place: true },
+        },
+        { event: 'run.completed', output: 'Done' },
+      ),
+    });
+    const sink = new Collector();
+    expect((await adapterWith(fetch).start(bundle, sink, new AbortController().signal)).kind).toBe(
+      'completed',
+    );
+    expect(sink.events.find((value) => value.type === 'hook_event')).toMatchObject({
+      name: 'on_compaction',
+      detail: { compression_count: 2, in_place: true },
+    });
+    // A detail field nobody declared is a gap, not a record with an extra key.
+    const rejected = harness({
+      sse: frames({
+        ...hook('on_compaction'),
+        detail: { compression_count: 2, session_id: 'ses_private' },
+      }),
+    });
+    const outcome = await adapterWith(rejected.fetch).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome.kind).toBe('failed');
+  });
+
+  test('unrecognized fields never leave the adapter in a hook record', async () => {
+    const { fetch } = harness({
+      sse: frames(
+        { ...hook('pre_tool_call'), args: { token: 'secret' }, error_message: 'private' },
+        { event: 'run.completed', output: 'Done' },
+      ),
+    });
+    const sink = new Collector();
+    await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+    expect(JSON.stringify(sink.events)).not.toContain('secret');
+    expect(JSON.stringify(sink.events)).not.toContain('private');
+  });
+});
+
+describe('a recorded run', () => {
+  test("the owner's new message reaches the model once, and earlier context once", async () => {
+    const { calls, fetch } = harness();
+    const asked = {
+      role: 'user' as const,
+      content: 'Book the dentist for Tuesday.',
+      at: '2026-09-23T09:00:00Z',
+    };
+    const earlier = {
+      role: 'user' as const,
+      content: 'I prefer mornings.',
+      at: '2026-09-22T09:00:00Z',
+    };
+    const reply = {
+      role: 'assistant' as const,
+      content: 'Noted, mornings.',
+      at: '2026-09-22T09:00:05Z',
+    };
+    await adapterWith(fetch).start(
+      {
+        ...bundle,
+        transcript: [earlier, reply, asked],
+        inputs: { ...bundle.inputs, new_user_messages: [asked] },
+      },
+      new Collector(),
+      new AbortController().signal,
+    );
+    const started = calls.find(
+      (call) => new URL(call.url).pathname === '/v1/runs' && call.init?.method === 'POST',
+    );
+    const input = String(JSON.parse(String(started?.init?.body)).input);
+    const count = (text: string) => input.split(text).length - 1;
+    expect(count(asked.content)).toBe(1);
+    expect(count(earlier.content)).toBe(1);
+    expect(count(reply.content)).toBe(1);
+  });
+
+  test('maps the stream to contract events in order', async () => {
+    const { fetch } = harness();
+    const sink = new Collector();
+    const outcome = await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+
+    expect(outcome).toEqual({
+      kind: 'completed',
+      summary: 'Asked the landlord for a signed date and parked the send for approval.',
+      evidence: [],
+    });
+    expect(sink.events.map((e) => e.type)).toEqual([
+      'turn_started',
+      'tool_call_proposed',
+      'tool_result',
+      'text_delta',
+      'text_delta',
+      'tool_call_proposed',
+      'tool_result',
+      'attempt_outcome',
+    ]);
+  });
+
+  test('every event carries the one dedup key format', async () => {
+    const { fetch } = harness();
+    const sink = new Collector();
+    await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+
+    sink.events.forEach((event, index) => {
+      expect(event.attempt_id).toBe(ATTEMPT);
+      expect(event.local_seq).toBe(index);
+      expect(event.dedup_key).toBe(`${ATTEMPT}:${index}`);
+    });
+  });
+
+  test('a tool result is paired with the call that opened it', async () => {
+    const { fetch } = harness();
+    const sink = new Collector();
+    await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+
+    const proposed = sink.events.filter((e) => e.type === 'tool_call_proposed');
+    const results = sink.events.filter((e) => e.type === 'tool_result');
+    expect(proposed.map((e) => (e as { call_id: string }).call_id)).toEqual(
+      results.map((e) => (e as { call_id: string }).call_id),
+    );
+    expect(results.every((e) => (e as { ok: boolean }).ok)).toBe(true);
+  });
+
+  test('the start carries the attempt id as its idempotency key', async () => {
+    const { calls, fetch } = harness();
+    await adapterWith(fetch).start(bundle, new Collector(), new AbortController().signal);
+
+    const start = calls.find((c) => c.init?.method === 'POST');
+    const headers = start?.init?.headers as Record<string, string>;
+    expect(headers['Idempotency-Key']).toBe(ATTEMPT);
+    expect(headers['X-Hermes-Session-Key']).toBe(JOB);
+  });
+
+  test('keepalive and close comments produce no events', async () => {
+    const { fetch } = harness({ sse: ': keepalive\n\n: stream closed\n\n' });
+    const sink = new Collector();
+    await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+    expect(
+      sink.events.filter((e) => e.type !== 'turn_started' && e.type !== 'attempt_outcome'),
+    ).toEqual([]);
+  });
+});
+
+describe('the ledger has the last word', () => {
+  test('a parked action turns a completion into waiting_for_approval', async () => {
+    const { fetch } = harness();
+    const sink = new Collector();
+    const outcome = await adapterWith(fetch, [ACTION]).start(
+      bundle,
+      sink,
+      new AbortController().signal,
+    );
+
+    expect(outcome).toEqual({ kind: 'waiting_for_approval', action_ids: [ACTION] });
+    const requested = sink.events.find((e) => e.type === 'action_requested');
+    expect(requested).toMatchObject({ action_id: ACTION, kind: 'approval' });
+    // The recorded outcome is the settled one, not what the engine said.
+    const last = sink.events.at(-1) as { type: string; outcome: { kind: string } };
+    expect(last.outcome.kind).toBe('waiting_for_approval');
+  });
+
+  test('an unreadable ledger reports an unknown check without inventing failure', async () => {
+    const { fetch } = harness();
+    const outcome = await adapterWith(fetch, new Error('ledger down')).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome).toMatchObject({
+      kind: 'unknown_check',
+      check: 'parked_actions',
+      reason: 'unavailable',
+    });
+    expect((outcome as { message: string }).message).toContain('ledger down');
+  });
+});
+
+describe('a go-ahead with nothing proposed', () => {
+  const CONNECTION = `conn_${SUFFIX}`;
+  const tools: AttemptBundle['tools'] = [
+    {
+      name: 'email.draft',
+      description: 'Save a draft',
+      input_schema: { type: 'object' },
+      effect_class: 'write_reversible',
+      connection_id: CONNECTION,
+    },
+    {
+      name: 'email.send',
+      description: 'Send a message',
+      input_schema: { type: 'object' },
+      effect_class: 'write_external',
+      connection_id: CONNECTION,
+    },
+  ];
+  const withTools = { ...bundle, tools };
+  const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`;
+  const run = (output: string, called: string[] = []) =>
+    called
+      .flatMap((tool) => [
+        frame({ event: 'tool.started', tool, preview: '' }),
+        frame({ event: 'tool.completed', tool, duration: 0.1, error: false }),
+      ])
+      .join('') + frame({ event: 'run.completed', output });
+
+  /** One stream per run, and the parked ledger as it stands after each run. */
+  function script(runs: string[], parkedAfter: string[][] = []) {
+    const inputs: string[] = [];
+    let started = 0;
+    const fetch: FetchLike = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/v1/runs' && init?.method === 'POST') {
+        inputs.push((JSON.parse(String(init.body)) as { input: string }).input);
+        started++;
+        return Response.json({ run_id: `run_${started}`, status: 'started' }, { status: 202 });
+      }
+      if (path.endsWith('/events')) {
+        const index = Number(path.split('/')[3]?.replace('run_', '')) - 1;
+        return new Response(streamOf(runs[index] ?? ''), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }
+      return Response.json({ ok: true });
+    };
+    const adapter = new HermesRuntimeAdapter({
+      baseUrl: 'http://runtime:8790',
+      parkedActions: async () => parkedAfter[started - 1] ?? [],
+      fetch,
+      streamIdleMs: 2_000,
+    });
+    return { adapter, inputs };
+  }
+
+  test('a drafted reply that asks to send gets one continuation, and its proposal parks', async () => {
+    const { adapter, inputs } = script(
+      [
+        run('I drafted the reply. Shall I send it?', ['email.draft']),
+        run('The send is waiting for your approval.', ['email.send']),
+      ],
+      [[], [ACTION]],
+    );
+    const outcome = await adapter.start(withTools, new Collector(), new AbortController().signal);
+    expect(outcome).toEqual({ kind: 'waiting_for_approval', action_ids: [ACTION] });
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toContain('proposed nothing');
+    expect(inputs[1]).toContain('the broker will ask the person');
+  });
+
+  test('an ask that still proposes nothing settles waiting for input, never completed', async () => {
+    const { adapter, inputs } = script([
+      run('Would you like me to send the confirmation now?'),
+      run('Let me know if I should send it.'),
+      run('unreachable'),
+    ]);
+    const outcome = await adapter.start(withTools, new Collector(), new AbortController().signal);
+    expect(outcome).toEqual({
+      kind: 'waiting_for_input',
+      question: 'Let me know if I should send it.',
+    });
+    // Exactly one continuation: the third scripted run is never started.
+    expect(inputs).toHaveLength(2);
+  });
+
+  test('an effect the owner refused in this wake is not asked for again', async () => {
+    const refused: AttemptBundle = {
+      ...withTools,
+      inputs: {
+        ...withTools.inputs,
+        approval_results: [{ action_id: ACTION, decision: 'denied', note: null }],
+      },
+    };
+    const reply = "I won't send it. Let me know if you'd like me to send a shorter version.";
+    const { adapter, inputs } = script([run(reply), run('unreachable')]);
+    const outcome = await adapter.start(refused, new Collector(), new AbortController().signal);
+    // The reply is still a question, so the job asks it. What must not happen is
+    // answering a refusal with "call the tool now" and proposing again on our word.
+    expect(outcome).toEqual({ kind: 'waiting_for_input', question: reply });
+    expect(inputs).toHaveLength(1);
+  });
+
+  test('a finished send, a closing offer or a plain question completes in one run', async () => {
+    for (const [output, called] of [
+      ['I sent the reply.', ['email.send']],
+      ['Done. Let me know if you need anything else.', []],
+      ['Which address should I use, work or personal?', []],
+      ["I can't send mail from here, so nothing was sent.", []],
+    ] as const) {
+      const { adapter, inputs } = script([run(output, [...called])]);
+      const outcome = await adapter.start(withTools, new Collector(), new AbortController().signal);
+      expect(outcome).toEqual({ kind: 'completed', summary: output, evidence: [] });
+      expect(inputs).toHaveLength(1);
+    }
+  });
+});
+
+describe('nothing becomes a completion that was not one', () => {
+  test('an interrupted run fails retryably and says history is missing', async () => {
+    const sse =
+      'data: {"event":"message.delta","delta":"half a "}\n\n' +
+      'data: {"event":"run.interrupted","run_id":"run_fixture_1"}\n\n';
+    const { fetch } = harness({ sse });
+    const sink = new Collector();
+    const outcome = await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+
+    expect(outcome).toMatchObject({ kind: 'failed', retryable: true });
+    expect((outcome as { reason: string }).reason).toContain('interrupted');
+    expect((outcome as { reason: string }).reason).toContain('transcript is incomplete');
+  });
+
+  test('a stream that stops without a terminal frame is a gap, not a success', async () => {
+    const { fetch } = harness({ sse: 'data: {"event":"message.delta","delta":"only this"}\n\n' });
+    const outcome = await adapterWith(fetch).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome).toMatchObject({ kind: 'failed', retryable: true });
+    expect((outcome as { reason: string }).reason).toContain('before the run reported an outcome');
+  });
+
+  test('a failed run keeps the engine reason', async () => {
+    const { fetch } = harness({
+      sse: 'data: {"event":"run.failed","error":"provider refused the request"}\n\n',
+    });
+    const outcome = await adapterWith(fetch).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome).toEqual({
+      kind: 'failed',
+      reason: 'provider refused the request',
+      retryable: true,
+    });
+  });
+
+  test('a run the provider refused carries the class, and only a passing one is retried', async () => {
+    const run = async (error: string) => {
+      const { fetch } = harness({
+        sse: `data: ${JSON.stringify({ event: 'run.failed', error })}\n\n`,
+      });
+      return adapterWith(fetch).start(bundle, new Collector(), new AbortController().signal);
+    };
+    expect(
+      await run(
+        "Error code: 401 - {'error': {'code': 'provider_key_refused', 'message': 'provider_key_refused'}}",
+      ),
+    ).toMatchObject({ kind: 'failed', failure: 'key_refused', retryable: false });
+    expect(await run('HTTP 402: provider_quota')).toMatchObject({
+      failure: 'quota',
+      retryable: false,
+    });
+    expect(await run('HTTP 404: provider_model_not_found')).toMatchObject({
+      failure: 'model_not_found',
+      retryable: false,
+    });
+    expect(await run('Error code: 429 - provider_rate_limited')).toMatchObject({
+      failure: 'rate_limited',
+      retryable: true,
+    });
+    expect(await run('Error code: 502 - provider_down')).toMatchObject({
+      failure: 'provider_down',
+      retryable: true,
+    });
+    // Words that merely look alike name nothing.
+    const plain = await run('the provider_downstream cache missed');
+    expect(plain).toMatchObject({ retryable: true });
+    expect(plain).not.toHaveProperty('failure');
+  });
+
+  test('a start the engine refused never opens a stream', async () => {
+    const { calls, fetch } = harness({ startStatus: 503 });
+    const outcome = await adapterWith(fetch).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome).toMatchObject({ kind: 'failed', retryable: true });
+    expect(calls.some((c) => c.url.endsWith('/events'))).toBe(false);
+  });
+
+  test('an events route that refuses is a gap', async () => {
+    const { fetch } = harness({ eventsStatus: 404 });
+    const outcome = await adapterWith(fetch).start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect((outcome as { reason: string }).reason).toContain('answered 404');
+  });
+});
+
+describe('streamed text and reasoning', () => {
+  const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`;
+  /** Records each event only after a pause, as a database write would. */
+  class SlowCollector extends Collector {
+    override async emit(event: RuntimeEvent) {
+      await Bun.sleep(15);
+      await super.emit(event);
+    }
+  }
+  const texts = (events: RuntimeEvent[], type: 'text_delta' | 'reasoning_delta') =>
+    events.flatMap((event) => (event.type === type ? [event.text] : []));
+
+  test('reasoning reaches the sink as reasoning, never as answer text', async () => {
+    const sse =
+      frame({ event: 'reasoning.delta', delta: 'The person said hey. ' }) +
+      frame({ event: 'reasoning.delta', delta: 'A short greeting back.' }) +
+      frame({ event: 'message.delta', delta: 'Hey!' }) +
+      frame({ event: 'run.completed', output: 'Hey!' });
+    const { fetch } = harness({ sse });
+    const sink = new Collector();
+    const outcome = await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+    expect(outcome).toEqual({ kind: 'completed', summary: 'Hey!', evidence: [] });
+    expect(texts(sink.events, 'reasoning_delta').join('')).toBe(
+      'The person said hey. A short greeting back.',
+    );
+    expect(texts(sink.events, 'text_delta')).toEqual(['Hey!']);
+  });
+
+  test('frames that arrive while one is being recorded are recorded together, in order', async () => {
+    const words = Array.from({ length: 40 }, (_, index) => `w${index} `);
+    const sse =
+      words.map((word) => frame({ event: 'message.delta', delta: word })).join('') +
+      frame({ event: 'tool.started', tool: 'search', preview: 'looking' }) +
+      frame({ event: 'tool.completed', tool: 'search', duration: 0.1, error: false }) +
+      words.map((word) => frame({ event: 'message.delta', delta: word.toUpperCase() })).join('') +
+      frame({ event: 'run.completed', output: 'done' });
+    const { fetch } = harness({ sse: sse });
+    const sink = new SlowCollector();
+    await adapterWith(fetch).start(bundle, sink, new AbortController().signal);
+    const pieces = texts(sink.events, 'text_delta');
+    expect(pieces.join('')).toBe(words.join('') + words.join('').toUpperCase());
+    // Fewer writes than frames, and nothing moved across the tool call.
+    expect(pieces.length).toBeLessThan(words.length * 2);
+    const types = sink.events.map((event) => event.type);
+    const call = types.indexOf('tool_call_proposed');
+    expect(texts(sink.events.slice(0, call), 'text_delta').join('')).toBe(words.join(''));
+  });
+
+  test('only neighbouring frames of the same kind are merged', () => {
+    const merged = coalesceDeltas([
+      { event: 'reasoning.delta', delta: 'a' },
+      { event: 'reasoning.delta', delta: 'b' },
+      { event: 'message.delta', delta: 'c' },
+      { event: 'message.delta', delta: 'd' },
+      { event: 'tool.started', tool: 'x' },
+      { event: 'message.delta', delta: 'e' },
+    ]);
+    expect(merged).toEqual([
+      { event: 'reasoning.delta', delta: 'ab' },
+      { event: 'message.delta', delta: 'cd' },
+      { event: 'tool.started', tool: 'x' },
+      { event: 'message.delta', delta: 'e' },
+    ]);
+  });
+});
+
+describe('control', () => {
+  test('an abort stops the run on the engine', async () => {
+    const controller = new AbortController();
+    const { calls, fetch } = harness({
+      sse: 'data: {"event":"run.completed","output":"done"}\n\n',
+    });
+    const adapter = adapterWith(fetch);
+    const started = adapter.start(bundle, new Collector(), controller.signal);
+    controller.abort();
+    await started;
+    expect(calls.some((c) => c.url.endsWith('/stop'))).toBe(true);
+  });
+
+  test('a shell-command approval is denied, never allowed for the session', async () => {
+    const { calls, fetch } = harness({
+      sse:
+        'data: {"event":"approval.request","request_id":"req_9","command":"rm -rf /work","allow_session":true}\n\n' +
+        'data: {"event":"run.completed","output":"stopped"}\n\n',
+    });
+    await adapterWith(fetch).start(bundle, new Collector(), new AbortController().signal);
+
+    const approval = calls.find((c) => c.url.endsWith('/approval'));
+    expect(approval).toBeDefined();
+    expect(JSON.parse(String(approval?.init?.body))).toEqual({
+      request_id: 'req_9',
+      choice: 'deny',
+    });
+  });
+});
+
+describe('the default ledger lookup', () => {
+  test('asks for this job and keeps only this attempt', async () => {
+    const calls: string[] = [];
+    const lookup = brokerParkedActions({
+      brokerUrl: 'http://openduet:3112/',
+      serviceKey: 'service-key',
+      spaceId: `spc_${SUFFIX}`,
+      fetch: async (url) => {
+        calls.push(url);
+        return Response.json({
+          actions: [
+            { id: ACTION, attempt_id: ATTEMPT },
+            { id: 'act_from_an_older_attempt', attempt_id: 'att_older' },
+          ],
+        });
+      },
+    });
+
+    expect(await lookup(bundle)).toEqual([ACTION]);
+    expect(calls[0]).toContain(`job_id=${JOB}`);
+    expect(calls[0]).toContain('status=needs_approval');
+  });
+
+  test('a refusal raises rather than reporting nothing parked', async () => {
+    const lookup = brokerParkedActions({
+      brokerUrl: 'http://openduet:3112',
+      serviceKey: 'service-key',
+      spaceId: `spc_${SUFFIX}`,
+      fetch: async () => new Response('no', { status: 401 }),
+    });
+    expect(lookup(bundle)).rejects.toThrow(/answered 401/);
+  });
+});
+
+test('the actual Hermes run request carries the since-last receipt and pending question', async () => {
+  const requests: Array<{ input: string; instructions: string }> = [];
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 3190,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === '/v1/runs' && request.method === 'POST') {
+        requests.push((await request.json()) as { input: string; instructions: string });
+        return Response.json({ run_id: 'run_delta', status: 'started' }, { status: 202 });
+      }
+      if (path === '/v1/runs/run_delta/events') {
+        return new Response(RECORDED, { headers: { 'content-type': 'text/event-stream' } });
+      }
+      return new Response('not found', { status: 404 });
+    },
+  });
+  try {
+    const adapter = new HermesRuntimeAdapter({
+      baseUrl: server.url.toString(),
+      parkedActions: async () => [],
+    });
+    const outcome = await adapter.start(
+      {
+        ...bundle,
+        since_last: {
+          ...EMPTY_SINCE_LAST,
+          attempt_id: ATTEMPT,
+          actions: [
+            {
+              action_id: ACTION,
+              kind: 'email.send',
+              status: 'succeeded',
+              receipt_ref: 'receipt-marker-delta@example.test',
+              at: '2026-09-11T10:00:00Z',
+            },
+          ],
+          pending_questions: [
+            { id: 'qst_delta', text: 'Which recording should I use?', state: 'asked' },
+          ],
+        },
+      },
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(outcome.kind).toBe('completed');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.input).toContain('receipt receipt-marker-delta@example.test');
+    expect(requests[0]?.input).toContain('question asked: Which recording should I use?');
+  } finally {
+    await server.stop(true);
+  }
+});
+
+describe('a turn never hangs silently and never ends without a word', () => {
+  const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`;
+  const said = (output: string, called: string[] = []) =>
+    called
+      .flatMap((tool) => [
+        frame({ event: 'tool.started', tool, preview: '' }),
+        frame({ event: 'tool.completed', tool, duration: 0.1, error: false }),
+      ])
+      .join('') + frame({ event: 'run.completed', output });
+  /** A run whose step never answers: the socket stays open, with keepalives only. */
+  const HANGS = Symbol('hangs');
+
+  function script(runs: Array<string | typeof HANGS>, options: { refuseAfter?: number } = {}) {
+    const inputs: string[] = [];
+    const stopped: string[] = [];
+    let started = 0;
+    // Silence is measured on this clock, which moves only when the stream
+    // ticks, so how fast the machine runs cannot change what the test sees.
+    let clock = 0;
+    const encoder = new TextEncoder();
+    const fetch: FetchLike = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/v1/runs' && init?.method === 'POST') {
+        if (options.refuseAfter !== undefined && started >= options.refuseAfter)
+          return new Response('engine busy', { status: 503 });
+        inputs.push((JSON.parse(String(init.body)) as { input: string }).input);
+        started++;
+        return Response.json({ run_id: `run_${started}`, status: 'started' }, { status: 202 });
+      }
+      if (path.endsWith('/stop')) {
+        stopped.push(path.split('/')[3] ?? '');
+        return Response.json({ ok: true });
+      }
+      if (path.endsWith('/events')) {
+        const scripted = runs[Number(path.split('/')[3]?.replace('run_', '')) - 1] ?? '';
+        if (scripted !== HANGS)
+          return new Response(streamOf(scripted), {
+            headers: { 'content-type': 'text/event-stream' },
+          });
+        let timer: ReturnType<typeof setInterval> | undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(frame({ event: 'tool.started', tool: 'browser.open', preview: '' })),
+            );
+            timer = setInterval(() => {
+              clock += 10;
+              controller.enqueue(encoder.encode(': keepalive\n\n'));
+            }, 10);
+          },
+          cancel() {
+            clearInterval(timer);
+          },
+        });
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+      }
+      return Response.json({ ok: true });
+    };
+    const adapter = new HermesRuntimeAdapter({
+      baseUrl: 'http://runtime:8790',
+      parkedActions: async () => [],
+      fetch,
+      streamIdleMs: 2_000,
+      // Keepalives every 10 ms keep the socket open; only an event counts as progress.
+      quietMs: () => 120,
+      now: () => clock,
+    });
+    return { adapter, inputs, stopped };
+  }
+
+  test('a step that never answers is stopped, and the agent is asked once to report what it has', async () => {
+    const { adapter, inputs, stopped } = script([
+      HANGS,
+      said('I found two routes so far: BART from Powell St, about 35 minutes.'),
+    ]);
+    const sink = new Collector();
+    const outcome = await adapter.start(bundle, sink, new AbortController().signal);
+    expect(outcome).toEqual({
+      kind: 'completed',
+      summary: 'I found two routes so far: BART from Powell St, about 35 minutes.',
+      evidence: [],
+    });
+    expect(stopped).toEqual(['run_1']);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toContain('Nothing came back from your last step');
+    expect(inputs[1]).toContain('Do not repeat it');
+    const quiet = sink.events.find((event) => event.type === 'stalled');
+    expect(quiet).toMatchObject({ type: 'stalled', tool: 'browser.open' });
+    expect(quiet?.type === 'stalled' ? quiet.silent_ms : 0).toBeGreaterThanOrEqual(120);
+  });
+
+  test('an engine that stays stuck after being asked ends the turn with a plain note', async () => {
+    const { adapter, inputs, stopped } = script([HANGS, HANGS, said('never started')]);
+    const sink = new Collector();
+    const outcome = await adapter.start(bundle, sink, new AbortController().signal);
+    if (outcome.kind !== 'completed') throw new Error(`expected a note, got ${outcome.kind}`);
+    expect(outcome.summary).toStartWith('I stopped here: my work stopped responding');
+    expect(outcome.summary).toContain('Send a message');
+    expect(stopped).toEqual(['run_1', 'run_2']);
+    expect(inputs).toHaveLength(2);
+    // The person is shown the stuck state once, not once per run.
+    expect(sink.events.filter((event) => event.type === 'stalled')).toHaveLength(1);
+  });
+
+  test('an engine that will not take the run asking it to report ends the turn the same way', async () => {
+    const { adapter, inputs } = script([HANGS], { refuseAfter: 1 });
+    const outcome = await adapter.start(bundle, new Collector(), new AbortController().signal);
+    if (outcome.kind !== 'completed') throw new Error(`expected a note, got ${outcome.kind}`);
+    expect(outcome.summary).toStartWith('I stopped here');
+    expect(inputs).toHaveLength(1);
+  });
+
+  test('a run that ends on its tool calls without a word is asked once to deliver the result', async () => {
+    const { adapter, inputs } = script([
+      said('', ['web.fetch']),
+      said('The cheapest non-stop is American at $370, departing 3:28 PM.'),
+    ]);
+    const outcome = await adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(outcome).toEqual({
+      kind: 'completed',
+      summary: 'The cheapest non-stop is American at $370, departing 3:28 PM.',
+      evidence: [],
+    });
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toContain('You stopped without telling the person anything');
+  });
+
+  test('the nudge to deliver is given once, and a turn with no tool calls is left alone', async () => {
+    const twice = script([said('', ['web.fetch']), said(''), said('never started')]);
+    await twice.adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(twice.inputs).toHaveLength(2);
+    const plain = script([said(''), said('never started')]);
+    await plain.adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(plain.inputs).toHaveLength(1);
+  });
+
+  test('a reply that claims a step no tool took is asked once, out of sight, to do it or say it again', async () => {
+    const { adapter, inputs } = script([
+      said('I found the summary and I sent it to Priya.', ['web.search']),
+      said('I found the summary. I have not sent it to Priya yet; say the word and I will.'),
+    ]);
+    const outcome = await adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(outcome).toEqual({
+      kind: 'completed',
+      summary: 'I found the summary. I have not sent it to Priya yet; say the word and I will.',
+      evidence: [],
+    });
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toContain('Your reply says you did something no tool in this turn did');
+    expect(inputs[1]).toContain('sending something');
+    expect(inputs[1]).toContain('Do not mention this check');
+  });
+
+  test('a claim a tool backs is left alone, and the repair is asked for only once', async () => {
+    const backed = script([
+      said('I opened their page in my browser: the clinic is open until 6.', ['browser.open']),
+      said('never started'),
+    ]);
+    await backed.adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(backed.inputs).toHaveLength(1);
+    const stubborn = script([
+      said('I booked the table for 7.'),
+      said('I booked the table for 7.'),
+      said('never started'),
+    ]);
+    const outcome = await stubborn.adapter.start(
+      bundle,
+      new Collector(),
+      new AbortController().signal,
+    );
+    expect(stubborn.inputs).toHaveLength(2);
+    // What still claims it is the service's to take out, from the turn's receipts.
+    expect(outcome).toMatchObject({ kind: 'completed', summary: 'I booked the table for 7.' });
+  });
+
+  test('the time a step may take follows its deadline, and silence with no step is short', () => {
+    const catalog: AttemptBundle['tools'] = [
+      {
+        name: 'web.search',
+        description: 'Search',
+        input_schema: { type: 'object' },
+        effect_class: 'read',
+        connection_id: `conn_${SUFFIX}`,
+        deadline_ms: 90_000,
+      },
+      {
+        name: 'device.run',
+        description: 'Run a command',
+        input_schema: { type: 'object', properties: { timeout_ms: { type: 'integer' } } },
+        effect_class: 'write_reversible',
+        connection_id: `conn_${SUFFIX}`,
+      },
+    ];
+    expect(quietAllowanceMs([], catalog)).toBe(MODEL_SILENCE_MS + STALL_MARGIN_MS);
+    expect(stepDeadlineMs('web.search', catalog)).toBe(120_000);
+    expect(stepDeadlineMs('email.search', catalog)).toBe(60_000);
+    expect(stepDeadlineMs('device.run', catalog)).toBe(15 * 60_000 + 30_000);
+    expect(stepDeadlineMs('terminal', catalog)).toBe(810_000);
+    expect(quietAllowanceMs(['web.search', 'terminal'], catalog)).toBe(810_000 + STALL_MARGIN_MS);
+  });
+});
+
+describe('words the person sends while the turn runs', () => {
+  const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`;
+  const encoder = new TextEncoder();
+
+  /**
+   * An engine whose runs are scripted frame by frame. A run may wait on a
+   * promise between frames, so a test can steer while a step is in flight.
+   */
+  function engine(runs: Array<Array<string | Promise<unknown>>>, refuseSteer = false) {
+    const inputs: string[] = [];
+    const steered: Array<{ run: string; input: string }> = [];
+    let started = 0;
+    const fetch: FetchLike = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/v1/runs' && init?.method === 'POST') {
+        inputs.push((JSON.parse(String(init.body)) as { input: string }).input);
+        started++;
+        return Response.json({ run_id: `run_${started}`, status: 'started' }, { status: 202 });
+      }
+      if (path.endsWith('/steer')) {
+        if (refuseSteer)
+          return Response.json({ error: { code: 'run_not_accepting_steer' } }, { status: 409 });
+        steered.push({
+          run: path.split('/')[3] ?? '',
+          input: (JSON.parse(String(init?.body)) as { input: string }).input,
+        });
+        return Response.json({ accepted: true });
+      }
+      if (path.endsWith('/events')) {
+        const script = runs[Number(path.split('/')[3]?.replace('run_', '')) - 1] ?? [];
+        const body = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            for (const piece of script) {
+              if (typeof piece === 'string') controller.enqueue(encoder.encode(piece));
+              else await piece;
+            }
+            controller.close();
+          },
+        });
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+      }
+      return Response.json({ ok: true });
+    };
+    const adapter = new HermesRuntimeAdapter({
+      baseUrl: 'http://runtime:8790',
+      parkedActions: async () => [],
+      fetch,
+    });
+    return { adapter, inputs, steered };
+  }
+
+  function gate() {
+    let open: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { open, opened };
+  }
+
+  /** Until the attempt's first run is open, so a steer goes to it. */
+  async function runOpen(inputs: string[]) {
+    while (!inputs.length) await Bun.sleep(1);
+    await Bun.sleep(5);
+  }
+
+  test('words sent during a step reach the run, and are delivered at that step’s end', async () => {
+    const steeredIn = gate();
+    const { adapter, inputs, steered } = engine([
+      [
+        frame({ event: 'tool.started', tool: 'web.search', preview: '' }),
+        steeredIn.opened,
+        frame({ event: 'tool.completed', tool: 'web.search', duration: 0.1, error: false }),
+        frame({ event: 'run.completed', output: 'Here are three wireless keyboards.' }),
+      ],
+    ]);
+    const sink = new Collector();
+    const running = adapter.start(bundle, sink, new AbortController().signal);
+    await runOpen(inputs);
+    expect(await adapter.steer(ATTEMPT, { id: 'str_1', text: 'Wireless only, actually.' })).toBe(
+      true,
+    );
+    steeredIn.open();
+    const outcome = await running;
+    expect(steered).toHaveLength(1);
+    expect(steered[0]?.input).toContain('> Wireless only, actually.');
+    expect(steered[0]?.input).toContain('Take this into account and carry on');
+    expect(inputs).toHaveLength(1);
+    const kinds = sink.events.map((event) => event.type);
+    expect(kinds.filter((kind) => kind === 'steer_delivered')).toHaveLength(1);
+    expect(kinds.indexOf('steer_delivered')).toBeLessThan(kinds.indexOf('attempt_outcome'));
+    expect(outcome).toMatchObject({ kind: 'completed' });
+  });
+
+  test('words the run took but never read become the next run’s input, in the same attempt', async () => {
+    const steeredIn = gate();
+    const { adapter, inputs } = engine([
+      [
+        steeredIn.opened,
+        frame({
+          event: 'run.completed',
+          output: 'Here are three keyboards.',
+          pending_steer: 'Wireless only',
+        }),
+      ],
+      [frame({ event: 'run.completed', output: 'Here are three wireless keyboards.' })],
+    ]);
+    const sink = new Collector();
+    const running = adapter.start(bundle, sink, new AbortController().signal);
+    await runOpen(inputs);
+    await adapter.steer(ATTEMPT, { id: 'str_2', text: 'Wireless only, actually.' });
+    steeredIn.open();
+    const outcome = await running;
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toContain('> Wireless only, actually.');
+    expect(inputs[1]).toContain('> Here are three keyboards.');
+    expect(inputs[1]).toContain('Write your whole reply again');
+    expect(outcome).toMatchObject({ summary: 'Here are three wireless keyboards.' });
+    expect(sink.events.filter((event) => event.type === 'steer_delivered')).toHaveLength(1);
+  });
+
+  test('words a run refuses wait for the next run, and the same words are taken once', async () => {
+    const steeredIn = gate();
+    const { adapter, inputs, steered } = engine(
+      [
+        [
+          steeredIn.opened,
+          frame({ event: 'tool.started', tool: 'web.search', preview: '' }),
+          frame({ event: 'tool.completed', tool: 'web.search', duration: 0.1, error: false }),
+          frame({ event: 'run.completed', output: 'A.' }),
+        ],
+        [frame({ event: 'run.completed', output: 'B.' })],
+      ],
+      true,
+    );
+    const sink = new Collector();
+    const running = adapter.start(bundle, sink, new AbortController().signal);
+    await runOpen(inputs);
+    const message = { id: 'str_3', text: 'Make it under 50 dollars.' };
+    expect(await adapter.steer(ATTEMPT, message)).toBe(true);
+    expect(await adapter.steer(ATTEMPT, message)).toBe(true);
+    steeredIn.open();
+    expect(await running).toMatchObject({ summary: 'B.' });
+    expect(steered).toHaveLength(0);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]?.match(/Make it under 50 dollars/g)).toHaveLength(1);
+    expect(sink.events.filter((event) => event.type === 'steer_delivered')).toHaveLength(1);
+  });
+
+  test('once the attempt is over, words are refused here so the service can carry them', async () => {
+    const { adapter } = engine([[frame({ event: 'run.completed', output: 'Done.' })]]);
+    await adapter.start(bundle, new Collector(), new AbortController().signal);
+    expect(await adapter.steer(ATTEMPT, { id: 'str_4', text: 'One more thing.' })).toBe(false);
+  });
+});
+
+describe('a reply that hit the output limit', () => {
+  // The engine's own wording, as the pinned release writes it.
+  const THINKING =
+    '⚠️ **Thinking Budget Exhausted**\n\nThe model used all its output tokens on reasoning ' +
+    'and had none left for the actual response.\n\nTo fix this:\n' +
+    '→ Lower reasoning effort: `/reasoning low` or `/reasoning minimal`\n' +
+    '→ Or switch to a larger/non-reasoning model with `/model`';
+  const REPEATING =
+    '⚠️ **Response Stopped — Repetition Detected**\n\nThe model fell into a repetition loop.' +
+    '\n\n→ Switch to a different model with `/model`';
+
+  test('names what can be done here, never the engine slash commands', async () => {
+    for (const output of [
+      THINKING,
+      REPEATING,
+      'Response truncated due to output length limit',
+      '⚠️ **No visible answer was produced.** The model hit its output-token limit.\n' +
+        '→ Lower reasoning effort: `/reasoning low` or `/reasoning none`',
+    ]) {
+      const { fetch } = harness({
+        sse: `data: ${JSON.stringify({ event: 'run.completed', output })}\n\n`,
+      });
+      const outcome = await adapterWith(fetch).start(
+        bundle,
+        new Collector(),
+        new AbortController().signal,
+      );
+      expect(outcome.kind).toBe('completed');
+      const said = (outcome as { summary: string }).summary;
+      expect(said).not.toContain('/reasoning');
+      expect(said).not.toContain('/model');
+      expect(said).toContain('Settings › Models');
+    }
+  });
+
+  test('an ordinary answer is left as written', () => {
+    expect(plainEngineNotice('Response times were fine today.')).toBe(
+      'Response times were fine today.',
+    );
+  });
+});

@@ -1,0 +1,251 @@
+import type {
+  Action,
+  CapabilityManifest,
+  ConnectorHealth,
+  ConnectorManifest,
+  DispatchResult,
+  JobConstraints,
+  JsonObject,
+  VerifyResult,
+} from '@openduet/contracts';
+import type { CatalogMetadata } from '../broker/catalog.ts';
+import type { PersonPaysPage } from '../broker/money.ts';
+import type { Query } from '../broker/records.ts';
+import type { Declaration, ReversalPlan } from '../broker/reversals.ts';
+import type { SignalSource, SubjectReader } from '../signals/types.ts';
+import type { ConnectorDescription, RepairAttemptContext } from './faults.ts';
+
+/** Trusted service context, assembled from persisted job state, never tool arguments. */
+export type ConnectorContext = {
+  job_id: string;
+  space_id: string;
+  idempotency_key: string;
+  constraints: JobConstraints;
+  signal?: AbortSignal;
+  /**
+   * Present only on a repaired re-execution. A connector may read it to take
+   * the route the policy authorized; it is never a way to change what is sent.
+   */
+  repair?: RepairAttemptContext;
+  /**
+   * Set by the broker when this action was let through only because what it
+   * makes is new in the person's space (`staysInSpace`), with no approval and
+   * no standing permission behind it. The connector must then not replace
+   * anything that has appeared at that name since.
+   */
+  only_new?: boolean;
+  /**
+   * Set by the broker at dispatch when what this action does is one of the
+   * risks only the person lets through (spend, credentials, a delete, a send
+   * to someone outside, widening who can see something), whoever let it
+   * through: a standing permission does not make a payment less of one.
+   */
+  risk?: 'spend' | 'credentials' | 'delete' | 'outside_send' | 'visibility';
+  /**
+   * What `ahead` read from the destination for this proposal, before the
+   * proposal's lock; handed to `prepare` only. Null when it could not be read.
+   */
+  ahead?: JsonObject | null;
+  /**
+   * At proposal only: the tools this job may use on this connection, so a
+   * connector can withhold what the job could not read itself.
+   */
+  granted?: readonly string[];
+};
+
+export interface Connector {
+  manifest: ConnectorManifest;
+  /**
+   * The outside service this connector's tools reach (`google:mail`,
+   * `opentable.com`), when it is fixed where the connector is built. Left out,
+   * it is read from the connection's stored configuration (`paths/services.ts`).
+   * The path policy compares it with where a browser submit goes.
+   */
+  service?: string | null;
+  /**
+   * Resolve trusted resource identities before hashing an approval payload.
+   * `kind` is the tool asked for, for tools whose payloads look alike.
+   */
+  prepare?(
+    payload: JsonObject,
+    ctx: ConnectorContext,
+    tx: Query,
+    kind?: string,
+  ): Promise<JsonObject>;
+  /**
+   * Read what `prepare` needs from the destination itself, before the
+   * proposal's lock is taken: a calendar write's conflicts, for one. Called
+   * with the raw proposal, outside every transaction, with a deadline; a
+   * throw or null means nothing could be read, and `prepare` must then bind
+   * that and leave the final check to dispatch. Never writes anything.
+   */
+  ahead?(
+    proposal: Pick<Action, 'kind' | 'canonical_payload'>,
+    ctx: ConnectorContext,
+    sql: Query,
+  ): Promise<JsonObject | null>;
+  /**
+   * Refuse a new proposal over what `ahead` read (in `ctx.ahead`). Called
+   * under the proposal's lock after the repeat lookups found nothing, so a
+   * repeated proposal is handed the action it made rather than refused over
+   * it. Throws a `BrokerFault` to refuse.
+   */
+  checkAhead?(
+    proposal: Pick<Action, 'kind' | 'canonical_payload'>,
+    ctx: ConnectorContext,
+  ): void | Promise<void>;
+  /** Recheck bound resources under the admission/dispatch transaction. */
+  validateBinding?(action: Action, ctx: ConnectorContext, tx: Query): Promise<void>;
+  /**
+   * How many guests the existing item this action changes has now, read from
+   * the destination: the attendees of the event a `calendar.update` rewrites.
+   * Throws when it cannot be read. Auto-review asks it before treating such a
+   * change as one that reaches nobody but the person.
+   */
+  existingGuests?(action: Action, ctx: ConnectorContext): Promise<number>;
+  /**
+   * Present when this connector is a generative capability rather than a reach
+   * into something that already exists. It carries the cost and the mime type
+   * the call produces, both from trusted configuration.
+   */
+  capability?: CapabilityManifest;
+  /** Trusted discovery metadata: source, examples and core priorities. Never from a tool result. */
+  catalog?: CatalogMetadata;
+  /**
+   * For an installed MCP server: whether the server declares this tool
+   * read-only. Only then is a read of it whose answer never came settled as
+   * failed; without it, the person is asked, as for any other effect.
+   */
+  readOnlyDeclared?(kind: string): boolean;
+  /**
+   * For a connector that renames its server's tools (an installed MCP server
+   * under the operator's aliases): the server's own name for this tool, which
+   * says what it does as much as the alias does. The money check reads both.
+   */
+  rawToolName?(kind: string): string | undefined;
+  /**
+   * A page this tool opens in the conversation where the person pays in the
+   * page themselves, as the installation's own policy declares it (never the
+   * server's description of itself). The money check does not ask for a
+   * step-up to open such a page.
+   */
+  personPaysPage?(kind: string): PersonPaysPage | null;
+  execute(action: Action, ctx: ConnectorContext): Promise<DispatchResult>;
+  verify(action: Action, ctx: ConnectorContext): Promise<VerifyResult>;
+  /**
+   * What a dispatch is settled as when the process that sent it ended before
+   * its answer came back. Called only for such orphaned dispatches, and only
+   * for a connector that opts in by defining it: a command in the agent's own
+   * sandbox can read its marker. It returns `failed` only when that record
+   * shows the step never started; anything still open stays `unknown`, so a
+   * late receipt can still land. Without it, such a dispatch is unknown.
+   */
+  abandoned?(action: Action, ctx: ConnectorContext): Promise<DispatchResult>;
+  /**
+   * Its steps run on the agent's own computer. An outcome left open stays
+   * `unknown`, but it is the agent's to check (a screenshot, the page, what a
+   * command left behind), so the person is never asked whether it worked.
+   */
+  ownComputer?: boolean;
+  /**
+   * With `ownComputer`: no step of this connector can reach anything outside
+   * OpenDuet (files in the agent's workspace and the person's Files), so an
+   * open outcome is the agent's to check whatever any computer's network
+   * allows. Without it, only a step on a computer that could reach nothing is.
+   */
+  staysInside?: boolean;
+  /**
+   * How long one dispatch of this action may take before its outcome is
+   * unknown, for a connector whose work may outlast the broker's own dispatch
+   * timeout: a command the admitted payload gives two minutes. The broker
+   * never waits less than its own timeout, whatever this says.
+   */
+  dispatchBudgetMs?(action: Pick<Action, 'kind' | 'canonical_payload'>): number;
+  /**
+   * True when this particular action needs the person's approval although its
+   * tool alone does not, because of what the payload names: opening an
+   * address on the person's own network, for one. It can only add a question,
+   * never remove one.
+   */
+  asksFirst?(action: Pick<Action, 'kind' | 'canonical_payload'>): boolean;
+  /**
+   * True when this particular action stays in the person's own space, where
+   * they can open and delete it, although its tool can also reach outside: an
+   * artifact saved to the space rather than emailed. It is then treated as
+   * work in the agent's own workspace, under the person's own settings.
+   */
+  staysInSpace?(action: Pick<Action, 'kind' | 'canonical_payload'>, spaceId: string): boolean;
+  /**
+   * Payload paths (as `collectOriginFields` names them) whose values this
+   * connector proved itself before anyone was asked, and proves again in
+   * `validateBinding`: a file it checked is the person's own. Where such a value
+   * came from in the conversation then says nothing more, so the broker leaves
+   * it out of origin checking. Only `resource` fields are ever left out; a
+   * recipient, destination or amount is always checked.
+   */
+  verifiedFields?(action: Pick<Action, 'kind' | 'canonical_payload'>): readonly string[];
+  health(): Promise<ConnectorHealth>;
+  /**
+   * For a connected app's own tools, which the built-in list in
+   * `broker/reversals.ts` does not know: how one of them is taken back
+   * (`reversal`, `compensation`, `hold` or `none`). Left out, it is `none`.
+   */
+  reversalDeclared?(kind: string): Declaration | null;
+  /**
+   * The reversal or compensation for one of its own changes that succeeded,
+   * built from that change's receipt and payload only. Null when it has none.
+   */
+  reversal?(action: Action): ReversalPlan | null;
+  /**
+   * How the signal poller reads what changed in this account: new mail, or the
+   * occurrences on a calendar. Only reads; a connector without it is never
+   * polled.
+   */
+  signals?: SignalSource;
+  /**
+   * Reads one thing the account holds as it is now (a Drive file's metadata),
+   * for a deadline's fresh look when its clock fires. Only reads.
+   */
+  subjects?: SubjectReader;
+  /**
+   * The shape the destination wants now. Answered after a `schema_drift` fault
+   * so the policy can compare it with what was sent and propose a mapping. A
+   * connector without one simply cannot be repaired that way.
+   */
+  describe?(action: Action, ctx: ConnectorContext): Promise<ConnectorDescription>;
+  /**
+   * Refresh a stale credential through the credential store. True when a fresh
+   * credential is in hand; false when the grant is gone and nothing was
+   * refreshed. It never substitutes a different identity.
+   */
+  refreshCredential?(action: Action, ctx: ConnectorContext): Promise<boolean>;
+  /** Reopen a transport only after repair has proved the previous call did not execute. */
+  reconnect?(action: Action, ctx: ConnectorContext): Promise<void>;
+  /**
+   * Equivalent authorized routes for the SAME operation, best first. Consulted
+   * only after a route said definitively that it did not execute.
+   */
+  routes?(action: Action, ctx: ConnectorContext): Promise<string[]>;
+  close?(): Promise<void>;
+  /**
+   * In place of `close` when the connection itself is gone: stop, then
+   * release what only this connection owned, such as its kept data. The
+   * registry calls it on removal; shutdown never does.
+   */
+  retire?(): Promise<void>;
+}
+
+/**
+ * An installed account is unavailable to public compartments. It serves its own
+ * person's space, or a room's space when the room's owners added it there; which
+ * jobs in a room it serves is the `shared_use` rule's to say.
+ */
+export function connectorAllowsAudience(
+  connector: Connector,
+  constraints: JobConstraints,
+  audience: string,
+): boolean {
+  if (!connector.catalog?.audience) return true;
+  if (constraints.public_compartment) return false;
+  return audience === connector.catalog.audience || audience === 'space';
+}

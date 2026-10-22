@@ -1,0 +1,1041 @@
+import { afterAll, expect, test } from 'bun:test';
+import type { Skill, ToolSpec } from '@openduet/contracts';
+import { ASK_PERSON_TOOL } from '../../src/broker/ask-person.ts';
+import { signCapability } from '../../src/broker/capability.ts';
+import { accountToolName, META_TOOLS, ToolCatalog, toolTokens } from '../../src/broker/catalog.ts';
+import { COMPOSE_TOOL, createTestComposeExecutor } from '../../src/broker/compose.ts';
+import { createBrokerApp } from '../../src/broker/http.ts';
+import { recordId } from '../../src/broker/records.ts';
+import { RUNTIME_WAIT_TOOL } from '../../src/broker/runtime-wait.ts';
+import { BrokerService } from '../../src/broker/service.ts';
+import { REACT_TOOL } from '../../src/connectors/catalog.ts';
+import { ConnectorRegistry } from '../../src/connectors/registry.ts';
+import type { Connector } from '../../src/connectors/types.ts';
+import { skillsDone, skillsGiven, skillsSent } from '../../src/gateway/given-skills.ts';
+import { rejectionOf, seedJob } from '../helpers/broker.ts';
+import { testDatabase } from '../helpers/database.ts';
+
+const db = await testDatabase();
+const dbTest = db ? test : test.skip;
+afterAll(async () => {
+  await db?.close();
+});
+
+dbTest(
+  'Postgres lexical ranking uses names, descriptions and examples in deterministic order',
+  async () => {
+    const s = await setup();
+    const read = s.connector.manifest.tools.find((tool) => tool.name === 'test.read');
+    if (!read) throw new Error('fixture tool absent');
+    read.description = 'Read an invoice';
+    const byName = await s.broker.discovery.search(s.claims, 'INVOICE');
+    expect(byName.map((entry) => entry.name)).toEqual(['test.invoice', 'test.read']);
+    expect(
+      (await s.broker.discovery.search(s.claims, 'receipt')).map((entry) => entry.name),
+    ).toEqual(['test.invoice']);
+    expect(await s.broker.discovery.search(s.claims, '"; DROP TABLE action; --')).toEqual([]);
+    expect(await s.broker.discovery.search(s.claims, 'INVOICE')).toEqual(byName);
+  },
+);
+
+const withoutIndex = (tools: readonly ToolSpec[]): ToolSpec[] =>
+  tools.map((tool) => META_TOOLS.find((meta) => meta.name === tool.name) ?? tool);
+
+async function setup(options: { skills?: Skill[]; compose?: boolean } = {}) {
+  if (!db) throw new Error('Postgres unavailable');
+  const seed = await seedJob(db.sql, { scopes: ['test.read', 'test.invoice', 'test.send'] });
+  let calls = 0;
+  const connector: Connector = {
+    manifest: {
+      name: 'test',
+      provider: 'test',
+      version: '1',
+      description: 'Scripted catalog',
+      credentials: [],
+      health: true,
+      tools: ['read', 'invoice', 'send'].map((verb) => ({
+        name: `test.${verb}`,
+        description: verb === 'invoice' ? 'Find archived invoices by vendor' : `Perform ${verb}`,
+        input_schema: {
+          type: 'object',
+          properties: { vendor: { type: 'string' } },
+          additionalProperties: false,
+        },
+        effect_class: verb === 'send' ? 'write_external' : 'read',
+        required_scopes: [`test.${verb}`],
+        requires_approval: false,
+        verify: false,
+      })),
+    },
+    catalog: {
+      source: 'capability',
+      examples: { 'test.invoice': ['Look up a past receipt', 'Find archived invoices', 'omitted'] },
+    },
+    async execute(action) {
+      calls++;
+      return {
+        outcome: 'succeeded',
+        receipt: {
+          action_id: action.id,
+          connection_id: action.connection_id,
+          external_ref: 'invoice-17',
+          received_at: new Date().toISOString(),
+          late: false,
+          detail: { rows: [{ vendor: 'Paper', amount: 17 }] },
+        },
+      };
+    },
+    async verify() {
+      return { decision: 'unsupported', reason: 'fixture' };
+    },
+    async health() {
+      return { status: 'ok', detail: 'fixture', checked_at: new Date().toISOString() };
+    },
+  };
+  const registry = new ConnectorRegistry().register(seed.connectionId, connector);
+  const broker = new BrokerService({
+    sql: db.sql,
+    connectors: registry,
+    catalog: { skills: async () => options.skills ?? [] },
+    ...(options.compose ? { composeExecutor: createTestComposeExecutor() } : {}),
+  });
+  return { ...seed, broker, registry, connector, calls: () => calls, sql: db.sql };
+}
+
+dbTest('a large valid scope manifest remains discoverable and callable', async () => {
+  const s = await setup();
+  const tool = s.connector.manifest.tools.find((item) => item.name === 'test.invoice');
+  if (!tool) throw new Error('fixture tool absent');
+  const extraScopes = Array.from({ length: 32 }, (_, index) => `scope_${index}_${'a'.repeat(125)}`);
+  tool.required_scopes.push(...extraScopes);
+  s.claims.scopes.push(...extraScopes);
+  await s.sql`update connection set scopes = ${JSON.stringify(s.claims.scopes)}::jsonb where id = ${s.connectionId}`;
+  const matches = await s.broker.discovery.search(s.claims, 'invoice');
+  expect(matches.map((entry) => entry.name)).toEqual(['test.invoice']);
+  expect(matches[0]?.required_scopes).toHaveLength(33);
+  const loaded = await s.broker.discovery.load(s.claims, 'test.invoice');
+  expect(
+    (
+      await s.broker.propose(s.claims, {
+        kind: loaded.tool.name,
+        connection_id: s.connectionId,
+        payload: {},
+      })
+    ).status,
+  ).toBe('succeeded');
+  expect(s.calls()).toBe(1);
+});
+
+dbTest(
+  'scripted job discovers, loads and calls a tool absent from initial context through the broker',
+  async () => {
+    const s = await setup();
+    const initial = await s.broker.catalog(s.claims);
+    // Discovery leads the core; `react` is the one broker-owned tool always beside it.
+    // Everything left outside is named, without a schema, on `load_tool`.
+    expect(withoutIndex(initial)).toEqual([...META_TOOLS, ASK_PERSON_TOOL, REACT_TOOL]);
+    expect(initial.find((tool) => tool.name === 'load_tool')?.description).toContain(
+      'Not loaded yet: test.invoice (Find archived invoices by vendor); test.read (Perform read); test.send (Perform send).',
+    );
+    const found = await s.broker.discovery.search(s.claims, 'archived invoices');
+    expect(found.map((tool) => tool.name)).toEqual(['test.invoice']);
+    expect(found[0]).toMatchObject({
+      source: 'capability',
+      effect_class: 'read',
+      examples: ['Look up a past receipt', 'Find archived invoices'],
+    });
+    expect(found[0]).not.toHaveProperty('input_schema');
+    const loaded = await s.broker.discovery.load(s.claims, found[0]?.name ?? '');
+    expect(loaded.tool.input_schema).toHaveProperty('properties.vendor');
+    expect((await s.broker.catalog(s.claims)).map((tool) => tool.name)).toContain('test.invoice');
+    const response = await s.broker.propose(s.claims, {
+      kind: loaded.tool.name,
+      connection_id: loaded.tool.connection_id ?? '',
+      payload: { vendor: 'Paper' },
+    });
+    expect(response.status).toBe('succeeded');
+    const action = await s.broker.get(s.claims, response.action_id);
+    expect(action.receipt).toMatchObject({ detail: { rows: [{ vendor: 'Paper', amount: 17 }] } });
+    expect(s.calls()).toBe(1);
+    expect(await s.broker.discovery.search(s.claims, 'invoices')).toEqual([]);
+    const [context] =
+      await s.sql`select * from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+    expect(context?.loaded).toHaveLength(1);
+    expect(context?.loaded[0]).toEqual(loaded.tool);
+    expect(
+      await s.sql`select * from budget_ledger where action_id = ${response.action_id}`,
+    ).toHaveLength(1);
+    expect(
+      await s.sql`select * from event where attempt_id = ${s.claims.attempt_id} and payload->>'phase' = 'load_tool'`,
+    ).toHaveLength(1);
+    expect(toolTokens(initial)).toBeLessThan(1_400);
+  },
+);
+
+dbTest(
+  'loaded schema persists across service restart without leaking to another attempt',
+  async () => {
+    const s = await setup();
+    await Promise.all([
+      s.broker.discovery.load(s.claims, 'test.invoice'),
+      s.broker.discovery.load(s.claims, 'test.invoice'),
+    ]);
+    const restarted = new BrokerService({ sql: s.sql, connectors: s.registry });
+    expect(
+      (await restarted.catalog(s.claims)).filter((tool) => tool.name === 'test.invoice'),
+    ).toHaveLength(1);
+    const newId = recordId('att');
+    await s.sql`insert into attempt (id, job_id, epoch, runtime_version, provider, model) values (${newId}, ${s.claims.job_id}, 2, 'fake', 'fake', 'scripted')`;
+    await s.sql`update job set lease_epoch = 2 where id = ${s.claims.job_id}`;
+    expect(
+      withoutIndex(await restarted.catalog({ ...s.claims, attempt_id: newId, epoch: 2 })),
+    ).toEqual([...META_TOOLS, ASK_PERSON_TOOL, REACT_TOOL]);
+    expect(await rejectionOf(restarted.discovery.load(s.claims, 'test.read'))).toMatchObject({
+      code: 'stale_epoch',
+    });
+  },
+);
+
+dbTest(
+  'discovery and invocation recheck persisted scopes, space, revision and expiry',
+  async () => {
+    const s = await setup();
+    await s.broker.discovery.load(s.claims, 'test.invoice');
+    await s.sql`update connection set scopes = '["test.read"]'::jsonb where id = ${s.connectionId}`;
+    expect(await s.broker.discovery.search(s.claims, 'invoices')).toEqual([]);
+    expect(await rejectionOf(s.broker.discovery.load(s.claims, 'test.invoice'))).toMatchObject({
+      code: 'unknown_tool',
+    });
+    expect(
+      await rejectionOf(
+        s.broker.propose(s.claims, {
+          kind: 'test.invoice',
+          connection_id: s.connectionId,
+          payload: {},
+        }),
+      ),
+    ).toMatchObject({ code: 'scope_denied' });
+    expect((await s.broker.catalog(s.claims)).map((tool) => tool.name)).not.toContain(
+      'test.invoice',
+    );
+    for (const [claims, code] of [
+      [{ ...s.claims, space_id: recordId('sp') }, 'scope_denied'],
+      [{ ...s.claims, revision: 9 }, 'revision_mismatch'],
+      [{ ...s.claims, exp: 1 }, 'stale_epoch'],
+    ] as const)
+      expect(await rejectionOf(s.broker.discovery.search(claims, 'read'))).toMatchObject({ code });
+    expect(s.calls()).toBe(0);
+  },
+);
+
+dbTest('loading an external write never changes its approval requirement', async () => {
+  const s = await setup();
+  const { tool } = await s.broker.discovery.load(s.claims, 'test.send');
+  const response = await s.broker.propose(s.claims, {
+    kind: tool.name,
+    connection_id: s.connectionId,
+    payload: {},
+  });
+  expect(response).toMatchObject({ status: 'needs_approval', effect_class: 'write_external' });
+  expect(s.calls()).toBe(0);
+});
+
+dbTest('a tool reclassified after admission cannot dispatch through a loaded schema', async () => {
+  for (const change of ['effect', 'approval'] as const) {
+    const s = await setup();
+    await s.broker.discovery.load(s.claims, 'test.read');
+    const broker = new BrokerService({
+      sql: s.sql,
+      connectors: s.registry,
+      resolveAuthority: async (_tx, input) => {
+        if (input.phase === 'execution') {
+          const tool = s.connector.manifest.tools.find((item) => item.name === 'test.read');
+          if (tool) {
+            if (change === 'effect') tool.effect_class = 'write_reversible';
+            else tool.requires_approval = true;
+          }
+        }
+        return {};
+      },
+    });
+    const response = await broker.proposeRead(s.claims, {
+      kind: 'test.read',
+      connection_id: s.connectionId,
+      payload: {},
+    });
+    expect(response.status).toBe('failed');
+    expect(s.calls()).toBe(0);
+    expect((await broker.get(s.claims, response.action_id)).dispatched_at).toBeNull();
+  }
+});
+
+dbTest('schema change or failed health cannot silently replace a loaded tool', async () => {
+  const s = await setup();
+  await s.broker.discovery.load(s.claims, 'test.invoice');
+  const declared = s.connector.manifest.tools.find((tool) => tool.name === 'test.invoice');
+  if (!declared) throw new Error('fixture tool absent');
+  declared.input_schema = { type: 'object', properties: { new_argument: { type: 'number' } } };
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'test.invoice'))).toMatchObject({
+    code: 'unknown_tool',
+  });
+  expect((await s.broker.catalog(s.claims)).map((tool) => tool.name)).not.toContain('test.invoice');
+  await s.sql`update connection set health = 'failing' where id = ${s.connectionId}`;
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'test.read'))).toMatchObject({
+    code: 'connector_unavailable',
+  });
+});
+
+dbTest(
+  'same-named tools on two accounts receive stable aliases bound to their connection',
+  async () => {
+    const s = await setup();
+    const second = recordId('conn');
+    await s.sql`insert into connection (id, space_id, provider, label, scopes) values (${second}, ${s.claims.space_id}, 'test', 'Second', '["test.invoice"]'::jsonb)`;
+    s.registry.register(second, s.connector);
+    const names = (await s.broker.discovery.search(s.claims, 'invoice')).map((tool) => tool.name);
+    expect(names).toHaveLength(2);
+    const name = accountToolName('test.invoice', second);
+    const { tool } = await s.broker.discovery.load(s.claims, name);
+    expect(tool.connection_id).toBe(second);
+    const response = await s.broker.propose(s.claims, {
+      kind: name,
+      connection_id: second,
+      payload: {},
+    });
+    expect(await s.broker.get(s.claims, response.action_id)).toMatchObject({
+      kind: 'test.invoice',
+      connection_id: second,
+    });
+    expect(
+      await rejectionOf(
+        s.broker.propose(s.claims, { kind: name, connection_id: s.connectionId, payload: {} }),
+      ),
+    ).toMatchObject({ code: 'unknown_tool' });
+  },
+);
+
+dbTest('granting a second account preserves the loaded first account name', async () => {
+  const s = await setup();
+  await s.broker.discovery.load(s.claims, 'test.invoice');
+  const second = recordId('conn');
+  await s.sql`insert into connection (id, space_id, provider, label, scopes) values (${second}, ${s.claims.space_id}, 'test', 'Second', '["test.invoice"]'::jsonb)`;
+  s.registry.register(second, s.connector);
+  expect(await s.broker.discovery.load(s.claims, 'test.invoice')).toMatchObject({
+    tool: { name: 'test.invoice', connection_id: s.connectionId },
+  });
+  expect((await s.broker.catalog(s.claims)).map((tool) => tool.name)).toContain('test.invoice');
+  const secondName = accountToolName('test.invoice', second);
+  expect((await s.broker.discovery.search(s.claims, 'invoice')).map((tool) => tool.name)).toEqual([
+    secondName,
+  ]);
+  await s.broker.discovery.load(s.claims, secondName);
+  await s.sql`update connection set status = 'revoked' where id = ${s.connectionId}`;
+  expect(await s.broker.discovery.load(s.claims, secondName)).toMatchObject({
+    tool: { name: secondName, connection_id: second },
+  });
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'test.invoice'))).toMatchObject({
+    code: 'unknown_tool',
+  });
+});
+
+dbTest('a new account cannot reuse a revoked account name during the same attempt', async () => {
+  const s = await setup();
+  await s.broker.discovery.load(s.claims, 'test.invoice');
+  await s.sql`update connection set status = 'revoked' where id = ${s.connectionId}`;
+  const second = recordId('conn');
+  await s.sql`insert into connection (id, space_id, provider, label, scopes) values (${second}, ${s.claims.space_id}, 'test', 'Replacement', '["test.invoice"]'::jsonb)`;
+  s.registry.register(second, s.connector);
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'test.invoice'))).toMatchObject({
+    code: 'unknown_tool',
+  });
+  const secondName = accountToolName('test.invoice', second);
+  expect(await s.broker.discovery.load(s.claims, secondName)).toMatchObject({
+    tool: { connection_id: second },
+  });
+  const [context] =
+    await s.sql`select loaded from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+  expect(context?.loaded.map((tool: { connection_id: string }) => tool.connection_id)).toEqual([
+    s.connectionId,
+    second,
+  ]);
+});
+
+dbTest('asynchronous or unresolved connector schemas cannot authorize an action', async () => {
+  for (const schema of [
+    { $async: true, type: 'object', required: ['vendor'] },
+    { $ref: 'https://unregistered.invalid/schema' },
+  ]) {
+    const s = await setup();
+    const tool = s.connector.manifest.tools.find((tool) => tool.name === 'test.invoice');
+    if (!tool) throw new Error('fixture tool absent');
+    tool.input_schema = schema;
+    expect(
+      await rejectionOf(
+        s.broker.propose(s.claims, {
+          kind: tool.name,
+          connection_id: s.connectionId,
+          payload: {},
+        }),
+      ),
+    ).toMatchObject({ code: 'schema_invalid' });
+    expect(await s.sql`select id from action where job_id = ${s.claims.job_id}`).toHaveLength(0);
+    expect(s.calls()).toBe(0);
+  }
+});
+
+dbTest(
+  'independent tool schemas may use the same schema id without sharing validation',
+  async () => {
+    const s = await setup();
+    for (const [name, property] of [
+      ['test.read', 'first'],
+      ['test.invoice', 'second'],
+    ]) {
+      const tool = s.connector.manifest.tools.find((tool) => tool.name === name);
+      if (!tool || !property) throw new Error('fixture tool absent');
+      tool.input_schema = {
+        $id: 'https://example.test/schema',
+        type: 'object',
+        properties: { [property]: { type: 'string' } },
+        required: [property],
+        additionalProperties: false,
+      };
+      expect(
+        (
+          await s.broker.propose(s.claims, {
+            kind: tool.name,
+            connection_id: s.connectionId,
+            payload: { [property]: 'valid' },
+          })
+        ).status,
+      ).toBe('succeeded');
+      expect(
+        await rejectionOf(
+          s.broker.propose(s.claims, {
+            kind: tool.name,
+            connection_id: s.connectionId,
+            payload: { wrong: 'invalid' },
+          }),
+        ),
+      ).toMatchObject({ code: 'payload_invalid' });
+    }
+    expect(s.calls()).toBe(2);
+  },
+);
+
+dbTest('skills are scoped read content and cannot grant their named tool scopes', async () => {
+  const skill = (name: string, tools: string[]): Skill => ({
+    path: 'fixture/SKILL.md',
+    body: 'Follow the procedure.',
+    frontmatter: {
+      name,
+      tools,
+      description: 'Find a receipt procedure',
+      triggers: ['receipt'],
+      max_tokens: 400,
+    },
+  });
+  const s = await setup({
+    skills: [skill('receipts', ['test.invoice']), skill('forbidden', ['vault.export'])],
+  });
+  expect((await s.broker.discovery.search(s.claims, 'procedure')).map((tool) => tool.name)).toEqual(
+    ['skills.receipts'],
+  );
+  await s.broker.discovery.load(s.claims, 'skills.receipts');
+  expect(await s.broker.discovery.callSkill(s.claims, 'skills.receipts', {})).toEqual({
+    name: 'receipts',
+    body: 'Follow the procedure.',
+  });
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'skills.forbidden'))).toMatchObject({
+    code: 'unknown_tool',
+  });
+  await s.sql`update job set constraints = '{"public_compartment":true}'::jsonb where id = ${s.claims.job_id}`;
+  expect(
+    await rejectionOf(s.broker.discovery.callSkill(s.claims, 'skills.receipts', {})),
+  ).toMatchObject({ code: 'unknown_tool' });
+});
+
+dbTest('skills.read reads an indexed skill by name, once per read, with a tool entry', async () => {
+  const skill = (name: string, tools: string[]) => ({
+    path: `${name}/SKILL.md`,
+    body: `The ${name} procedure.`,
+    source: 'builtin' as const,
+    frontmatter: {
+      name,
+      tools,
+      description: `The ${name} skill`,
+      triggers: [name],
+      max_tokens: 400,
+    },
+  });
+  const s = await setup({
+    skills: [skill('receipts', ['test.invoice']), skill('vault', ['vault.export'])],
+  });
+  // With a skill to read, the reader is in the first catalog; no load is needed.
+  expect((await s.broker.catalog(s.claims)).map((tool) => tool.name)).toContain('skills.read');
+  expect(await s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'receipts' })).toEqual(
+    { name: 'receipts', body: 'The receipts procedure.' },
+  );
+  // A skill outside the attempt's scopes, or one that does not exist, cannot be read.
+  for (const name of ['vault', 'nothing-here'])
+    expect(
+      await rejectionOf(s.broker.discovery.callSkill(s.claims, 'skills.read', { name })),
+    ).toMatchObject({ code: 'unknown_tool' });
+  expect(
+    await rejectionOf(
+      s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'receipts', extra: 1 }),
+    ),
+  ).toBeDefined();
+  const traced = await s.sql`select payload from event where attempt_id = ${s.claims.attempt_id}
+    and type = 'notice' and payload->>'kind' = 'tool_trace'`;
+  expect(traced.map((row) => row.payload.call)).toEqual([
+    expect.objectContaining({
+      id: `skill-read:${s.claims.attempt_id}:receipts`,
+      kind: 'skill',
+      title: 'Used the skill: Receipts',
+      status: 'done',
+    }),
+  ]);
+});
+
+dbTest('a skill given in full is not offered again as its own tool', async () => {
+  const skill = (name: string): Skill => ({
+    path: `${name}/SKILL.md`,
+    body: `The ${name} procedure.`,
+    frontmatter: {
+      name,
+      tools: [],
+      description: `Find a ${name} procedure`,
+      triggers: [name],
+      max_tokens: 400,
+    },
+  });
+  const s = await setup({ skills: [skill('receipts'), skill('refunds')] });
+  // The attempt started with "receipts" in its instructions, as the runner records it.
+  await s.sql`insert into learning_attempt (attempt_id, versions) values (${s.claims.attempt_id},
+    ${JSON.stringify({ attempt_id: s.claims.attempt_id, skills: [{ name: 'receipts', version: 'sha256:x' }] })}::jsonb)
+    on conflict (attempt_id) do update set versions = excluded.versions`;
+  await s.sql`delete from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+  const offered = (await s.broker.discovery.search(s.claims, 'procedure')).map((tool) => tool.name);
+  // Calling it would only read the same words again, a round trip before any work.
+  expect(offered).not.toContain('skills.receipts');
+  expect(offered).toContain('skills.refunds');
+  expect(
+    await rejectionOf(s.broker.discovery.callSkill(s.claims, 'skills.receipts', {})),
+  ).toMatchObject({ code: 'unknown_tool' });
+  // The agent's latest request still carries it in full.
+  const attemptId = s.claims.attempt_id;
+  const request = (content: string) => ({
+    tools: [{ type: 'function', function: { name: 'skills.read' } }],
+    messages: [{ role: 'user', content }],
+  });
+  skillsGiven(attemptId, [{ name: 'receipts', body: 'The receipts procedure.' }]);
+  skillsSent(
+    attemptId,
+    request('## How to do this kind of work\n\n### receipts\n\nThe receipts procedure.'),
+  );
+  // Read by name anyway, it answers with a pointer, not the same words again,
+  // and adds no second "Used the skill" entry; a skill not given still reads.
+  const again = await s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'receipts' });
+  expect(again.name).toBe('receipts');
+  expect(String(again.body)).not.toContain('The receipts procedure.');
+  expect(String(again.body)).toContain('already in your instructions');
+  expect(await s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'refunds' })).toEqual({
+    name: 'refunds',
+    body: 'The refunds procedure.',
+  });
+  const traced = await s.sql`select payload from event where attempt_id = ${s.claims.attempt_id}
+    and type = 'notice' and payload->>'kind' = 'tool_trace'`;
+  expect(traced.map((row) => row.payload.call.id)).toEqual([
+    `skill-read:${s.claims.attempt_id}:refunds`,
+  ]);
+  const read = () => s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'receipts' });
+  try {
+    // The engine compacted the turn and its summary left the skill out: the
+    // agent no longer has it, so it is read in full.
+    skillsSent(attemptId, request('Summary of the work so far.'));
+    expect(await read()).toEqual({ name: 'receipts', body: 'The receipts procedure.' });
+    // Only part of it in the request is not having it.
+    skillsSent(attemptId, request('### receipts\n\nThe receipts'));
+    expect(await read()).toEqual({ name: 'receipts', body: 'The receipts procedure.' });
+    // The skill changed since the attempt was given it: the agent holds an
+    // older version, so the current one is read in full.
+    skillsGiven(attemptId, [{ name: 'receipts', body: 'The older receipts procedure.' }]);
+    skillsSent(attemptId, request('### receipts\n\nThe older receipts procedure.'));
+    expect(await read()).toEqual({ name: 'receipts', body: 'The receipts procedure.' });
+    // An attempt this service is not following gets the skill in full.
+    skillsDone(attemptId);
+    expect(await read()).toEqual({ name: 'receipts', body: 'The receipts procedure.' });
+  } finally {
+    skillsDone(attemptId);
+  }
+});
+
+dbTest('the skills a turn is given in full leave the load_tool index as it was', async () => {
+  // The tool definitions lead a Claude request's cached prefix, ahead of the
+  // system prompt: an index that changed with the turn's skills had every
+  // turn write the whole prompt to the cache again.
+  const skill = (name: string): Skill => ({
+    path: `${name}/SKILL.md`,
+    body: `The ${name} procedure.`,
+    frontmatter: {
+      name,
+      tools: [],
+      description: `Find a ${name} procedure`,
+      triggers: [name],
+      max_tokens: 400,
+    },
+  });
+  const s = await setup({ skills: [skill('receipts'), skill('refunds')] });
+  const loaderGiven = async (given: string[]) => {
+    await s.sql`insert into learning_attempt (attempt_id, versions) values (${s.claims.attempt_id},
+      ${JSON.stringify({ attempt_id: s.claims.attempt_id, skills: given.map((name) => ({ name, version: 'sha256:x' })) })}::jsonb)
+      on conflict (attempt_id) do update set versions = excluded.versions`;
+    await s.sql`delete from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+    return (await s.broker.catalog(s.claims)).find((tool) => tool.name === 'load_tool')
+      ?.description;
+  };
+  const none = await loaderGiven([]);
+  expect(none).toContain('skills.receipts');
+  expect(none).toContain('skills.refunds');
+  expect(await loaderGiven(['receipts'])).toBe(none);
+  expect(await loaderGiven(['refunds'])).toBe(none);
+  // Named, but there is nothing to load for a skill already in the instructions.
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, 'skills.refunds'))).toMatchObject({
+    code: 'unknown_tool',
+    message: expect.stringContaining('given in full'),
+  });
+  // A long turn's compaction can drop it from the instructions; the reader the
+  // refusal points to still has it then.
+  expect(
+    await s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'refunds' }),
+  ).toMatchObject({ name: 'refunds', body: 'The refunds procedure.' });
+});
+
+dbTest('a private space skill is read only by the space’s own owner', async () => {
+  const s = await setup({
+    skills: [
+      {
+        path: 'private-way/SKILL.md',
+        body: 'The private way.',
+        source: 'space',
+        frontmatter: {
+          name: 'private-way',
+          tools: [],
+          description: 'How the owner likes it done',
+          triggers: ['private way'],
+          max_tokens: 400,
+        },
+      } as Skill,
+    ],
+  });
+  const readable = async () => {
+    // Each principal starts from a fresh first catalog, as a new attempt would.
+    await s.sql`delete from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+    return s.broker.discovery.callSkill(s.claims, 'skills.read', { name: 'private-way' }).then(
+      (result) => result.body,
+      (error: { code?: string }) => error.code,
+    );
+  };
+
+  // A space from before principals belongs to the installation's owner.
+  await s.sql`insert into owner (id, email) values (${recordId('own')}, 'legacy-owner@example.test')
+    on conflict do nothing`;
+  const [installation] = await s.sql`select id from owner limit 1`;
+  s.claims.principal_id = String(installation?.id);
+  expect(await readable()).toBe('The private way.');
+
+  // In a shared space it is the maker's: an owner they added reads it as a
+  // member does, which is not at all, as the context a run is built from agrees.
+  const owner = recordId('prn');
+  const coOwner = recordId('prn');
+  const member = recordId('prn');
+  for (const id of [owner, coOwner, member])
+    await s.sql`insert into principal (id, email) values (${id}, ${`${id}@example.test`})`;
+  await s.sql`update space set kind = 'shared', owner_principal_id = ${owner} where id = ${s.claims.space_id}`;
+  for (const [id, role] of [
+    [owner, 'owner'],
+    [coOwner, 'owner'],
+    [member, 'member'],
+  ] as const)
+    await s.sql`insert into space_membership (principal_id, space_id, role, generation)
+      values (${id}, ${s.claims.space_id}, ${role}, 0)`;
+  const as = async (principal: string | undefined) => {
+    await s.sql`update job set principal_id = ${principal ?? null} where id = ${s.claims.job_id}`;
+    s.claims.principal_id = principal;
+    s.claims.membership_generation = 0;
+    return readable();
+  };
+  expect(await as(owner)).toBe('The private way.');
+  expect(await as(coOwner)).toBe('unknown_tool');
+  expect(await as(member)).toBe('unknown_tool');
+});
+
+dbTest(
+  'HTTP discovery rejects unauthenticated, forged schemas and extra authority fields',
+  async () => {
+    const s = await setup();
+    const key = 'catalog-capability-key-32-characters';
+    const app = createBrokerApp({
+      broker: s.broker,
+      capabilityKey: key,
+      approvalKey: 'catalog-approval-key-32-characters',
+    });
+    const request = (payload: unknown, token?: string) =>
+      app.request('/tools/load', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+    expect((await request({ name: 'test.read' })).status).toBe(401);
+    const token = signCapability(s.claims, key);
+    expect(
+      (await request({ name: 'test.invoice', input_schema: {}, required_scopes: [] }, token))
+        .status,
+    ).toBe(400);
+    expect((await request({ name: 'test.invoice' }, token)).status).toBe(200);
+  },
+);
+
+dbTest('load_tool rejects an oversized schema before persisting it', async () => {
+  const s = await setup();
+  await s.broker.catalog(s.claims);
+  const tool = s.connector.manifest.tools.find((item) => item.name === 'test.invoice');
+  if (!tool) throw new Error('fixture tool absent');
+  tool.input_schema = { type: 'object', description: '\u754c'.repeat(1100) };
+  expect(await rejectionOf(s.broker.discovery.load(s.claims, tool.name))).toMatchObject({
+    code: 'connector_unavailable',
+  });
+  const [context] =
+    await s.sql`select loaded from attempt_tool_context where attempt_id = ${s.claims.attempt_id}`;
+  expect(context?.loaded).toEqual([]);
+  expect((await s.broker.discovery.load(s.claims, 'test.read')).tool.name).toBe('test.read');
+});
+
+dbTest('a connector named compose is dropped without breaking HTTP discovery', async () => {
+  const s = await setup({ compose: true });
+  const declared = s.connector.manifest.tools[0];
+  if (!declared) throw new Error('fixture tool absent');
+  s.connector.manifest.tools.push({
+    ...declared,
+    name: 'compose',
+    required_scopes: ['compose'],
+  });
+  s.claims.scopes.push('compose');
+  await s.sql`update connection set scopes = ${JSON.stringify(s.claims.scopes)}::jsonb where id = ${s.connectionId}`;
+  const key = 'catalog-capability-key-32-characters';
+  const app = createBrokerApp({
+    broker: s.broker,
+    capabilityKey: key,
+    approvalKey: 'catalog-approval-key-32-characters',
+  });
+  const response = await app.request('/tools', {
+    headers: { authorization: `Bearer ${signCapability(s.claims, key)}` },
+  });
+  expect(response.status).toBe(200);
+  const available = await s.broker.discovery.available(s.claims);
+  expect(available.filter((tool) => tool.name === 'compose')).toEqual([COMPOSE_TOOL]);
+  expect(
+    available.some(
+      (tool) => tool.connection_id === s.connectionId && tool.name.startsWith('compose'),
+    ),
+  ).toBe(false);
+  expect((await s.broker.discovery.load(s.claims, 'test.invoice')).tool.name).toBe('test.invoice');
+  const notes =
+    await s.sql`select payload from event where attempt_id = ${s.claims.attempt_id} and payload->>'phase' = 'catalog_rejected'`;
+  expect(notes).toHaveLength(1);
+  expect(notes[0]?.payload).toMatchObject({
+    code: 'unknown_tool',
+    name: 'compose',
+    connection_id: s.connectionId,
+  });
+});
+
+dbTest('invalid native entries are dropped with a broker fault note', async () => {
+  const s = await setup();
+  const catalog = new ToolCatalog({
+    sql: s.sql,
+    connectors: s.registry,
+    nativeTools: [
+      { ...COMPOSE_TOOL, name: 'invalid_native', effect_class: 'write_external' },
+      COMPOSE_TOOL,
+    ],
+  });
+  expect((await catalog.available(s.claims)).map((tool) => tool.name)).not.toContain(
+    'invalid_native',
+  );
+  expect((await catalog.load(s.claims, 'test.invoice')).tool.name).toBe('test.invoice');
+  const notes =
+    await s.sql`select payload from event where attempt_id = ${s.claims.attempt_id} and payload->>'phase' = 'catalog_rejected'`;
+  expect(notes).toHaveLength(1);
+  expect(notes[0]?.payload).toMatchObject({ code: 'unknown_tool', name: 'invalid_native' });
+});
+
+dbTest('duplicate skills are dropped without disabling other tools', async () => {
+  const skill: Skill = {
+    path: 'fixture/SKILL.md',
+    body: 'Read receipts.',
+    frontmatter: {
+      name: 'receipts',
+      tools: ['test.invoice'],
+      description: 'Receipt procedure',
+      triggers: ['receipt'],
+      max_tokens: 400,
+    },
+  };
+  const s = await setup({ skills: [skill, structuredClone(skill)] });
+  const available = await s.broker.discovery.available(s.claims);
+  expect(available.filter((tool) => tool.name === 'skills.receipts')).toHaveLength(1);
+  expect((await s.broker.discovery.load(s.claims, 'test.invoice')).tool.name).toBe('test.invoice');
+  const notes =
+    await s.sql`select payload from event where attempt_id = ${s.claims.attempt_id} and payload->>'phase' = 'catalog_rejected'`;
+  expect(notes).toHaveLength(1);
+  expect(notes[0]?.payload).toMatchObject({ code: 'unknown_tool', name: 'skills.receipts' });
+});
+
+dbTest(
+  'the core is chosen from the objective, the latest owner message and the registered trigger',
+  async () => {
+    if (!db) throw new Error('Postgres unavailable');
+    const scopes = ['test.alpha', 'test.beta', 'test.send', 'job.wait'];
+    const seed = await seedJob(db.sql, { scopes });
+    const tool = (verb: string, effect: 'read' | 'write_external') => ({
+      name: `test.${verb}`,
+      description: `Perform ${verb}`,
+      input_schema: { type: 'object' as const, properties: {}, additionalProperties: false },
+      effect_class: effect,
+      required_scopes: [`test.${verb}`],
+      requires_approval: false,
+      verify: false,
+    });
+    const connector: Connector = {
+      manifest: {
+        name: 'test',
+        provider: 'test',
+        version: '1',
+        description: 'Ranking fixture',
+        credentials: [],
+        health: true,
+        tools: [tool('alpha', 'read'), tool('beta', 'read'), tool('send', 'write_external')],
+      },
+      async execute() {
+        throw new Error('not dispatched here');
+      },
+      async verify() {
+        return { decision: 'unsupported', reason: 'fixture' };
+      },
+      async health() {
+        return { status: 'ok', detail: 'fixture', checked_at: new Date().toISOString() };
+      },
+    };
+    const registry = new ConnectorRegistry().register(seed.connectionId, connector);
+    const manifest = connector.manifest.tools.map((entry) => ({
+      name: entry.name,
+      description: entry.description,
+      input_schema: entry.input_schema,
+      effect_class: entry.effect_class,
+      connection_id: seed.connectionId,
+    }));
+    const [send, beta] = [manifest[2], manifest[1]];
+    if (!send || !beta) throw new Error('fixture tool absent');
+    await db.sql`update job set objective = 'Send the note to Alex' where id = ${seed.claims.job_id}`;
+    await db.sql`insert into event (job_id, type, payload, dedup_key)
+      values (${seed.claims.job_id}, 'notice',
+        ${JSON.stringify({ kind: 'user_message', text: 'Run beta first.' })}::jsonb,
+        ${`${seed.claims.job_id}:message`})`;
+    await db.sql`insert into trigger (id, job_id, kind, spec) values (${recordId('trg')},
+      ${seed.claims.job_id}, 'event',
+      ${JSON.stringify({ kind: 'event', connection_id: seed.connectionId, event_name: 'reply_received' })}::jsonb)`;
+    // Room for the pinned lifecycle wait, the reaction and two connector verbs: the
+    // alphabetical first verb is the one left out, because nothing asked for it.
+    const budget = toolTokens([...META_TOOLS, RUNTIME_WAIT_TOOL, REACT_TOOL, send, beta]);
+    const broker = new BrokerService({
+      sql: db.sql,
+      connectors: registry,
+      catalog: { coreTokenBudget: budget },
+    });
+    const core = await broker.catalog(seed.claims);
+    // Asking the person rides beside the budget, like discovery.
+    expect(core.map((entry) => entry.name)).toEqual([
+      'search_tools',
+      'load_tool',
+      'ask_person',
+      'job.wait',
+      'react',
+      'test.beta',
+      'test.send',
+    ]);
+    expect(core.find((entry) => entry.name === 'load_tool')?.description).toContain(
+      'test.alpha (Perform alpha)',
+    );
+    // A later wake that carries no new owner message is not a conversational turn.
+    const next = recordId('att');
+    await db.sql`update attempt set outcome = 'completed', ended_at = now(),
+      input_cursor = (select max(seq) from event) where id = ${seed.claims.attempt_id}`;
+    await db.sql`insert into attempt (id, job_id, epoch, runtime_version, provider, model)
+      values (${next}, ${seed.claims.job_id}, 2, 'fake', 'fake', 'scripted')`;
+    await db.sql`update job set lease_epoch = 2 where id = ${seed.claims.job_id}`;
+    const later = await broker.catalog({ ...seed.claims, attempt_id: next, epoch: 2 });
+    expect(later.map((entry) => entry.name).slice(0, 4)).toEqual([
+      'search_tools',
+      'load_tool',
+      'ask_person',
+      'job.wait',
+    ]);
+    expect(later.map((entry) => entry.name)).toContain('test.send');
+    // A new message that names neither verb leaves the catalog as the last
+    // attempts had it, rather than handing beta's room to the first by name:
+    // the tools lead the cached prompt.
+    const third = recordId('att');
+    await db.sql`update attempt set outcome = 'completed', ended_at = now(),
+      input_cursor = (select max(seq) from event) where id = ${next}`;
+    await db.sql`insert into event (job_id, type, payload, dedup_key)
+      values (${seed.claims.job_id}, 'notice',
+        ${JSON.stringify({ kind: 'user_message', text: 'Thanks!' })}::jsonb,
+        ${`${seed.claims.job_id}:thanks`})`;
+    await db.sql`insert into attempt (id, job_id, epoch, runtime_version, provider, model)
+      values (${third}, ${seed.claims.job_id}, 3, 'fake', 'fake', 'scripted')`;
+    await db.sql`update job set lease_epoch = 3 where id = ${seed.claims.job_id}`;
+    const thanked = await broker.catalog({ ...seed.claims, attempt_id: third, epoch: 3 });
+    expect(thanked.map((entry) => entry.name)).toEqual(core.map((entry) => entry.name));
+  },
+);
+
+async function discoverable(
+  verbs: Record<string, string>,
+): Promise<{ broker: BrokerService; claims: Awaited<ReturnType<typeof seedJob>>['claims'] }> {
+  if (!db) throw new Error('Postgres unavailable');
+  const scopes = Object.keys(verbs);
+  const seed = await seedJob(db.sql, { scopes });
+  const connector: Connector = {
+    manifest: {
+      name: 'test',
+      provider: 'test',
+      version: '1',
+      description: 'Discovery fixture',
+      credentials: [],
+      health: true,
+      tools: Object.entries(verbs).map(([name, description]) => ({
+        name,
+        description,
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        effect_class: 'read',
+        required_scopes: [name],
+        requires_approval: false,
+        verify: false,
+      })),
+    },
+    // Outside the core, so every verb is reached through discovery alone.
+    catalog: { source: 'capability' },
+    async execute() {
+      throw new Error('not dispatched here');
+    },
+    async verify() {
+      return { decision: 'unsupported', reason: 'fixture' };
+    },
+    async health() {
+      return { status: 'ok', detail: 'fixture', checked_at: new Date().toISOString() };
+    },
+  };
+  const registry = new ConnectorRegistry().register(seed.connectionId, connector);
+  return { broker: new BrokerService({ sql: db.sql, connectors: registry }), claims: seed.claims };
+}
+
+dbTest('search matches any term, stems it, and reads identifier segments', async () => {
+  const s = await discoverable({
+    'ops.restart': 'Bring a managed unit back up',
+    'ops.status': 'Report the health of managed services',
+    'notes.archive': 'Archive a note',
+    'ledger_export.run': 'Write the ledger to a file',
+  });
+  const found = async (query: string) =>
+    (await s.broker.discovery.search(s.claims, query)).map((entry) => entry.name);
+  // One missing term no longer empties the result, and the name outranks prose.
+  expect(await found('restarting the billing service')).toEqual(['ops.restart', 'ops.status']);
+  expect(await found('archived notes')).toEqual(['notes.archive']);
+  // Identifier spellings: dotted, underscored, and the identifier typed whole.
+  expect(await found('ledger export')).toEqual(['ledger_export.run']);
+  expect(await found('ops.restart')).toEqual(['ops.restart', 'ops.status']);
+  expect(await found('the')).toEqual([]);
+});
+
+dbTest('a search with no match names what can be loaded instead of returning nothing', async () => {
+  const s = await discoverable({
+    'ops.restart': 'Bring a managed unit back up. Needs approval.',
+    'notes.archive': 'Archive a note',
+  });
+  const miss = await s.broker.discovery.find(s.claims, 'quarterly invoice totals');
+  expect(miss.tools).toEqual([]);
+  expect(miss.index).toEqual([
+    { name: 'notes.archive', gist: 'Archive a note' },
+    { name: 'ops.restart', gist: 'Bring a managed unit back up' },
+  ]);
+  expect(miss.hint).toBe(
+    'No tool matched "quarterly invoice totals". These are the tools load_tool can fetch by exact name.',
+  );
+  const hit = await s.broker.discovery.find(s.claims, 'archive');
+  expect(hit.tools.map((entry) => entry.name)).toEqual(['notes.archive']);
+  expect(hit).not.toHaveProperty('index');
+  expect(hit).not.toHaveProperty('hint');
+});
+
+dbTest("the first catalog's room follows the attempt's model window", async () => {
+  if (!db) throw new Error('Postgres unavailable');
+  const verbs = Array.from({ length: 30 }, (_, index) => `test.verb_${index}`);
+  const seed = await seedJob(db.sql, { scopes: verbs });
+  const connector: Connector = {
+    manifest: {
+      name: 'test',
+      provider: 'test',
+      version: '1',
+      description: 'Window fixture',
+      credentials: [],
+      health: true,
+      tools: verbs.map((name) => ({
+        name,
+        description: `Read one kind of record from the service, the ${name} kind.`,
+        input_schema: {
+          type: 'object',
+          properties: { id: { type: 'string' }, note: { type: 'string' } },
+          additionalProperties: false,
+        },
+        effect_class: 'read',
+        required_scopes: [name],
+        requires_approval: false,
+        verify: false,
+      })),
+    },
+    async execute() {
+      throw new Error('not dispatched here');
+    },
+    async verify() {
+      return { decision: 'unsupported', reason: 'fixture' };
+    },
+    async health() {
+      return { status: 'ok', detail: 'fixture', checked_at: new Date().toISOString() };
+    },
+  };
+  const broker = new BrokerService({
+    sql: db.sql,
+    connectors: new ConnectorRegistry().register(seed.connectionId, connector),
+  });
+  // A model the catalog does not name keeps the baseline: most verbs wait behind discovery.
+  const small = await broker.catalog(seed.claims);
+  const smallVerbs = small.filter((tool) => tool.name.startsWith('test.verb_'));
+  expect(smallVerbs.length).toBeLessThan(verbs.length);
+  expect(toolTokens(small)).toBeLessThanOrEqual(750 + 250 + toolTokens([ASK_PERSON_TOOL]));
+  // A million-token model's next attempt is offered every verb it was granted.
+  const next = recordId('att');
+  await db.sql`update attempt set outcome = 'completed', ended_at = now() where id = ${seed.claims.attempt_id}`;
+  await db.sql`insert into attempt (id, job_id, epoch, runtime_version, provider, model)
+    values (${next}, ${seed.claims.job_id}, 2, 'fake', 'fireworks', 'accounts/fireworks/models/deepseek-v4p1-flash')`;
+  await db.sql`update job set lease_epoch = 2 where id = ${seed.claims.job_id}`;
+  const large = await broker.catalog({ ...seed.claims, attempt_id: next, epoch: 2 });
+  expect(large.filter((tool) => tool.name.startsWith('test.verb_'))).toHaveLength(verbs.length);
+  expect(large.find((tool) => tool.name === 'load_tool')?.description).not.toContain(
+    'Not loaded yet',
+  );
+});

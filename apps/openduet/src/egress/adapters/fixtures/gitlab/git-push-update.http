@@ -1,0 +1,19 @@
+# git push origin openduet/fix-login (fast-forward)
+
+### read
+GET https://gitlab.com/alice/site.git/info/refs?service=git-receive-pack
+user-agent: git/2.53.0
+accept: */*
+
+### write base64
+POST https://gitlab.com/alice/site.git/git-receive-pack
+user-agent: git/2.53.0
+accept: application/x-git-receive-pack-result
+content-type: application/x-git-receive-pack-request
+
+MDBjZjJiMmU5NGQyMjQ3ZWI1YTc0ZjE2MTg5Yjc2MGI2MTIxY2ZlNDE1OWQgNTQ4NTRhZmVmMGNjYzI0Mzc4MjRkMTE1NDY5MGNl
+MzRjYWE0Zjc4OSByZWZzL2hlYWRzL29wZW5kdWV0L2ZpeC1sb2dpbgAgcmVwb3J0LXN0YXR1cy12MiBzaWRlLWJhbmQtNjRrIHF1
+aWV0IG9iamVjdC1mb3JtYXQ9c2hhMSBhZ2VudD1naXQvMi41My4wLndpbmRvd3MuMi1XaW5kb3dzMDAwMFBBQ0sAAAACAAAAAZYM
+eJyNyksKAjEMgOF9T5G9IGlIXyCiG+/RtOlYcB4MFeb4zhH8lx//2FWBJZKrxTMV8Sopo0d1LC1WnyjGJqqckM2Wd10GkJAmrkQc
+VFwO3Ky3MUnwKN6SLU3ZulRN/o73usMTbvmhR563j17LOt/BhoTRUkSEC56ZU+c+hv41m1c/4LNOfYE85b6YHyoaOKhJY2z56/rT
+jDGVKf2HSEcz2bHVFA==

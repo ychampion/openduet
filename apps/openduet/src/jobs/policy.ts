@@ -1,0 +1,575 @@
+import {
+  CALENDAR_EVENT_NAMES,
+  type ConnectionLifecycle,
+  type ContextInvalidated,
+  connectionGeneration,
+  connectionLifecycle,
+  DOCUMENT_EVENT_NAMES,
+  jobBudget,
+  MAIL_EVENT_NAMES,
+  type ProviderAccess,
+  type ProviderRevokeAt,
+  policyGeneration,
+  waitSpec,
+} from '@openduet/contracts';
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { ServiceError } from '../api/errors.ts';
+import type { Database } from '../db/client.ts';
+import {
+  action,
+  approval,
+  attempt,
+  backgroundOperation,
+  connection,
+  experienceTurn,
+  job,
+  secret,
+  space,
+  trigger,
+} from '../db/schema.ts';
+import type { Transaction } from '../db/transaction.ts';
+import { appendEvent } from '../events/store.ts';
+import { managesConnection, requestPrincipal, spaceAuthority } from '../principals/authority.ts';
+import { carryForward, jobsReachedBy } from './connection-use.ts';
+import { type AttemptRunner, DISCONNECTED_NOTE } from './runner.ts';
+import { type JobService, routineRest } from './service.ts';
+
+/** Account changes commit fences before signalling disposable inference processes. */
+
+/** The names of what a mailbox, calendar or Drive reports, as a SQL list. Fixed strings only. */
+const OBSERVATION_NAMES = [...MAIL_EVENT_NAMES, ...CALENDAR_EVENT_NAMES, ...DOCUMENT_EVENT_NAMES]
+  .map((name) => `'${name}'`)
+  .join(', ');
+
+export class PolicyService {
+  constructor(
+    readonly jobs: JobService,
+    readonly runner?: AttemptRunner,
+    readonly options: {
+      /**
+       * Runs before a revocation, or a switch to another key, commits: after
+       * its authority and generation checks, before the key it replaces is
+       * gone, and outside the transaction, so it may use connections of its
+       * own. What that key alone can undo is undone here. It never refuses the
+       * change.
+       */
+      beforeKeyChange?: (
+        connection: { id: string; provider: string },
+        change: 'revoke' | 'switch',
+        next?: { secretRef: string; spaceId: string },
+      ) => Promise<void>;
+      /**
+       * Asked before a switch, and before anything is torn down: the reason
+       * this connection may not take that secret as its key, or null.
+       */
+      checkKeyChange?: (
+        connection: { provider: string; spaceId: string; configuration: unknown },
+        secretRef: string,
+      ) => Promise<string | null>;
+      /**
+       * Runs once a revocation has committed, with the connection as it was:
+       * withdraws the access at the provider where that is possible and
+       * deletes the sealed tokens. Answers what happened at the provider,
+       * and where the person cancels the credential when OpenDuet could not.
+       * It never undoes the revocation.
+       */
+      afterRevoke?: (connection: {
+        id: string;
+        spaceId: string;
+        provider: string;
+        configuration: unknown;
+        secretRef: string | null;
+      }) => Promise<{ provider_access: ProviderAccess; revoke_at?: ProviderRevokeAt } | undefined>;
+    } = {},
+  ) {}
+
+  async invalidateInTransaction(
+    tx: Transaction,
+    spaceId: string,
+    generation: number,
+    connectionId: string | null,
+    reason: ContextInvalidated['reason'],
+    /** Only these jobs of the space; left out, every job in it. */
+    only?: readonly string[],
+  ): Promise<ContextInvalidated[]> {
+    const affected = (
+      await tx.select({ id: job.id }).from(job).where(eq(job.spaceId, spaceId))
+    ).filter((candidate) => !only || only.includes(candidate.id));
+    const controls: ContextInvalidated[] = [];
+    for (const candidate of affected) {
+      const row = await this.jobs.lock(tx, candidate.id);
+      if (!row) continue;
+      const [running] = await tx
+        .select()
+        .from(attempt)
+        .where(and(eq(attempt.jobId, row.id), isNull(attempt.endedAt)));
+      await tx.update(attempt).set({ contextSnapshotRef: null }).where(eq(attempt.jobId, row.id));
+      const pending = await tx
+        .select()
+        .from(action)
+        .where(
+          and(
+            eq(action.jobId, row.id),
+            inArray(action.status, [
+              'proposed',
+              'needs_approval',
+              'approved',
+              'admitted',
+              'dispatched',
+            ]),
+          ),
+        );
+      for (const effect of pending) {
+        const status = effect.dispatchedAt ? 'unknown' : 'failed';
+        await tx
+          .update(action)
+          .set({
+            status,
+            resolvedAt: effect.dispatchedAt ? null : new Date(),
+            reconciliation: { reason, policy_generation: generation },
+          })
+          .where(eq(action.id, effect.id));
+        await appendEvent(tx, {
+          jobId: row.id,
+          attemptId: effect.attemptId,
+          type: 'action_status_changed',
+          payload: { action_id: effect.id, from: effect.status, to: status, reason },
+          dedupKey: `${effect.id}:generation:${generation}`,
+        });
+        const decisions = await tx
+          .update(approval)
+          .set({ decision: 'denied', decidedAt: new Date(), decidedBy: 'policy' })
+          .where(and(eq(approval.actionId, effect.id), isNull(approval.decision)))
+          .returning();
+        for (const decision of decisions)
+          await appendEvent(tx, {
+            jobId: row.id,
+            attemptId: effect.attemptId,
+            type: 'approval_decided',
+            payload: {
+              approval_id: decision.id,
+              action_id: effect.id,
+              decision: 'denied',
+              payload_hash: decision.payloadHash,
+              reason,
+            },
+            dedupKey: `${decision.id}:decision`,
+          });
+      }
+      // Local continuations carry inference context; remote accepted effects keep their own truth.
+      await tx
+        .update(backgroundOperation)
+        .set({
+          state: 'interrupted',
+          leaseExpiresAt: null,
+          substrateDisposition: 'local_process_interrupted',
+          version: sql`${backgroundOperation.version} + 1`,
+        })
+        .where(
+          and(
+            eq(backgroundOperation.jobId, row.id),
+            eq(backgroundOperation.kind, 'local_process'),
+            inArray(backgroundOperation.state, ['registered', 'ready', 'claimed']),
+          ),
+        );
+      const payload = {
+        type: 'context_invalidated' as const,
+        job_id: row.id,
+        policy_generation: generation,
+        connection_id: connectionId,
+        reason,
+      };
+      await appendEvent(tx, {
+        jobId: row.id,
+        attemptId: running?.id,
+        type: 'context_invalidated',
+        payload: { ...payload, ...(running ? { attempt_id: running.id } : {}) },
+        dedupKey: `${row.id}:context:${generation}`,
+      });
+      if (running && row.state === 'running') {
+        const control = { ...payload, attempt_id: running.id };
+        controls.push(control);
+        await tx
+          .update(attempt)
+          .set({
+            endedAt: new Date(),
+            outcome: 'fenced',
+            outcomeDetail: control,
+            leaseExpiresAt: null,
+            leaseStatus: 'context_invalidated',
+          })
+          .where(eq(attempt.id, running.id));
+        // A conversation or routine counts the attempts of its current turn only.
+        const [count] = await tx
+          .select({ n: sql<number>`count(*)::int` })
+          .from(attempt)
+          .where(
+            and(
+              eq(attempt.jobId, row.id),
+              ['chat', 'routine'].includes(row.kind) && row.currentTurnId
+                ? eq(attempt.turnId, row.currentTurnId)
+                : undefined,
+            ),
+          );
+        const remaining = Math.max(
+          0,
+          jobBudget.parse(row.budget).max_attempts - Number(count?.n ?? 0),
+        );
+        // A routine whose run cannot be retried goes back to its schedule.
+        const rest = remaining === 0 ? await routineRest(tx, row) : null;
+        // A turn with no attempt left ends here, and says the app it used was disconnected.
+        const ended = reason === 'connection_revoked' && row.currentTurnId && remaining === 0;
+        await appendEvent(tx, {
+          jobId: row.id,
+          attemptId: running.id,
+          type: 'attempt_ended',
+          payload: ended
+            ? {
+                ...control,
+                outcome: { kind: 'failed', reason: DISCONNECTED_NOTE, retryable: false },
+                turn_status: 'failed',
+              }
+            : control,
+          dedupKey: `${running.id}:ended`,
+        });
+        if (ended && row.currentTurnId)
+          await tx
+            .update(experienceTurn)
+            .set({
+              status: 'failed',
+              answer: sql`case when ${experienceTurn.answer} = '' then ${DISCONNECTED_NOTE}
+                else ${experienceTurn.answer} || ${`\n\n${DISCONNECTED_NOTE}`} end`,
+              finishedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(experienceTurn.id, row.currentTurnId),
+                inArray(experienceTurn.status, ['queued', 'working', 'streaming', 'stalled']),
+              ),
+            );
+        await this.jobs.move(
+          tx,
+          row,
+          rest
+            ? { kind: 'attempt_waiting_for_event_or_time' }
+            : { kind: 'attempt_failed', retryable: true, attempts_remaining: remaining },
+          {
+            attemptId: running.id,
+            bumpEpoch: true,
+            reason: 'recovery',
+            payload: { reason },
+            ...(rest ? { wait: rest } : {}),
+          },
+        );
+      } else if (
+        row.state === 'waiting_for_approval' &&
+        pending.some((effect) => effect.status === 'needs_approval') &&
+        // Waiting work with no attempt left cannot wake into one. What it asked
+        // is refused above and it holds nothing, so it stays as it is rather
+        // than stopping the change that fences it.
+        (await this.jobs.attemptsLeft(tx, row))
+      ) {
+        await this.jobs.move(
+          tx,
+          row,
+          { kind: 'approval_decided', decision: 'denied' },
+          { reason: 'approval', payload: { reason } },
+        );
+      } else if (row.state === 'waiting_for_event_or_time' && connectionId) {
+        const wait = waitSpec.parse(row.wait);
+        if (wait.kind === 'event') {
+          const [registration] = await tx
+            .select()
+            .from(trigger)
+            .where(eq(trigger.id, wait.trigger_id));
+          if (
+            (registration?.spec as { connection_id?: string } | undefined)?.connection_id ===
+              connectionId &&
+            (await this.jobs.attemptsLeft(tx, row))
+          )
+            await this.jobs.move(
+              tx,
+              row,
+              { kind: 'event_fired' },
+              { reason: 'recovery', payload: { reason } },
+            );
+        }
+      }
+    }
+    return controls;
+  }
+  private async signal(controls: ContextInvalidated[]) {
+    for (const control of controls) await this.runner?.invalidateContext(control);
+  }
+
+  async changeConnection(id: string, input: ConnectionLifecycle) {
+    const request = connectionLifecycle.parse(input);
+    /** Authority, generation and credential, read without a lock or under the transaction's. */
+    const checked = async (reader: Database | Transaction, lock: boolean) => {
+      const query = reader.select().from(connection).where(eq(connection.id, id));
+      const [source] = lock ? await query.for('update') : await query;
+      if (!source) throw new ServiceError('not_found', 'Connection not found.', 404);
+      if (
+        requestPrincipal() &&
+        !managesConnection(
+          await spaceAuthority(reader, source.spaceId, requestPrincipal(), lock),
+          source.sharedUse,
+        )
+      )
+        throw new ServiceError('scope_denied', 'Space owner required.', 403);
+      if (source.generation !== request.expected_generation)
+        throw new ServiceError('generation_conflict', 'The connection generation changed.');
+      if (request.kind === 'switch') {
+        const [credential] = await reader
+          .select({ id: secret.id })
+          .from(secret)
+          .where(and(eq(secret.id, request.secret_ref), eq(secret.spaceId, source.spaceId)));
+        if (!credential)
+          throw new ServiceError(
+            'invalid_credential',
+            'Choose a credential in the same space.',
+            400,
+          );
+      }
+      return source;
+    };
+    // The key check and what the old key alone can undo reach providers and
+    // the secret store, on connections of their own. They run before the
+    // event order lock, which must never wait on another connection; the
+    // locked transaction then checks again that nothing moved meanwhile.
+    const before = await checked(this.jobs.db, false);
+    if (request.kind === 'switch') {
+      const refused = await this.options.checkKeyChange?.(
+        {
+          provider: before.provider,
+          spaceId: before.spaceId,
+          configuration: before.configuration,
+        },
+        request.secret_ref,
+      );
+      if (refused) throw new ServiceError('invalid_credential', refused, 400);
+    }
+    // While the old key's work is undone nothing new may start through this
+    // connection, so it reads as inactive until the change commits, and the
+    // row records which change paused it. That is a short write of its own:
+    // the teardown reaches providers for up to two minutes, which no
+    // transaction is held open for. A restart part way finishes a revocation
+    // (`finishInterruptedRevocations`) and puts a switch back on its old key
+    // (`configuredConnectors`).
+    let paused = false;
+    const resume = async () => {
+      if (!paused) return;
+      await this.jobs.db
+        .update(connection)
+        .set({ status: 'active', keyChange: null })
+        .where(
+          and(
+            eq(connection.id, id),
+            eq(connection.generation, before.generation),
+            eq(connection.status, 'disabled'),
+            eq(connection.keyChange, request.kind),
+          ),
+        );
+    };
+    const changed = () =>
+      this.jobs.transaction(async (tx) => {
+        const source = await checked(tx, true);
+        const [parent] = await tx
+          .update(space)
+          .set({ policyGeneration: sql`${space.policyGeneration} + 1` })
+          .where(eq(space.id, source.spaceId))
+          .returning();
+        if (!parent) throw new Error('Connection space disappeared');
+        const [updated] = await tx
+          .update(connection)
+          .set({
+            generation: source.generation + 1,
+            status: request.kind === 'revoke' ? 'revoked' : 'active',
+            secretRef: request.kind === 'switch' ? request.secret_ref : null,
+            keyChange: null,
+            health: 'unknown',
+            lastCheckedAt: null,
+          })
+          .where(eq(connection.id, id))
+          .returning();
+        if (!updated) throw new Error('Locked connection disappeared');
+        // The work that used it, read before what it reported is deleted below.
+        // Null when its use cannot be told job by job: then every job is fenced.
+        const reached = await jobsReachedBy(tx, {
+          id,
+          spaceId: source.spaceId,
+          provider: source.provider,
+        });
+        // What was read from the old account, and where its feed was read to,
+        // say nothing about the next one; a revoked one is read no more.
+        await tx.execute(sql`delete from source_cursor where connection_id = ${id}`);
+        await tx.execute(sql`delete from subject_state where connection_id = ${id}`);
+        await tx.execute(sql`delete from observation_tombstone where connection_id = ${id}`);
+        // And how they were sorted, and the labels kept for them.
+        await tx.execute(sql`delete from triage_item where connection_id = ${id}`);
+        await tx.execute(sql`delete from triage_verdict where connection_id = ${id}`);
+        // So do the mail, calendar and Drive observations read from it that no job
+        // took in: headers, titles and places from an account the connection
+        // no longer stands for. A revocation takes everything it reported.
+        await tx.execute(sql`delete from event
+          where job_id is null and payload->>'kind' = 'connector_event'
+            and payload->>'connection_id' = ${id}
+            and (${request.kind === 'revoke'}
+              or payload->>'event_name' in ${sql.raw(`(${OBSERVATION_NAMES})`)})`);
+        // What OpenDuet noticed in it goes too, with anything still waiting to be
+        // pushed about it: its facts came from the account it no longer stands
+        // for. A switch keeps the deadlines kept on it; they read the account
+        // afresh, as it now is. A revocation takes them.
+        const noticed = sql`select id from situation where connection_id = ${id}
+          or (kind = 'meeting.conflict' and evidence::text like ${`%"calendar:${id}:%`})`;
+        // A switch keeps the deadlines' situations, and what is still to be pushed about them.
+        const removed = sql`select id from situation where id in (${noticed})
+          and (${request.kind === 'revoke'} or kind <> 'deadline.at_risk')`;
+        await tx.execute(sql`update push_intent set dropped_at = now()
+          where situation_id in (${removed}) and sent_at is null and dropped_at is null`);
+        await tx.execute(sql`delete from situation where id in (${removed})`);
+        if (request.kind === 'revoke')
+          await tx.execute(sql`delete from clock where connection_id = ${id}`);
+        if (request.kind === 'revoke')
+          await tx
+            .update(trigger)
+            .set({ enabled: false })
+            .where(
+              and(
+                // A watch listens on its connection exactly as an event trigger does.
+                inArray(trigger.kind, ['event', 'watch']),
+                sql`${trigger.spec}->>'connection_id' = ${id}`,
+              ),
+            );
+        const controls = await this.invalidateInTransaction(
+          tx,
+          source.spaceId,
+          parent.policyGeneration,
+          id,
+          request.kind === 'switch' ? 'credential_switched' : 'connection_revoked',
+          reached ?? undefined,
+        );
+        // Work that never used it is not fenced, and keeps acting under the new generations.
+        if (reached)
+          await carryForward(tx, {
+            spaceId: source.spaceId,
+            policyGeneration: parent.policyGeneration,
+            connectionId: id,
+            from: source.generation,
+            to: request.kind === 'revoke' ? null : updated.generation,
+            reached,
+          });
+        return {
+          response: connectionGeneration.parse({
+            connection_id: id,
+            generation: updated.generation,
+            policy_generation: parent.policyGeneration,
+            status: updated.status,
+          }),
+          controls,
+          // What the revocation let go of, for the provider and the sealed store.
+          released:
+            request.kind === 'revoke'
+              ? {
+                  id,
+                  spaceId: source.spaceId,
+                  provider: source.provider,
+                  configuration: source.configuration,
+                  secretRef: source.secretRef,
+                }
+              : null,
+        };
+      });
+    let result: Awaited<ReturnType<typeof changed>>;
+    try {
+      if (
+        this.options.beforeKeyChange &&
+        ((request.kind === 'revoke' && before.status !== 'revoked') ||
+          (request.kind === 'switch' && request.secret_ref !== before.secretRef))
+      ) {
+        paused = await this.jobs.db.transaction(async (tx) => {
+          const source = await checked(tx, true);
+          if (source.status !== 'active') return false;
+          await tx
+            .update(connection)
+            .set({ status: 'disabled', keyChange: request.kind })
+            .where(eq(connection.id, id));
+          return true;
+        });
+        await this.options.beforeKeyChange(
+          { id: before.id, provider: before.provider },
+          request.kind,
+          request.kind === 'switch'
+            ? { secretRef: request.secret_ref, spaceId: before.spaceId }
+            : undefined,
+        );
+      }
+      result = await changed();
+    } catch (error) {
+      await resume();
+      throw error;
+    }
+    await this.signal(result.controls);
+    if (result.released && this.options.afterRevoke) {
+      const outcome = await this.options.afterRevoke(result.released).catch(() => undefined);
+      if (outcome) return { ...result.response, ...outcome };
+    }
+    return result.response;
+  }
+
+  /**
+   * Finish the revocations a stopped process left part way: the person asked
+   * for them, so they complete, teardown included, rather than the connection
+   * coming back. Until each does, its connection stays inactive. Returns the
+   * ids that could not be finished; a later start tries them again.
+   */
+  async finishInterruptedRevocations(): Promise<string[]> {
+    const interrupted = await this.jobs.db
+      .select({ id: connection.id, generation: connection.generation })
+      .from(connection)
+      .where(and(eq(connection.keyChange, 'revoke'), eq(connection.status, 'disabled')));
+    const unfinished: string[] = [];
+    for (const row of interrupted) {
+      try {
+        await this.changeConnection(row.id, {
+          kind: 'revoke',
+          expected_generation: row.generation,
+        });
+      } catch (error) {
+        unfinished.push(row.id);
+        console.error(
+          `connections: the interrupted revocation of ${row.id} is not finished yet (${error instanceof Error ? error.message : 'error'}); it stays inactive`,
+        );
+      }
+    }
+    return unfinished;
+  }
+
+  async changePolicy(spaceId: string, expectedGeneration: number) {
+    const result = await this.jobs.transaction(async (tx) => {
+      const [parent] = await tx.select().from(space).where(eq(space.id, spaceId)).for('update');
+      if (!parent) throw new ServiceError('not_found', 'Space not found.', 404);
+      if (
+        requestPrincipal() &&
+        (await spaceAuthority(tx, spaceId, requestPrincipal(), true)).role !== 'owner'
+      )
+        throw new ServiceError('scope_denied', 'Space owner required.', 403);
+      if (parent.policyGeneration !== expectedGeneration)
+        throw new ServiceError('generation_conflict', 'The policy generation changed.');
+      const generation = parent.policyGeneration + 1;
+      await tx.update(space).set({ policyGeneration: generation }).where(eq(space.id, spaceId));
+      return {
+        response: policyGeneration.parse({ space_id: spaceId, policy_generation: generation }),
+        controls: await this.invalidateInTransaction(
+          tx,
+          spaceId,
+          generation,
+          null,
+          'policy_changed',
+        ),
+      };
+    });
+    await this.signal(result.controls);
+    return result.response;
+  }
+}

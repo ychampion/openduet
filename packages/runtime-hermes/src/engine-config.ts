@@ -1,0 +1,464 @@
+/**
+ * One place that decides what the engine is configured to do.
+ *
+ * Every surface that starts the engine — the image's baked configuration, the
+ * boot script, the process supervisor, the container supervisor, the evaluation
+ * stack and the local end-to-end harness — used to spell its own subset of these
+ * keys, and they had drifted apart. They now all render the same object from the
+ * same options, so a setting is changed once and every surface moves with it.
+ *
+ * The renderer is pure and holds no secrets. The attempt capability is a
+ * per-attempt value and the surrogate model key is an environment name, so the
+ * image's copy carries neither; the boot script writes the capability into the
+ * rendered object at start-up, and callers that already hold it (a supervisor on
+ * the host, a test harness) may pass it here instead.
+ */
+import {
+  GATEWAY_MAX_REQUEST_BYTES,
+  hasKnownContextWindow,
+  modelContextWindow,
+  modelSupportsVision,
+  VISION_IMAGE_RESERVE_BYTES,
+} from '@openduet/contracts';
+
+/** Where in-cell commands run, once the native terminal toolset is turned on. */
+export type TerminalBackend = 'openduet_sandbox';
+
+/** The brokered tool a sandbox connection serves; its presence is what selects the sandbox. */
+export const SANDBOX_TERMINAL_TOOL = 'terminal.run';
+
+/**
+ * The engine's toolset holding its terminal and nothing else. The `terminal`
+ * toolset also carries `process_manage`, whose background polls would each
+ * become a broker action; background processes in a remote sandbox are not
+ * offered.
+ */
+export const SANDBOX_TERMINAL_TOOLSET = 'terminal_tools';
+
+/** The engine's helpers, offered only to an attempt whose budget can carry them. */
+export const DELEGATION_TOOLSET = 'delegation';
+
+/** Says whether an attempt's engine is built with helpers: `1`, or absent. */
+export const DELEGATION_ENV = 'OPENDUET_ENGINE_DELEGATION';
+
+/**
+ * The smallest budget helpers are offered with: a conversation turn's. Helper
+ * model calls are charged to the job like the parent's, so three helpers of
+ * fifty turns each would spend a routine's twenty calls and leave the parent
+ * none to answer with. A conversation keeps fifty calls of its own beside them.
+ */
+export const DELEGATION_MIN_BUDGET = { max_turns: 200, max_output_tokens: 400_000 } as const;
+
+/** Whether a budget can carry helpers and still leave the parent its answer. */
+export function delegationFits(budget?: { max_turns: number; max_output_tokens: number }): boolean {
+  return (
+    !!budget &&
+    budget.max_turns >= DELEGATION_MIN_BUDGET.max_turns &&
+    budget.max_output_tokens >= DELEGATION_MIN_BUDGET.max_output_tokens
+  );
+}
+
+/**
+ * The engine features an attempt's catalog and budget call for. A space with
+ * one active sandbox connection is offered exactly one `terminal.run`, and then
+ * the engine's own terminal is built and pinned to the sandbox backend, which
+ * forwards every command to the broker. A budget the size of a conversation
+ * turn's also gets the engine's helpers. Anything else keeps the image's
+ * configuration: no terminal at all, never a local one, and no helpers.
+ */
+export function attemptEngineFeatures(
+  tools: readonly { name: string; connection_id: string | null }[],
+  budget?: { max_turns: number; max_output_tokens: number },
+): Partial<EngineFeatures> {
+  const toolsets = [...DEFAULT_FEATURES.toolsets];
+  if (delegationFits(budget)) toolsets.push(DELEGATION_TOOLSET);
+  const connections = new Set(
+    tools
+      .filter((tool) => tool.name === SANDBOX_TERMINAL_TOOL && tool.connection_id)
+      .map((tool) => tool.connection_id),
+  );
+  if (connections.size === 1)
+    return {
+      toolsets: [...toolsets, SANDBOX_TERMINAL_TOOLSET],
+      terminalBackend: 'openduet_sandbox',
+    };
+  return toolsets.length === DEFAULT_FEATURES.toolsets.length ? {} : { toolsets };
+}
+
+/**
+ * Engine capabilities an attempt's catalog can switch on. Every default here is
+ * what the runtime does without them, so rendering with no features named
+ * reproduces that configuration exactly.
+ */
+export type EngineFeatures = {
+  /** Toolsets the API-server agent is built with. An explicit list replaces the engine's default, so a built-in not named here is off. */
+  toolsets: readonly string[];
+  /** Absent while no terminal toolset is built. */
+  terminalBackend: TerminalBackend | null;
+};
+
+export type EngineConfigOptions = {
+  /** The gateway path segment naming which upstream the gateway injects a key for. */
+  provider: string;
+  /** The model id the attempt is allowed to spend on. */
+  model: string;
+  /** Base address of the broker, which carries the metered model paths. */
+  brokerUrl: string;
+  /** The wire protocol the gateway expects for this model, when it is not the default. */
+  modelApiMode?: string;
+  /** Overrides the catalog window; a proof that needs a small window states it here. */
+  contextWindow?: number;
+  /** The window an operator stated for this deployment's models. */
+  contextWindowLimit?: number;
+  /** The largest body the model gateway will accept. */
+  gatewayMaxRequestBytes?: number;
+  /** The owner's ceiling on the compaction trigger. */
+  compactionMaxTokens?: number;
+  /** The engine's per-run iteration ceiling. */
+  maxTurns?: number;
+  /**
+   * Whether the model is shown screenshots as pictures. Absent, the model
+   * catalog decides. A model that reads images has part of the gateway's body
+   * limit set aside for the pictures it keeps, so compaction starts sooner.
+   */
+  vision?: boolean;
+  /** Written into the model and provider headers when the caller may hold it. */
+  capability?: string;
+  features?: Partial<EngineFeatures>;
+};
+
+/**
+ * A runaway ceiling, not a cost control: a run that has taken 150 turns is
+ * looping, and the job's own accounting decides what an attempt may spend.
+ */
+export const DEFAULT_ENGINE_MAX_TURNS = 150;
+
+/**
+ * The owner's cap on the compaction trigger. Without it a million-token window
+ * would let half a million tokens accumulate before the first summary, and every
+ * request until then carries the whole history.
+ */
+export const DEFAULT_COMPACTION_MAX_TOKENS = 200_000;
+
+/** The provider entry name every rendered configuration uses. */
+export const GATEWAY_PROVIDER = 'openduet-gateway';
+
+/** Says whether the attempt's model is shown screenshots as pictures: `1` or `0`. */
+export const VISION_ENV = 'OPENDUET_ENGINE_SUPPORTS_VISION';
+
+/** The header the model gateway meters by. */
+export const CAPABILITY_HEADER = 'x-openduet-capability';
+
+/** What the image is built with when nothing names a model. */
+export const DEFAULT_ENGINE_PROVIDER = 'fireworks';
+export const DEFAULT_ENGINE_MODEL = 'accounts/fireworks/models/deepseek-v4p1-flash';
+export const DEFAULT_BROKER_URL = 'http://openduet:8788';
+
+/** The engine home's skills directory is filled from this path; it must not exist. */
+export const BUNDLED_SKILLS_DIR = '/opt/openduet-runtime/no-bundled-skills';
+
+/**
+ * The engine's own toolsets an attempt may be built with, beside the plugin's.
+ * Each acts only inside the engine process, so nothing it does can reach a
+ * file, the network, a shell or a credential except through the broker:
+ *
+ * - `todo`, on for every attempt, keeps a task list in the agent's memory for
+ *   multi-step work. It reads and writes nothing else (tools/todo_tool.py).
+ * - `delegation`, on only for a budget that fits (`delegationFits`), runs
+ *   helpers with their own context inside the same run. A helper is built with
+ *   the parent's toolsets minus delegation, the engine's question tool and
+ *   memory (tools/delegate_tool_toolsets.py). The broker tools that speak to
+ *   the person, park the job or start more work (`ask_person`, `say`, `react`,
+ *   `job.wait`, `search_tools`, `load_tool` and `run.*`) are left out of its
+ *   list and refused by the plugin if called anyway; a helper reports what the
+ *   person needs, and the parent decides. Everything else a helper does is a
+ *   broker tool call on this attempt's capability, under the same approvals and
+ *   action budget, and its model calls go through the same gateway with the
+ *   same metering header, which is keyed on the gateway's address
+ *   (agent/agent_init.py). It speaks as OpenDuet: the delegation seam in
+ *   patches/observer_bridge.py builds it with the engine home's SOUL.md, keeps
+ *   the delegation inside the turn (at the pin its results would arrive after
+ *   the attempt ended), and hands the parent any action a helper left waiting
+ *   for approval.
+ *
+ * Everything else stays off. Files, the terminal, the web, the browser, code
+ * execution, vision and memory each act outside the engine, and OpenDuet offers
+ * them as broker tools instead. Session search stays off too: an engine home
+ * lives for one attempt, so it could only find the conversation already in
+ * front of the model, while earlier ones are recalled by OpenDuet.
+ */
+export const ENGINE_BUILTIN_TOOLSETS = ['todo'] as const;
+
+/**
+ * Bounds on helpers. Three at a time, one level deep, fifty turns each, and
+ * ten minutes each: a helper that hangs ends with a timed-out result to the
+ * parent, well inside a conversation turn's thirty minutes. What they may spend
+ * is still the job's own accounting.
+ */
+export const DELEGATION_LIMITS = {
+  max_concurrent_children: 3,
+  max_spawn_depth: 1,
+  orchestrator_enabled: false,
+  max_iterations: 50,
+  child_timeout_seconds: 600,
+  subagent_auto_approve: false,
+} as const;
+
+const DEFAULT_FEATURES: EngineFeatures = {
+  toolsets: ['openduet', ...ENGINE_BUILTIN_TOOLSETS],
+  terminalBackend: null,
+};
+
+/**
+ * Below this window the engine treats the conversation as short enough to keep
+ * whole, and its own minimum overrides the percentage.
+ */
+const MINIMUM_TRIGGER_WINDOW = 64_000;
+
+/** Above this window the engine keeps the configured half rather than raising it. */
+const LARGE_WINDOW = 512_000;
+
+/** The share of the window the engine will not let the minimum push past. */
+const MINIMUM_TRIGGER_CEILING = 0.85;
+
+/** Headroom between the compaction trigger and the body the gateway will accept. */
+const BODY_LIMIT_HEADROOM = 0.8;
+
+/** The engine's own estimate: four characters of request body to the token. */
+const CHARS_PER_TOKEN = 4;
+
+/**
+ * The number of tokens at which the engine itself would start a compaction for a
+ * window, reproducing its arithmetic: half the window, raised to three quarters
+ * below 512,000 tokens, then floored at 64,000 but never above 85% of the
+ * window. At 64,000 tokens the floor binds and the ceiling applies, which is why
+ * the answer there is 54,400 rather than the 48,000 the percentage alone gives.
+ */
+export function engineCompactionTrigger(contextWindow: number): number {
+  const percent = contextWindow < LARGE_WINDOW ? 0.75 : 0.5;
+  const scaled = Math.floor(contextWindow * percent);
+  if (scaled >= MINIMUM_TRIGGER_WINDOW) return scaled;
+  return Math.min(MINIMUM_TRIGGER_WINDOW, Math.floor(contextWindow * MINIMUM_TRIGGER_CEILING));
+}
+
+/**
+ * The window to tell the engine about.
+ *
+ * The catalog names the models OpenDuet knows, and anything else falls back to
+ * 128,000 tokens — a guess, and one that is too generous for a smaller model: it
+ * would be told to compact at 96,000 tokens, never reach that, and have every
+ * request past its own window refused by the provider with nothing summarized.
+ * So an operator may state the window their deployment's models really have. For
+ * a model the catalog names their number may lower the window and never raise
+ * it, because the catalog is what the gateway's own accounting is keyed on; for
+ * one it does not name, their number is the only real one there is.
+ */
+export function engineContextWindow(model: string, stated?: number): number {
+  const catalog = modelContextWindow(model);
+  if (stated === undefined) return catalog;
+  return hasKnownContextWindow(model) ? Math.min(catalog, stated) : stated;
+}
+
+/**
+ * The trigger OpenDuet configures: the engine's own trigger, lowered by the
+ * owner's cap, and lowered again to stay inside the body the gateway accepts.
+ * The last term is what keeps proactive compaction ahead of the gateway's
+ * refusal rather than behind it.
+ */
+export function compactionThresholdTokens(options: {
+  contextWindow: number;
+  compactionMaxTokens?: number;
+  gatewayMaxRequestBytes?: number;
+  vision?: boolean;
+}): number {
+  // The engine counts a kept picture as a flat number of tokens, not by its
+  // bytes, so the bytes its pictures can take are set aside from the body first.
+  const limit = options.gatewayMaxRequestBytes ?? GATEWAY_MAX_REQUEST_BYTES;
+  const textBytes = options.vision ? Math.max(0, limit - VISION_IMAGE_RESERVE_BYTES) : limit;
+  const bodyLimit = Math.floor((BODY_LIMIT_HEADROOM * textBytes) / CHARS_PER_TOKEN);
+  return Math.min(
+    engineCompactionTrigger(options.contextWindow),
+    options.compactionMaxTokens ?? DEFAULT_COMPACTION_MAX_TOKENS,
+    bodyLimit,
+  );
+}
+
+export type EngineConfig = Record<string, unknown>;
+
+/**
+ * What the engine tells the model about the surface its reply reaches. OpenDuet
+ * shows replies as chat text, and files the model makes arrive as artifacts.
+ */
+export const API_SERVER_HINT =
+  'Replies are shown to the person as chat text. Keep them brief and natural. Files you make reach them as artifacts, never as paths in the reply.';
+
+/** Whether the model these options name is shown pictures. */
+export function engineVision(
+  options: Pick<EngineConfigOptions, 'provider' | 'model' | 'vision'>,
+): boolean {
+  return options.vision ?? modelSupportsVision(decodeURIComponent(options.provider), options.model);
+}
+
+/** The engine configuration these options describe, secrets included only if given. */
+export function renderEngineConfig(options: EngineConfigOptions): EngineConfig {
+  const features = { ...DEFAULT_FEATURES, ...options.features };
+  const contextWindow =
+    options.contextWindow ?? engineContextWindow(options.model, options.contextWindowLimit);
+  const vision = engineVision(options);
+  const thresholdTokens = compactionThresholdTokens({
+    contextWindow,
+    compactionMaxTokens: options.compactionMaxTokens,
+    gatewayMaxRequestBytes: options.gatewayMaxRequestBytes,
+    vision,
+  });
+  const headers = options.capability
+    ? { extra_headers: { [CAPABILITY_HEADER]: options.capability } }
+    : {};
+  const provider: Record<string, unknown> = {
+    base_url: `${options.brokerUrl.replace(/\/+$/, '')}/providers/${options.provider}/v1`,
+    key_env: 'OPENDUET_MODEL_KEY',
+    default_model: options.model,
+    ...headers,
+  };
+  if (options.modelApiMode) provider.api_mode = options.modelApiMode;
+  const config: EngineConfig = {
+    platform_toolsets: { api_server: [...features.toolsets] },
+    plugins: { enabled: ['openduet'], allow_deprecated_imports: false },
+    tools: { tool_search: { enabled: 'off' } },
+    // The two keys the engine actually reads. A store built from either one
+    // loads its files out of the engine home whatever the toolset list says.
+    memory: { memory_enabled: false, user_profile_enabled: false, provider: '' },
+    curator: { enabled: false },
+    // Read by tools/delegate_tool_config.py. No provider or model is named, so
+    // a helper runs on the attempt's own model through the same gateway.
+    delegation: { ...DELEGATION_LIMITS },
+    checkpoints: { enabled: false },
+    // The engine is updated by pinning a new release. Its own check runs git
+    // against the source checkout, in the background of every start.
+    updates: { check: false },
+    agent: {
+      max_turns: options.maxTurns ?? DEFAULT_ENGINE_MAX_TURNS,
+      // Read under `agent:` (agent/agent_init.py). The probe describes the
+      // host's Python toolchain, which no tool offered to an attempt uses.
+      environment_probe: false,
+      // The prompt seam in patches/observer_bridge.py: leaves out the engine's
+      // product pointer, its profile line and its host runtime block.
+      host_prompt: false,
+      // Read under `agent:` (agent/agent_init.py, agent/system_prompt.py). For
+      // DeepSeek, Qwen, GLM, Kimi and GPT models the engine otherwise adds a
+      // coding-agent brief that says to run a tool for every calculation, date
+      // and claim and to keep calling tools until the result is verified. On a
+      // personal assistant that sent a sum to the computer (about 10 s a
+      // command) and a concept question to the web. OpenDuet's own task notes say
+      // when to reach for a tool (LOOKING_UP in instructions.ts).
+      execution_guidance: false,
+      // What a person attaches arrives as text. Deciding how to pass images
+      // otherwise probes the model endpoint, here the broker, for a local model
+      // server. Screenshots the agent takes are decided by model.supports_vision.
+      image_input_mode: 'text',
+    },
+    // Read at the top level, not under `agent:` (agent/agent_init.py).
+    // Replaces the engine's api_server hint, which describes MEDIA: file tags
+    // no OpenDuet surface renders.
+    platform_hints: { api_server: { replace: API_SERVER_HINT } },
+    tool_loop_guardrails: { hard_stop_enabled: true },
+    compression: {
+      enabled: true,
+      in_place: true,
+      abort_on_summary_failure: false,
+      threshold_tokens: thresholdTokens,
+    },
+    auxiliary: {
+      title_generation: { enabled: false },
+      background_review: { enabled: false },
+      compression: { provider: GATEWAY_PROVIDER, fallback_chain: [] },
+    },
+    // Read by tools/approval.py. The broker is the approval layer for commands
+    // in the agent's own computer; with the engine's guard on, a command there
+    // such as clearing the workspace was refused with nobody asked, and the
+    // model reported it as the person's refusal. The engine's unconditional
+    // floors (catastrophic commands, its deny list) still apply.
+    approvals: { mode: 'off', timeout: 300 },
+    model: {
+      provider: GATEWAY_PROVIDER,
+      default: options.model,
+      context_length: contextWindow,
+      // Read first by the engine's vision lookup (agent/image_routing.py,
+      // _supports_vision_override), ahead of a catalog it cannot reach from
+      // here. True: a screenshot tool's picture goes to the model; false: its
+      // text summary does (agent/vision_message_prep.py).
+      supports_vision: vision,
+      ...headers,
+    },
+    providers: { [GATEWAY_PROVIDER]: provider },
+    gateway: { platforms: { api_server: { max_concurrent_runs: 1 } } },
+  };
+  if (features.terminalBackend)
+    config.terminal = { backend: features.terminalBackend, cwd: '/work' };
+  return config;
+}
+
+/** The options the image's own copy is rendered from. */
+export const IMAGE_ENGINE_OPTIONS: EngineConfigOptions = {
+  provider: DEFAULT_ENGINE_PROVIDER,
+  model: DEFAULT_ENGINE_MODEL,
+  brokerUrl: DEFAULT_BROKER_URL,
+};
+
+/**
+ * The per-attempt numbers the boot script applies over the image's copy. They
+ * are not secret, but they follow the model the attempt was given, which the
+ * image cannot know.
+ */
+export function engineConfigEnvironment(options: EngineConfigOptions): Record<string, string> {
+  const contextWindow =
+    options.contextWindow ?? engineContextWindow(options.model, options.contextWindowLimit);
+  const terminal = options.features?.terminalBackend;
+  const vision = engineVision(options);
+  return {
+    // The engine reads its backend from here as well as from the file; the
+    // boot script writes the terminal section from it and refuses any other.
+    ...(terminal ? { TERMINAL_ENV: terminal } : {}),
+    // The boot script adds the helpers' toolset from it, and refuses any other value.
+    ...(options.features?.toolsets?.includes(DELEGATION_TOOLSET) ? { [DELEGATION_ENV]: '1' } : {}),
+    OPENDUET_ENGINE_MAX_TURNS: String(options.maxTurns ?? DEFAULT_ENGINE_MAX_TURNS),
+    OPENDUET_ENGINE_CONTEXT_LENGTH: String(contextWindow),
+    OPENDUET_ENGINE_COMPACTION_THRESHOLD: String(
+      compactionThresholdTokens({
+        contextWindow,
+        compactionMaxTokens: options.compactionMaxTokens,
+        gatewayMaxRequestBytes: options.gatewayMaxRequestBytes,
+        vision,
+      }),
+    ),
+    // The boot script writes model.supports_vision from it, and the plugin reads
+    // it to decide whether a screenshot is sent as a picture at all.
+    [VISION_ENV]: vision ? '1' : '0',
+  };
+}
+
+const positive = (value: string | undefined, name: string): number | undefined => {
+  if (value === undefined || value === '') return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0)
+    throw new RangeError(`${name} must be a positive whole number of tokens`);
+  return parsed;
+};
+
+/** The settings an operator may state, read once and validated once. */
+export function engineSettingsFromEnvironment(
+  environment: Record<string, string | undefined> = process.env,
+): { maxTurns: number; compactionMaxTokens: number; contextWindowLimit: number | undefined } {
+  return {
+    maxTurns:
+      positive(environment.OPENDUET_ENGINE_MAX_TURNS, 'OPENDUET_ENGINE_MAX_TURNS') ??
+      DEFAULT_ENGINE_MAX_TURNS,
+    compactionMaxTokens:
+      positive(environment.OPENDUET_COMPACTION_MAX_TOKENS, 'OPENDUET_COMPACTION_MAX_TOKENS') ??
+      DEFAULT_COMPACTION_MAX_TOKENS,
+    contextWindowLimit: positive(
+      environment.OPENDUET_MODEL_CONTEXT_WINDOW,
+      'OPENDUET_MODEL_CONTEXT_WINDOW',
+    ),
+  };
+}

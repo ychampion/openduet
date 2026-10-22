@@ -1,0 +1,155 @@
+/**
+ * The web form for installing a connection knows no kind of connection: it
+ * follows the descriptors `GET /connection-kinds` serves. This runs that same
+ * form logic against the mock, whose `POST /connections` validates with the
+ * contract schemas, so a descriptor and the request it describes cannot drift.
+ */
+import { expect, test } from 'bun:test';
+import { connectionKindListResponse, connectionResponse } from '@openduet/contracts';
+import {
+  emptyForm,
+  emptyRow,
+  type FormValues,
+  missing,
+  requestBody,
+} from '../../web/src/experience/connection-form.ts';
+import { createMock } from './index.ts';
+
+const TYPED: Record<string, string> = {
+  'mail.username': 'me@example.test',
+  'mail.from': 'me@example.test',
+  'credentials.password': '  spaced secret  ',
+  'mail.imap.host': 'imap.example.test',
+  'mail.smtp.host': 'smtp.example.test',
+  'caldav.calendar_url': 'https://dav.example.test/calendars/me/home/',
+  'caldav.username': 'me',
+  'ics.url': 'webcal://feeds.example.test/private-token/feed.ics',
+  'mcp.id': 'notes',
+  'mcp.url': 'https://mcp.example.test/mcp',
+  'credentials.access_token': 'token-value',
+  'mcp.allowed_scopes': 'mcp_notes.search, mcp_notes.add',
+  'mcp_stdio.id': 'notes',
+  'mcp_stdio.source': '@example/notes-server@1.0.0',
+  'mcp_stdio.args': '/data',
+  'mcp_stdio.allowed_scopes': 'mcp_notes.search, mcp_notes.add',
+  'sandbox.image': 'base',
+  'credentials.api_key': 'sandbox-key-value',
+  'credentials.token': 'github_pat_example_value',
+  'credentials.access_key_id': 'AKIAEXAMPLEKEY000001',
+  'credentials.secret_access_key': 'example/Secret+value0000000',
+  'command_line.region': 'us-east-1',
+  'credentials.account_sid': `AC${'0123456789abcdef'.repeat(2)}`,
+  'credentials.auth_token': 'twilio0auth0token0value0123456789',
+  'credentials.from_number': '+15550001111',
+  'sms.allowed_numbers': '+15557654321',
+};
+const TOOL_ROWS = [
+  { name: 'search', alias: 'search', required_scopes: 'mcp_notes.search', effect_class: 'read' },
+  { name: 'add', alias: 'add', required_scopes: 'mcp_notes.add', effect_class: 'write_external' },
+];
+const ROWS: Record<string, Record<string, string>[]> = {
+  'mcp.tools': TOOL_ROWS,
+  'mcp_stdio.tools': TOOL_ROWS,
+  'mcp_stdio.secret_env': [{ name: 'NOTES_TOKEN', value: '  sealed variable  ' }],
+};
+
+test('a form drawn only from the served descriptors installs every kind', async () => {
+  const mock = createMock({ speed: 0 });
+  const json = async (path: string, body?: unknown) => {
+    const response = await mock.app.fetch(
+      new Request(`http://mock.test${path}`, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: { 'content-type': 'application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+    );
+    return { status: response.status, text: await response.text() };
+  };
+  const kinds = connectionKindListResponse.parse(
+    JSON.parse((await json('/connection-kinds')).text),
+  ).kinds;
+  expect([...new Set(kinds.map((kind) => kind.kind))].sort()).toEqual([
+    'caldav',
+    'command_line',
+    'ics',
+    'mail',
+    'mcp',
+    'mcp_stdio',
+    'sandbox',
+    'sms',
+  ]);
+
+  for (const kind of kinds) {
+    const values: FormValues = emptyForm(kind);
+    // An untouched form names what is missing instead of sending a request the service would refuse.
+    expect(missing(kind, values)).not.toBeNull();
+    for (const field of kind.fields) {
+      if (field.input === 'list')
+        values.lists[field.path] = (ROWS[field.path] ?? []).map((row) => ({
+          ...emptyRow(field.item_fields ?? []),
+          ...row,
+        }));
+      else if (TYPED[field.path] !== undefined) values.fields[field.path] = TYPED[field.path] ?? '';
+    }
+    expect(missing(kind, values)).toBeNull();
+
+    const body = requestBody(kind, values);
+    const created = await json('/connections', body);
+    expect([kind.id, created.status]).toEqual([kind.id, 201]);
+    const view = connectionResponse.parse(JSON.parse(created.text));
+    expect(view.check?.code).toBe('ok');
+    for (const field of kind.fields.filter((item) => item.secret))
+      expect(created.text).not.toContain(String(values.fields[field.path]).trim());
+    if (kind.id === 'mail') {
+      // Numbers and switches arrive typed, optional blanks are left out, a password is not trimmed.
+      expect(body).toMatchObject({
+        provider: 'imap',
+        credentials: { password: '  spaced secret  ' },
+        mail: { imap: { port: 993, secure: true }, smtp: { port: 465, secure: true } },
+      });
+      expect(Object.keys((body.mail ?? {}) as object)).not.toContain('inbox');
+      expect(view.connection.scopes).toEqual([
+        'email.search',
+        'email.read',
+        'email.draft',
+        'email.discard',
+        'email.send',
+      ]);
+    }
+    if (kind.kind === 'mcp' || kind.kind === 'mcp_stdio')
+      expect(view.connection.scopes).toEqual(['mcp_notes.search', 'mcp_notes.add']);
+    if (kind.kind === 'mcp_stdio') {
+      // A variable's value is sent exactly as typed and never comes back.
+      expect(body).toMatchObject({
+        mcp_stdio: { secret_env: [{ name: 'NOTES_TOKEN', value: '  sealed variable  ' }] },
+      });
+      expect(created.text).not.toContain('sealed variable');
+      // An optional list left blank is left out rather than sent as an empty row.
+      const blank = emptyForm(kind);
+      for (const field of kind.fields)
+        if (field.input === 'list' && field.required)
+          blank.lists[field.path] = values.lists[field.path] ?? [];
+        else if (field.input !== 'list') blank.fields[field.path] = values.fields[field.path] ?? '';
+      expect(missing(kind, blank)).toBeNull();
+      expect(
+        (requestBody(kind, blank).mcp_stdio as Record<string, unknown>).secret_env,
+      ).toBeUndefined();
+    }
+  }
+
+  // Unticking a grant narrows the request; unticking all of them is caught before sending.
+  const mail = kinds.find((kind) => kind.id === 'mail');
+  if (!mail) throw new Error('Missing mail descriptor');
+  const narrowed = emptyForm(mail);
+  for (const [path, value] of Object.entries(TYPED))
+    if (path in narrowed.fields) narrowed.fields[path] = value;
+  narrowed.scopes['email.send'] = false;
+  expect(requestBody(mail, narrowed).scopes).toEqual([
+    'email.search',
+    'email.read',
+    'email.draft',
+    'email.discard',
+  ]);
+  for (const scope of Object.keys(narrowed.scopes)) narrowed.scopes[scope] = false;
+  expect(missing(mail, narrowed)).toBe('Choose at least one thing this connection may do.');
+});

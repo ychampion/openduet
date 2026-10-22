@@ -1,0 +1,42 @@
+/**
+ * A JSON call made the way the rest of the application makes them: the shared
+ * client's base URL and session cookie, and a { data, error, unavailable }
+ * result rather than a thrown exception. For routes that answer a plain body
+ * with no `not_available` arm to unwrap.
+ */
+import { API_BASE_URL, client, type Result } from './adapter.ts';
+import { instanceName } from './instance.ts';
+
+const offline = () => `Couldn’t reach ${instanceName()}. Check that the service is running.`;
+
+type Failure = { error?: { message?: string; code?: string } };
+
+export async function call<T>(
+  path: string,
+  init: { method?: string; body?: unknown } = {},
+): Promise<Result<T>> {
+  try {
+    const response = await client.options.fetch(`${API_BASE_URL}${path}`, {
+      method: init.method ?? 'GET',
+      headers: {
+        ...client.options.headers,
+        ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      credentials: client.options.credentials,
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+    });
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      const failure = (body as Failure | null)?.error;
+      return {
+        data: null,
+        error: failure?.message ?? offline(),
+        unavailable: null,
+        ...(failure?.code ? { code: failure.code } : {}),
+      };
+    }
+    return { data: body as T, error: null, unavailable: null };
+  } catch {
+    return { data: null, error: offline(), unavailable: null };
+  }
+}

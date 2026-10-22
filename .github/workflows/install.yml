@@ -1,0 +1,380 @@
+# Runs the one-line installer on a clean runner exactly as a person would:
+# downloaded from this commit's raw URL and piped to bash, into a directory with
+# no checkout of the repository in it and no Bun on its PATH. It pulls the
+# published images, starts them, checks the web app and the API, creates the
+# first account, turns on the browser worker by running the installer again with
+# OPENDUET_BROWSER=1, asks `doctor` in the service container for the worker's
+# state, then runs the plain installer once more to show a later run keeps
+# deploy/.env, the data and the worker. The first run prints a one-time setup
+# code and keeps only its SHA-256 in deploy/.env; the account is made with it.
+# A second installation then runs beside the first, under umask 077, with a
+# project name and ports of its own, after one without them is refused and
+# leaves nothing behind. Last, the first installation is moved to another
+# folder and run from there, and keeps its containers and its data.
+# On a pull request the published images
+# are main's, so this pull request's images are built and served under the same
+# names from a registry on the runner, as the setup-guide workflow does. No
+# secret is read.
+name: Install
+
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - install.ps1
+      - .github/workflows/install.yml
+      - deploy/docker-compose.browser.yml
+      - packages/cli/src/browser.ts
+      - packages/cli/src/commands/browser.ts
+      - packages/cli/src/commands/browser-files.ts
+      - packages/cli/src/commands/doctor.ts
+      - apps/openduet/src/workers/browser/enable.ts
+  workflow_run:
+    workflows: [Images]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Check install.sh with shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck install.sh
+
+  install:
+    name: Install with the one-line command on a clean machine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    env:
+      # The commit under test, so the script and the files it downloads are this commit's.
+      REF: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
+      # Compose reads this before deploy/.env, so a pull request's install pulls its own images.
+      OPENDUET_IMAGE_REGISTRY: ${{ github.event_name == 'pull_request' && 'localhost:5000' || '' }}
+    steps:
+      # The checkout is only for the image builds; the installer runs from its
+      # URL into ~/openduet, away from it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+      - name: Build this pull request's images and serve them as main's
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          docker run -d --name install-registry -p 127.0.0.1:5000:5000 registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          docker build -f deploy/Dockerfile.openduet -t localhost:5000/openduet-service:main .
+          docker build -f deploy/Dockerfile.web --build-arg VITE_OPENDUET_API=/api -t localhost:5000/openduet-web:main .
+          docker build -t localhost:5000/openduet-runtime:main packages/runtime-hermes
+          docker build -f deploy/Dockerfile.browser -t localhost:5000/openduet-browser:main .
+          for image in service web runtime browser; do
+            docker push "localhost:5000/openduet-$image:main"
+            # Removed here, so the installer's own pull is what puts them back.
+            docker image rm "localhost:5000/openduet-$image:main"
+          done
+          # The agents' computer image, which a new installation pulls too, is
+          # main's: served under the same name rather than built here.
+          docker pull ghcr.io/ychampion/openduet-sandbox:main
+          docker tag ghcr.io/ychampion/openduet-sandbox:main localhost:5000/openduet-sandbox:main
+          docker push localhost:5000/openduet-sandbox:main
+          docker image rm localhost:5000/openduet-sandbox:main ghcr.io/ychampion/openduet-sandbox:main
+      # The published worker image may not be readable without signing in yet. The
+      # installer then runs the copy already on the machine, so one is built here
+      # under the published name, from the commit the images were built from.
+      - name: Have the published browser worker image, or build it under that name
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          image=ghcr.io/ychampion/openduet-browser:main
+          if docker pull "$image"; then
+            echo "pulled $image"
+          else
+            echo "::notice::$image could not be pulled; building it here under that name"
+            docker build -f deploy/Dockerfile.browser -t "$image" .
+          fi
+      - name: Hide Bun from the installer
+        run: |
+          set -euo pipefail
+          # Every later step runs with a PATH that holds no bun, as on a host that never installed it.
+          nobun="$(printf '%s' "$PATH" | tr ':' '\n' | while read -r dir; do [ -x "$dir/bun" ] || printf '%s:' "$dir"; done)"
+          echo "PATH=${nobun%:}" >> "$GITHUB_ENV"
+          (PATH="${nobun%:}" && command -v docker curl jq openssl)
+      - name: Run the installer as a person would
+        run: |
+          set -euo pipefail
+          if command -v bun; then echo "bun is on the PATH"; exit 1; fi
+          # No provider key is in this environment, so it starts with the practice model.
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/first.log"
+          # The worker is off, so the closing lines name the command that turns it
+          # on, with the option on the bash side of the pipe where the installer reads it.
+          grep -F 'install.sh | OPENDUET_BROWSER=1 bash' "$RUNNER_TEMP/first.log"
+          # A new installation gives every agent a computer of its own.
+          grep -Fx 'Every agent has a computer of its own, a container on this Docker engine.' "$RUNNER_TEMP/first.log"
+          grep -qx 'OPENDUET_SANDBOX_PROVIDER=docker' "$HOME/openduet/deploy/.env"
+          grep -qx 'COMPOSE_PROFILES=sandbox' "$HOME/openduet/deploy/.env"
+      - name: The web app and the API answer
+        run: |
+          set -euo pipefail
+          curl -fsS -o /dev/null http://localhost:3101/
+          health="$(curl -fsS http://localhost:3101/api/health)"
+          echo "$health"
+          echo "$health" | jq -e '.status == "ok" and .database == "ok"'
+          grep -q '^OPENDUET_DEFAULT_PROVIDER=fake$' "$HOME/openduet/deploy/.env"
+          test "$(stat -c %a "$HOME/openduet/deploy/.env")" = 600
+      - name: deploy/.env keeps only the setup code's hash, and it is the printed code's
+        run: |
+          set -euo pipefail
+          env_file="$HOME/openduet/deploy/.env"
+          test "$(grep -c '^OPENDUET_SETUP_CODE_HASH=' "$env_file")" = 1
+          # It stands where the template's commented line was, as `openduet init` writes it.
+          test "$(grep -c 'OPENDUET_SETUP_CODE_HASH' "$env_file")" = 1
+          hash="$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          code="$(sed -n 's|^Open http[^ ]*/#/welcome?code=\([A-Z0-9-]*\) to create your account$|\1|p' "$RUNNER_TEMP/first.log")"
+          [[ "$code" =~ ^[A-HJKMNP-TV-Z2-9]{4}(-[A-HJKMNP-TV-Z2-9]{4}){4}$ ]]
+          plain="${code//-/}"
+          if grep -rqF -e "$code" -e "$plain" "$HOME/openduet"; then
+            echo "the plain setup code was written to a file"
+            exit 1
+          fi
+          test "$(printf '%s' "$plain" | sha256sum | cut -d ' ' -f 1)" = "$hash"
+          # The installer's own hash agrees with the service's setupCodeHash() on
+          # a fixed code typed loosely (apps/openduet/src/api/setup-code.test.ts).
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | sed '$d' > "$RUNNER_TEMP/install-functions.sh"
+          fixed="$(source "$RUNNER_TEMP/install-functions.sh" && setup_code_hash ' abcd efgh-jkmn pqrs tvwx ')"
+          test "$fixed" = 8582f0401bebbf68f0492d9590c5b80f40e8f33a29c45cfd13e185b2eb4c0170
+          # A hash line written another way is still found, so a later run keeps it.
+          mkdir -p "$RUNNER_TEMP/state"
+          state() { printf '%s\n' "$1" > "$RUNNER_TEMP/state/.env" && (source "$RUNNER_TEMP/install-functions.sh" && DEPLOY="$RUNNER_TEMP/state" setup_code_state); }
+          test "$(state "export OPENDUET_SETUP_CODE_HASH=$hash")" = set
+          test "$(state "  OPENDUET_SETUP_CODE_HASH = \"$hash\"")" = set
+          # An empty one, as older templates shipped it, is no hash: it gets a code.
+          test "$(state 'OPENDUET_SETUP_CODE_HASH=')" = missing
+          test "$(state 'OPENDUET_SETUP_CODE_HASH=""')" = missing
+          test "$(state "OPENDUET_SETUP_CODE_HASH=$hash"$'\n''OPENDUET_SETUP_CODE_HASH=')" = missing
+          test "$(state 'OPENDUET_IMAGE_TAG=main')" = missing
+          # The service's own setupCodeHash() gives the printed code the same hash.
+          compose=(docker compose -f "$HOME/openduet/deploy/docker-compose.yml")
+          service="$(printf '%s' "$code" | "${compose[@]}" exec -T openduet bun -e \
+            "import { setupCodeHash } from './apps/openduet/src/api/setup-code.ts'; process.stdout.write(setupCodeHash(await Bun.stdin.text()))")"
+          test "$service" = "$hash"
+      - name: An installation made before setup codes gets one on its next run
+        run: |
+          set -euo pipefail
+          env_file="$HOME/openduet/deploy/.env"
+          before="$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")"
+          # As an older installer left it: no hash at all.
+          sed -i '/^OPENDUET_SETUP_CODE_HASH=/d' "$env_file"
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/upgrade.log"
+          test "$(grep -c '^OPENDUET_SETUP_CODE_HASH=' "$env_file")" = 1
+          hash="$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          test "$hash" != "$before"
+          test "$(stat -c %a "$env_file")" = 600
+          code="$(sed -n 's|^Open http[^ ]*/#/welcome?code=\([A-Z0-9-]*\) to create your account$|\1|p' "$RUNNER_TEMP/upgrade.log")"
+          [[ "$code" =~ ^[A-HJKMNP-TV-Z2-9]{4}(-[A-HJKMNP-TV-Z2-9]{4}){4}$ ]]
+          if grep -rqF -e "$code" -e "${code//-/}" "$HOME/openduet"; then
+            echo "the plain setup code was written to a file"
+            exit 1
+          fi
+          test "$(printf '%s' "${code//-/}" | sha256sum | cut -d ' ' -f 1)" = "$hash"
+          # From here on, this run's code is the installation's.
+          cp "$RUNNER_TEMP/upgrade.log" "$RUNNER_TEMP/first.log"
+      - name: OPENDUET_SETUP_OPEN=true makes no code, and an empty hash otherwise gets one
+        run: |
+          set -euo pipefail
+          env_file="$HOME/openduet/deploy/.env"
+          before="$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")"
+          # Open setup: no code is made, even with no hash.
+          sed -i 's/^OPENDUET_SETUP_CODE_HASH=.*/OPENDUET_SETUP_CODE_HASH=/' "$env_file"
+          printf 'OPENDUET_SETUP_OPEN=true\n' >> "$env_file"
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/open.log"
+          grep -qx 'OPENDUET_SETUP_CODE_HASH=' "$env_file"
+          if grep -F 'welcome?code=' "$RUNNER_TEMP/open.log"; then exit 1; fi
+          grep -F 'Setup is open: with OPENDUET_SETUP_OPEN=true' "$RUNNER_TEMP/open.log"
+          # Without it, the empty hash, as older templates shipped it, gets a
+          # code; so does one followed by a later empty line, which Compose reads.
+          sed -i '/^OPENDUET_SETUP_OPEN=/d' "$env_file"
+          sed -i "s/^OPENDUET_SETUP_CODE_HASH=.*/OPENDUET_SETUP_CODE_HASH=$before/" "$env_file"
+          printf 'OPENDUET_SETUP_CODE_HASH=\n' >> "$env_file"
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/empty.log"
+          test "$(grep -c 'OPENDUET_SETUP_CODE_HASH' "$env_file")" = 1
+          hash="$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          test "$hash" != "$before"
+          test "$(stat -c %a "$env_file")" = 600
+          code="$(sed -n 's|^Open http[^ ]*/#/welcome?code=\([A-Z0-9-]*\) to create your account$|\1|p' "$RUNNER_TEMP/empty.log")"
+          [[ "$code" =~ ^[A-HJKMNP-TV-Z2-9]{4}(-[A-HJKMNP-TV-Z2-9]{4}){4}$ ]]
+          if grep -rqF -e "$code" -e "${code//-/}" "$HOME/openduet"; then
+            echo "the plain setup code was written to a file"
+            exit 1
+          fi
+          test "$(printf '%s' "${code//-/}" | sha256sum | cut -d ' ' -f 1)" = "$hash"
+          grep -qx 'Set OPENDUET_SETUP_OPEN=true only if the first visitor should be allowed to create the owner without a code.' "$RUNNER_TEMP/empty.log"
+          cp "$RUNNER_TEMP/empty.log" "$RUNNER_TEMP/first.log"
+          # The next run keeps that hash and prints no code.
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/back.log"
+          test "$(sed -n 's/^OPENDUET_SETUP_CODE_HASH=//p' "$env_file")" = "$hash"
+          if grep -F 'welcome?code=' "$RUNNER_TEMP/back.log"; then exit 1; fi
+      - name: Create the owner account with the setup code, as the person does in the browser
+        run: |
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          code="$(sed -n 's|^Open http[^ ]*/#/welcome?code=\([A-Z0-9-]*\) to create your account$|\1|p' "$RUNNER_TEMP/first.log")"
+          curl -fsS http://localhost:3101/api/setup | jq -e '.needed == true and .code_required == true'
+          # Without the code, or with another, the first account is refused.
+          status="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3101/api/setup \
+            -H 'content-type: application/json' \
+            -d "{\"email\":\"owner@example.com\",\"password\":\"$password\"}")"
+          echo "setup without the code answered $status"
+          test "$status" = 403
+          status="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3101/api/setup \
+            -H 'content-type: application/json' \
+            -d "{\"email\":\"owner@example.com\",\"password\":\"$password\",\"setup_code\":\"ABCD-EFGH-JKMN-PQRS-TVWX\"}")"
+          echo "setup with another code answered $status"
+          test "$status" = 403
+          # Typed loosely, the printed code makes the account.
+          loose="$(printf '%s' "$code" | tr '[:upper:]' '[:lower:]' | tr - ' ')"
+          curl -fsS -X POST http://localhost:3101/api/setup \
+            -H 'content-type: application/json' \
+            -d "{\"email\":\"owner@example.com\",\"password\":\"$password\",\"setup_code\":\"$loose\"}" > /dev/null
+          curl -fsS http://localhost:3101/api/setup | jq -e '.needed == false'
+      - name: Turn on the browser worker with the installer, without Bun
+        run: |
+          set -euo pipefail
+          if command -v bun; then echo "bun is on the PATH"; exit 1; fi
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" OPENDUET_BROWSER=1 bash
+          deploy="$HOME/openduet/deploy"
+          grep -q '^OPENDUET_BROWSER_SPACE=sp_' "$deploy/.env"
+          grep -Eq '^OPENDUET_BROWSER_TOKEN=[0-9a-f]{64}$' "$deploy/.env"
+          test "$(stat -c %a "$deploy/.env")" = 600
+          jq -e '.overlays == ["browser"]' "$deploy/openduet.deploy.json"
+          jq -e 'map(select(.kind == "browser" and (.id | startswith("conn_")))) | length == 1' "$deploy/config/connections.json"
+      - name: Doctor in the service container reports the worker, and the worker is healthy
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f "$HOME/openduet/deploy/docker-compose.yml" -f "$HOME/openduet/deploy/docker-compose.browser.yml")
+          # The container has no Docker socket, so the host's rules are skipped and doctor passes.
+          code=0
+          "${compose[@]}" exec -T openduet bun run openduet doctor --offline --json > "$RUNNER_TEMP/doctor.json" || code=$?
+          jq '.results[] | select(.id | startswith("browser.") or . == "docker.engine")' "$RUNNER_TEMP/doctor.json"
+          jq -e '[.results[] | select(.id == "browser.worker")] | length == 1 and .[0].level == "ok"' "$RUNNER_TEMP/doctor.json"
+          jq -e '.ok and ([.results[] | select(.id == "docker.engine")] | length == 1 and .[0].level == "skip")' "$RUNNER_TEMP/doctor.json"
+          test "$code" = 0
+          worker="$("${compose[@]}" ps -q browser)"
+          test -n "$worker"
+          state="$(docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' "$worker")"
+          echo "browser worker: $state"
+          test "$state" = 'running healthy'
+      - name: Running it again keeps deploy/.env, the data and the browser worker
+        run: |
+          set -euo pipefail
+          deploy="$HOME/openduet/deploy"
+          before="$(cat "$deploy/.env" "$deploy/openduet.deploy.json" "$deploy/config/connections.json" | sha256sum)"
+          # Turning it on again changes nothing.
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" OPENDUET_BROWSER=1 bash
+          test "$before" = "$(cat "$deploy/.env" "$deploy/openduet.deploy.json" "$deploy/config/connections.json" | sha256sum)"
+          # A plain run keeps the worker, and prints no new setup code.
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh" | OPENDUET_REF="$REF" bash | tee "$RUNNER_TEMP/later.log"
+          if grep -F 'welcome?code=' "$RUNNER_TEMP/later.log"; then exit 1; fi
+          test "$before" = "$(cat "$deploy/.env" "$deploy/openduet.deploy.json" "$deploy/config/connections.json" | sha256sum)"
+          curl -fsS http://localhost:3101/api/health | jq -e '.status == "ok" and .database == "ok"'
+          # The worker survived --remove-orphans, and is healthy beside the service.
+          compose=(docker compose -f "$deploy/docker-compose.yml" -f "$deploy/docker-compose.browser.yml")
+          worker="$("${compose[@]}" ps -q browser)"
+          test -n "$worker"
+          state="$(docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' "$worker")"
+          echo "browser worker: $state"
+          test "$state" = 'running healthy'
+          "${compose[@]}" exec -T openduet bun run openduet doctor --offline --json > "$RUNNER_TEMP/doctor.json" || true
+          jq -e '.results[] | select(.id == "browser.worker") | .level == "ok"' "$RUNNER_TEMP/doctor.json"
+          # The owner made before the later runs is still there, so setup is refused.
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3101/api/setup \
+            -H 'content-type: application/json' \
+            -d '{"email":"other@example.com","password":"another-password-1"}')"
+          echo "second setup answered $code"
+          test "$code" -ge 400
+      - name: A second installation needs its own name, and runs beside the first under umask 077
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh"
+          # With the first one's project name it would take over the first one's
+          # containers, so it is refused before deploy/.env is written.
+          if curl -fsSL "$url" | OPENDUET_REF="$REF" OPENDUET_DIR="$HOME/openduet2" bash > "$RUNNER_TEMP/second-refused.log" 2>&1; then
+            echo "a second installation started under the first one's project"
+            exit 1
+          fi
+          grep -F 'already runs as the Compose project openduet' "$RUNNER_TEMP/second-refused.log"
+          grep -F "OPENDUET_DIR='$HOME/openduet2'" "$RUNNER_TEMP/second-refused.log"
+          # Refused before anything was downloaded, so nothing is left behind.
+          test ! -e "$HOME/openduet2"
+          # Under umask 077 every file it downloads would be its owner's alone;
+          # the service reads deploy/config as another user.
+          (umask 077 && curl -fsSL "$url" | OPENDUET_REF="$REF" OPENDUET_DIR="$HOME/openduet2" \
+            OPENDUET_PROJECT=openduet2 OPENDUET_PORT=3200 OPENDUET_WEB_PORT=3201 OPENDUET_COMPUTER=0 bash) | tee "$RUNNER_TEMP/second.log"
+          grep -Fx 'OpenDuet is running at http://localhost:3201' "$RUNNER_TEMP/second.log"
+          grep -F 'install.sh | OPENDUET_DIR=' "$RUNNER_TEMP/second.log" | grep -F 'OPENDUET_COMPUTER=1 bash'
+          env_file="$HOME/openduet2/deploy/.env"
+          grep -qx 'COMPOSE_PROJECT_NAME=openduet2' "$env_file"
+          grep -qx 'OPENDUET_SANDBOX_PROVIDER=' "$env_file"
+          test "$(stat -c %a "$env_file")" = 600
+          test "$(stat -c %a "$HOME/openduet2/deploy/config")" = 755
+          test "$(stat -c %a "$HOME/openduet2/deploy/config/connections.json")" = 644
+          curl -fsS http://localhost:3201/api/health | jq -e '.status == "ok" and .database == "ok"'
+          # The first installation is untouched and still answers.
+          curl -fsS http://localhost:3101/api/health | jq -e '.status == "ok" and .database == "ok"'
+          docker compose -f "$HOME/openduet2/deploy/docker-compose.yml" down -v --remove-orphans
+          curl -fsS http://localhost:3101/api/health | jq -e '.status == "ok" and .database == "ok"'
+      - name: A moved installation keeps its containers, and a copy beside the original is refused
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/${{ github.repository }}/$REF/install.sh"
+          # A folder with the first one's deploy/.env, while the first one is still where it was,
+          # is a second installation under the same name.
+          mkdir -p "$HOME/openduet-copy/deploy"
+          cp "$HOME/openduet/deploy/.env" "$HOME/openduet-copy/deploy/.env"
+          if curl -fsSL "$url" | OPENDUET_REF="$REF" OPENDUET_DIR="$HOME/openduet-copy" bash > "$RUNNER_TEMP/copy.log" 2>&1; then
+            echo "a copy beside the original took over its containers"
+            exit 1
+          fi
+          grep -F "Another installation, in $HOME/openduet/deploy" "$RUNNER_TEMP/copy.log"
+          test ! -e "$HOME/openduet-copy/deploy/docker-compose.yml"
+          rm -rf "$HOME/openduet-copy"
+          # Moved, it is the same installation: its own containers are taken over, with its data.
+          mv "$HOME/openduet" "$HOME/openduet-moved"
+          curl -fsSL "$url" | OPENDUET_REF="$REF" OPENDUET_DIR="$HOME/openduet-moved" bash | tee "$RUNNER_TEMP/moved.log"
+          grep -F "were started from $HOME/openduet/deploy" "$RUNNER_TEMP/moved.log"
+          if grep -F 'welcome?code=' "$RUNNER_TEMP/moved.log"; then exit 1; fi
+          curl -fsS http://localhost:3101/api/health | jq -e '.status == "ok" and .database == "ok"'
+          docker ps --filter label=com.docker.compose.project=openduet \
+            --format '{{.Label "com.docker.compose.project.working_dir"}}' | sort -u | tee "$RUNNER_TEMP/moved-dirs.txt"
+          # Compose recreates only the containers whose settings changed with the folder; the rest
+          # keep the folder they were started from, which no longer holds an installation.
+          grep -qx "$HOME/openduet-moved/deploy" "$RUNNER_TEMP/moved-dirs.txt"
+          if grep -vx -e "$HOME/openduet-moved/deploy" -e "$HOME/openduet/deploy" "$RUNNER_TEMP/moved-dirs.txt"; then exit 1; fi
+          # And a later run from the new folder still counts them as its own.
+          curl -fsSL "$url" | OPENDUET_REF="$REF" OPENDUET_DIR="$HOME/openduet-moved" bash > "$RUNNER_TEMP/moved-again.log"
+          curl -fsS http://localhost:3101/api/health | jq -e '.status == "ok" and .database == "ok"'
+      - name: Logs
+        if: failure()
+        run: |
+          for deploy in "$HOME/openduet/deploy" "$HOME/openduet-moved/deploy"; do
+            [ ! -f "$deploy/docker-compose.yml" ] || docker compose -f "$deploy/docker-compose.yml" logs --tail=100 || true
+          done
+          docker logs --tail=100 "$(docker ps -aq --filter label=com.docker.compose.service=browser | head -n1)" || true
+      - name: Remove it
+        if: always()
+        run: |
+          for deploy in "$HOME/openduet/deploy" "$HOME/openduet-moved/deploy" "$HOME/openduet2/deploy"; do
+            [ ! -f "$deploy/docker-compose.yml" ] || docker compose -f "$deploy/docker-compose.yml" down -v --remove-orphans || true
+          done
+          docker rm -f install-registry || true

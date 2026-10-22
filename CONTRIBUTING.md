@@ -1,0 +1,157 @@
+# Contributing
+
+For a substantial change, open an issue or a draft pull request first that says
+what should happen and why. Report a security problem privately, as described in
+[SECURITY](SECURITY.md), rather than in an issue.
+
+## Set up and verify
+
+Use Bun 1.3 or newer. From the repository root:
+
+```bash
+bun install --frozen-lockfile
+bun run doctor
+bun run typecheck
+bun run lint
+bun run test
+bun run openapi
+bun run client:generate
+bun run compose:check
+bun run browser:compose:check
+bun run tailscale:compose:check
+bun run conformance
+bun run conformance:memory
+bun run test:plugin
+```
+
+Run `bun run doctor` first: it names each missing test prerequisite. Tests use
+scripted providers, so no model key is needed.
+
+Database tests use disposable Postgres 17: embedded when `DATABASE_URL` is
+unset, otherwise disposable databases created on the server you supply, which
+needs permission to create databases. On Linux, point `DATABASE_URL` at a
+Postgres 17 you control: the embedded build needs `libpq5` and an ICU 60
+runtime that current Debian and Ubuntu ship without. Run tests as a non-root
+user with a writable `TMPDIR`; embedded Postgres refuses to start as root. On
+Windows, clone to a short path such as `C:\m`: the embedded server's own files
+sit about 145 characters below the clone, and once a path passes Windows'
+260-character limit its `initdb` says `pg_ident.conf.sample` is missing when the
+file is there.
+
+`bun run test:plugin` needs `uv` on `PATH`. The two integration tests that start
+an interpreter use `OPENDUET_PYTHON`, then `python3`, then `python`. Install
+Chromium with `bunx playwright install chromium` for the browser fixtures, and
+run the suites one at a time on small machines.
+
+`bun run lint` is Biome over the whole tree followed by `bun run scrub:check`,
+which refuses local paths and internal work codes in tracked files. The OpenAPI
+document and the client declarations are generated: run `bun run openapi` and
+`bun run client:generate` when you change a contract, and commit the result.
+
+### Work on the interface
+
+Run the scripted mock and the web app:
+
+```bash
+MOCK_PORT=3210 bun run dev:mock
+bun run dev:web
+```
+
+Then open http://localhost:5180. Set `OPENDUET_MOCK_SETUP=needed` to start the
+mock as a fresh install that asks for its first account, or
+`OPENDUET_MOCK_FIRST_RUN=on` for a person's very first visit: a fresh install
+with nothing connected, seeded or waiting, so setup and Home's first steps show
+as a new person sees them.
+[Building a client](docs/CLIENT.md) describes the scenarios the mock plays.
+
+### Run the agent runtime locally
+
+Install the runtime and select the process supervisor; the service then starts
+memory, the broker and one engine per attempt on this machine:
+
+```bash
+git clone --depth 1 --branch v2026.9.7 https://github.com/NousResearch/hermes-agent.git .hermes-src
+uv venv .hermes-venv --python 3.12
+# Windows: replace .hermes-venv/bin/python with .hermes-venv/Scripts/python.exe.
+uv pip install --python .hermes-venv/bin/python -e ./.hermes-src aiohttp==3.14.3
+export OPENDUET_RUNTIME_ADAPTER=hermes OPENDUET_RUNTIME_SUPERVISOR=process
+export OPENDUET_SPACES_DIR="$PWD/spaces" OPENDUET_WORK_DIR="$PWD/work"
+export OPENDUET_BROKER_BIND=127.0.0.1:3172 OPENDUET_BROKER_URL=http://127.0.0.1:3172 PORT=3170
+# Configure DATABASE_URL, OPENDUET_CAPABILITY_KEY, OPENDUET_APPROVAL_KEY and a provider key.
+bun run apps/openduet/src/index.ts
+```
+
+The process supervisor runs with your own user's access, for development; the
+sandboxed path is the Docker install. The scripted end-to-end run needs no
+provider key:
+
+```bash
+bun test apps/openduet/test/integration/wired-assistant.test.ts --max-concurrency=1
+```
+
+[Service conformance](conformance/README.md) and
+[memory conformance](conformance/memory/README.md) describe each scenario and
+how to run the deployment scenarios against a Compose stack.
+
+## Where things live
+
+| Path | What it holds |
+| --- | --- |
+| `apps/openduet` | The service: jobs, broker, memory, connectors and model metering |
+| `apps/web` | The web app |
+| `apps/mock-api` | The scripted mock the web app can run against |
+| `packages/contracts` | Schemas, state transitions and the generated OpenAPI document |
+| `packages/client` | The typed client |
+| `packages/runtime-hermes` | Runtime configuration, the OpenDuet plugin, the HTTP adapter and the runtime image |
+| `packages/knowledge`, `packages/skills` | File-view utilities and skill files |
+| `deploy` | Compose files, `.env.example`, the configuration generator and the deployment checks |
+| `conformance` | Service scenarios and [memory scenario families](conformance/memory/README.md) |
+| `docs` | The documentation |
+| `.agents/notes` | Engineering decisions and the evidence behind them |
+
+## Sending a change
+
+- Test behaviour at its boundaries: a stale attempt, an approval spent on
+  changed content, a send whose outcome is unknown.
+- Explain a change to the tool surface, prompts or budgets with what you
+  measured.
+- Record an architectural decision as a new note under `.agents/notes`; leave
+  earlier notes as they are.
+- Keep static configuration checks and inside-container probes apart: the
+  container scenarios run against a real Compose stack.
+
+Write commit messages as plain sentences. In the pull request, say what changed,
+how it behaves, and which suites you ran.
+
+## When main fails
+
+Two pull requests can each pass on their own and fail together once both are
+on main. Three things deal with that.
+
+- **An issue opens by itself.** After every run of CI, Conformance, Images,
+  Install and Setup guide on main, the Main health workflow checks the result.
+  On a failure it opens one issue per workflow, titled
+  `main is failing: <workflow> / <job>` and labelled `main-failing`. It names
+  the commit, the run, the failed job and step, the end of the step's log, the
+  last commit the workflow passed on, and the pull requests merged since then;
+  the cause is usually among those. A later failure updates the same issue.
+  When the same jobs pass on main again, the issue is closed with the commit
+  that fixed it.
+- **An automatic fix, if you turn it on.** Add an `ANTHROPIC_API_KEY`
+  repository secret and Main health also asks Claude to reproduce the failure
+  at the failing commit, find the cause among the merged pull requests and fix
+  it. The fix arrives as a pull request from a `fix/main-<short sha>` branch,
+  labelled `main-autofix`, that points at the issue. It is never pushed to
+  main and never merged: review it like any other pull request. A pull request
+  opened with the workflow's own token does not start CI, so close and reopen
+  it, or push to its branch, to run the checks. Only one automatic fix runs at
+  a time, and none starts while a `main-autofix` pull request is open. Without
+  the secret this step is skipped.
+- **Stale branches are stopped early.** The Base is current check fails a pull
+  request when main has changed `install.sh`, `deploy/`, `.github/workflows/`,
+  `apps/openduet/drizzle/` or `packages/contracts/` since the branch was cut.
+  Merge main into the branch so CI tests it against current main.
+
+## Licence
+
+Contributions are licensed under Apache-2.0, as described in [LICENSE](LICENSE).

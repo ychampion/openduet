@@ -1,0 +1,182 @@
+# Builds the five shipped images and publishes them to the GitHub Container
+# Registry, so an installation can pull finished images instead of building
+# (docs/DEPLOYMENT.md, "Using prebuilt images").
+#
+# Each image is pushed first under the short commit only. The moving `main` tag,
+# and a release's version tag, are added in a last step once all five exist, so
+# a host that pulls `main` never gets a service from one commit and an engine,
+# or a browser worker, from another. A pull request that changes this file builds the same images
+# without signing in or pushing. deploy/scripts/images-workflow.test.ts checks
+# this file.
+name: Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/images.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.ref }}
+  # A publish runs to the end, so the moving tags never stop half moved; a
+  # pull request's dry run gives way to a newer push.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The runtime image asserts its plugin digest during the build. This names a
+  # stale pin, and every other boundary check, before any build starts.
+  check:
+    name: Compose and pin checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      # Downloads are kept between runs, so a run fetches only what the lockfile changed.
+      - name: Cache Bun's downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      # A stalled registry download is cut off and retried rather than holding the job until
+      # its own limit; a normal install takes seconds.
+      - name: Install dependencies
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 120 bun install --frozen-lockfile && exit 0
+            echo "::warning::dependency install attempt $attempt of 3 did not finish"
+            [ "$attempt" = 3 ] || sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Compose boundary and plugin pin checks
+        run: bun run compose:check
+      # The OpenDuet images switch together: built names without a tag, the
+      # published names with one. The browser worker's file names Compose's own
+      # build name without a tag.
+      - name: Compose names the published images when a tag is set
+        env:
+          POSTGRES_PASSWORD: check
+          DATABASE_URL: postgres://check
+          OPENDUET_MASTER_KEY: check
+          OPENDUET_CAPABILITY_KEY: check
+          OPENDUET_APPROVAL_KEY: check
+          OPENDUET_RUNTIME_KEY: check
+          DOCKER_GID: '0'
+          OPENDUET_BROWSER_SPACE: sp_check
+          OPENDUET_BROWSER_TOKEN: check-check-check-check-check-check
+        run: |
+          compose=(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.browser.yml --profile sandbox)
+          built="$("${compose[@]}" config --images | sort -u)"
+          published="$(OPENDUET_IMAGE_TAG=check "${compose[@]}" config --images | sort -u)"
+          printf '%s\n' "$built" "$published"
+          test "$(grep -c '^openduet-[a-z]*:local$' <<<"$built")" = 4
+          grep -qE '^openduet-browser(:latest)?$' <<<"$built"
+          test "$(grep -c '^ghcr.io/ychampion/openduet-[a-z]*:check$' <<<"$published")" = 5
+
+  build:
+    name: Build ${{ matrix.image }}
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: openduet-service
+            context: .
+            file: deploy/Dockerfile.openduet
+          - image: openduet-web
+            context: .
+            file: deploy/Dockerfile.web
+          - image: openduet-runtime
+            context: packages/runtime-hermes
+            file: packages/runtime-hermes/Dockerfile
+          - image: openduet-sandbox
+            context: .
+            file: deploy/Dockerfile.sandbox
+          - image: openduet-browser
+            context: .
+            file: deploy/Dockerfile.browser
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Name the image
+        id: name
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "ref=ghcr.io/${owner}/${{ matrix.image }}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Sign in to the GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, and push under the commit
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          build-args: |
+            VITE_OPENDUET_API=/api
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.name.outputs.ref }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # Moves `main`, or adds the release's version, to the commit's five images
+  # together, after every one of them is in the registry. A manual run on
+  # another branch publishes under its commit only.
+  publish:
+    name: Tag the published images
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag openduet-service, openduet-web, openduet-runtime, openduet-sandbox and openduet-browser
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          commit="${GITHUB_SHA::7}"
+          if [ "$REF_TYPE" = tag ]; then
+            case "$REF_NAME" in
+              v[0-9]*) moving="$REF_NAME" ;;
+              *) echo "::error::not a version tag: $REF_NAME"; exit 1 ;;
+            esac
+          else
+            moving=main
+          fi
+          for image in openduet-service openduet-web openduet-runtime openduet-sandbox openduet-browser; do
+            source="ghcr.io/${owner}/${image}:${commit}"
+            docker buildx imagetools create --tag "ghcr.io/${owner}/${image}:${moving}" "$source"
+            echo "${source} -> ${moving}"
+          done

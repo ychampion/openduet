@@ -1,0 +1,2059 @@
+/**
+ * Sign-in and the guided setup on the contract: a password, or an emailed link
+ * when the service says it can send one, the first account (with the
+ * installation's setup code when it has one), the tour (only stages this
+ * instance can do), plugging in apps, meeting OpenDuet, and saving four answers
+ * as memory before opening a conversation that refers to one of them.
+ */
+
+import { suggestedConnections } from '@openduet/contracts/agent-library';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { AgentFace } from '../design/face.tsx';
+import { Icon } from '../design/icons.tsx';
+import { LoadError } from '../design/LoadError.tsx';
+import { Logo } from '../design/logos.tsx';
+import { OpenDuetAvatar, OpenDuetMark } from '../design/mark.tsx';
+import { Button, Chip, Field, Input, Segmented, Select, Toggle } from '../design/primitives.tsx';
+import { NEW_PASSWORD_MIN } from '../experience/account.ts';
+import { adapter } from '../experience/adapter.ts';
+import { lookOf, messageKey, useApp, useLoad, useMedia } from '../experience/hooks.ts';
+import { assistantName, instanceName } from '../experience/instance.ts';
+import { plainSchedule, zoneName } from '../experience/plain.ts';
+import { givenName, onboardedProfile, UNNAMED } from '../experience/profile.ts';
+import { keptAnswer, SETUP_QUESTIONS, SKIP_REPLY } from '../experience/setup-answers.ts';
+import { browserTimeZone, setupTimeZone, timeZoneChoices } from '../experience/timezone.ts';
+import type { AgentTemplate, Automation, MemoryItem, TourStage } from '../experience/types.ts';
+import { models } from '../models/api.ts';
+import { ActiveModel, ModelConnect } from '../models/ModelConnect.tsx';
+import { linkParam, navigate, useRoute } from '../router.ts';
+import { toast } from '../shell/Shell.tsx';
+import { inputOf } from './Agents.tsx';
+import { TopPicks } from './ConnectionInstall.tsx';
+import { BRIEF_DEFAULT_AT, BriefChoices, BriefParts, clockWords } from './MorningBrief.tsx';
+
+const studio = {
+  background: 'var(--studio)',
+  backgroundImage:
+    'radial-gradient(ellipse at 50% 0%, #2f5fd626, transparent 60%), linear-gradient(#ffffff07 1px, transparent 1px), linear-gradient(90deg, #ffffff07 1px, transparent 1px)',
+  backgroundSize: '100% 100%, 24px 24px, 24px 24px',
+  border: '1px solid var(--studio-line)',
+  color: 'var(--studio-text)',
+} as const;
+
+const NOVA = { color: '#4aa3f7', eyes: 'white', shape: 'blob', image: null } as const;
+const SAGE = { color: '#5ab4a0', eyes: 'black', shape: 'octagon', image: null } as const;
+const ATLAS = { color: '#ec8a2b', eyes: 'white', shape: 'diamond', image: null } as const;
+
+/* ---------- sign in ---------- */
+
+/** What a sign-in through the identity provider that came back refused says, by its code. */
+const OIDC_ERRORS: Record<string, string> = {
+  provider_unavailable: 'Couldn’t reach your identity provider. Try again in a moment.',
+  signin_expired: 'That sign-in took too long or was already used. Try again.',
+  signin_declined: 'Sign-in was cancelled at your identity provider.',
+  signin_failed: 'Sign-in didn’t work. Try again.',
+  email_unverified: 'Your identity provider hasn’t confirmed your email address yet.',
+  not_allowed: 'Your account at the identity provider isn’t allowed into this OpenDuet.',
+  no_account: 'There’s no account here for that email. Ask whoever runs this OpenDuet to add you.',
+  account_disabled: 'This account is turned off. Ask whoever runs this OpenDuet.',
+  account_conflict:
+    'That email belongs to an account that signs in another way here. Ask whoever runs this OpenDuet.',
+  setup_required: 'This OpenDuet has no account yet. Create the first one here.',
+};
+
+export function SignInScreen({ signedIn }: { signedIn: boolean }) {
+  const { refreshProfile, setOnboarded } = useApp();
+  const route = useRoute();
+  // A fresh install has no account yet: it offers "Create your account"
+  // instead of sign-in. Until the service answers, it is sign-in.
+  const [creating, setCreating] = useState(false);
+  // Whether creating it needs the installation's one-time setup code.
+  const [codeRequired, setCodeRequired] = useState(false);
+  // Whether this installation can email a sign-in link; until it says so, no.
+  const [emailSignIn, setEmailSignIn] = useState(false);
+  // Whether a password signs in here, and the identity provider's name when one is set up.
+  const [passwordSignIn, setPasswordSignIn] = useState(true);
+  const [provider, setProvider] = useState<string | null>(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  // The installer's link carries the code; otherwise it is typed.
+  const [setupCode, setSetupCode] = useState(() => route.query.get('code') ?? '');
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [linking, setLinking] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  // Said under the field that needs fixing: toasts belong to the signed-in shell
+  // and never show here.
+  const [emailProblem, setEmailProblem] = useState<string | null>(null);
+  const [passwordProblem, setPasswordProblem] = useState<string | null>(null);
+  const [codeProblem, setCodeProblem] = useState<string | null>(null);
+  const phone = useMedia('(max-width: 900px)');
+
+  useEffect(() => {
+    void adapter.setupStatus().then((r) => {
+      setCreating(r.data?.needed === true);
+      setCodeRequired(r.data?.code_required === true);
+      setEmailSignIn(r.data?.email_sign_in === true);
+      setPasswordSignIn(r.data?.signin?.password !== false);
+      setProvider(r.data?.signin?.oidc?.label ?? null);
+    });
+  }, []);
+
+  // The identity provider's sign-in comes back here with a reason when it did not work.
+  const signInError = route.query.get('signin_error');
+  useEffect(() => {
+    if (!signInError) return;
+    setNotice(OIDC_ERRORS[signInError] ?? OIDC_ERRORS.signin_failed ?? null);
+    // Off the address bar and out of history, so a reload doesn't say it again.
+    window.location.replace('#/welcome');
+  }, [signInError]);
+  const [leaving, setLeaving] = useState(false);
+  const continueWithProvider = () => {
+    setLeaving(true);
+    setNotice(null);
+    window.location.assign(
+      adapter.oidcSignInUrl(route.parts[0] === 'welcome' || !route.path ? '/' : route.path),
+    );
+  };
+  const passwordForm = creating || passwordSignIn;
+
+  // A mailed sign-in link lands here with its token in the fragment. Opening it
+  // spends nothing, because mail scanners open links too: the screen only asks
+  // whose account it opens, and the link is used when the person presses Sign in.
+  const linkToken = linkParam(route, 'token');
+  const [link, setLink] = useState<{ token: string; account: string | null } | null>(null);
+  const [usingLink, setUsingLink] = useState(false);
+  useEffect(() => {
+    if (!linkToken) {
+      setLink(null);
+      return;
+    }
+    let current = true;
+    setLink({ token: linkToken, account: null });
+    void adapter.checkMagicLink(linkToken).then((r) => {
+      if (!current) return;
+      if (r.data) {
+        setLink({ token: linkToken, account: r.data.masked_email });
+        return;
+      }
+      // Off the address bar and out of history, so a reload doesn't ask again.
+      window.location.replace('#/welcome');
+      setNotice(r.error ?? r.unavailable ?? 'That link did not work.');
+    });
+    return () => {
+      current = false;
+    };
+  }, [linkToken]);
+
+  const signInWithLink = async () => {
+    if (!link) return;
+    setUsingLink(true);
+    setNotice(null);
+    const result = await adapter.consumeMagicLink(link.token);
+    setUsingLink(false);
+    // Used or refused, the link is done: it leaves the address bar and history.
+    window.location.replace(result.data ? '#/' : '#/welcome');
+    if (result.data) refreshProfile();
+    else setNotice(result.error ?? result.unavailable ?? 'That link did not work.');
+  };
+
+  const sendLink = async () => {
+    if (!email.includes('@')) {
+      setEmailProblem('Enter the email address to send the link to.');
+      return;
+    }
+    setLinking(true);
+    setNotice(null);
+    const result = await adapter.magicLink(email);
+    setLinking(false);
+    if (result.data) setSent(true);
+    else setNotice(result.error ?? result.unavailable ?? 'Couldn’t send the link.');
+  };
+
+  const submit = async () => {
+    if (!email.includes('@')) {
+      setEmailProblem('Enter your email address.');
+      return;
+    }
+    if (creating ? password.length < NEW_PASSWORD_MIN : !password) {
+      setPasswordProblem(
+        creating
+          ? `Choose a password of at least ${NEW_PASSWORD_MIN} characters.`
+          : 'Enter your password.',
+      );
+      return;
+    }
+    if (creating && codeRequired && !setupCode.trim()) {
+      setCodeProblem('Enter the setup code for this installation.');
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    if (creating) {
+      const made = await adapter.createAccount(
+        email,
+        password,
+        codeRequired ? setupCode.trim() : undefined,
+      );
+      if (made.data) {
+        // Setup signs this browser in; sign in here only if it did not.
+        const me = await adapter.profile();
+        const session =
+          me.error !== null && me.unauthorized ? await adapter.logIn(email, password) : me;
+        setBusy(false);
+        if (session.data === null) {
+          setNotice(
+            session.error ?? session.unavailable ?? 'Your account is made. Sign in to continue.',
+          );
+          setCreating(false);
+          return;
+        }
+        setOnboarded(false);
+        navigate('/setup');
+        refreshProfile();
+        return;
+      }
+      setBusy(false);
+      // Someone else finished setup first: this installation now signs in.
+      if (made.error !== null && /already/i.test(made.error)) setCreating(false);
+      setNotice(made.error ?? made.unavailable ?? 'Couldn’t create the account.');
+      return;
+    }
+    const result = await adapter.logIn(email, password);
+    setBusy(false);
+    if (result.data) {
+      if (route.parts[0] === 'welcome') navigate('/');
+      refreshProfile();
+    } else setNotice(result.error ?? result.unavailable ?? 'Couldn’t sign in.');
+  };
+
+  // The hero's cards sit in named slots; base.css places them and drops the
+  // ones the panel has no room for, so nothing overlaps at any size.
+  const kcard = (inner: ReactNode, slot: 1 | 2 | 3, width: number, delay: string) => (
+    <div
+      className="col pop signin-card"
+      data-slot={slot}
+      style={{
+        gap: 8,
+        width,
+        padding: 12,
+        borderRadius: 14,
+        background: 'var(--studio-panel)',
+        border: '1px solid var(--studio-line)',
+        boxShadow: '0 24px 60px #00000080',
+        color: 'var(--studio-text)',
+        animationDelay: delay,
+      }}
+    >
+      {inner}
+    </div>
+  );
+  const kchip = (name: 'gcal' | 'gmail', label: string) => (
+    <span
+      className="row"
+      style={{
+        gap: 6,
+        height: 24,
+        padding: '0 8px 0 4px',
+        borderRadius: 6,
+        background: 'var(--studio-panel-2)',
+        border: '1px solid var(--studio-line)',
+        fontSize: 12,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <Logo name={name} size={16} />
+      {label}
+    </span>
+  );
+
+  return (
+    <div
+      className="row"
+      style={{
+        width: '100%',
+        height: '100%',
+        overflow: 'hidden',
+        background: 'var(--canvas)',
+        alignItems: 'stretch',
+      }}
+    >
+      {!phone ? (
+        <div
+          className="signin-hero"
+          style={{
+            ...studio,
+            width: '55%',
+            flexShrink: 0,
+            border: 0,
+            overflow: 'hidden',
+          }}
+        >
+          <div className="row" style={{ gap: 10 }}>
+            <OpenDuetMark width={46} />
+            <span style={{ fontFamily: 'var(--font-head)', fontSize: 18, fontWeight: 700 }}>
+              {instanceName()}
+            </span>
+          </div>
+          <div className="col" style={{ gap: 12, maxWidth: 540, marginTop: 40, flexShrink: 0 }}>
+            <span
+              style={{
+                fontFamily: 'var(--font-head)',
+                fontSize: 42,
+                lineHeight: '48px',
+                fontWeight: 700,
+                letterSpacing: '-.02em',
+                textWrap: 'balance',
+              }}
+            >
+              Your agent, with a computer of its own.
+            </span>
+            <span
+              style={{
+                fontSize: 16,
+                lineHeight: '24px',
+                color: 'var(--studio-muted)',
+                maxWidth: 460,
+                textWrap: 'pretty',
+              }}
+            >
+              {assistantName()} works with any model, keeps working while you’re away, follows up
+              for you, and comes back when something needs your approval.
+            </span>
+          </div>
+          <div className="signin-art">
+            <div className="row signin-faces" style={{ gap: 22, alignItems: 'flex-end' }}>
+              <AgentFace look={SAGE} size={64} glow />
+              <AgentFace look={NOVA} size={108} state="working" glow />
+              <AgentFace look={ATLAS} size={64} glow />
+            </div>
+            {kcard(
+              <>
+                <div className="col" style={{ alignItems: 'flex-end' }}>
+                  <span
+                    style={{
+                      padding: '7px 12px',
+                      borderRadius: '14px 14px 4px 14px',
+                      background: '#2f5fd6',
+                      color: '#fff',
+                      fontSize: 13,
+                      lineHeight: '18px',
+                    }}
+                  >
+                    Move my 3 PM to tomorrow and tell Sam.
+                  </span>
+                </div>
+                <div className="row" style={{ gap: 8, fontSize: 12, color: 'var(--studio-muted)' }}>
+                  <span style={{ color: '#4ade80', display: 'flex' }}>
+                    <Icon name="circleCheck" size={14} />
+                  </span>
+                  Moved to Tuesday 3:00 PM · note to Sam ready to approve
+                </div>
+                <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                  {kchip('gcal', 'Pricing sync · Tue 3:00 PM')}
+                  {kchip('gmail', 'Sam · to approve')}
+                </div>
+              </>,
+              1,
+              320,
+              '.4s',
+            )}
+            {kcard(
+              <>
+                <div className="row" style={{ gap: 10 }}>
+                  <span
+                    className="row"
+                    style={{
+                      justifyContent: 'center',
+                      width: 32,
+                      height: 32,
+                      borderRadius: 8,
+                      background: 'var(--studio-panel-2)',
+                      color: '#f5b342',
+                    }}
+                  >
+                    <Icon name="star" size={16} />
+                  </span>
+                  <div className="col grow" style={{ minWidth: 0 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>
+                      Luna Trattoria · 7:30, table for 3
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--studio-muted)' }}>
+                      Booked while you were out · a note to Alex to approve
+                    </span>
+                  </div>
+                </div>
+                <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                  {kchip('gcal', 'Tonight 7:30 PM')}
+                  {kchip('gmail', 'Alex · to approve')}
+                </div>
+              </>,
+              2,
+              320,
+              '.9s',
+            )}
+            {kcard(
+              <>
+                <div className="row" style={{ gap: 8, fontSize: 12, color: 'var(--studio-muted)' }}>
+                  <span className="spin" style={{ display: 'flex', color: '#8db6f7' }}>
+                    <Icon name="loader" size={12} stroke={2} />
+                  </span>
+                  Working · 6s
+                </div>
+                <span style={{ fontSize: 13, lineHeight: '18px' }}>
+                  Following up with legal on the pricing page review, as Sam asked.
+                </span>
+                <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                  {kchip('gmail', 'Legal · follow-up sent')}
+                  {kchip('gcal', 'Review · Thursday 2:00 PM')}
+                </div>
+              </>,
+              3,
+              300,
+              '1.4s',
+            )}
+          </div>
+          <div className="col signin-apps" style={{ gap: 10, flexShrink: 0 }}>
+            <span
+              style={{
+                fontSize: 11,
+                letterSpacing: '.08em',
+                textTransform: 'uppercase',
+                color: 'var(--studio-muted)',
+              }}
+            >
+              Works with your mail and calendar
+            </span>
+            <div className="row" style={{ gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+              <Logo name="gmail" size={28} />
+              <Logo name="gcal" size={28} />
+              <span style={{ fontSize: 13, color: 'var(--studio-muted)' }}>
+                Gmail, Google Calendar, Outlook, iCloud, Fastmail and any IMAP or CalDAV account
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {/* The form centres with auto margins rather than justify-content, so a
+          form taller than the window scrolls from its top instead of being
+          pushed above the scroll area where it cannot be reached. */}
+      <div
+        className="col grow"
+        style={{
+          alignItems: 'center',
+          position: 'relative',
+          minWidth: 0,
+          padding: 24,
+          overflowY: 'auto',
+        }}
+      >
+        <div
+          className="col"
+          style={{ gap: 22, width: 400, maxWidth: '100%', marginBlock: 'auto', flexShrink: 0 }}
+        >
+          <div className="col" style={{ gap: 8 }}>
+            <OpenDuetMark width={64} />
+            <h1
+              style={{
+                fontSize: 28,
+                fontWeight: 700,
+                letterSpacing: '-.01em',
+                lineHeight: '34px',
+                paddingTop: 6,
+              }}
+            >
+              {creating ? 'Create your account' : `Welcome to ${instanceName()}`}
+            </h1>
+            <p style={{ fontSize: 15, lineHeight: '22px', color: 'var(--muted)' }}>
+              {creating
+                ? 'This is the first account on this installation. Your agents come next.'
+                : link
+                  ? 'Finish signing in with the link from your email.'
+                  : provider && !passwordSignIn
+                    ? `Sign in with ${provider}.`
+                    : provider
+                      ? `Sign in with ${provider}, or with your email and password.`
+                      : 'Sign in with your email and password.'}
+            </p>
+          </div>
+          {link ? (
+            <SignInLinkCard
+              account={link.account}
+              busy={usingLink}
+              onSignIn={() => void signInWithLink()}
+              onElsewise={() => window.location.replace('#/welcome')}
+            />
+          ) : signedIn ? (
+            <div className="col card" style={{ gap: 10, padding: 16 }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--heading)' }}>
+                You’re already signed in on this device.
+              </span>
+              <Button icon="chevronRight" onClick={() => navigate('/')}>
+                Continue to {instanceName()}
+              </Button>
+            </div>
+          ) : null}
+          {link ? null : sent ? (
+            <div className="col card" style={{ gap: 10, padding: 16 }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--heading)' }}>
+                Check your inbox
+              </span>
+              <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+                If {email} has an account here, a sign-in link is on its way. It works once and
+                expires in ten minutes.
+              </span>
+            </div>
+          ) : (
+            <>
+              {!creating && provider ? (
+                <div className="col" style={{ gap: 12 }}>
+                  <Button
+                    size="lg"
+                    variant={passwordSignIn ? 'outline' : 'primary'}
+                    icon="user"
+                    block
+                    loading={leaving}
+                    onClick={continueWithProvider}
+                  >
+                    Continue with {provider}
+                  </Button>
+                  {passwordSignIn ? (
+                    <div
+                      className="row"
+                      style={{ gap: 10, fontSize: 12, color: 'var(--muted)' }}
+                      aria-hidden="true"
+                    >
+                      <span className="grow" style={{ height: 1, background: 'var(--line)' }} />
+                      or
+                      <span className="grow" style={{ height: 1, background: 'var(--line)' }} />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {passwordForm ? (
+                <form
+                  className="col"
+                  style={{ gap: 12 }}
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void submit();
+                  }}
+                >
+                  {creating && codeRequired ? (
+                    <Field
+                      label="Setup code"
+                      hint={`Whoever set up this ${instanceName()} has it, and the link they sent fills it in. If that is you, run bun run openduet account setup-code on the host for one.`}
+                    >
+                      <Input
+                        icon="lock"
+                        value={setupCode}
+                        onChange={(event) => {
+                          setSetupCode(event.target.value);
+                          setCodeProblem(null);
+                        }}
+                        placeholder="XXXX-XXXX-XXXX-XXXX-XXXX"
+                        width="100%"
+                        height={44}
+                        autoComplete="one-time-code"
+                        spellCheck={false}
+                        error={codeProblem !== null}
+                        aria-invalid={codeProblem !== null}
+                      />
+                    </Field>
+                  ) : null}
+                  {creating && codeRequired && codeProblem ? (
+                    <span role="alert" style={{ fontSize: 13, color: 'var(--danger)' }}>
+                      {codeProblem}
+                    </span>
+                  ) : null}
+                  <Field label="Email">
+                    <Input
+                      type="email"
+                      icon="mail"
+                      value={email}
+                      onChange={(event) => {
+                        setEmail(event.target.value);
+                        setEmailProblem(null);
+                      }}
+                      placeholder="you@example.com"
+                      width="100%"
+                      height={44}
+                      autoComplete="email"
+                      error={emailProblem !== null}
+                      aria-invalid={emailProblem !== null}
+                    />
+                  </Field>
+                  {emailProblem ? (
+                    <span role="alert" style={{ fontSize: 13, color: 'var(--danger)' }}>
+                      {emailProblem}
+                    </span>
+                  ) : null}
+                  <Field label="Password">
+                    <Input
+                      type="password"
+                      icon="lock"
+                      value={password}
+                      onChange={(event) => {
+                        setPassword(event.target.value);
+                        setPasswordProblem(null);
+                      }}
+                      placeholder={creating ? `At least ${NEW_PASSWORD_MIN} characters` : undefined}
+                      width="100%"
+                      height={44}
+                      autoComplete={creating ? 'new-password' : 'current-password'}
+                      error={passwordProblem !== null}
+                      aria-invalid={passwordProblem !== null}
+                    />
+                  </Field>
+                  {passwordProblem ? (
+                    <span role="alert" style={{ fontSize: 13, color: 'var(--danger)' }}>
+                      {passwordProblem}
+                    </span>
+                  ) : null}
+                  <Button size="lg" icon="chevronRight" block type="submit" loading={busy}>
+                    {creating ? 'Create account' : 'Sign in'}
+                  </Button>
+                  {creating || !emailSignIn ? null : (
+                    <Button
+                      variant="ghost"
+                      icon="send"
+                      block
+                      loading={linking}
+                      onClick={() => void sendLink()}
+                    >
+                      Email me a link instead
+                    </Button>
+                  )}
+                  {creating ? null : (
+                    <Button variant="ghost" size="sm" onClick={() => navigate('/reset')}>
+                      Forgot your password?
+                    </Button>
+                  )}
+                </form>
+              ) : null}
+              {notice ? (
+                <div
+                  className="row"
+                  style={{
+                    gap: 8,
+                    padding: '10px 12px',
+                    borderRadius: 10,
+                    background: 'var(--sand)',
+                    color: 'var(--sand-ink)',
+                    fontSize: 13,
+                  }}
+                >
+                  <Icon name="info" size={14} />
+                  <span>{notice}</span>
+                </div>
+              ) : null}
+            </>
+          )}
+          <div className="col" style={{ gap: 10, alignItems: 'center', textAlign: 'center' }}>
+            <span className="row" style={{ gap: 6, fontSize: 12, color: 'var(--muted)' }}>
+              <Icon name="lock" size={13} />
+              Your data stays yours.
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What a sign-in link opens to: whose account it is, and one button that uses
+ * it. Until the button is pressed the link is unspent, so a mail scanner that
+ * opens the page signs no one in.
+ */
+export function SignInLinkCard({
+  account,
+  busy,
+  onSignIn,
+  onElsewise,
+}: {
+  /** The account's address, masked; null while the link is being checked. */
+  account: string | null;
+  busy: boolean;
+  onSignIn: () => void;
+  onElsewise: () => void;
+}) {
+  return (
+    <div className="col card" style={{ gap: 12, padding: 16 }}>
+      {account === null ? (
+        <span className="row" style={{ gap: 8, fontSize: 14, color: 'var(--muted)' }}>
+          <Icon name="loader" size={14} stroke={2} className="spin" />
+          Checking your sign-in link…
+        </span>
+      ) : (
+        <>
+          <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--heading)' }}>
+            Sign in as <span style={{ overflowWrap: 'anywhere' }}>{account}</span>
+          </span>
+          <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+            This link works once, and only after you press Sign in.
+          </span>
+          <Button
+            size="lg"
+            icon="chevronRight"
+            block
+            loading={busy}
+            disabled={busy}
+            onClick={onSignIn}
+          >
+            Sign in
+          </Button>
+        </>
+      )}
+      <Button variant="ghost" size="sm" onClick={onElsewise}>
+        Sign in another way
+      </Button>
+    </div>
+  );
+}
+
+/* ---------- setup ---------- */
+
+const tourStages = (): Record<TourStage, { title: string; desc: string }> => ({
+  calendar: {
+    title: 'Say it once. It gets done.',
+    desc: `Not answers, outcomes. ${assistantName()} checks what it needs, does the steps, and comes back with the one thing only you can do.`,
+  },
+  drafting: {
+    title: 'Messages you always send yourself',
+    desc: `${assistantName()} drafts the note in your voice and stops. Nothing goes out until you press send.`,
+  },
+  browser: {
+    title: 'It has hands',
+    desc: `Expense reports, forms, bookings, sign-ups: ${assistantName()} does them in its own sandboxed browser. Watch, take over any time. Money and messages always wait for your yes.`,
+  },
+  plans: {
+    title: 'Plans that run themselves',
+    desc: `A project at work or a goal at home: say it once. ${assistantName()} drafts the milestones, assigns the legwork to agents, and keeps the next step in front of you.`,
+  },
+  memory: {
+    title: 'Memory that compounds',
+    desc: 'It remembers the people, habits and rules of your life, and uses them without being asked. Every bit is visible and editable.',
+  },
+});
+
+function Stage({ stage }: { stage: TourStage }) {
+  const chip = (inner: ReactNode, delay: number) => (
+    <span
+      className="row pop"
+      style={{
+        gap: 6,
+        height: 26,
+        padding: '0 9px 0 5px',
+        borderRadius: 7,
+        background: 'var(--studio-panel-2)',
+        border: '1px solid var(--studio-line)',
+        fontSize: 12,
+        alignSelf: 'flex-start',
+        animationDelay: `${delay}s`,
+        maxWidth: '100%',
+      }}
+    >
+      {inner}
+    </span>
+  );
+  const bubble = (text: string) => (
+    <div className="col pop" style={{ alignItems: 'flex-end' }}>
+      <span
+        style={{
+          padding: '8px 14px',
+          borderRadius: '16px 16px 5px 16px',
+          background: '#2f5fd6',
+          color: '#fff',
+          fontSize: 14,
+          maxWidth: 560,
+        }}
+      >
+        {text}
+      </span>
+    </div>
+  );
+  const memCard = (inner: ReactNode, delay: number) => (
+    <span
+      className="row pop"
+      style={{
+        gap: 8,
+        height: 32,
+        padding: '0 10px 0 6px',
+        borderRadius: 9,
+        background: 'var(--studio-panel)',
+        border: '1px solid var(--studio-line)',
+        fontSize: 12,
+        animationDelay: `${delay}s`,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {inner}
+    </span>
+  );
+  return (
+    <div
+      className="col"
+      style={{
+        ...studio,
+        minHeight: 300,
+        borderRadius: 14,
+        overflow: 'hidden',
+        padding: 22,
+        justifyContent: 'center',
+        gap: 12,
+      }}
+    >
+      {stage === 'calendar' ? (
+        <>
+          {bubble('Move my 3 PM with Priya to tomorrow and tell her.')}
+          <div className="row" style={{ gap: 10, alignItems: 'flex-start' }}>
+            <AgentFace look={NOVA} size={26} state="working" />
+            <div className="col" style={{ gap: 6, minWidth: 0 }}>
+              {chip(
+                <>
+                  <Logo name="gcal" size={16} />
+                  Checked both calendars · you’re both free Thu 10:00
+                </>,
+                0.4,
+              )}
+              {chip(
+                <>
+                  <Logo name="gcal" size={16} />
+                  Moved “Pricing review” to Thu 10:00 · invite updated
+                </>,
+                1.2,
+              )}
+              {chip(
+                <>
+                  <Logo name="whatsapp" size={16} />
+                  Drafted a note to Priya, in your tone
+                </>,
+                2,
+              )}
+            </div>
+          </div>
+        </>
+      ) : stage === 'drafting' ? (
+        <div
+          className="row pop"
+          style={{
+            gap: 14,
+            padding: '12px 14px',
+            borderRadius: 14,
+            background: 'var(--studio-panel)',
+            border: '1px solid var(--studio-line)',
+            alignItems: 'flex-start',
+          }}
+        >
+          <Logo name="whatsapp" size={44} />
+          <div className="col grow" style={{ gap: 6, minWidth: 0 }}>
+            <span style={{ fontFamily: 'var(--font-head)', fontSize: 15, fontWeight: 600 }}>
+              To Priya · not sent yet
+            </span>
+            <span style={{ fontSize: 13, lineHeight: '19px' }}>
+              “Hey Priya, can we do the pricing review Thu 10 instead of today at 3? Invite’s
+              updated, shout if it doesn’t work.”
+            </span>
+            <div className="row" style={{ gap: 8, paddingTop: 2 }}>
+              <span
+                className="row"
+                style={{
+                  gap: 6,
+                  height: 30,
+                  padding: '0 12px',
+                  borderRadius: 8,
+                  fontSize: 12,
+                  fontWeight: 500,
+                  background: 'var(--primary)',
+                  color: '#fff',
+                }}
+              >
+                <Icon name="send" size={14} />
+                Send
+              </span>
+              <span
+                className="row"
+                style={{
+                  height: 30,
+                  padding: '0 12px',
+                  borderRadius: 8,
+                  fontSize: 12,
+                  fontWeight: 500,
+                  background: 'var(--studio-panel-2)',
+                  border: '1px solid var(--studio-line)',
+                }}
+              >
+                Edit
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : stage === 'browser' ? (
+        <div className="col" style={{ gap: 10 }}>
+          <span
+            style={{
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: '.06em',
+              textTransform: 'uppercase',
+              color: 'var(--studio-muted)',
+            }}
+          >
+            Friday · 5:12 PM
+          </span>
+          {chip(
+            <>
+              <Logo name="gmail" size={16} />6 receipts found in Gmail · Uber, lunches, the client
+              dinner
+            </>,
+            0.4,
+          )}
+          {chip(
+            <>
+              <span style={{ color: 'var(--primary)', display: 'flex' }}>
+                <Icon name="cursor" size={14} />
+              </span>
+              Filling the expense portal · amounts, dates, categories
+            </>,
+            1.6,
+          )}
+          {chip(
+            <>
+              <span style={{ color: '#5ab4a0', display: 'flex' }}>
+                <Icon name="check" size={14} />
+              </span>
+              Report ready · $214.30 · nothing over the limit
+            </>,
+            3,
+          )}
+        </div>
+      ) : stage === 'plans' ? (
+        <div
+          className="col"
+          style={{
+            gap: 12,
+            padding: '16px 18px',
+            borderRadius: 14,
+            background: 'var(--studio-panel)',
+            border: '1px solid var(--studio-line)',
+          }}
+        >
+          <div className="row" style={{ gap: 12 }}>
+            <span
+              className="row"
+              style={{
+                justifyContent: 'center',
+                width: 40,
+                height: 40,
+                borderRadius: 10,
+                background: '#1b2942',
+                color: '#b9d1f6',
+              }}
+            >
+              <Icon name="plans" size={20} />
+            </span>
+            <div className="col grow" style={{ gap: 2, minWidth: 0 }}>
+              <span style={{ fontFamily: 'var(--font-head)', fontSize: 16, fontWeight: 600 }}>
+                Launch the new pricing page · Sep 30
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--studio-muted)' }}>
+                3 weeks · 3 agents on it · you sign off on copy and go-live
+              </span>
+            </div>
+          </div>
+          {[
+            ['Agree the three tiers with Sam', 'done', null],
+            ['Draft page copy from the brief', 'done', ATLAS],
+            [
+              'Collect legal and finance sign-off',
+              'active',
+              { color: '#c9c1f5', eyes: 'black', shape: 'square', image: null } as const,
+            ],
+            ['Schedule the announcement', 'todo', NOVA],
+          ].map(([text, state, who]) => (
+            <div key={String(text)} className="row" style={{ gap: 10, minHeight: 30 }}>
+              <span
+                className="row"
+                style={{
+                  justifyContent: 'center',
+                  width: 16,
+                  height: 16,
+                  borderRadius: 4,
+                  border: '1px solid #3a3f46',
+                  background: state === 'done' ? 'var(--primary)' : 'transparent',
+                  color: '#fff',
+                }}
+              >
+                {state === 'done' ? (
+                  <Icon name="check" size={11} stroke={3} />
+                ) : state === 'active' ? (
+                  <Icon name="loader" size={11} stroke={2.5} className="spin" />
+                ) : null}
+              </span>
+              <span
+                style={{
+                  flex: 1,
+                  fontSize: 13,
+                  color: state === 'done' ? 'var(--studio-muted)' : 'var(--studio-text)',
+                }}
+              >
+                {String(text)}
+              </span>
+              {who ? (
+                <AgentFace
+                  look={who as typeof NOVA}
+                  size={20}
+                  state={state === 'active' ? 'working' : 'idle'}
+                />
+              ) : (
+                <span style={{ fontSize: 11, color: 'var(--studio-muted)' }}>you</span>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="col" style={{ gap: 14, alignItems: 'center' }}>
+          <AgentFace look={NOVA} size={76} state="thinking" glow />
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+            {memCard(
+              <>
+                <Icon name="user" size={14} />
+                Alex · vegetarian, hates loud rooms
+              </>,
+              0.6,
+            )}
+            {memCard(
+              <>
+                <Logo name="gcal" size={18} />
+                Stand-up · 9:30 daily, never move it
+              </>,
+              1.2,
+            )}
+            {memCard(
+              <>
+                <Logo name="whatsapp" size={18} />
+                Priya prefers WhatsApp over email
+              </>,
+              1.8,
+            )}
+            {memCard(
+              <>
+                <Icon name="mapPin" size={14} />
+                Office · 14th St · you walk when it’s dry
+              </>,
+              2.4,
+            )}
+          </div>
+          <span
+            className="row pop"
+            style={{
+              gap: 8,
+              height: 28,
+              padding: '0 10px',
+              borderRadius: 999,
+              background: '#2f5fd6',
+              color: '#fff',
+              fontSize: 12,
+              fontWeight: 500,
+              animationDelay: '3s',
+              textAlign: 'center',
+            }}
+          >
+            <Icon name="check" size={12} stroke={3} />
+            So the team dinner was vegetarian-friendly, quiet, near the office.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Card({
+  title,
+  sub,
+  children,
+  footer,
+  width = 780,
+}: {
+  title: string;
+  sub?: string;
+  children: ReactNode;
+  footer: ReactNode;
+  width?: number;
+}) {
+  return (
+    <div
+      className="col card"
+      style={{
+        width,
+        maxWidth: '100%',
+        borderRadius: 22,
+        boxShadow: 'var(--elevated)',
+        overflow: 'hidden',
+      }}
+    >
+      <div className="row" style={{ gap: 10, padding: '20px 24px 0' }}>
+        <OpenDuetMark width={40} />
+        <span
+          style={{
+            fontFamily: 'var(--font-head)',
+            fontSize: 18,
+            fontWeight: 700,
+            color: 'var(--heading)',
+            flex: 1,
+          }}
+        >
+          {title}
+        </span>
+      </div>
+      {sub ? (
+        <p
+          style={{
+            padding: '6px 24px 0 62px',
+            fontSize: 14,
+            lineHeight: '21px',
+            color: 'var(--muted)',
+          }}
+        >
+          {sub}
+        </p>
+      ) : null}
+      <div className="col" style={{ gap: 16, padding: '18px 24px 22px' }}>
+        {children}
+      </div>
+      <div
+        className="row"
+        style={{
+          gap: 12,
+          padding: '14px 24px',
+          borderTop: '1px solid var(--line)',
+          background: 'var(--soft)',
+          flexWrap: 'wrap',
+        }}
+      >
+        {footer}
+      </div>
+    </div>
+  );
+}
+
+/** Four quick questions; see experience/setup-answers.ts for what is kept. */
+const QUESTIONS = SETUP_QUESTIONS;
+
+type Exchange = { id: number; who: 'agent' | 'you'; text: string };
+let exchangeId = 0;
+const exchange = (who: Exchange['who'], text: string): Exchange => ({
+  id: ++exchangeId,
+  who,
+  text,
+});
+
+/** The templates the person picked, in the order the service lists them. */
+export const chosenTemplates = (templates: AgentTemplate[], picked: string[]) =>
+  templates.filter((template) => picked.includes(template.id));
+
+export function OnboardingScreen() {
+  const { capabilities, profile, setOnboarded, refreshProfile, refreshAgents } = useApp();
+  const stages = (['calendar', 'drafting', 'browser', 'plans', 'memory'] as TourStage[]).filter(
+    (stage) =>
+      stage === 'calendar'
+        ? capabilities.calendar
+        : stage === 'browser'
+          ? capabilities.browser
+          : true,
+  );
+  const connections = useLoad(() => adapter.connections(), []);
+  const model = useLoad(() => models.settings(), []);
+  // Asked once, before the tour, when the owner has no model that can answer.
+  // Settings that could not be read are not a model that answers: the step says so, with a retry.
+  const [modelStep, setModelStep] = useState<'unknown' | 'ask' | 'failed' | 'done'>('unknown');
+  useEffect(() => {
+    if ((modelStep !== 'unknown' && modelStep !== 'failed') || model.loading) return;
+    if (!model.data && model.error) setModelStep('failed');
+    else setModelStep(model.data?.can_edit && !model.data.active.connected ? 'ask' : 'done');
+  }, [modelStep, model.loading, model.data, model.error]);
+  const [step, setStep] = useState(1);
+  const [stage, setStage] = useState(0);
+  const [name, setName] = useState(givenName(profile));
+  // The morning brief: offered on its own step, made the moment the person says yes.
+  const [briefAt, setBriefAt] = useState(BRIEF_DEFAULT_AT);
+  const [topics, setTopics] = useState<string[]>([]);
+  const [briefMade, setBriefMade] = useState<Automation | null>(null);
+  // Apps connected during setup, by catalog id, beside those already connected.
+  const [linked, setLinked] = useState<ReadonlySet<string>>(new Set());
+  // The zone the person chose before, or this browser's: never the account's default.
+  const [zone, setZone] = useState(() => setupTimeZone(profile, browserTimeZone()));
+  const [zoneOpen, setZoneOpen] = useState(false);
+  // Setup tunes OpenDuet, the agent every space has. Specialists are only an
+  // extra the person picks; none is made unless they choose one.
+  const [voice, setVoice] = useState({
+    tone: 'Warm',
+    standing_instruction: '',
+    asks_before_acting: true,
+  });
+  const templates = useLoad(() => adapter.agentTemplates(), []);
+  const [picked, setPicked] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [asked, setAsked] = useState(0);
+  const [log, setLog] = useState<Exchange[]>(() => [exchange('agent', QUESTIONS[0]?.ask ?? '')]);
+  const [kept, setKept] = useState<MemoryItem[]>([]);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  // An answer that did not save stays on screen with the reason and a retry.
+  const [unsaved, setUnsaved] = useState<{ choice: string; reason: string } | null>(null);
+  // Keep accepted steps across a failed welcome request so retrying cannot
+  // create a second agent, conversation, or first message.
+  const completed = useRef({
+    agentId: '',
+    made: [] as string[],
+    chatId: '',
+    messageKey: messageKey(),
+  });
+  const total = 6;
+
+  const [typed, setTyped] = useState('');
+  const skip = () => {
+    const question = QUESTIONS[asked];
+    if (!question || saving) return;
+    setUnsaved(null);
+    setTyped('');
+    const next = QUESTIONS[asked + 1];
+    setLog((previous) => [
+      ...previous,
+      exchange('agent', SKIP_REPLY),
+      ...(next ? [exchange('agent', next.ask)] : []),
+    ]);
+    setAsked(asked + 1);
+  };
+  const answer = async (raw: string) => {
+    const question = QUESTIONS[asked];
+    if (!question || saving) return;
+    // Only what the person said is kept; a stand-in answer is a skip.
+    const choice = keptAnswer(raw);
+    if (!choice) return skip();
+    setSaving(true);
+    setUnsaved(null);
+    setLog((previous) => [...previous, exchange('you', choice)]);
+    const saved = await adapter.createMemoryItem({
+      key: question.key,
+      value: choice,
+      statement: `${question.ask} ${choice}`,
+    });
+    setSaving(false);
+    if (saved.data === null) {
+      const reason = saved.error ?? saved.unavailable ?? 'Something went wrong.';
+      toast({ kind: 'err', title: 'Couldn’t save that', sub: reason });
+      setLog((previous) => previous.slice(0, -1));
+      setUnsaved({ choice, reason });
+      return;
+    }
+    const item = saved.data.item;
+    setTyped('');
+    setKept((previous) => [...previous.filter((entry) => entry.id !== item.id), item]);
+    setAnswers((previous) => ({ ...previous, [question.key]: choice }));
+    const next = QUESTIONS[asked + 1];
+    setLog((previous) => [
+      ...previous,
+      exchange('agent', question.reply(choice)),
+      ...(next ? [exchange('agent', next.ask)] : []),
+    ]);
+    setAsked(asked + 1);
+  };
+
+  const saveProfile = (onboarded = true) =>
+    adapter.saveProfile({
+      // No name given stays unnamed, so the greeting never calls the person "You".
+      name: name.trim() || profile?.name || UNNAMED,
+      time_zone: zone,
+      day_hours: profile?.day_hours ?? { start: '08:00', end: '22:00' },
+      time_zone_confirmed: true,
+      ...(onboarded ? { onboarded: true } : {}),
+    });
+
+  /** One tap: the brief is an ordinary routine, on Automations from now on. */
+  const setUpBrief = async () => {
+    if (busy || briefMade) return;
+    setBusy(true);
+    // The routine runs on the person's clock, so the zone they chose is kept first.
+    const savedProfile = await saveProfile(false);
+    if (!savedProfile.data) {
+      setBusy(false);
+      toast({
+        kind: 'err',
+        title: savedProfile.error ?? savedProfile.unavailable ?? 'Couldn’t save your time zone',
+      });
+      return;
+    }
+    const made = await adapter.morningBrief({ at: briefAt, topics });
+    setBusy(false);
+    if (made.data === null) {
+      toast({
+        kind: 'err',
+        title: 'Couldn’t set up the brief',
+        sub: made.error ?? made.unavailable ?? '',
+      });
+      return;
+    }
+    setBriefMade(made.data.automation);
+  };
+
+  /** Setup put off: only the name and time zone are kept. No agent, routine or chat is made. */
+  const later = async () => {
+    if (busy || saving) return;
+    setBusy(true);
+    const saved = await saveProfile();
+    setBusy(false);
+    if (!saved.data) {
+      toast({
+        kind: 'err',
+        title: saved.error ?? saved.unavailable ?? 'Couldn’t save your profile',
+      });
+      return;
+    }
+    refreshProfile();
+    setOnboarded(true);
+    navigate('/');
+  };
+
+  const finish = async () => {
+    if (busy || saving) return;
+    setBusy(true);
+    const fail = (title: string) => {
+      toast({ kind: 'err', title });
+      setBusy(false);
+    };
+    const savedProfile = await saveProfile();
+    if (!savedProfile.data)
+      return fail(savedProfile.error ?? savedProfile.unavailable ?? 'Couldn’t save your profile');
+    let agentId = completed.current.agentId;
+    if (!agentId) {
+      const listed = await adapter.agents();
+      if (!listed.data)
+        return fail(listed.error ?? listed.unavailable ?? `Couldn’t reach ${instanceName()}`);
+      const openduet = listed.data.agents.find((candidate) => candidate.is_default);
+      if (!openduet) return fail(`Couldn’t reach ${instanceName()}`);
+      const saved = await adapter.updateAgent(openduet.id, { ...inputOf(openduet), ...voice });
+      if (!saved.data)
+        return fail(saved.error ?? saved.unavailable ?? `Couldn’t save ${assistantName()}`);
+      agentId = openduet.id;
+      completed.current.agentId = agentId;
+    }
+    // Each specialist the person picked is made once, even across a retry.
+    for (const template of chosenTemplates(templates.data?.templates ?? [], picked)) {
+      if (completed.current.made.includes(template.id)) continue;
+      // It reaches the connections it works best with, as the list under the chips shows.
+      const made = await adapter.createAgent({
+        ...template.agent,
+        allowed_connection_ids: suggestedConnections(
+          template.works_best_with,
+          connections.data?.connections ?? [],
+        ),
+      });
+      if (!made.data)
+        return fail(made.error ?? made.unavailable ?? `Couldn’t add ${template.agent.name}`);
+      completed.current.made.push(template.id);
+    }
+    // The first message names one thing the person just said, so the agent's
+    // reply can show it was kept.
+    const focus = answers['pref.focus.this-month'];
+    const first = focus
+      ? `${focus} is what eats my week right now. Where do we start?`
+      : kept[0]
+        ? `I told you: ${kept[0].value}. Where do we start?`
+        : null;
+    if (first) {
+      if (!completed.current.chatId) {
+        const opened = await adapter.createConversation({
+          title: 'Getting started',
+          agent_id: agentId,
+        });
+        if (!opened.data)
+          return fail(
+            opened.error ?? opened.unavailable ?? 'Couldn’t open your first conversation',
+          );
+        completed.current.chatId = opened.data.conversation.id;
+      }
+      const sent = await adapter.send(
+        completed.current.chatId,
+        first,
+        completed.current.messageKey,
+      );
+      if (!sent.data)
+        return fail(sent.error ?? sent.unavailable ?? 'Couldn’t send your first message');
+    }
+    setBusy(false);
+    refreshProfile();
+    refreshAgents();
+    setOnboarded(true);
+    navigate(completed.current.chatId ? `/chat/${completed.current.chatId}` : '/');
+  };
+
+  const stepLabel = (
+    <span style={{ fontSize: 12, color: 'var(--muted)', paddingRight: 8 }}>
+      Step {step} of {total}
+    </span>
+  );
+  const back = (
+    <Button
+      variant="ghost"
+      disabled={busy || saving}
+      onClick={() =>
+        step === 2 && stage > 0 ? setStage(stage - 1) : setStep(Math.max(1, step - 1))
+      }
+    >
+      Back
+    </Button>
+  );
+
+  let card: ReactNode;
+  if (modelStep === 'failed' && model.error) {
+    card = (
+      <Card
+        title="Connect a model"
+        sub={`${assistantName()} needs a model to answer with. It couldn’t check yours just now.`}
+        footer={
+          <>
+            <div className="grow" />
+            <Button variant="ghost" onClick={() => setModelStep('done')}>
+              Skip for now
+            </Button>
+          </>
+        }
+      >
+        <LoadError what="your model settings" error={model.error} onRetry={model.reload} />
+      </Card>
+    );
+  } else if (modelStep === 'ask' && model.data) {
+    const connected = model.data.active.connected;
+    card = (
+      <Card
+        title="Connect a model"
+        sub="Choose the model your agents answer with. You can change it any time in Settings › Models."
+        footer={
+          <>
+            <div className="grow" />
+            {connected ? null : (
+              <Button variant="ghost" onClick={() => setModelStep('done')}>
+                Skip for now
+              </Button>
+            )}
+            <Button
+              iconRight="chevronRight"
+              disabled={!connected}
+              onClick={() => setModelStep('done')}
+            >
+              Continue
+            </Button>
+          </>
+        }
+      >
+        <ActiveModel settings={model.data} onChanged={model.set} />
+        <ModelConnect settings={model.data} onChanged={model.set} />
+      </Card>
+    );
+  } else if (step === 1) {
+    card = (
+      <Card
+        title={`Welcome to ${instanceName()}`}
+        footer={
+          <>
+            {stepLabel}
+            <div className="grow" />
+            <Button variant="ghost" disabled={busy} onClick={() => void later()}>
+              Maybe later
+            </Button>
+            <Button iconRight="chevronRight" onClick={() => setStep(2)}>
+              Show me
+            </Button>
+          </>
+        }
+      >
+        <div className="col" style={{ gap: 18, alignItems: 'center', padding: '8px 0 4px' }}>
+          <div
+            className="row"
+            style={{
+              ...studio,
+              height: 220,
+              width: '100%',
+              borderRadius: 14,
+              justifyContent: 'center',
+              gap: 28,
+              position: 'relative',
+            }}
+          >
+            <AgentFace look={SAGE} size={64} glow />
+            <AgentFace look={NOVA} size={96} glow />
+            <AgentFace look={ATLAS} size={64} glow />
+            <span
+              className="row pop"
+              style={{
+                position: 'absolute',
+                bottom: 18,
+                height: 28,
+                padding: '0 12px',
+                borderRadius: 999,
+                background: 'var(--studio-panel)',
+                border: '1px solid var(--studio-line)',
+                fontSize: 12,
+                animationDelay: '.8s',
+                textAlign: 'center',
+              }}
+            >
+              Meetings, messages, expenses, errands. The doing, not just the answers.
+            </span>
+          </div>
+          <div className="col" style={{ gap: 6, alignItems: 'center', textAlign: 'center' }}>
+            <span
+              style={{
+                fontFamily: 'var(--font-head)',
+                fontSize: 26,
+                fontWeight: 700,
+                letterSpacing: '-.01em',
+                color: 'var(--heading)',
+              }}
+            >
+              The assistant that actually does it
+            </span>
+            <span style={{ fontSize: 15, color: 'var(--muted)', maxWidth: 520 }}>
+              For your life and your work. {assistantName()} takes the task off your plate end to
+              end, and only comes back for the moments that need you.
+            </span>
+          </div>
+          <div style={{ width: 520, maxWidth: '100%' }}>
+            <Field label="Your name">
+              <Input
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                width="100%"
+                height={40}
+                placeholder="Jamie Davis"
+              />
+            </Field>
+          </div>
+          <div className="col setup-zone" style={{ gap: 6, width: 520, maxWidth: '100%' }}>
+            <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+              <Icon name="clock" size={15} />
+              <span style={{ fontSize: 14, color: 'var(--heading)' }}>
+                Your time zone: <strong style={{ fontWeight: 600 }}>{zoneName(zone)}</strong>
+              </span>
+              {zoneOpen ? null : (
+                <Button variant="ghost" size="sm" onClick={() => setZoneOpen(true)}>
+                  Change
+                </Button>
+              )}
+            </div>
+            {zoneOpen ? (
+              <Select
+                label="Time zone"
+                value={zone}
+                onChange={(next) => {
+                  setZone(next);
+                  setZoneOpen(false);
+                }}
+                width="100%"
+                options={timeZoneChoices(zone).map((value) => ({
+                  value,
+                  label: zoneName(value),
+                }))}
+              />
+            ) : (
+              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                Taken from this browser. Routines and reminders run on this clock.
+              </span>
+            )}
+          </div>
+        </div>
+      </Card>
+    );
+  } else if (step === 2) {
+    const current = stages[stage] ?? stages[0];
+    card = (
+      <Card
+        title={`What ${assistantName()} does`}
+        footer={
+          <>
+            {back}
+            <div className="grow" />
+            <div className="row" style={{ gap: 6 }}>
+              {stages.map((s, i) => (
+                <span
+                  key={s}
+                  style={{
+                    width: i === stage ? 18 : 6,
+                    height: 6,
+                    borderRadius: 3,
+                    background:
+                      i === stage
+                        ? 'var(--primary)'
+                        : i < stage
+                          ? 'var(--blue-line)'
+                          : 'var(--line-strong)',
+                  }}
+                />
+              ))}
+            </div>
+            <div className="grow" />
+            {stepLabel}
+            <Button
+              iconRight="chevronRight"
+              onClick={() => (stage < stages.length - 1 ? setStage(stage + 1) : setStep(3))}
+            >
+              {stage < stages.length - 1 ? 'Next' : 'Continue'}
+            </Button>
+          </>
+        }
+      >
+        {current ? (
+          <div className="col" style={{ gap: 14 }}>
+            <Stage key={current} stage={current} />
+            <div className="col" style={{ gap: 4 }}>
+              <span
+                style={{
+                  fontFamily: 'var(--font-head)',
+                  fontSize: 19,
+                  fontWeight: 700,
+                  color: 'var(--heading)',
+                }}
+              >
+                {tourStages()[current].title}
+              </span>
+              <span style={{ fontSize: 14, lineHeight: '21px', color: 'var(--muted)' }}>
+                {tourStages()[current].desc}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <p style={{ fontSize: 14, color: 'var(--muted)' }}>
+            Nothing to show on this instance yet.
+          </p>
+        )}
+      </Card>
+    );
+  } else if (step === 3) {
+    const connected = new Set([
+      ...(connections.data?.connections ?? []).flatMap((item) =>
+        item.catalog_id ? [item.catalog_id] : [],
+      ),
+      ...linked,
+    ]);
+    card = (
+      <Card
+        title="Connect your apps"
+        sub={`Each one is optional. ${assistantName()} looks things up there, and asks you before it sends, posts or pays for anything.`}
+        footer={
+          <>
+            {back}
+            <div className="grow" />
+            {stepLabel}
+            <Button iconRight="chevronRight" onClick={() => setStep(4)}>
+              {linked.size ? 'Continue' : 'Skip for now'}
+            </Button>
+          </>
+        }
+      >
+        <TopPicks
+          connected={connected}
+          onInstalled={(id) => {
+            setLinked((previous) => new Set(previous).add(id));
+            connections.reload();
+          }}
+        />
+        <div className="row" style={{ gap: 8, fontSize: 12, color: 'var(--muted)' }}>
+          <Icon name="apps" size={14} />
+          Every app, including mail with an app password, is in Settings › Connections.
+        </div>
+      </Card>
+    );
+  } else if (step === 4) {
+    card = (
+      <Card
+        title="Want a morning brief?"
+        sub={`Start each day with one short note from ${assistantName()}. It works from today, and gets richer with each app you connect.`}
+        footer={
+          <>
+            {back}
+            <div className="grow" />
+            {stepLabel}
+            {briefMade ? (
+              <Button iconRight="chevronRight" onClick={() => setStep(5)}>
+                Continue
+              </Button>
+            ) : (
+              <>
+                <Button variant="ghost" disabled={busy} onClick={() => setStep(5)}>
+                  Not now
+                </Button>
+                <Button icon="sun" loading={busy} disabled={busy} onClick={() => void setUpBrief()}>
+                  Send me one at {clockWords(briefAt)}
+                </Button>
+              </>
+            )}
+          </>
+        }
+      >
+        <BriefParts />
+        {briefMade ? (
+          <div className="brief-made" role="status">
+            <Icon name="circleCheck" size={16} />
+            <span>
+              <strong>Your morning brief is set.</strong> {plainSchedule(briefMade.schedule)}. It’s
+              on Automations, where you can pause it.
+            </span>
+          </div>
+        ) : (
+          <BriefChoices
+            at={briefAt}
+            topics={topics}
+            zone={zoneName(zone)}
+            disabled={busy}
+            onAt={setBriefAt}
+            onTopics={setTopics}
+          />
+        )}
+      </Card>
+    );
+  } else if (step === 6) {
+    const question = QUESTIONS[asked];
+    card = (
+      <Card
+        title={`Let ${assistantName()} get to know you`}
+        sub="Four quick questions, so it can help from day one. Answer in your own words or skip any of them. What you say is kept under Settings › Memory and can be changed there."
+        footer={
+          <>
+            {back}
+            <div className="grow" />
+            {stepLabel}
+            {asked >= QUESTIONS.length ? (
+              <Button
+                iconRight="chevronRight"
+                loading={busy}
+                disabled={busy}
+                onClick={() => void finish()}
+              >
+                Open {instanceName()}
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                loading={busy}
+                disabled={saving || busy}
+                onClick={() => void finish()}
+              >
+                Skip, I’ll tell it later
+              </Button>
+            )}
+          </>
+        }
+      >
+        <div className="row" style={{ gap: 16, alignItems: 'stretch', flexWrap: 'wrap' }}>
+          <div
+            className="col grow"
+            style={{
+              gap: 12,
+              minWidth: 260,
+              minHeight: 280,
+              padding: 14,
+              borderRadius: 14,
+              background: 'var(--canvas)',
+              border: '1px solid var(--line)',
+              justifyContent: 'flex-end',
+            }}
+          >
+            {log.slice(-6).map((entry) =>
+              entry.who === 'agent' ? (
+                <div key={entry.id} className="row" style={{ gap: 10, alignItems: 'flex-start' }}>
+                  <OpenDuetAvatar size={24} />
+                  <p style={{ fontSize: 14, lineHeight: '21px', textWrap: 'pretty' }}>
+                    {entry.text}
+                  </p>
+                </div>
+              ) : (
+                <div key={entry.id} className="col" style={{ alignItems: 'flex-end' }}>
+                  <span
+                    style={{
+                      padding: '7px 12px',
+                      borderRadius: '14px 14px 4px 14px',
+                      background: 'var(--bubble)',
+                      color: 'var(--bubble-ink)',
+                      fontSize: 14,
+                    }}
+                  >
+                    {entry.text}
+                  </span>
+                </div>
+              ),
+            )}
+            {question && unsaved ? (
+              <div
+                role="alert"
+                className="row"
+                style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center', paddingLeft: 34 }}
+              >
+                <span style={{ fontSize: 13 }}>
+                  Couldn’t save “{unsaved.choice}”: {unsaved.reason}
+                </span>
+                <Chip disabled={saving} onClick={() => void answer(unsaved.choice)}>
+                  Retry
+                </Chip>
+              </div>
+            ) : null}
+            {question ? (
+              <div className="col" style={{ gap: 8, paddingLeft: 34 }}>
+                {question.suggestions.length ? (
+                  <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                    {question.suggestions.map((choice) => (
+                      <Chip key={choice} disabled={saving} onClick={() => void answer(choice)}>
+                        {choice}
+                      </Chip>
+                    ))}
+                  </div>
+                ) : null}
+                <form
+                  className="row"
+                  style={{ gap: 6, flexWrap: 'wrap' }}
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void answer(typed);
+                  }}
+                >
+                  <Input
+                    value={typed}
+                    onChange={(event) => setTyped(event.target.value)}
+                    placeholder={question.placeholder}
+                    aria-label={question.ask}
+                    width="min(100%, 280px)"
+                    maxLength={500}
+                  />
+                  <Button size="sm" type="submit" disabled={saving || !typed.trim()}>
+                    Save
+                  </Button>
+                  <Button size="sm" variant="ghost" disabled={saving} onClick={skip}>
+                    Skip
+                  </Button>
+                </form>
+              </div>
+            ) : null}
+          </div>
+          <div className="col" style={{ gap: 8, width: 220, flexShrink: 0 }}>
+            <span className="overline">What {assistantName()} will remember</span>
+            {kept.length === 0 ? (
+              <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                Nothing yet. Each answer appears here as it is saved.
+              </span>
+            ) : null}
+            {kept.map((item) => (
+              <div
+                key={item.id}
+                className="row pop"
+                style={{
+                  gap: 10,
+                  padding: '8px 10px',
+                  borderRadius: 10,
+                  background: 'var(--surface)',
+                  border: '1px solid var(--line)',
+                }}
+              >
+                <span
+                  className="row"
+                  style={{
+                    justifyContent: 'center',
+                    width: 24,
+                    height: 24,
+                    borderRadius: 7,
+                    background: 'var(--blue-soft)',
+                    color: 'var(--blue-ink)',
+                    flexShrink: 0,
+                  }}
+                >
+                  <Icon name="bookmark" size={13} />
+                </span>
+                <span className="col grow" style={{ minWidth: 0 }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--heading)' }}>
+                    {item.key}
+                  </span>
+                  <span className="clamp1" style={{ fontSize: 12, color: 'var(--muted)' }}>
+                    {item.value}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+    );
+  } else {
+    card = (
+      <Card
+        title={`Meet ${assistantName()}`}
+        sub={`${assistantName()} is your assistant. It can use every app you connect, its own computer and what you tell it to remember. Set how it sounds; change anything later in Agents.`}
+        footer={
+          <>
+            {back}
+            <div className="grow" />
+            {stepLabel}
+            <Button iconRight="chevronRight" onClick={() => setStep(6)}>
+              Continue
+            </Button>
+          </>
+        }
+      >
+        <div className="row" style={{ gap: 24, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+          <div
+            className="col"
+            style={{
+              ...studio,
+              gap: 10,
+              alignItems: 'center',
+              width: 236,
+              height: 200,
+              flexShrink: 0,
+              borderRadius: 14,
+              justifyContent: 'center',
+            }}
+          >
+            <OpenDuetAvatar size={88} />
+            <span style={{ fontSize: 12, color: 'var(--studio-muted)' }}>
+              Calls you {name.trim() || 'by your name'}
+            </span>
+          </div>
+          <div className="col grow" style={{ gap: 14, minWidth: 260 }}>
+            <Field label="Tone">
+              <Segmented
+                label="Tone"
+                value={voice.tone}
+                onChange={(tone) => setVoice({ ...voice, tone })}
+                options={[
+                  { value: 'Warm', label: 'Warm' },
+                  { value: 'Direct', label: 'Direct' },
+                  { value: 'Playful', label: 'Playful' },
+                ]}
+              />
+            </Field>
+            <Field label="One standing instruction" hint="Optional. Up to 200 characters.">
+              <Input
+                value={voice.standing_instruction}
+                onChange={(event) =>
+                  setVoice({ ...voice, standing_instruction: event.target.value })
+                }
+                placeholder="One option first, not five. Confirm before paying."
+                width="100%"
+                maxLength={200}
+              />
+            </Field>
+            <div className="row" style={{ gap: 12 }}>
+              <div className="col grow" style={{ gap: 1 }}>
+                <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--heading)' }}>
+                  Asks before acting
+                </span>
+                <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                  Anything that sends, books or pays waits for your yes.
+                </span>
+              </div>
+              <Toggle
+                on={voice.asks_before_acting}
+                label="Asks before acting"
+                onChange={(on) => setVoice({ ...voice, asks_before_acting: on })}
+              />
+            </div>
+            {templates.data?.templates.some((template) => template.featured) ? (
+              <fieldset className="field-group col" style={{ gap: 8 }}>
+                <legend className="overline">Add a specialist too? Optional</legend>
+                <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                  A specialist keeps to one job and only the tools it needs. Each one you pick
+                  reaches the connections listed for it; change that later on the Agents screen,
+                  where the full library is too. Ask one in any chat with @ and its name.
+                </span>
+                <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                  {templates.data.templates
+                    .filter((template) => template.featured)
+                    .map((template) => {
+                      const on = picked.includes(template.id);
+                      return (
+                        <Chip
+                          key={template.id}
+                          on={on}
+                          aria-pressed={on}
+                          onClick={() =>
+                            setPicked(
+                              on
+                                ? picked.filter((id) => id !== template.id)
+                                : [...picked, template.id],
+                            )
+                          }
+                        >
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <AgentFace look={lookOf(template.agent)} size={16} />
+                            {template.agent.name} · {template.title}
+                          </span>
+                        </Chip>
+                      );
+                    })}
+                </div>
+                {chosenTemplates(templates.data.templates, picked).length ? (
+                  <ul className="col" style={{ gap: 4, listStyle: 'none', padding: 0, margin: 0 }}>
+                    {chosenTemplates(templates.data.templates, picked).map((template) => {
+                      const reach = (connections.data?.connections ?? []).filter(
+                        (connection) =>
+                          suggestedConnections(template.works_best_with, [connection]).length,
+                      );
+                      return (
+                        <li key={template.id} style={{ fontSize: 12, color: 'var(--secondary)' }}>
+                          {template.agent.name} will reach{' '}
+                          {reach.length
+                            ? reach.map((connection) => connection.label).join(', ')
+                            : 'nothing yet, until you connect what it works best with'}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+              </fieldset>
+            ) : null}
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <div
+      className="col"
+      style={{ width: '100%', height: '100%', overflowY: 'auto', background: 'var(--canvas)' }}
+    >
+      <header className="row" style={{ gap: 10, height: 64, padding: '0 32px', flexShrink: 0 }}>
+        <OpenDuetMark width={40} />
+        <span
+          style={{
+            fontFamily: 'var(--font-head)',
+            fontSize: 16,
+            fontWeight: 600,
+            color: 'var(--heading)',
+          }}
+        >
+          {instanceName()}
+        </span>
+        <div className="grow" />
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => {
+            setOnboarded(true);
+            // Skipping is recorded too, so setup is not offered again on another device.
+            if (profile && !profile.onboarded)
+              void adapter.saveProfile(onboardedProfile(profile)).then(() => refreshProfile());
+            navigate('/');
+          }}
+        >
+          Skip setup
+        </Button>
+      </header>
+      <div
+        className="col grow"
+        style={{ alignItems: 'center', justifyContent: 'flex-start', padding: '16px 16px 40px' }}
+      >
+        {card}
+      </div>
+    </div>
+  );
+}

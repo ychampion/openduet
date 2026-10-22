@@ -1,0 +1,1229 @@
+#!/usr/bin/env python3
+"""The desktop inside a docker sandbox, driven one exec at a time by the service.
+
+    openduet-desktop screenshot            PNG of the whole screen on stdout
+    openduet-desktop stream --fps N        length-prefixed JPEG frames on stdout until the pipe closes
+    openduet-desktop info                  JSON: the screen, the window in front, whether a browser runs
+    openduet-desktop text                  JSON: what the screen says, from the page's accessibility tree or OCR
+    openduet-desktop open URL              open an address in the browser, starting it if needed,
+                                         and say whether the page in front now shows it
+    openduet-desktop click X Y BUTTON N    click N times with button 1, 2 or 3
+    openduet-desktop type TEXT             type into whatever has focus
+    openduet-desktop key KEY...            press keys, such as Return or ctrl+l
+    openduet-desktop scroll X Y STEPS      positive scrolls down, negative up
+    openduet-desktop input JSON            a person's live-view events, in order
+    openduet-desktop stop                  end the display's browser, and the display itself
+                                         when it is not display 0
+
+Before the command, `--display N --owner ID` picks a display of the computer
+and says whose it is. Each chat works on its own display, with its own
+browser: display 0 uses the computer's browser profile, and display N starts
+from a copy of it (`~/.config/openduet-browser-dN`), since one profile cannot
+be open in two browsers at once. When a display's owner changes, whatever the
+one before left on it is ended first, so a chat never sees another's page.
+Without `--display`, everything is display 0, as before displays.
+
+Everything runs as the sandbox user against the chosen display. Nothing here reads a
+credential, and the only socket it opens is to the browser's DevTools endpoint
+on the loopback address inside this container; the browser reaches the
+internet only through the proxy the sandbox was given, when it was given one.
+"""
+
+import base64
+import hashlib
+import http.client
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+DISPLAY = os.environ.get("DISPLAY", ":0")
+NUMBER = 0
+WIDTH, HEIGHT = 1024, 768
+BROWSER = shutil.which("chromium") or shutil.which("chromium-browser") or "chromium"
+BASE_PROFILE = os.path.join(os.environ.get("HOME", "/home/agent"), ".config", "openduet-browser")
+PROFILE = BASE_PROFILE
+BROWSER_LOG = "/tmp/browser.log"
+#: The most displays a computer has; the service's cap is at most this.
+MAX_DISPLAY = 63
+#: What a display's copy of the profile leaves out: locks of a running
+#: browser, caches, and the tabs another chat had open.
+PROFILE_SKIP = (
+    "SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort",
+    "Cache", "Code Cache", "GPUCache", "GrShaderCache", "ShaderCache", "Crashpad",
+    "Sessions", "Current Session", "Current Tabs", "Last Session", "Last Tabs",
+)
+# Where a browser profile keeps saved passwords, cards and addresses.
+STORES = tuple(
+    name + suffix
+    for name in ("Login Data", "Login Data For Account", "Web Data")
+    for suffix in ("", "-journal")
+)
+
+# The live view speaks DOM key names; xdotool speaks X keysyms.
+KEYSYMS = {
+    "Enter": "Return", "Backspace": "BackSpace", "Tab": "Tab", "Escape": "Escape",
+    "Delete": "Delete", "Insert": "Insert", "Home": "Home", "End": "End",
+    "PageUp": "Prior", "PageDown": "Next", "ArrowLeft": "Left", "ArrowRight": "Right",
+    "ArrowUp": "Up", "ArrowDown": "Down", "Shift": "Shift_L", "Control": "Control_L",
+    "Alt": "Alt_L", "Meta": "Super_L", "CapsLock": "Caps_Lock", " ": "space",
+    "ContextMenu": "Menu",
+}
+for number in range(1, 13):
+    KEYSYMS[f"F{number}"] = f"F{number}"
+
+
+def fail(message, code=1):
+    sys.stderr.write(message + "\n")
+    sys.exit(code)
+
+
+def xdotool(*args, check=True):
+    result = subprocess.run(["xdotool", *args], capture_output=True, text=True, env=os.environ)
+    if check and result.returncode != 0:
+        fail(f"xdotool {args[0]} failed: {result.stderr.strip()[:200]}")
+    return result.stdout.strip()
+
+
+def wait_for_display(seconds=20):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if subprocess.run(["xdotool", "getdisplaygeometry"], capture_output=True).returncode == 0:
+            return
+        time.sleep(0.2)
+    fail("the desktop did not start")
+
+
+def grab():
+    from PIL import ImageGrab
+
+    return ImageGrab.grab(xdisplay=DISPLAY)
+
+
+def profile_pattern(profile):
+    """The browser processes on one profile, as pgrep and pkill match their command lines."""
+    return "--user-data-dir=" + profile.replace(".", "\\.") + "( |$)"
+
+
+def browser_running():
+    uid = str(os.getuid())
+    found = subprocess.run(["pgrep", "-u", uid, "-f", "--", profile_pattern(PROFILE)], capture_output=True)
+    return found.returncode == 0
+
+
+def end_browser(profile):
+    """End the browser on one profile, and wait a moment for it to go."""
+    uid = str(os.getuid())
+    subprocess.run(["pkill", "-u", uid, "-f", "--", profile_pattern(profile)], capture_output=True)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        alive = subprocess.run(["pgrep", "-u", uid, "-f", "--", profile_pattern(profile)], capture_output=True)
+        if alive.returncode != 0:
+            return
+        time.sleep(0.1)
+    subprocess.run(["pkill", "-KILL", "-u", uid, "-f", "--", profile_pattern(profile)], capture_output=True)
+
+
+def display_file(name):
+    return f"/tmp/openduet-display-{NUMBER}.{name}"
+
+
+def ensure_display():
+    """Start this display's screen and window manager when it is not display 0 and not running."""
+    if NUMBER == 0 or os.path.exists(f"/tmp/.X11-unix/X{NUMBER}"):
+        return
+    with open(f"/tmp/xvfb-{NUMBER}.log", "ab") as log:
+        screen = subprocess.Popen(
+            ["Xvfb", DISPLAY, "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp",
+             "-nolisten", "local", "-noreset"],
+            stdout=log, stderr=log, start_new_session=True,
+        )
+    deadline = time.monotonic() + 10
+    while not os.path.exists(f"/tmp/.X11-unix/X{NUMBER}") and time.monotonic() < deadline:
+        time.sleep(0.1)
+    with open(f"/tmp/openbox-{NUMBER}.log", "ab") as log:
+        manager = subprocess.Popen(
+            ["openbox", "--sm-disable"], stdout=log, stderr=log, start_new_session=True,
+            env={**os.environ, "DISPLAY": DISPLAY},
+        )
+    with open(display_file("pids"), "w", encoding="ascii") as handle:
+        handle.write(f"{screen.pid} {manager.pid}\n")
+
+
+def end_display():
+    """End this display's browser, and its screen when it is not display 0."""
+    end_browser(PROFILE)
+    if NUMBER != 0:
+        try:
+            with open(display_file("pids"), encoding="ascii") as handle:
+                pids = [int(word) for word in handle.read().split()]
+        except (OSError, ValueError):
+            pids = []
+        for pid in reversed(pids):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        for path in (display_file("pids"), f"/tmp/.X11-unix/X{NUMBER}", f"/tmp/.X{NUMBER}-lock"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        shutil.rmtree(PROFILE, ignore_errors=True)
+    try:
+        os.unlink(display_file("owner"))
+    except OSError:
+        pass
+
+
+def display_owner():
+    """The chat this display was last claimed for, or None when nobody has claimed it."""
+    try:
+        with open(display_file("owner"), encoding="ascii") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def claim_display(owner):
+    """A display given to another chat starts clean: what the one before left is ended."""
+    if not owner:
+        return
+    before = display_owner()
+    if before == owner:
+        return
+    end_display()
+    with open(display_file("owner"), "w", encoding="ascii") as handle:
+        handle.write(owner + "\n")
+
+
+def copy_profile():
+    """A display other than 0 starts its browser from a copy of the computer's profile."""
+    if NUMBER == 0 or os.path.isdir(PROFILE):
+        return
+    if not os.path.isdir(BASE_PROFILE):
+        os.makedirs(PROFILE, exist_ok=True)
+        return
+    try:
+        shutil.copytree(
+            BASE_PROFILE, PROFILE, symlinks=True,
+            ignore=lambda _dir, names: [name for name in names if name in PROFILE_SKIP],
+        )
+    except shutil.Error:
+        # A file the running browser changed while it was copied is left out;
+        # the sign-ins that were copied still stand.
+        pass
+
+
+def choose(number, owner):
+    global DISPLAY, NUMBER, PROFILE, BROWSER_LOG
+    NUMBER = number
+    DISPLAY = f":{number}"
+    os.environ["DISPLAY"] = DISPLAY
+    if number:
+        PROFILE = f"{BASE_PROFILE}-d{number}"
+        BROWSER_LOG = f"/tmp/browser-{number}.log"
+    return owner
+
+
+def active_window():
+    result = subprocess.run(["xdotool", "getactivewindow", "getwindowname"], capture_output=True, text=True)
+    return result.stdout.strip()[:300] if result.returncode == 0 else ""
+
+
+def screenshot():
+    image = grab()
+    out = io.BytesIO()
+    image.save(out, format="PNG", compress_level=6)
+    sys.stdout.buffer.write(out.getvalue())
+
+
+def stream(fps):
+    period = 1.0 / max(1, min(10, fps))
+    last_digest, last_sent = None, 0.0
+    out = sys.stdout.buffer
+    while True:
+        started = time.monotonic()
+        buffer = io.BytesIO()
+        grab().convert("RGB").save(buffer, format="JPEG", quality=60)
+        frame = buffer.getvalue()
+        digest = hashlib.sha256(frame).digest()
+        # An unchanged screen is sent again only now and then, so a new viewer is painted.
+        if digest != last_digest or started - last_sent > 2.0:
+            try:
+                out.write(struct.pack(">I", len(frame)) + frame)
+                out.flush()
+            except BrokenPipeError:
+                return
+            last_digest, last_sent = digest, started
+        time.sleep(max(0.0, period - (time.monotonic() - started)))
+
+
+def info():
+    print(json.dumps({
+        "width": WIDTH,
+        "height": HEIGHT,
+        "window": active_window(),
+        "browser": browser_running(),
+    }))
+
+
+# ---- what the screen says ------------------------------------------------
+#
+# A model that reads no pictures still has to know what is on the screen. The
+# browser starts with its DevTools endpoint on the loopback address inside this
+# container (the port it chose is written to DevToolsActivePort in its
+# profile), and `text` reads the accessibility tree of the page in front from
+# it: each element's role, name, value, state and box on the screen, with a
+# reference that stays the same while the element does. Anything else in front,
+# or a browser started without the endpoint, is read with OCR instead.
+#
+# What is printed is raw material: the service formats it, bounds it and marks
+# it as the page's words, never the person's.
+
+#: Elements looked at, in page order, before their boxes are asked for.
+MAX_CANDIDATES = 3000
+#: Elements printed, of those on screen.
+MAX_ELEMENTS = 600
+#: Characters kept of a name or a value.
+MAX_FIELD = 300
+#: Roles that say nothing on their own; their text is kept by the nodes inside.
+QUIET_ROLES = {
+    "none", "generic", "presentation", "InlineTextBox", "LineBreak", "RootWebArea", "WebArea",
+    "paragraph", "group", "Section", "div", "LayoutTable", "LayoutTableRow", "LayoutTableCell",
+    "ListMarker", "sectionheader", "sectionfooter",
+}
+#: Roles a person acts on, kept even when they have no name.
+CONTROL_ROLES = {
+    "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio", "switch", "slider",
+    "spinbutton", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "listbox",
+    "treeitem", "gridcell", "ComboBoxSelect", "ComboBoxMenuButton", "PopUpButton", "DisclosureTriangle",
+}
+#: The most bytes one DevTools answer may take. A page whose tree is larger
+#: (a large article's is about 14 MB) is read with OCR instead, so the reader's
+#: memory stays bounded whatever the page holds.
+MAX_MESSAGE = 32 << 20
+#: The most seconds one reading of the page may take, all calls together.
+READ_SECONDS = 20.0
+#: Element states worth saying, as the accessibility tree names them.
+STATES = ("focused", "checked", "pressed", "selected", "expanded", "disabled", "required", "invalid")
+
+
+class DevToolsSocket:
+    """Just enough of a WebSocket client for the DevTools protocol on the loopback address."""
+
+    def __init__(self, url, timeout=5.0, seconds=READ_SECONDS):
+        self.deadline = time.monotonic() + seconds
+        self.timeout = timeout
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise OSError("the DevTools endpoint is not on this computer")
+        self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        self.sock.sendall(
+            (
+                f"GET {target} HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+        )
+        self.buffer = bytearray()
+        while b"\r\n\r\n" not in self.buffer:
+            self._fill()
+        end = self.buffer.index(b"\r\n\r\n") + 4
+        status = bytes(self.buffer[:end]).split(b"\r\n", 1)[0]
+        del self.buffer[:end]
+        if b" 101 " not in status + b" ":
+            raise OSError("the DevTools endpoint refused the connection")
+        self.last = 0
+
+    def _fill(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise OSError("the page took too long to read")
+        self.sock.settimeout(min(self.timeout, left))
+        chunk = self.sock.recv(1 << 16)
+        if not chunk:
+            raise OSError("the DevTools endpoint closed the connection")
+        self.buffer += chunk
+
+    def _take(self, size):
+        while len(self.buffer) < size:
+            self._fill()
+        out = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return out
+
+    def _frame(self, opcode, data):
+        header = bytearray([0x80 | opcode])
+        size = len(data)
+        if size < 126:
+            header.append(0x80 | size)
+        elif size < 1 << 16:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", size)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", size)
+        mask = os.urandom(4)
+        header += mask
+        self.sock.sendall(bytes(header) + bytes(byte ^ mask[index % 4] for index, byte in enumerate(data)))
+
+    def send(self, method, params=None):
+        self.last += 1
+        self._frame(0x1, json.dumps({"id": self.last, "method": method, "params": params or {}}).encode("utf-8"))
+        return self.last
+
+    def receive(self):
+        message = bytearray()
+        while True:
+            first, second = self._take(2)
+            opcode, size = first & 0x0F, second & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", self._take(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", self._take(8))[0]
+            if len(message) + size > MAX_MESSAGE:
+                raise OSError("the page's accessibility tree is too large to read")
+            mask = self._take(4) if second & 0x80 else None
+            data = self._take(size)
+            if mask:
+                data = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
+            if opcode == 0x8:
+                raise OSError("the DevTools endpoint closed the connection")
+            if opcode == 0x9:
+                self._frame(0xA, data)
+                continue
+            if opcode == 0xA:
+                continue
+            message += data
+            if first & 0x80:
+                return json.loads(message.decode("utf-8"))
+
+    def answers(self, ids):
+        """The results for these message ids, by id; an error answers None."""
+        waiting, found = set(ids), {}
+        while waiting:
+            reply = self.receive()
+            if reply.get("id") in waiting:
+                waiting.discard(reply["id"])
+                found[reply["id"]] = None if "error" in reply else reply.get("result", {})
+        return found
+
+    def call(self, method, params=None):
+        sent = self.send(method, params)
+        result = self.answers([sent])[sent]
+        if result is None:
+            raise OSError(f"DevTools could not {method}")
+        return result
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def devtools_port(path=None):
+    path = path or os.path.join(PROFILE, "DevToolsActivePort")
+    try:
+        with open(path, encoding="ascii") as handle:
+            port = int(handle.readline().strip())
+    except (OSError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def page_target(port, window_title):
+    """The page in the window in front: the one whose title the window shows, else the most recent."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        connection.request("GET", "/json/list")
+        listed = json.loads(connection.getresponse().read())
+    finally:
+        connection.close()
+    targets = [entry for entry in listed if isinstance(entry, dict) and entry.get("type") == "page"]
+    if not targets:
+        return None
+    for target in targets:
+        title = target.get("title") or ""
+        if title and window_title.startswith(title):
+            return target
+    return targets[0]
+
+
+def clean(value):
+    """One line of at most MAX_FIELD characters: a page cannot make one element look like two."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= MAX_FIELD else text[: MAX_FIELD - 1] + "…"
+
+
+def ax_value(node, key):
+    entry = node.get(key)
+    return entry.get("value") if isinstance(entry, dict) else None
+
+
+def candidates(nodes):
+    """The tree's elements worth saying, in page order: named, valued, or acted on."""
+    by_id = {node.get("nodeId"): node for node in nodes}
+    roots = [node for node in nodes if node.get("parentId") not in by_id]
+    order, stack, seen = [], [root.get("nodeId") for root in reversed(roots)], set()
+    while stack:
+        node_id = stack.pop()
+        if node_id in seen or node_id not in by_id:
+            continue
+        seen.add(node_id)
+        order.append(by_id[node_id])
+        stack.extend(reversed(by_id[node_id].get("childIds") or []))
+    picked = []
+    for node in order:
+        if node.get("ignored") or not isinstance(node.get("backendDOMNodeId"), int):
+            continue
+        role = str(ax_value(node, "role") or "")
+        name = clean(ax_value(node, "name") or "")
+        value = ax_value(node, "value")
+        value = clean(value) if value not in (None, "") else ""
+        if role in QUIET_ROLES and not value:
+            continue
+        if role == "StaticText":
+            # Text a link, a button or a field already says by its name or
+            # value is said once, there.
+            said, above = False, by_id.get(node.get("parentId"))
+            for _ in range(3):
+                if not above:
+                    break
+                if any(name in clean(ax_value(above, key) or "") for key in ("name", "value")):
+                    said = True
+                    break
+                above = by_id.get(above.get("parentId"))
+            if not name or said:
+                continue
+            role = "text"
+        elif not name and not value and role not in CONTROL_ROLES:
+            continue
+        states, secret = [], False
+        for prop in node.get("properties") or []:
+            key = prop.get("name")
+            got = (prop.get("value") or {}).get("value")
+            if key in STATES and got not in (None, False, "false"):
+                states.append(key if got in (True, "true") else f"{key}={clean(got)}")
+            if (key == "protected" and got in (True, "true")) or (
+                key == "autocomplete" and re.search(r"password|one-time-code", str(got or ""), re.I)
+            ):
+                secret = True
+        if role.lower() in ("passwordfield", "securetextfield"):
+            secret = True
+        # The elements around it, nearest first, for the clip of any that scrolls.
+        around, above = [], by_id.get(node.get("parentId"))
+        while above is not None and len(around) < 64:
+            if isinstance(above.get("backendDOMNodeId"), int):
+                around.append(above["backendDOMNodeId"])
+            above = by_id.get(above.get("parentId"))
+        picked.append(
+            {"ref": f"n{node['backendDOMNodeId']}", "role": role, "name": name, "value": value,
+             "states": states, "backend": node["backendDOMNodeId"], "around": around, "secure": secret}
+        )
+        if len(picked) >= MAX_CANDIDATES:
+            break
+    return picked
+
+
+#: The elements that clip what is inside them: scrolling panes, pickers and
+#: anything else whose overflow is not visible, up to a bound.
+CLIPPERS = """(() => {
+  const found = [];
+  for (const element of document.querySelectorAll('body *')) {
+    const style = getComputedStyle(element);
+    if (/auto|scroll|hidden|clip/.test(style.overflowX + ' ' + style.overflowY)) found.push(element);
+    if (found.length >= 400) break;
+  }
+  return found;
+})()"""
+CLIP_RECTS = """function () {
+  return this.map((element) => {
+    const box = element.getBoundingClientRect();
+    return [box.left + element.clientLeft, box.top + element.clientTop,
+            box.left + element.clientLeft + element.clientWidth, box.top + element.clientTop + element.clientHeight];
+  });
+}"""
+
+
+#: What a field autocompletes when its value is a secret, as the browser tools
+#: read it (`apps/openduet/src/workers/browser/controller.ts`): a password, a
+#: one-time code, a passkey, a card's number, its expiry or its security code.
+SECRET_AUTOCOMPLETE = "password|one-time-code|webauthn|cc-number|cc-csc|cc-exp"
+#: Fields whose value is a secret: passwords and codes, by type, by what they
+#: autocomplete, or by text the page draws masked. Fields inside a component's
+#: open shadow root are looked at as well, since its tree shows them.
+SECURE_FIELDS = """(() => {
+  const found = [];
+  const look = (root) => {
+    for (const element of root.querySelectorAll('*')) {
+      if (found.length >= 400) return;
+      if (element.matches('input, textarea, [contenteditable]') && (
+        element.type === 'password' ||
+        /%s/i.test(element.getAttribute('autocomplete') || '') ||
+        !/^(none|)$/.test(getComputedStyle(element).getPropertyValue('-webkit-text-security'))
+      )) found.push(element);
+      if (element.shadowRoot) look(element.shadowRoot);
+    }
+  };
+  look(document);
+  return found;
+})()""" % SECRET_AUTOCOMPLETE
+
+
+def clip_boxes(tools, expression=CLIPPERS):
+    """Each element the expression finds, by its DOM node id, with its visible inside in page pixels."""
+    group = "openduet-text"
+    try:
+        listed = tools.call("Runtime.evaluate", {"expression": expression, "objectGroup": group})
+        array = (listed.get("result") or {}).get("objectId")
+        if not array:
+            return {}
+        rects = tools.call(
+            "Runtime.callFunctionOn",
+            {"objectId": array, "functionDeclaration": CLIP_RECTS, "returnByValue": True},
+        )["result"]["value"]
+        props = tools.call("Runtime.getProperties", {"objectId": array, "ownProperties": True})
+        elements = {}
+        for prop in props.get("result") or []:
+            name, value = prop.get("name", ""), prop.get("value") or {}
+            if name.isdigit() and value.get("objectId"):
+                elements[int(name)] = value["objectId"]
+        sent = {tools.send("DOM.describeNode", {"objectId": oid}): index for index, oid in elements.items()}
+        described = tools.answers(list(sent))
+    finally:
+        try:
+            tools.call("Runtime.releaseObjectGroup", {"objectGroup": group})
+        except OSError:
+            pass
+    clips = {}
+    for sent_id, index in sent.items():
+        node = (described.get(sent_id) or {}).get("node") or {}
+        if isinstance(node.get("backendNodeId"), int) and index < len(rects):
+            clips[node["backendNodeId"]] = tuple(rects[index])
+    return clips
+
+
+def union(quads):
+    xs = [quad[index] for quad in quads for index in range(0, len(quad) - 1, 2)]
+    ys = [quad[index] for quad in quads for index in range(1, len(quad), 2)]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+#: Who may draw a check that a person is there, as the service names them.
+CHALLENGE_PROVIDERS = ("cloudflare", "recaptcha", "hcaptcha", "arkose", "datadome", "perimeterx")
+#: Whether the page shows such a check, and whose: a visible frame or widget
+#: from a bot-check provider, as the browser tools look for one
+#: (`apps/openduet/src/workers/browser/controller.ts`, `challengeShown`), in open
+#: shadow roots too (PerimeterX's press-and-hold box among them), or
+#: Cloudflare's own check page. The invisible kind, which asks nothing of
+#: anyone, is left out. Null when there is none.
+CHALLENGE_SHOWN = r"""(() => {
+  const hosts = [
+    [/(^|\.)challenges\.cloudflare\.com$/i, 'cloudflare'],
+    [/(^|\.)recaptcha\.net$/i, 'recaptcha'],
+    [/(^|\.)hcaptcha\.com$/i, 'hcaptcha'],
+    [/(^|\.)(arkoselabs\.com|funcaptcha\.com)$/i, 'arkose'],
+    [/(^|\.)captcha-delivery\.com$/i, 'datadome'],
+    [/(^|\.)(px-cdn\.net|px-cloud\.net|perimeterx\.net)$/i, 'perimeterx'],
+  ];
+  const shown = (element) => {
+    const box = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return box.width >= 30 && box.height >= 30 && style.visibility !== 'hidden' &&
+      style.display !== 'none' && Number(style.opacity) > 0;
+  };
+  const found = [];
+  const look = (root) => {
+    for (const element of root.querySelectorAll('iframe, .g-recaptcha, .h-captcha, .cf-turnstile, #px-captcha')) {
+      if (found.length >= 200) return;
+      found.push(element);
+    }
+    for (const element of root.querySelectorAll('*')) if (element.shadowRoot) look(element.shadowRoot);
+  };
+  look(document);
+  for (const element of found) {
+    if (element.tagName === 'IFRAME') {
+      let url;
+      try { url = new URL(element.getAttribute('src') || '', location.href); } catch (error) { continue; }
+      if (url.searchParams.get('size') === 'invisible') continue;
+      const google = /(^|\.)google\.com$/i.test(url.hostname) && url.pathname.includes('/recaptcha/');
+      const named = google ? 'recaptcha' : (hosts.find(([host]) => host.test(url.hostname)) || [])[1];
+      if (named && shown(element)) return named;
+    } else if (element.getAttribute('data-size') !== 'invisible' && shown(element)) {
+      return element.id === 'px-captcha' ? 'perimeterx'
+        : element.classList.contains('cf-turnstile') ? 'cloudflare'
+        : element.classList.contains('h-captcha') ? 'hcaptcha' : 'recaptcha';
+    }
+  }
+  if (window._cf_chl_opt || document.querySelector('#challenge-form, #challenge-stage, #challenge-running'))
+    return 'cloudflare';
+  return null;
+})()"""
+
+
+def challenge_shown(tools):
+    """Whose check that a person is there the page shows, or None; never a failure of the read."""
+    try:
+        looked = tools.call("Runtime.evaluate", {"expression": CHALLENGE_SHOWN, "returnByValue": True})
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    said = (looked.get("result") or {}).get("value")
+    return said if said in CHALLENGE_PROVIDERS else None
+
+
+def accessibility_view(port, window_title):
+    """The page in front, element by element, with boxes in screen pixels; None when there is none."""
+    target = page_target(port, window_title)
+    if not target or not target.get("webSocketDebuggerUrl"):
+        return None
+    tools = DevToolsSocket(target["webSocketDebuggerUrl"])
+    try:
+        # A page still loading may have no document to ask yet: asked again, once.
+        for attempt in range(2):
+            frame = tools.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "JSON.stringify([screenX, screenY, outerWidth, outerHeight, innerWidth,"
+                    " innerHeight, scrollY, document.documentElement.scrollHeight])",
+                    "returnByValue": True,
+                },
+            )
+            said = (frame.get("result") or {}).get("value")
+            if isinstance(said, str) or attempt:
+                break
+            time.sleep(0.5)
+        sx, sy, outer_w, outer_h, inner_w, inner_h, scroll_y, page_h = json.loads(said)
+        tools.call("Accessibility.enable")
+        found = candidates(tools.call("Accessibility.getFullAXTree").get("nodes") or [])
+        try:
+            clips = clip_boxes(tools)
+        except (OSError, KeyError, TypeError, ValueError):
+            clips = {}
+        # A secret field's value is never read out. When the fields cannot be
+        # told apart, no field's value is.
+        try:
+            secure = set(clip_boxes(tools, SECURE_FIELDS))
+        except (OSError, KeyError, TypeError, ValueError):
+            secure = None
+        challenge = challenge_shown(tools)
+        sent = {tools.send("DOM.getContentQuads", {"backendNodeId": item["backend"]}): item for item in found}
+        answers = tools.answers(list(sent))
+    finally:
+        tools.close()
+    # Page pixels to screen pixels: the window's place, then the browser's own
+    # bars above the page and any border at the sides.
+    side = max(0, (outer_w - inner_w) // 2)
+    left, top = sx + side, sy + max(0, outer_h - inner_h - side)
+    elements, offscreen = [], 0
+    for sent_id, item in sent.items():
+        quads = (answers.get(sent_id) or {}).get("quads") or []
+        if not quads:
+            continue
+        x1, y1, x2, y2 = union(quads)
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(inner_w, x2), min(inner_h, y2)
+        # What a scrolling pane or a clipping box around it hides is not on the screen.
+        for clip in (clips[node] for node in item["around"] if node in clips):
+            x1, y1, x2, y2 = max(x1, clip[0]), max(y1, clip[1]), min(x2, clip[2]), min(y2, clip[3])
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            offscreen += 1
+            continue
+        if len(elements) >= MAX_ELEMENTS:
+            continue
+        hidden = item["secure"] or (secure is not None and item["backend"] in secure)
+        if secure is not None and any(node in secure for node in item["around"]):
+            # What is drawn inside a secret field is its value too.
+            continue
+        element = {key: item[key] for key in ("ref", "role", "name") if item[key]}
+        if item["value"] and not hidden and secure is not None:
+            element["value"] = item["value"]
+        states = item["states"] + (["protected"] if hidden else [])
+        if states:
+            element["states"] = states
+        element["box"] = [round(left + x1), round(top + y1), round(x2 - x1), round(y2 - y1)]
+        elements.append(element)
+    return {
+        "source": "accessibility",
+        # Where the page is and what it is called, as the browser lists it: a
+        # page's own script can say anything about itself.
+        "url": str(target.get("url") or "")[:2048],
+        "title": clean(target.get("title") or ""),
+        "scroll": {"top": round(scroll_y), "page_height": round(page_h), "view_height": round(inner_h)},
+        "elements": elements,
+        "offscreen": offscreen,
+        **({"challenge": challenge} if challenge else {}),
+    }
+
+
+def ocr_lines(tsv):
+    """Tesseract's TSV as lines of text, each with its box."""
+    lines, order = {}, []
+    for row in tsv.splitlines()[1:]:
+        cells = row.split("\t")
+        if len(cells) < 12 or cells[0] != "5":
+            continue
+        word = cells[11].strip()
+        try:
+            confidence = float(cells[10])
+            x, y, w, h = (int(cells[index]) for index in range(6, 10))
+        except ValueError:
+            continue
+        if not word or confidence < 0:
+            continue
+        key = (cells[1], cells[2], cells[3], cells[4])
+        if key not in lines:
+            lines[key] = {"words": [], "x1": x, "y1": y, "x2": x + w, "y2": y + h}
+            order.append(key)
+        line = lines[key]
+        line["words"].append(word)
+        line["x1"], line["y1"] = min(line["x1"], x), min(line["y1"], y)
+        line["x2"], line["y2"] = max(line["x2"], x + w), max(line["y2"], y + h)
+    elements = []
+    for index, key in enumerate(order[:MAX_ELEMENTS]):
+        line = lines[key]
+        elements.append({
+            "ref": f"t{index + 1}",
+            "role": "text",
+            "name": clean(" ".join(line["words"])),
+            "box": [line["x1"], line["y1"], line["x2"] - line["x1"], line["y2"] - line["y1"]],
+        })
+    return elements
+
+
+def ocr_view(reason):
+    if not shutil.which("tesseract"):
+        return {"source": "none", "reason": f"{reason}, and no OCR is installed"}
+    with tempfile.NamedTemporaryFile(suffix=".png", dir="/tmp") as shot:
+        grab().save(shot.name, format="PNG")
+        result = subprocess.run(
+            ["tesseract", shot.name, "stdout", "--psm", "3", "tsv"],
+            capture_output=True, text=True, timeout=45,
+        )
+    if result.returncode != 0:
+        return {"source": "none", "reason": f"{reason}, and OCR failed: {result.stderr.strip()[:200]}"}
+    return {"source": "ocr", "reason": reason, "elements": ocr_lines(result.stdout)}
+
+
+def text():
+    window = active_window()
+    view = None
+    port = devtools_port() if browser_running() else None
+    if port is None:
+        reason = "no browser with an accessibility tree is open"
+    elif not window.endswith("Chromium"):
+        reason = "the window in front is not the browser"
+    else:
+        try:
+            view = accessibility_view(port, window[: -len("Chromium")].rstrip(" -–"))
+            reason = "the browser showed no page"
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+            reason = f"the browser's accessibility tree could not be read ({type(error).__name__})"
+    if view is None:
+        view = ocr_view(reason)
+    view["window"] = window
+    view["width"], view["height"] = WIDTH, HEIGHT
+    print(json.dumps(view, ensure_ascii=False))
+
+
+def browser_windows():
+    found = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "[Cc]hromium"],
+                           capture_output=True, text=True)
+    return found.stdout.split() if found.returncode == 0 else []
+
+
+def window_name(window):
+    result = subprocess.run(["xdotool", "getwindowname", window], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def front_browser_window():
+    """Bring the browser's own window to the front: the one in front already, else the top one.
+
+    A bubble the browser draws (such as one offering to restore pages) is a
+    window of the browser's too, but it holds no page, so it is never the one.
+    """
+    windows = browser_windows()
+    pages = [window for window in windows if window_name(window).endswith("Chromium")]
+    active = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True).stdout.strip()
+    choice = active if active in pages else (pages or windows)[-1]
+    xdotool("windowactivate", "--sync", choice, check=False)
+
+
+# Titles a window shows before any page is in it.
+BLANK_TITLES = {"", "chromium", "new tab - chromium", "about:blank - chromium", "untitled - chromium"}
+
+
+def settled_title(before, seconds):
+    """The title of the window in front once it moved off `before`, or the last one seen."""
+    deadline = time.monotonic() + seconds
+    title = active_window()
+    while time.monotonic() < deadline:
+        title = active_window()
+        if title != before and title.lower() not in BLANK_TITLES:
+            return title
+        time.sleep(0.25)
+    return title
+
+
+def comparable(address):
+    """An address the way two addresses of one page compare equal.
+
+    The scheme (a site moves http to https), a leading `www.`, a default port, a
+    trailing slash, the fragment and how characters are escaped are set aside.
+    None for anything that is not a web address.
+    """
+    try:
+        parts = urllib.parse.urlsplit(str(address or "").strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        return None
+    host = parts.hostname.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = urllib.parse.unquote(parts.path) or "/"
+    if len(path) > 1:
+        path = path.rstrip("/") or "/"
+    return (host, None if port in (80, 443) else port, path, urllib.parse.unquote_plus(parts.query))
+
+
+def front_page(port):
+    """The page in the browser window in front, as the browser lists it, and that window's title."""
+    window = active_window()
+    title = window[: -len("Chromium")].rstrip(" -–") if window.endswith("Chromium") else ""
+    return page_target(port, title), window
+
+
+def asked_address(target):
+    """What was asked for in the entry the page shows, before any redirect, as the browser records it."""
+    tools = DevToolsSocket(target["webSocketDebuggerUrl"], seconds=5.0)
+    try:
+        history = tools.call("Page.getNavigationHistory")
+    finally:
+        tools.close()
+    entries, index = history.get("entries") or [], history.get("currentIndex")
+    if isinstance(index, int) and 0 <= index < len(entries):
+        return str(entries[index].get("userTypedURL") or "")
+    return ""
+
+
+def navigate(port, url):
+    """Load the address in the page in front through the browser's DevTools endpoint.
+
+    Unlike keys typed into the address bar, this reaches the page whatever has
+    the keyboard. Returns the browser's error, or None when the page loaded.
+    """
+    target, _ = front_page(port)
+    if not target or not target.get("webSocketDebuggerUrl"):
+        raise OSError("the browser showed no page")
+    tools = DevToolsSocket(target["webSocketDebuggerUrl"])
+    try:
+        tools.call("Page.bringToFront")
+        result = tools.call("Page.navigate", {"url": url})
+    finally:
+        tools.close()
+    return result.get("errorText") or None
+
+
+def showing(url, seconds):
+    """Whether the page in front shows `url`, waiting up to `seconds`.
+
+    Returns (shows, its address, the window's title, whether it was read). The
+    address is the one the browser lists for the page in the window in front,
+    read over its DevTools endpoint. A site that sends the browser on to another
+    address still counts: the browser records what was asked for. With no
+    endpoint to read, `shows` is None: not known.
+    """
+    want = comparable(url)
+    deadline = time.monotonic() + seconds
+    address, window, read = "", active_window(), False
+    while True:
+        port = devtools_port() if browser_running() else None
+        target = None
+        if port is not None:
+            try:
+                target, window = front_page(port)
+                read = True
+            except (OSError, ValueError, KeyError, TypeError):
+                target = None
+        if target:
+            address = str(target.get("url") or "")[:2048]
+            if want and comparable(address) == want:
+                return True, address, window, read
+            if want and comparable(address) is not None and target.get("webSocketDebuggerUrl"):
+                try:
+                    if comparable(asked_address(target)) == want:
+                        return True, address, window, read
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+        if time.monotonic() >= deadline:
+            return (False if read else None), address, window, read
+        time.sleep(0.25)
+
+
+def open_url(url):
+    if not re.match(r"^https?://", url):
+        fail("an address to open must start with http:// or https://")
+    error = None
+    if browser_running() and browser_windows():
+        # The visible browser is reused: its window comes to the front, and the
+        # address goes into the page it shows, over its DevTools endpoint.
+        front_browser_window()
+        before = active_window()
+        port, sent = devtools_port(), False
+        if port is not None:
+            try:
+                error, sent = navigate(port, url), True
+            except (OSError, ValueError, KeyError, TypeError):
+                sent = False
+        if not sent:
+            # A browser without the endpoint: the address bar, the address, then
+            # Return, the way a person types it. Delete drops any completion the
+            # address bar added after the address.
+            xdotool("key", "--clearmodifiers", "ctrl+l")
+            time.sleep(0.2)
+            xdotool("type", "--delay", "4", "--", url)
+            xdotool("key", "--clearmodifiers", "Delete", "Return")
+    else:
+        before = ""
+        # A profile from a browser that is no longer running can still hold its
+        # lock, which keeps a new one from opening the address, and the port of
+        # an endpoint that is gone.
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"):
+            try:
+                os.unlink(os.path.join(PROFILE, name))
+            except FileNotFoundError:
+                pass
+        # The browser's policy keeps it from saving passwords, cards or
+        # addresses; anything an older image saved is removed before it starts.
+        for name in STORES:
+            try:
+                os.unlink(os.path.join(PROFILE, "Default", name))
+            except FileNotFoundError:
+                pass
+        copy_profile()
+        flags = [
+            f"--user-data-dir={PROFILE}",
+            # The container is the boundary: it already runs whatever the agent
+            # asks, under the engine's seccomp profile, which refuses the
+            # namespaces Chromium's own sandbox would make.
+            "--no-sandbox",
+            "--test-type",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-gpu",
+            "--disable-features=Translate,MediaRouter,OptimizationHints",
+            "--password-store=basic",
+            # A computer stopped while idle ends its browser abruptly; the next
+            # start would otherwise offer to restore pages in a bubble that
+            # takes the keyboard.
+            "--hide-crash-restore-bubble",
+            # The page's accessibility tree, for `text`, and the address of the
+            # page in front, for `open`: on the loopback address inside this
+            # container, at a port written to the profile.
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--window-position=0,0",
+            f"--window-size={WIDTH},{HEIGHT}",
+            "--start-maximized",
+        ]
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if proxy:
+            flags.append(f"--proxy-server={proxy}")
+        os.makedirs(PROFILE, exist_ok=True)
+        with open(BROWSER_LOG, "ab") as log:
+            subprocess.Popen([BROWSER, *flags, url], stdout=log, stderr=log, start_new_session=True)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if browser_windows():
+                break
+            time.sleep(0.25)
+        else:
+            fail("the browser did not open a window")
+    # Whether the page in front shows the address is read from the browser,
+    # not assumed: an open that left an earlier page in front says so, and so
+    # does one the browser could not load, whatever its error page is called.
+    navigated, address, title, read = showing(url, 0 if error else 15)
+    if error:
+        navigated = False
+    elif navigated is None:
+        # No endpoint to read: the title changes when a page, a picture or an
+        # error page takes the window's place.
+        title = settled_title(before, 3)
+        navigated = title != before and title.lower() not in BLANK_TITLES
+    if navigated:
+        # Let the page start painting before anyone looks.
+        time.sleep(1.5)
+        title = active_window()
+    answer = {"opened": url, "navigated": navigated, "window": title, "browser": True,
+              "checked": "address" if read else "title"}
+    if address:
+        answer["address"] = address
+    if not navigated:
+        answer["reason"] = (
+            f"the browser could not load it ({error})" if error
+            else "the page in front is still another one" if read
+            else "the window did not change"
+        )
+    print(json.dumps(answer, ensure_ascii=False))
+
+
+def number(value, low, high, what):
+    try:
+        parsed = int(value)
+    except ValueError:
+        fail(f"{what} must be a whole number")
+    if parsed < low or parsed > high:
+        fail(f"{what} must be from {low} to {high}")
+    return parsed
+
+
+def click(x, y, button, count):
+    x, y = number(x, 0, WIDTH - 1, "x"), number(y, 0, HEIGHT - 1, "y")
+    button, count = number(button, 1, 3, "button"), number(count, 1, 3, "count")
+    xdotool("mousemove", "--sync", str(x), str(y), "click", "--repeat", str(count), "--delay", "80", str(button))
+    print(json.dumps({"clicked": [x, y], "button": button, "count": count, "window": active_window()}))
+
+
+def type_text(text):
+    xdotool("type", "--delay", "8", "--", text)
+    print(json.dumps({"typed": len(text), "window": active_window()}))
+
+
+def keys(names):
+    for name in names:
+        if not re.match(r"^[A-Za-z0-9_+]{1,48}$", name):
+            fail(f"not a key name: {name!r}")
+    xdotool("key", "--delay", "40", "--", *names)
+    print(json.dumps({"pressed": names, "window": active_window()}))
+
+
+def scroll(x, y, steps):
+    x, y = number(x, 0, WIDTH - 1, "x"), number(y, 0, HEIGHT - 1, "y")
+    steps = number(steps, -50, 50, "steps")
+    button = "5" if steps > 0 else "4"
+    xdotool("mousemove", "--sync", str(x), str(y), "click", "--repeat", str(abs(steps)), "--delay", "30", button)
+    print(json.dumps({"scrolled": steps, "window": active_window()}))
+
+
+def live_input(raw):
+    """A person's events from the live view, which is the same size as the screen."""
+    events = json.loads(raw)
+    if not isinstance(events, list) or len(events) > 200:
+        fail("input is a list of at most 200 events")
+    commands = []
+
+    def point(event):
+        return str(max(0, min(WIDTH - 1, int(event["x"])))), str(max(0, min(HEIGHT - 1, int(event["y"]))))
+
+    for event in events:
+        kind = event.get("k")
+        if kind in ("move", "down", "up"):
+            x, y = point(event)
+            commands.append(["mousemove", x, y])
+            button = str({0: 1, 1: 2, 2: 3}.get(event.get("button", 0), 1))
+            if kind == "down":
+                commands.append(["mousedown", button])
+            elif kind == "up":
+                commands.append(["mouseup", button])
+        elif kind == "wheel":
+            x, y = point(event)
+            commands.append(["mousemove", x, y])
+            dy, dx = float(event.get("dy", 0)), float(event.get("dx", 0))
+            if dy:
+                commands.append(["click", "--repeat", str(min(10, max(1, round(abs(dy) / 100)))), "5" if dy > 0 else "4"])
+            if dx:
+                commands.append(["click", "--repeat", str(min(10, max(1, round(abs(dx) / 100)))), "7" if dx > 0 else "6"])
+        elif kind == "key":
+            key = str(event.get("key", ""))
+            text = event.get("text")
+            if event.get("down") and isinstance(text, str) and len(key) == 1:
+                # Printable keys arrive as text on the way down; the way up has nothing to do.
+                commands.append(["type", "--", text])
+                continue
+            if len(key) == 1:
+                continue
+            keysym = KEYSYMS.get(key)
+            if keysym:
+                commands.append(["keydown" if event.get("down") else "keyup", keysym])
+        elif kind == "text":
+            commands.append(["type", "--delay", "4", "--", str(event.get("text", ""))[:4096]])
+        elif kind == "touch":
+            points = event.get("points") or []
+            if points:
+                x, y = point(points[0])
+                commands.append(["mousemove", x, y])
+                if event.get("phase") == "start":
+                    commands.append(["mousedown", "1"])
+            elif event.get("phase") == "end":
+                commands.append(["mouseup", "1"])
+    for command in commands:
+        subprocess.run(["xdotool", *command], capture_output=True, env=os.environ)
+    print(json.dumps({"accepted": len(events)}))
+
+
+def main(argv):
+    number, owner = 0, ""
+    while argv[:1] in (["--display"], ["--owner"]) and len(argv) >= 2:
+        if argv[0] == "--display":
+            number = int(argv[1]) if re.match(r"^[0-9]{1,2}$", argv[1]) else -1
+            if not 0 <= number <= MAX_DISPLAY:
+                fail(f"a display is a whole number from 0 to {MAX_DISPLAY}")
+        else:
+            if not re.match(r"^[A-Za-z0-9_]{1,64}$", argv[1]):
+                fail("a display's owner is named by its id")
+            owner = argv[1]
+        argv = argv[2:]
+    if not argv:
+        fail(__doc__.strip())
+    choose(number, owner)
+    command, rest = argv[0], argv[1:]
+    if command == "stop" and not rest:
+        # A stop that arrives after the display was given to another chat is
+        # for a display that no longer exists: the one now on it is left alone.
+        if owner and display_owner() not in (None, owner):
+            return None
+        return end_display()
+    claim_display(owner)
+    ensure_display()
+    wait_for_display()
+    if command == "screenshot" and not rest:
+        return screenshot()
+    if command == "stream":
+        fps = 5
+        if rest[:1] == ["--fps"] and len(rest) == 2:
+            fps = number(rest[1], 1, 10, "fps")
+        return stream(fps)
+    if command == "info" and not rest:
+        return info()
+    if command == "text" and not rest:
+        return text()
+    if command == "open" and len(rest) == 1:
+        return open_url(rest[0])
+    if command == "click" and len(rest) == 4:
+        return click(*rest)
+    if command == "type" and len(rest) == 1:
+        return type_text(rest[0])
+    if command == "key" and rest:
+        return keys(rest)
+    if command == "scroll" and len(rest) == 3:
+        return scroll(*rest)
+    if command == "input" and len(rest) == 1:
+        return live_input(rest[0])
+    fail(f"unknown desktop command: {command}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

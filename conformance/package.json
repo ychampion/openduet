@@ -1,0 +1,21 @@
+{
+  "name": "@openduet/conformance",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "The conformance suite: eight scenarios that prove OpenDuet's boundary and durability properties.",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@openduet/contracts": "workspace:*",
+    "@openduet/skills": "workspace:*",
+    "zod": "4.6.2"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "drizzle-orm": "0.45.2",
+    "postgres": "3.4.9"
+  }
+}

@@ -1,0 +1,390 @@
+import { describe, expect, spyOn, test } from 'bun:test';
+import { Hono } from 'hono';
+import nodemailer from 'nodemailer';
+import { plainSmtpAvailable, plainSmtpServer } from '../../test/helpers/plain-smtp.ts';
+import { mountHealthDetail } from '../api/usage.ts';
+import { loadEnv } from '../env.ts';
+import { smtpTransportOptions } from '../experience/account-mail.ts';
+import { failureCode } from '../memory/gateway.ts';
+import {
+  type Alert,
+  alertSendersFromEnv,
+  cellsProbe,
+  diskCheck,
+  emailSender,
+  type HealthDetail,
+  HealthMonitor,
+  healthDetail,
+  spendAlertsFromEnv,
+  spendRateCheck,
+  spendShareCheck,
+  statfsFree,
+  webhookSender,
+} from './monitor.ts';
+
+const healthy: HealthDetail = {
+  status: 'ok',
+  version: 'test',
+  checks: [{ name: 'database', ok: true, detail: 'ok' }],
+  time: '2026-10-03T12:00:00.000Z',
+};
+const unhealthy: HealthDetail = {
+  status: 'unhealthy',
+  version: 'test',
+  checks: [
+    { name: 'database', ok: false, detail: 'unreachable' },
+    { name: 'runtime', ok: true, detail: 'ok' },
+  ],
+  time: '2026-10-03T12:01:00.000Z',
+};
+
+/** A monitor fed a script of results, on a clock the test moves. */
+function scripted(results: HealthDetail[]) {
+  const sent: Alert[] = [];
+  let clock = 0;
+  const monitor = new HealthMonitor({
+    check: async () => {
+      const next = results.shift();
+      if (!next) throw new Error('script ran out');
+      return next;
+    },
+    senders: [async (alert) => void sent.push(alert)],
+    intervalMs: 60_000,
+    repeatMs: 3_600_000,
+    now: () => clock,
+  });
+  return {
+    sent,
+    tick: (at: number) => {
+      clock = at;
+      return monitor.tick();
+    },
+  };
+}
+
+describe('operator alerts', () => {
+  test('a healthy service sends nothing', async () => {
+    const monitor = scripted([healthy, healthy, healthy]);
+    for (const at of [0, 60_000, 120_000]) expect(await monitor.tick(at)).toBeNull();
+    expect(monitor.sent).toEqual([]);
+  });
+
+  test('turning unhealthy alerts once, repeats after the interval, and says when it clears', async () => {
+    const monitor = scripted([healthy, unhealthy, unhealthy, unhealthy, healthy, healthy]);
+    await monitor.tick(0);
+    await monitor.tick(60_000);
+    await monitor.tick(120_000);
+    await monitor.tick(3_700_000);
+    await monitor.tick(3_760_000);
+    await monitor.tick(3_820_000);
+    expect(monitor.sent.map((alert) => alert.kind)).toEqual([
+      'unhealthy',
+      'unhealthy',
+      'recovered',
+    ]);
+    expect(monitor.sent[0]?.subject).toBe('OpenDuet is unhealthy: database');
+    expect(monitor.sent[0]?.text).toContain('- database: unreachable');
+    expect(monitor.sent[2]?.subject).toBe('OpenDuet is healthy again');
+  });
+
+  test('a check that starts failing while another already fails is alerted at once', async () => {
+    const stuck: HealthDetail = {
+      status: 'unhealthy',
+      version: 'test',
+      checks: [
+        { name: 'database', ok: true, detail: 'ok' },
+        { name: 'background_work', ok: false, detail: 'trash sweep: sp_a failed 3 times' },
+      ],
+      time: '2026-10-03T12:01:00.000Z',
+    };
+    const down: HealthDetail = {
+      ...stuck,
+      checks: [
+        { name: 'database', ok: false, detail: 'unreachable' },
+        { name: 'background_work', ok: false, detail: 'trash sweep: sp_a failed 3 times' },
+      ],
+    };
+    const monitor = scripted([stuck, stuck, down, down, stuck]);
+    await monitor.tick(0);
+    await monitor.tick(60_000);
+    await monitor.tick(600_000);
+    await monitor.tick(660_000);
+    await monitor.tick(720_000);
+    expect(monitor.sent.map((alert) => alert.kind)).toEqual(['unhealthy', 'unhealthy']);
+    expect(monitor.sent[1]?.subject).toBe('OpenDuet is unhealthy: database, background_work');
+  });
+
+  test('an instance that does not hold the alert lease sends nothing', async () => {
+    const sent: Alert[] = [];
+    const monitor = new HealthMonitor({
+      check: async () => unhealthy,
+      senders: [async (alert) => void sent.push(alert)],
+      intervalMs: 60_000,
+      repeatMs: 3_600_000,
+      leads: async () => false,
+    });
+    expect(await monitor.tick()).toBeNull();
+    expect(sent).toEqual([]);
+  });
+
+  test('a spending limit reached in the memory gateway waits for the reset', () => {
+    expect(
+      failureCode(402, '{"error":{"code":"spending_limit_reached","message":"x"}}', null),
+    ).toBe('spending_limit_reached');
+  });
+
+  test('a health check that throws is itself an alert', async () => {
+    const monitor = scripted([]);
+    const alert = await monitor.tick(0);
+    expect(alert?.kind).toBe('unhealthy');
+    expect(alert?.detail.checks[0]?.name).toBe('health_check');
+  });
+
+  test('the webhook receives JSON with the text chat tools show and every check', async () => {
+    const received: Request[] = [];
+    const send = webhookSender('https://hooks.example.net/openduet', async (request) => {
+      received.push(request);
+      return new Response('ok');
+    });
+    await send({
+      kind: 'unhealthy',
+      subject: 's',
+      text: 'OpenDuet is unhealthy',
+      detail: unhealthy,
+    });
+    expect(received[0]?.method).toBe('POST');
+    expect(await received[0]?.json()).toEqual({
+      text: 'OpenDuet is unhealthy',
+      status: 'unhealthy',
+      service: 'openduet',
+      version: 'test',
+      checks: unhealthy.checks,
+      time: unhealthy.time,
+    });
+    const failing = webhookSender(
+      'https://hooks.example.net/openduet',
+      async () => new Response('', { status: 500 }),
+    );
+    await expect(
+      failing({ kind: 'unhealthy', subject: 's', text: 't', detail: unhealthy }),
+    ).rejects.toThrow('webhook answered 500');
+  });
+
+  test.skipIf(!plainSmtpAvailable)(
+    'alert mail is never sent to a server that cannot take TLS, unless its URL allows that',
+    async () => {
+      const server = plainSmtpServer();
+      try {
+        const alert: Alert = { kind: 'unhealthy', subject: 's', text: 't', detail: unhealthy };
+        const options = { to: 'ops@example.test', from: 'openduet@example.test' };
+        await expect(emailSender({ smtpUrl: server.url, ...options })(alert)).rejects.toThrow(
+          /TLS/,
+        );
+        expect(server.received).toEqual([]);
+        await emailSender({ smtpUrl: `${server.url}?requireTLS=false`, ...options })(alert);
+        expect(server.received).toContain('Subject: s');
+      } finally {
+        server.stop();
+      }
+    },
+  );
+
+  test("alert mail's timeouts are connection settings, not message defaults", async () => {
+    const opened = spyOn(nodemailer, 'createTransport').mockImplementation(
+      () => ({ sendMail: async () => ({}), close: () => {} }) as never,
+    );
+    try {
+      await emailSender({
+        smtpUrl: 'smtps://user:pw@smtp.example.com:465',
+        to: 'ops@example.test',
+        from: 'openduet@example.test',
+      })({ kind: 'unhealthy', subject: 's', text: 't', detail: unhealthy });
+      expect(opened).toHaveBeenCalledTimes(1);
+      expect(opened.mock.calls[0]).toEqual([
+        smtpTransportOptions('smtps://user:pw@smtp.example.com:465'),
+      ]);
+      expect(opened.mock.calls[0]?.[0]).toMatchObject({
+        requireTLS: true,
+        connectionTimeout: 10_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 15_000,
+      });
+    } finally {
+      opened.mockRestore();
+    }
+  });
+
+  test('alerts are off until a webhook or an email address is configured', () => {
+    expect(alertSendersFromEnv(loadEnv({}))).toHaveLength(0);
+    expect(
+      alertSendersFromEnv(loadEnv({ OPENDUET_ALERT_WEBHOOK_URL: 'https://hooks.example.net/x' })),
+    ).toHaveLength(1);
+    expect(() => loadEnv({ OPENDUET_ALERT_EMAIL_TO: 'ops@example.net' })).toThrow(
+      'OPENDUET_ALERT_SMTP_URL',
+    );
+  });
+
+  test('spending alerts are off until the operator sets one', () => {
+    expect(spendAlertsFromEnv(loadEnv({}))).toBeUndefined();
+    expect(spendAlertsFromEnv(loadEnv({ OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE: '5' }))).toEqual({
+      hourlyMultiple: 5,
+      minUsd: 1,
+    });
+    expect(
+      spendAlertsFromEnv(
+        loadEnv({ OPENDUET_ALERT_SPEND_PERSON_PERCENT: '60', OPENDUET_ALERT_SPEND_MIN_USD: '2.5' }),
+      ),
+    ).toEqual({ personPercent: 60, minUsd: 2.5 });
+  });
+
+  test('an hour far above the usual one alerts, but not below the floor', () => {
+    expect(spendRateCheck(6, 1, 5, 1)).toMatchObject({ name: 'spend_rate', ok: false });
+    expect(spendRateCheck(4, 1, 5, 1).ok).toBe(true);
+    // Below the floor, even a quiet installation's first spending is not an alert.
+    expect(spendRateCheck(0.5, 0, 5, 1).ok).toBe(true);
+    expect(spendRateCheck(1.5, 0, 5, 1).detail).toBe(
+      '$1.50 on model calls in the last hour; the usual hour is $0.00, and the alert is set at 5 times that',
+    );
+  });
+
+  test("one person's share of the day alerts only beside other people, and above the floor", () => {
+    const top = { personId: 'own_a', usd: 9 };
+    expect(spendShareCheck(top, 10, 3, 60, 1)).toMatchObject({ name: 'spend_share', ok: false });
+    expect(spendShareCheck(top, 10, 3, 95, 1).ok).toBe(true);
+    // The only person spending is all of it, which says nothing.
+    expect(spendShareCheck(top, 9, 1, 60, 1).ok).toBe(true);
+    expect(spendShareCheck({ personId: 'own_a', usd: 0.9 }, 1, 2, 60, 1).ok).toBe(true);
+    expect(spendShareCheck(null, 0, 0, 60, 1)).toEqual({
+      name: 'spend_share',
+      ok: true,
+      detail: 'no model spending today',
+    });
+  });
+
+  test('spending that cannot be read is reported as such, and the job queue as itself', async () => {
+    const sql = ((strings: TemplateStringsArray) =>
+      strings.join('').includes('percentile_cont')
+        ? Promise.reject(new Error('spending read failed'))
+        : Promise.resolve([{ stuck: 0, ended: 0, failed: 0, total: 0 }])) as never;
+    const detail = await healthDetail({
+      version: 'test',
+      database: async () => 'ok',
+      sql,
+      spend: { hourlyMultiple: 5, minUsd: 1 },
+    });
+    const checks = Object.fromEntries(detail.checks.map((check) => [check.name, check.ok]));
+    expect(checks).toEqual({ database: true, job_queue: true, error_rate: true, spend: false });
+    expect(detail.checks.at(-1)?.detail).toBe('spending could not be read (spending read failed)');
+  });
+
+  test('the detail checks the runtime with a time limit', async () => {
+    const detail = await healthDetail(
+      { version: 'test', database: async () => 'ok', runtime: () => new Promise(() => {}) },
+      {
+        runtime_timeout_ms: 50,
+        queue_stuck_minutes: 10,
+        error_window_minutes: 15,
+        error_min_samples: 5,
+        error_rate: 0.5,
+      },
+    );
+    expect(detail.status).toBe('unhealthy');
+    expect(detail.checks[1]).toMatchObject({ name: 'runtime', ok: false });
+  });
+});
+
+describe('disk and the container engine', () => {
+  const MB = 1024 ** 2;
+  const database = async () => 'ok' as const;
+
+  test('the fullest directory below the floor fails the disk check', async () => {
+    const free: Record<string, number> = { '/data/spaces': 9000 * MB, '/work': 900 * MB };
+    const detail = await healthDetail({
+      version: 'test',
+      database,
+      disk: {
+        paths: ['/data/spaces', '/work'],
+        minFreeBytes: 2048 * MB,
+        free: (path) => free[path] ?? null,
+      },
+    });
+    const disk = detail.checks.find((check) => check.name === 'disk');
+    expect(disk).toEqual({
+      name: 'disk',
+      ok: false,
+      detail: '900 MB free under /work, below the 2048 MB floor (OPENDUET_ALERT_DISK_MIN_FREE_MB)',
+    });
+    expect(detail.status).toBe('unhealthy');
+    free['/work'] = 5000 * MB;
+    const after = await healthDetail({
+      version: 'test',
+      database,
+      disk: {
+        paths: ['/data/spaces', '/work'],
+        minFreeBytes: 2048 * MB,
+        free: (p) => free[p] ?? null,
+      },
+    });
+    expect(after.status).toBe('ok');
+  });
+
+  test('disk that cannot be measured anywhere is reported, not passed', () => {
+    expect(diskCheck({ paths: ['/data'], minFreeBytes: MB, free: () => null }).ok).toBe(false);
+  });
+
+  test('a real directory is measured', () => {
+    expect(statfsFree(import.meta.dir)).toBeGreaterThan(0);
+    expect(statfsFree('/no/such/directory/here')).toBeNull();
+  });
+
+  test('openduet-cells answering 503 means the engine is down, and fails the cells check', async () => {
+    const down = cellsProbe(
+      'http://openduet-cells:8791',
+      async () => new Response('{}', { status: 503 }),
+    );
+    const detail = await healthDetail({ version: 'test', database, cells: down });
+    expect(detail.checks.find((check) => check.name === 'cells')).toMatchObject({
+      ok: false,
+      detail: "agents' computers and attempts cannot start: the container engine does not answer",
+    });
+    const asked: string[] = [];
+    const up = cellsProbe('http://openduet-cells:8791', async (url) => {
+      asked.push(url);
+      return new Response('{}', { status: 200 });
+    });
+    expect((await healthDetail({ version: 'test', database, cells: up })).status).toBe('ok');
+    expect(asked).toEqual(['http://openduet-cells:8791/health']);
+  });
+
+  test('the floor is a setting, 2048 MB unless set, and 0 turns it off', () => {
+    expect(loadEnv({}).OPENDUET_ALERT_DISK_MIN_FREE_MB).toBe(2048);
+    expect(loadEnv({ OPENDUET_ALERT_DISK_MIN_FREE_MB: '' }).OPENDUET_ALERT_DISK_MIN_FREE_MB).toBe(
+      2048,
+    );
+    expect(loadEnv({ OPENDUET_ALERT_DISK_MIN_FREE_MB: '0' }).OPENDUET_ALERT_DISK_MIN_FREE_MB).toBe(
+      0,
+    );
+  });
+});
+
+describe('GET /health/detail', () => {
+  const token = 'operator-token-0123456789abcdef';
+  const app = (detail: HealthDetail, configured: string | null = token) => {
+    const routes = new Hono();
+    mountHealthDetail(routes, { token: configured ?? undefined, detail: async () => detail });
+    return routes;
+  };
+
+  test('takes the operator token, and answers 503 while a check fails', async () => {
+    const auth = { authorization: `Bearer ${token}` };
+    expect((await app(healthy).request('/health/detail', { headers: auth })).status).toBe(200);
+    const failing = await app(unhealthy).request('/health/detail', { headers: auth });
+    expect(failing.status).toBe(503);
+    expect(((await failing.json()) as HealthDetail).checks[0]?.ok).toBe(false);
+    expect(
+      (await app(healthy).request('/health/detail', { headers: { authorization: 'Bearer wrong' } }))
+        .status,
+    ).toBe(401);
+    expect((await app(healthy, null).request('/health/detail')).status).toBe(404);
+  });
+});

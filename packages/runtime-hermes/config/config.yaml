@@ -1,0 +1,201 @@
+# Hermes configuration for the OpenDuet runtime.
+#
+# This file is the image's copy of one rendered object. It is produced by
+# `renderEngineConfig` in packages/runtime-hermes/src/engine-config.ts, and
+# `engine-config.test.ts` fails if the two ever disagree — change the renderer
+# and bring this file with it, never one alone. The entrypoint writes the
+# per-attempt parts over it at boot: the capability header, the model the
+# attempt was granted, and the window and compaction trigger that follow from
+# that model.
+#
+# Thin behavior is configured here; the image additionally applies the checked
+# observer bridge in patches/observer_bridge.py.
+
+# The API server agent is built with exactly these toolsets. An explicit list
+# replaces the hermes-api-server default, so a built-in not named here is off.
+# There is no separate "enabled_toolsets: []" key.
+#
+# Beside the plugin's toolset, `todo`: a task list kept in the agent's memory,
+# which acts only inside the engine. The engine's helpers (`delegation`) are
+# added by the boot script only for an attempt whose budget can carry them
+# (OPENDUET_ENGINE_DELEGATION, from delegationFits in engine-config.ts). Files,
+# the terminal, the web, the browser, code execution, vision, memory and
+# session search stay off; the ones that act outside the engine are broker tools.
+platform_toolsets:
+  api_server: [openduet, todo]
+
+plugins:
+  # An ALLOW-LIST of registry keys, not a boolean and not "allow".
+  # `plugins.enabled: true` loads nothing at all, silently. The key is the
+  # directory name under $HERMES_HOME/plugins/.
+  enabled: [openduet]
+  # The compatibility import paths are removed. The OpenDuet plugin imports nothing
+  # from Hermes beyond `ctx`, so this stays false and a plugin that ever did
+  # reach past `ctx` would stop loading rather than drift.
+  allow_deprecated_imports: false
+
+tools:
+  tool_search:
+    # Plugin tools are "deferrable" and are collapsed behind a
+    # tool_search/tool_describe/tool_call bridge by default. At this pin the
+    # bridge defers every plugin tool, the first catalog included, with no way
+    # to keep one offered directly, so `say`, `ask_person` and the job's own
+    # tools would each cost a search and a describe before a call. Discovery is
+    # supplied by OpenDuet's own scoped search_tools/load_tool pair, under the same
+    # broker authority, and a tool it loads joins the running agent through the
+    # engine's own live tool refresh (the live-tools seam in
+    # patches/observer_bridge.py), so loading one does not restart the run.
+    enabled: "off"
+
+memory:
+  # OpenDuet owns memory. The knowledge package decides what a job may recall, and
+  # a retracted record has to disappear from retrieval at once, which an
+  # engine-side store would quietly undo.
+  #
+  # These are the two keys the engine reads, and both default to true. A store
+  # built from either one loads MEMORY.md and USER.md out of the engine home
+  # whatever the toolset list says, so leaving the toolset out is only half the
+  # job and an inert `enabled: false` was none of it.
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: ""
+
+# Evaluated skill learning belongs to OpenDuet. No independent runtime mutations
+# or title-generation requests may spend a job's model budget in the background.
+curator:
+  enabled: false
+
+# Helpers, when an attempt has them: three at a time, one level deep, fifty
+# turns and ten minutes each, and never allowed to approve a command
+# themselves. A helper that runs out of time ends with a timed-out result to the
+# parent. No provider or model is named, so a helper runs on the attempt's own
+# model through the same gateway, which meters it under the same capability.
+delegation:
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  orchestrator_enabled: false
+  max_iterations: 50
+  child_timeout_seconds: 600
+  subagent_auto_approve: false
+
+# Conversation checkpoints are engine-side state with its own lifetime. Job
+# continuity is OpenDuet's, recorded on the ledger and replayable from it.
+checkpoints:
+  enabled: false
+
+# The engine is updated by pinning a new release, never from inside an attempt.
+# Its own update check would run git against the source checkout on every start.
+updates:
+  check: false
+
+agent:
+  # A runaway ceiling, not a cost control. Left unset this is unlimited, which
+  # means a looping run is bounded only by wall time. What an attempt may spend
+  # is decided by the job's accounting, not here.
+  max_turns: 150
+  # Read under `agent:`. The probe describes the host's Python toolchain, which
+  # no tool offered to an attempt uses.
+  environment_probe: false
+  # The prompt seam in patches/observer_bridge.py: leaves out the engine's
+  # product pointer, its profile line and its host runtime block, which
+  # describe the engine's install rather than the attempt.
+  host_prompt: false
+  # Read under `agent:`. For DeepSeek, Qwen, GLM, Kimi and GPT models the engine
+  # otherwise adds a coding-agent brief: run a tool for every calculation, date
+  # and claim, and keep calling tools until the result is verified. OpenDuet's own
+  # task notes say when a tool is worth its time.
+  execution_guidance: false
+  # An attempt's input is text. Deciding how to pass images otherwise probes
+  # the model endpoint, here the broker, for a local model server on every start.
+  image_input_mode: text
+
+# Read at the top level, not under `agent:`. Replaces the engine's api_server
+# hint, which describes MEDIA: file tags no OpenDuet surface renders.
+platform_hints:
+  api_server:
+    replace: Replies are shown to the person as chat text. Keep them brief and natural. Files you make reach them as artifacts, never as paths in the reply.
+
+tool_loop_guardrails:
+  # The engine counts this platform as attended, so its non-interactive hard stop
+  # never applies to an unattended run unless it is asked for by name. Without
+  # this, a model repeating one failing call is only ever warned.
+  hard_stop_enabled: true
+
+compression:
+  # Long conversations are compacted by the engine, in place, inside the attempt.
+  enabled: true
+  # Keeps the session id across a compaction, which continuity depends on.
+  in_place: true
+  # A summary that fails leaves a deterministic handoff and drops the middle.
+  # Losing the middle of a conversation is recoverable; losing the attempt is
+  # not, and every durable fact is on the ledger either way.
+  abort_on_summary_failure: false
+  # The trigger, in tokens. The engine would compact at half the window, raised
+  # to three quarters below 512,000 tokens and floored at 64,000; this caps that
+  # so a large window does not accumulate a fortune of context before the first
+  # summary, and keeps every request inside the body the gateway accepts.
+  threshold_tokens: 200000
+
+auxiliary:
+  # OpenDuet owns job titles and learning. These side calls must not enter an
+  # auxiliary fallback chain, which would reach a provider the cell cannot pay
+  # for and has no route to.
+  title_generation:
+    enabled: false
+  background_review:
+    enabled: false
+  compression:
+    # The summary call runs on the attempt's own model, through the gateway, and
+    # is metered like any other request. With no model named, the auxiliary
+    # client falls back to the main runtime's.
+    provider: openduet-gateway
+    fallback_chain: []
+
+approvals:
+  # OpenDuet does not use Hermes's approval gate: this platform is unattended, so a
+  # plugin-escalated approval hard-denies with nobody to ask. Broker tools return
+  # a structured needs_approval result instead and the job parks on OpenDuet's
+  # ledger. Commands run in the agent's own computer, through the sandbox
+  # backend, and the broker decides which of them the person is asked about,
+  # so the engine's own command guard is off (tools/approval.py
+  # check_all_command_guards). Its unconditional floors still apply. If
+  # something ever does block, not for longer than five minutes.
+  mode: "off"
+  timeout: 300
+
+model:
+  provider: openduet-gateway
+  # The image's default. The entrypoint replaces this with the model the attempt
+  # was granted, along with the window and trigger that follow from it.
+  default: accounts/fireworks/models/deepseek-v4p1-flash
+  # Told to the engine so its compaction arithmetic and OpenDuet's agree. A wrong
+  # number here means compacting a conversation that still fits, or not
+  # compacting one that no longer does.
+  context_length: 1000000
+  # Whether a screenshot tool's picture goes to the model, read ahead of any
+  # catalog the engine cannot reach from here. The image's default model reads
+  # images; the entrypoint sets this for the model the attempt was granted.
+  supports_vision: true
+
+providers:
+  # The only endpoint the runtime may reach for inference is OpenDuet's model
+  # gateway, which injects the real provider key. The surrogate this container
+  # holds is worth nothing anywhere else. The address is the broker bind from
+  # deploy/docker-compose.yml, which carries both the broker routes and the
+  # metered model paths on one listener. The provider segment selects which
+  # upstream the gateway injects a key for.
+  #
+  # The per-attempt capability header is added here AND under `model` at boot:
+  # the main agent reads the provider entry, while the auxiliary client that
+  # makes the compaction summary call reads only `model.extra_headers`.
+  openduet-gateway:
+    base_url: "http://openduet:8788/providers/fireworks/v1"
+    key_env: OPENDUET_MODEL_KEY
+    default_model: accounts/fireworks/models/deepseek-v4p1-flash
+
+gateway:
+  platforms:
+    api_server:
+      # One attempt at a time. A second concurrent run in this container would
+      # share the same fenced epoch, which the broker would refuse anyway.
+      max_concurrent_runs: 1

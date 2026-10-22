@@ -1,0 +1,468 @@
+/**
+ * What the service does about sandboxes besides running commands in them.
+ *
+ * Three things, all of them the service's own business rather than a job's: at
+ * boot and every hour after it asks each provider what it still holds and
+ * brings that into agreement with the session table; on a timer it sweeps leases that ran out,
+ * suspends workspaces whose attempt stopped renewing them and forgets
+ * workspaces nobody resumed; and when an attempt ends it suspends that
+ * attempt's workspace, or closes its sandbox when there is nothing to keep.
+ *
+ * A workspace with background processes still running when its attempt ends
+ * is kept running for them instead, where its provider can keep a computer
+ * running between attempts; the sweep keeps it while they live and suspends
+ * it once they have ended. Where the provider cannot, suspending would end
+ * them, so they are stopped first, each with that reason on its record.
+ *
+ * A computer with displays is shared by the chats using it: when the attempt
+ * holding it ends, it passes to another chat's attempt still on it rather than
+ * being suspended. A chat's display is ended when the chat or run ends, when
+ * it has gone unused for a while, and when the chat is stopped; only that
+ * display's browser and screen end, never another chat's.
+ *
+ * A provider belongs to the connection that holds its key, so everything here
+ * is resolved by connection: two spaces may use the same provider with
+ * different accounts, and one account's reconciliation must never judge the
+ * other's sandboxes.
+ */
+import type { Sql } from 'postgres';
+import { isDesktopProvider } from './adapters/docker.ts';
+import { notHeldByPerson } from './computer-control.ts';
+import { type DisplayRow, displayKey, passToJoiners } from './displays.ts';
+import { END_REASONS, LIVE_STATES, type SandboxProcesses } from './processes.ts';
+import { reconcileSandboxes } from './reconcile.ts';
+import { type SandboxSessions, sessionHandle } from './sessions.ts';
+import type { SandboxProvider } from './types.ts';
+import { cleanRunningComputers } from './work-files.ts';
+
+/** The providers this installation currently has, by the connection that holds the key. */
+export type SandboxProviders = () => ReadonlyMap<
+  string,
+  { adapter: string; provider: SandboxProvider }
+>;
+
+export type SandboxWiringOptions = {
+  sql: Sql;
+  sessions: SandboxSessions;
+  providers: SandboxProviders;
+  /** The `openduet.project` label: which sandboxes this installation owns. */
+  project: string;
+  /** How often the sweep runs. */
+  sweepMs: number;
+  /** The computers' background processes, which may keep a workspace running after its attempt. */
+  processes?: SandboxProcesses;
+  /**
+   * How often reconciliation runs again after boot, so an orphan left while
+   * the service ran is found without waiting for a restart. An hour unless set.
+   */
+  reconcileMs?: number;
+  log?: (line: string) => void;
+};
+
+export type ReconciledAdapter = {
+  connectionId: string;
+  adapter: string;
+  destroyed: string[];
+  lost: string[];
+};
+
+export type SandboxWiring = {
+  reconcile(signal: AbortSignal): Promise<ReconciledAdapter[]>;
+  sweep(signal: AbortSignal): Promise<string[]>;
+  /** Called when an attempt finishes. Never blocks the outcome that called it. */
+  afterAttempt(attemptId: string): void;
+  /**
+   * Called when a person stops a conversation's turn: the processes that turn
+   * started are ended at once, and so is the conversation's display on the
+   * computer. Never blocks the stop that called it.
+   */
+  afterStop(jobId: string): void;
+  /** Ends the displays of a stopped job's chat or run; another chat's are left alone. */
+  endStoppedDisplays(jobId: string, signal: AbortSignal): Promise<string[]>;
+  /** Ends the displays whose chat or run ended, or that nobody used for a while. */
+  reapDisplays(signal: AbortSignal): Promise<string[]>;
+  /** Ends the processes a stopped turn of this job started; see `SandboxProcesses.endStopped`. */
+  endStopped(jobId: string, signal: AbortSignal): Promise<string[]>;
+  /** Ends the attempt's session: suspended if it is a workspace, closed if not. */
+  settleAttempt(attemptId: string, signal: AbortSignal): Promise<void>;
+  /**
+   * Starts the timed sweep and reconciliation. With several service instances
+   * on one database, the lease says whether this one runs them now, so one
+   * instance at a time does, and its signal stops a run whose lease was lost.
+   */
+  start(lease?: { leads(): Promise<boolean>; signal(): AbortSignal }): void;
+  stop(): void;
+};
+
+export function startSandboxes(options: SandboxWiringOptions): SandboxWiring {
+  const { sql, sessions } = options;
+  const say = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  // A row names the adapter that created its sandbox. A connection that now
+  // holds another adapter cannot reach that sandbox, and handing the other
+  // adapter its id would ask the wrong provider to destroy it.
+  const providerFor = (adapter: string, connectionId: string) => {
+    const held = options.providers().get(connectionId);
+    if (held && held.adapter !== adapter)
+      throw new Error(
+        `connection ${connectionId} now holds the ${held.adapter} adapter, and this session's sandbox was created by ${adapter}`,
+      );
+    return held?.provider;
+  };
+  /** End a computer's live processes before a suspend that would end them anyway. */
+  const stopForSuspend = async (
+    row: Record<string, unknown>,
+    provider: SandboxProvider,
+    signal: AbortSignal,
+  ) => {
+    const processes = options.processes;
+    if (!processes) return;
+    const live = (
+      await processes.forComputer(String(row.space_id), String(row.agent_id), 0)
+    ).filter(
+      (each) => each.connectionId === String(row.connection_id) && LIVE_STATES.includes(each.state),
+    );
+    if (!live.length) return;
+    const computer = processes.computer(provider, {
+      providerSandboxId: String(row.provider_sandbox_id),
+      imageDigest: (row.image_digest as string | null) ?? null,
+      region: (row.region as string | null) ?? null,
+    });
+    for (const each of live)
+      await processes.end(each, computer, 'stopped', END_REASONS.suspended, signal);
+  };
+  /**
+   * End displays: recorded first, then the browser and screen on each are
+   * stopped inside its computer, when the computer is running. A display a
+   * person holds is theirs and is left alone; with `reaping`, so is one a chat
+   * came back to after it was listed.
+   */
+  const endDisplays = async (
+    rows: DisplayRow[],
+    reason: string,
+    signal: AbortSignal,
+    reaping = false,
+  ): Promise<string[]> => {
+    const ended: string[] = [];
+    for (const row of rows) {
+      const key = displayKey(row.providerSandboxId, row.display);
+      if ((await sessions.controls.state(key)).control === 'human') continue;
+      const [gone] = await sessions.displays.end([row.id], reason, { reaping });
+      if (!gone) continue;
+      ended.push(row.id);
+      try {
+        const provider = providerFor(row.adapter, row.connectionId);
+        if (!provider || !isDesktopProvider(provider)) continue;
+        await provider.endDisplay(
+          { providerSandboxId: row.providerSandboxId, imageDigest: null, region: null },
+          { number: row.display, id: row.id },
+          signal,
+        );
+      } catch (error) {
+        // The next chat given this number starts it clean in any case.
+        say(`display ${row.display} of ${row.providerSandboxId} was not stopped: ${String(error)}`);
+      }
+    }
+    return ended;
+  };
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  const pending = new Set<Promise<void>>();
+  const settling = new Set<string>();
+
+  const wiring: SandboxWiring = {
+    async reconcile(signal) {
+      const reports: ReconciledAdapter[] = [];
+      for (const [connectionId, { adapter, provider }] of options.providers()) {
+        try {
+          const report = await reconcileSandboxes({
+            sql,
+            provider,
+            project: options.project,
+            connectionId,
+            signal,
+          });
+          reports.push({ connectionId, adapter, ...report });
+        } catch (error) {
+          // A provider that does not answer proves nothing; the next boot asks again.
+          say(`sandbox reconciliation with ${adapter} did not finish: ${String(error)}`);
+        }
+      }
+      return reports;
+    },
+
+    async sweep(signal) {
+      const swept = await sessions.sweep(providerFor, signal);
+      await wiring.reapDisplays(signal).catch((error: unknown) => {
+        say(`sandbox displays were not reaped: ${String(error)}`);
+      });
+      // Files deleted chats made leave a running computer here; a stopped one
+      // is cleaned when it next starts, never started for this.
+      await cleanRunningComputers(sql, providerFor, signal, say).catch((error: unknown) => {
+        say(`files deleted chats made were not removed from their computers: ${String(error)}`);
+      });
+      return swept;
+    },
+
+    async reapDisplays(signal) {
+      const ended: string[] = [];
+      for (const row of await sessions.displays.reapable()) {
+        if (signal.aborted) break;
+        ended.push(...(await endDisplays([row], row.reason, signal, true)));
+      }
+      await sessions.displays.prune();
+      return ended;
+    },
+
+    async endStoppedDisplays(jobId, signal) {
+      return endDisplays(await sessions.displays.ofStopped(jobId), 'its chat was stopped', signal);
+    },
+
+    async settleAttempt(attemptId, signal) {
+      // Its displays stay with their chats, for the next turn.
+      await sessions.displays.release(attemptId);
+      const rows = await sql`select id, agent_id, persistence, connection_id, adapter,
+          provider_sandbox_id, space_id, image_digest, region, status
+        from sandbox_session
+        where attempt_id = ${attemptId} and status in ('opening', 'ready')
+          and ${notHeldByPerson(sql)}`;
+      for (const row of rows) {
+        const id = String(row.id);
+        // Taking over the computer is what ended this attempt; the person keeps
+        // it (on whichever instance they took it), and the sweep settles it
+        // once they hand it back. Their sessions are not selected above.
+        const workspace = row.agent_id !== null && row.persistence !== 'ephemeral';
+        try {
+          // Another chat still on the computer keeps it, under its own attempt.
+          if (
+            workspace &&
+            (await passToJoiners(sql, sessions.leaseSeconds, { sessionId: id, ended: attemptId }))
+              .length
+          )
+            continue;
+          const provider = providerFor(String(row.adapter), String(row.connection_id));
+          if (!provider) continue;
+          if (workspace && row.status === 'ready' && (await sessions.hasLiveProcesses(id))) {
+            // Its processes keep it running, and the next attempt takes it over.
+            if (provider.capabilities.keepAwake) {
+              const held = await sessions.holdForProcesses(id, attemptId);
+              if (held) {
+                await provider
+                  .keepAlive?.(sessionHandle(held), sessions.leaseSeconds * 2, signal)
+                  .catch((error: unknown) => {
+                    say(`sandbox session ${id} could not be kept running: ${String(error)}`);
+                  });
+                continue;
+              }
+            }
+            // Suspending stops them on this provider: they are ended first,
+            // with the reason, rather than left to be found lost; not when a
+            // person has taken the computer over since the rows were read.
+            else if (await sessions.heldByPerson(String(row.provider_sandbox_id))) continue;
+            else await stopForSuspend(row, provider, signal);
+          }
+          if (workspace) await sessions.suspendWorkspace(id, provider, signal);
+          // Checked again in the statement that acts: a takeover that landed
+          // since the rows were read, on any instance, keeps the computer.
+          else await sessions.close(id, provider, signal, { unlessHeldByPerson: true });
+        } catch (error) {
+          // Recorded on the row; the lease sweep finishes what this could not.
+          say(`sandbox session ${id} was not settled when its attempt ended: ${String(error)}`);
+        }
+      }
+    },
+
+    async endStopped(jobId, signal) {
+      return options.processes
+        ? options.processes.endStopped(options.providers, jobId, signal)
+        : [];
+    },
+
+    afterStop(jobId) {
+      const work = Promise.all([
+        wiring.endStopped(jobId, AbortSignal.timeout(120_000)),
+        wiring.endStoppedDisplays(jobId, AbortSignal.timeout(60_000)),
+      ])
+        .then(
+          () => undefined,
+          (error: unknown) => {
+            // The sweep ends them on its next pass.
+            say(`the processes of stopped job ${jobId} were not ended yet: ${String(error)}`);
+          },
+        )
+        .finally(() => pending.delete(work));
+      pending.add(work);
+    },
+
+    afterAttempt(attemptId) {
+      // An attempt can be reported ended twice (its outcome, then its return);
+      // one settlement at a time, so its workspace is not suspended twice.
+      if (settling.has(attemptId)) return;
+      settling.add(attemptId);
+      const work = wiring
+        .settleAttempt(attemptId, AbortSignal.timeout(120_000))
+        .catch(() => {})
+        .finally(() => {
+          pending.delete(work);
+          settling.delete(attemptId);
+        });
+      pending.add(work);
+    },
+
+    start(lease) {
+      const led = async () => (lease ? lease.leads() : true);
+      // Work under a lease stops the moment the lease is found lost.
+      const bounded = (ms: number) =>
+        lease
+          ? AbortSignal.any([AbortSignal.timeout(ms), lease.signal()])
+          : AbortSignal.timeout(ms);
+      timer ??= setInterval(() => {
+        void led()
+          .then((leading) => (leading ? wiring.sweep(bounded(options.sweepMs)) : undefined))
+          .catch(() => {
+            say('sandbox sweep failed');
+          });
+      }, options.sweepMs);
+      timer.unref?.();
+      reconcileTimer ??= setInterval(() => {
+        void led()
+          .then((leading) => (leading ? wiring.reconcile(bounded(120_000)) : undefined))
+          .catch(() => {
+            say('sandbox reconciliation failed');
+          });
+      }, options.reconcileMs ?? 3_600_000);
+      reconcileTimer.unref?.();
+    },
+
+    stop() {
+      clearInterval(timer);
+      clearInterval(reconcileTimer);
+      timer = undefined;
+      reconcileTimer = undefined;
+    },
+  };
+  return wiring;
+}
+
+/**
+ * What revoking a sandbox connection, or switching it to another key, does
+ * first, while the key it had is still held: destroy every sandbox and
+ * snapshot the connection's sessions recorded. That key is the only way into
+ * the account they live in, and after the change nothing here holds it. A
+ * teardown that does not finish does not stop the change; what is left is
+ * recorded lost on its rows with the reason, where the sweep and a space
+ * removal report it.
+ */
+export function sandboxKeyChange(options: {
+  sessions: SandboxSessions;
+  providerFor: (adapter: string, connectionId: string) => SandboxProvider | undefined;
+  /** A provider lent a given key, to ask whether a new key reaches the same account. */
+  withKey?: (
+    adapter: string,
+    secretRef: string,
+    spaceId: string,
+  ) => { provider: SandboxProvider; close(): Promise<void> };
+  log?: (line: string) => void;
+}) {
+  const say = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  return async (
+    connection: { id: string; provider: string },
+    change: 'revoke' | 'switch' = 'revoke',
+    next?: { secretRef: string; spaceId: string },
+    signal: AbortSignal = AbortSignal.timeout(120_000),
+  ): Promise<void> => {
+    if (connection.provider !== 'sandbox') return;
+    // A new key that sees what the old one made is the same account's key,
+    // rotated: the sandboxes and workspaces carry on under it, since the
+    // connection lends whatever key it holds on each call. Only a key that
+    // cannot see them, another account's, means they must end now.
+    const withKey = options.withKey;
+    if (
+      change === 'switch' &&
+      next &&
+      withKey &&
+      (await options.sessions.visibleWith(
+        connection.id,
+        (adapter) => withKey(adapter, next.secretRef, next.spaceId),
+        signal,
+      ))
+    )
+      return;
+    try {
+      await options.sessions.destroyWorkspacesForConnection(
+        connection.id,
+        options.providerFor,
+        signal,
+      );
+    } catch (error) {
+      const happened = change === 'revoke' ? 'was revoked' : 'had its key replaced';
+      const left = await options.sessions.recordLeftBehind(
+        connection.id,
+        `the connection ${happened} before this sandbox could be destroyed, and nothing can reach it without the key it had: ${String(error)}`,
+      );
+      say(
+        `sandbox connection ${connection.id} ${happened} with ${left.length} session(s) not destroyed: ${String(error)}`,
+      );
+    }
+  };
+}
+
+/**
+ * What a space removal's sandboxes phase is given: providers built from the
+ * connection rows, since a space under removal serves no connectors, the
+ * teardown, and the question the removal finishes on, asked of the providers
+ * rather than of these rows.
+ */
+export function sandboxRemovalTeardown(
+  sessions: SandboxSessions,
+  providerFor: (adapter: string, connectionId: string) => SandboxProvider,
+) {
+  return {
+    providerFor,
+    destroyWorkspacesForSpace: (
+      spaceId: string,
+      provider: typeof providerFor,
+      signal: AbortSignal,
+    ) => sessions.destroyWorkspacesForSpace(spaceId, provider, signal),
+    listWorkspacesForSpace: (spaceId: string, provider: typeof providerFor) =>
+      sessions.listWorkspacesForSpace(spaceId, provider),
+  };
+}
+
+/**
+ * What the wiring needs of the connector factory, without depending on it: the
+ * sandbox settings it was built with and the providers it has opened.
+ */
+export type SandboxFactory = {
+  options: {
+    sandbox?: {
+      sessions: SandboxSessions;
+      project: string;
+      maxConcurrent: number;
+      processes?: SandboxProcesses;
+    };
+  };
+  sandboxProviders: ReadonlyMap<string, { adapter: string; provider: SandboxProvider }>;
+};
+
+/**
+ * The wiring a validated environment implies, or nothing when this
+ * installation has no sandbox project and therefore owns no sandboxes.
+ */
+export function startSandboxesFromEnv(
+  sql: Sql,
+  env: { OPENDUET_SANDBOX_LEASE_SECONDS: number },
+  factory: SandboxFactory,
+): SandboxWiring | undefined {
+  const sandbox = factory.options.sandbox;
+  if (!sandbox) return undefined;
+  return startSandboxes({
+    sql,
+    sessions: sandbox.sessions,
+    providers: () => factory.sandboxProviders,
+    project: sandbox.project,
+    ...(sandbox.processes ? { processes: sandbox.processes } : {}),
+    // Often enough that a lease that ran out is noticed well before a session
+    // could be mistaken for live, and seldom enough to be cheap.
+    sweepMs: Math.max(30_000, Math.floor((env.OPENDUET_SANDBOX_LEASE_SECONDS * 1000) / 3)),
+  });
+}

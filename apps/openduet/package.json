@@ -1,0 +1,51 @@
+{
+  "name": "@openduet/service",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "The OpenDuet service: API, jobs, broker, gateway, connectors, knowledge, and events.",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@openduet/contracts": "workspace:*",
+    "@openduet/knowledge": "workspace:*",
+    "@openduet/runtime-hermes": "workspace:*",
+    "@openduet/skills": "workspace:*",
+    "@smithy/signature-v4": "5.7.4",
+    "ajv": "8.20.0",
+    "chrono-node": "2.10.1",
+    "drizzle-orm": "0.45.2",
+    "fast-xml-parser": "5.11.1",
+    "graphql": "17.0.2",
+    "hono": "4.13.7",
+    "ical.js": "2.2.1",
+    "imapflow": "2.0.2",
+    "jose": "6.2.12",
+    "libsodium-wrappers": "0.8.4",
+    "mailparser": "3.9.24",
+    "nodemailer": "10.0.3",
+    "pdfjs-dist": "6.3.289",
+    "pg-boss": "12.31.0",
+    "playwright": "1.63.0",
+    "postgres": "3.4.9",
+    "tldts": "7.4.13",
+    "ulid": "3.0.2",
+    "yaml": "2.8.1",
+    "zod": "4.6.2"
+  },
+  "devDependencies": {
+    "@types/mailparser": "3.4.6",
+    "@types/nodemailer": "8.0.1",
+    "drizzle-kit": "0.31.10",
+    "embedded-postgres": "17.10.0-beta.17"
+  },
+  "optionalDependencies": {
+    "modal": "0.10.1"
+  }
+}

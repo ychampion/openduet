@@ -1,0 +1,27 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@openduet/contracts": ["./packages/contracts/src/index.ts"],
+      "@openduet/contracts/*": ["./packages/contracts/src/*"],
+      "@openduet/knowledge": ["./packages/knowledge/src/index.ts"],
+      "@openduet/skills": ["./packages/skills/src/index.ts"],
+      "@openduet/runtime-hermes": ["./packages/runtime-hermes/src/index.ts"],
+      "@openduet/client": ["./packages/client/src/index.ts"],
+      "@openduet/client/*": ["./packages/client/src/*"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/scripts/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "apps/*/test/**/*.ts",
+    "apps/*/*.ts",
+    "deploy/scripts/**/*.ts",
+    ".github/scripts/**/*.ts",
+    "conformance/**/*.ts",
+    "evals/**/*.ts"
+  ],
+  "exclude": ["node_modules", "**/node_modules", "**/dist", "apps/web"]
+}

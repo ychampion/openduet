@@ -1,0 +1,74 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
+  "vcs": {
+    "enabled": false,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!**/dist",
+      "!output",
+      "!**/.wrangler",
+      "!.gstack",
+      "!**/.omx",
+      "!**/.hermes-src",
+      "!**/.hermes-venv",
+      "!**/*.json.lock",
+      "!bun.lock",
+      "!packages/contracts/openapi.json",
+      "!apps/web/docs/design/preview",
+      "!apps/openduet/drizzle",
+      "!packages/client/src/schema.d.ts",
+      "!conformance/memory/report.json",
+      "!conformance/memory/eval-report.json",
+      "!.agents/browser-measurements.json",
+      "!**/.eval-state",
+      "!evals/results"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "suspicious": {
+        "noTemplateCurlyInString": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts", "**/*.test.tsx"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noTemplateCurlyInString": "off"
+          }
+        }
+      }
+    }
+  ],
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}

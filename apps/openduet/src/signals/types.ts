@@ -1,0 +1,230 @@
+/**
+ * What a connector offers the signal poller: a way to read what changed.
+ *
+ * A mailbox hands back the messages that arrived since its cursor and a new
+ * cursor. A calendar hands back every occurrence in a window, one per
+ * instance of a repeating event, and the poller works out what changed by
+ * comparing with what it kept from the last read. A Drive hands back the files
+ * that changed since its cursor, as metadata. None ever sends anything.
+ */
+import type { MailMessage } from '../connectors/mail-transport.ts';
+
+/** One new message, and the key that makes a second sighting of it the same event. */
+export type NewMail = MailMessage & {
+  /** Stable for the message across reads: its Message-ID, or the provider's own id. */
+  key: string;
+  /** What `email.read` takes to open it: an IMAP UID or a provider id. */
+  read_key: number | string;
+};
+
+export type MailRead = {
+  /** Where the next read starts. */
+  cursor: string;
+  messages: NewMail[];
+};
+
+export type MailReadOptions = {
+  /** At most this many messages are read in one go; the cursor stops after the last one. */
+  limit: number;
+  /** True when a message with this key was already delivered, so it need not be fetched. */
+  seen?: (key: string) => Promise<boolean>;
+  now?: number;
+};
+
+/** A mailbox that can say what arrived since a cursor. A null cursor starts from now. */
+export interface MailChanges {
+  changes(cursor: string | null, options: MailReadOptions): Promise<MailRead>;
+}
+
+export type OccurrenceStatus = 'confirmed' | 'tentative' | 'cancelled';
+
+/**
+ * What the calendar's own account said to an event: it organises it, it
+ * accepted, it said maybe or no, or it has not answered (an invitation).
+ * `unknown` when a calendar that keeps answers shows none for the person (an
+ * invitation sent to a list they are on). Null when the source cannot tell,
+ * as with a feed or a CalDAV collection.
+ */
+export type OwnResponse =
+  | 'organizer'
+  | 'accepted'
+  | 'tentative'
+  | 'declined'
+  | 'needs_action'
+  | 'unknown';
+
+/**
+ * One occurrence of a calendar event. A single event is one occurrence with no
+ * `occurrence` id; each instance of a repeating one carries the start it was
+ * scheduled at (its recurrence id), which stays the same when the instance is
+ * moved, so a moved Tuesday is the same Tuesday at a new time.
+ */
+export type Occurrence = {
+  /** The event, or the series an instance belongs to. */
+  uid: string;
+  /** The instance's original start, as a UTC instant or an all-day date; null for a single event. */
+  occurrence: string | null;
+  title: string;
+  /** A UTC instant (`2026-10-05T16:00:00.000Z`), or a date for an all-day event. */
+  start: string;
+  end: string;
+  all_day: boolean;
+  location: string;
+  status: OccurrenceStatus;
+  /** Guests other than the calendar's own account. */
+  attendees: number;
+  /** The event's own time zone, when the source names one. */
+  time_zone: string | null;
+  /** When the provider says the event last changed, if it says. */
+  updated_at?: string | null;
+  /** The provider's own id for this instance, to look it up again. */
+  ref?: string | null;
+  /** Shown as free: the event does not block the time (TRANSP, transparency, showAs). */
+  transparent?: boolean;
+  /** The calendar's own account declined it, so it does not block the time either. */
+  declined?: boolean;
+  /** The OpenDuet action that wrote this event, when OpenDuet wrote it. */
+  openduet_action?: string | null;
+  /** The account's own answer to the event, when the source says. */
+  response?: OwnResponse | null;
+  /** True when the event is marked important or high priority. */
+  important?: boolean;
+  /**
+   * The OpenDuet action the event says made it, as the calendar reports it. It
+   * is only a claim: whether OpenDuet made the event is decided from OpenDuet's
+   * own records (`openduet`), never from what the calendar says.
+   */
+  openduet_uid?: string;
+  /** Set by the broker from its own records: OpenDuet created this event. */
+  openduet?: boolean;
+};
+
+export type CalendarWindow = { from: string; to: string };
+
+/**
+ * One read of a calendar. `complete` is false when the source stopped before
+ * the end of the window (too many occurrences to list), and then nothing past
+ * the last occurrence it did list is taken as removed.
+ */
+export type CalendarRead = {
+  items: readonly Occurrence[];
+  complete: boolean;
+};
+
+/**
+ * What became of an occurrence a read no longer lists: where it is now (moved
+ * out of the window, perhaps), `gone` when the provider says it no longer
+ * exists or was cancelled, or `unknown`.
+ */
+export type Confirmed = Occurrence | 'gone' | 'unknown';
+
+/** A lookup that could not be made this time: the occurrence is kept and asked about again. */
+export type Lookup = Confirmed | 'failed';
+
+/**
+ * How a read for free and busy time is made: stopped by `signal`, with a
+ * floating time (one written with no zone) read in `zone`, and the person's
+ * own `self` addresses, so an invitation they declined is known as one. The
+ * signal poller passes none of these.
+ */
+export type ReadOptions = { signal?: AbortSignal; zone?: string; self?: readonly string[] };
+
+/** A calendar that can list the occurrences touching a window. */
+export interface CalendarOccurrences {
+  occurrences(window: CalendarWindow, options?: ReadOptions): Promise<CalendarRead>;
+  /** Look one occurrence up again by the provider's own id. */
+  confirm?(occurrence: {
+    uid: string;
+    occurrence: string | null;
+    ref: string | null;
+  }): Promise<Confirmed>;
+}
+
+/** A provider asking to be left alone, or answering with an error, as the poller reads it. */
+export class SourceError extends Error {
+  constructor(
+    readonly status: number,
+    /** Seconds the provider asked for, from Retry-After. */
+    readonly retryAfter: number | null = null,
+  ) {
+    super(`source_${status}`);
+  }
+}
+
+/** Retry-After as seconds, from a number or an HTTP date; null when absent or unreadable. */
+export function retryAfterOf(response: Response): number | null {
+  const header = response.headers.get('retry-after');
+  if (!header) return null;
+  const seconds = Number(header.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds), 86_400);
+  const at = Date.parse(header);
+  return Number.isNaN(at)
+    ? null
+    : Math.max(0, Math.min(Math.ceil((at - Date.now()) / 1000), 86_400));
+}
+
+/** The error a failed provider answer becomes, its body discarded. */
+export async function sourceError(response: Response): Promise<SourceError> {
+  await response.body?.cancel().catch(() => {});
+  return new SourceError(response.status, retryAfterOf(response));
+}
+
+/**
+ * What a Drive says about one file: metadata only, never its contents. The
+ * name and the last editor's name are words someone else chose, so they are
+ * treated as the account's content, as a mail subject is.
+ */
+export type DocumentFile = {
+  id: string;
+  name: string;
+  mime_type: string;
+  /** When anyone last changed it, as a UTC instant. */
+  modified_time: string | null;
+  /** When the account's own person last changed it; null when they never have. */
+  modified_by_me_time: string | null;
+  /** Whether the last change was the account's own. Null when the Drive does not say. */
+  last_modifier_me: boolean | null;
+  /** Who made the last change, as the Drive names them. */
+  last_modifier: string | null;
+  shared: boolean;
+  trashed: boolean;
+  /** The Drive's own version number, which grows with every change to the file. */
+  version: string | null;
+  /** The shared drive the file is in; null for a file in the person's own Drive. */
+  drive_id: string | null;
+};
+
+/** One entry in a Drive's change feed: a file as it is now, or that it was removed. */
+export type DocumentChange = {
+  file_id: string;
+  removed: boolean;
+  /** Null when the file was removed or the account can no longer see it. */
+  file: DocumentFile | null;
+};
+
+export type DocumentRead = {
+  /** Where the next read starts. */
+  cursor: string;
+  changes: DocumentChange[];
+  /** False when the read stopped at its page budget; the cursor then resumes there. */
+  complete: boolean;
+};
+
+/** A Drive that can say what changed since a cursor. A null cursor starts from now. */
+export interface DocumentChanges {
+  /** `allDrives` also lists changes in the shared drives the account belongs to. */
+  changes(
+    cursor: string | null,
+    options: { limit: number; allDrives?: boolean },
+  ): Promise<DocumentRead>;
+}
+
+/** A connector that can read one subject's fields now, for a clock's fresh check. */
+export type SubjectReader = {
+  read(subject: { key: string; ref: string | null }): Promise<Record<string, unknown> | 'gone'>;
+};
+
+export type SignalSource =
+  | ({ stream: 'mail' } & MailChanges)
+  | ({ stream: 'calendar' } & CalendarOccurrences)
+  | ({ stream: 'documents' } & DocumentChanges);

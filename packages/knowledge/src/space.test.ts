@@ -1,0 +1,353 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { aRecord, fixedClock } from './fixtures.ts';
+import { serializeRecord } from './frontmatter.ts';
+import { git, runGit } from './git.ts';
+import type { SpacePaths } from './layout.ts';
+import {
+  commitRecord,
+  commitRemoval,
+  dropPaths,
+  eraseFromHistory,
+  headSha,
+  history,
+  initSpace,
+  openSpace,
+  readAtHead,
+  revert,
+} from './space.ts';
+
+let root: string;
+let paths: SpacePaths;
+const now = fixedClock();
+
+const write = (body: string, over = {}) => serializeRecord(aRecord(over), body);
+
+beforeEach(async () => {
+  root = mkdtempSync(join(tmpdir(), 'openduet-space-'));
+  paths = await initSpace(root, 'personal');
+});
+
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+describe('creating a space', () => {
+  test('lays out the directories and the generated files', () => {
+    for (const file of ['SCHEMA.md', 'index.md', 'log.md', '.gitignore']) {
+      expect(existsSync(join(paths.root, file))).toBe(true);
+    }
+    for (const dir of [paths.knowledge, paths.raw, paths.skills, paths.proposed]) {
+      expect(existsSync(dir)).toBe(true);
+    }
+  });
+
+  test('is a git repository with one commit in it', async () => {
+    const log = await git(paths.root, ['log', '--oneline']);
+    expect(log.trim().split('\n')).toHaveLength(1);
+    expect(log).toContain('Create the personal space');
+  });
+
+  test('does not track the derived index or the staging area', async () => {
+    const ignored = readFileSync(join(paths.root, '.gitignore'), 'utf8');
+    expect(ignored).toContain('.index/');
+    expect(ignored).toContain('.proposed/');
+    const check = await runGit(paths.root, ['check-ignore', '.index/fts.sqlite']);
+    expect(check.code).toBe(0);
+  });
+
+  test('running it twice leaves the existing space alone', async () => {
+    const before = await headSha(paths);
+    await initSpace(root, 'personal');
+    expect(await headSha(paths)).toBe(before);
+  });
+
+  test('opening a directory that is not a space says so', () => {
+    expect(() => openSpace(root, 'nothing-here')).toThrow('no space at');
+  });
+});
+
+describe('committing a record', () => {
+  test('writes the file and names who proposed it', async () => {
+    const commit = await commitRecord(paths, 'knowledge/prefers-bun.md', write('bun everywhere'), {
+      proposedBy: 'agent',
+      approvedBy: 'zara',
+      subject: 'Record the package manager preference',
+      now,
+    });
+
+    expect(commit.committed).toBe(true);
+    expect(commit.changed).toContain('knowledge/prefers-bun.md');
+    const message = await git(paths.root, ['log', '-1', '--format=%B']);
+    expect(message).toContain('Record the package manager preference');
+    expect(message).toContain('OpenDuet-Proposed-By: agent');
+    expect(message).toContain('OpenDuet-Approved-By: zara');
+  });
+
+  test('commits as openduet, whatever the host git config says', async () => {
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('bun everywhere'), {
+      proposedBy: 'agent',
+      now,
+    });
+    const who = await git(paths.root, ['log', '-1', '--format=%an <%ae> | %cn <%ce>']);
+    expect(who.trim()).toBe('openduet <openduet@localhost> | openduet <openduet@localhost>');
+  });
+
+  test('brings the catalog and the chronicle along in the same commit', async () => {
+    const commit = await commitRecord(paths, 'knowledge/prefers-bun.md', write('bun everywhere'), {
+      proposedBy: 'agent',
+      now,
+    });
+    expect(commit.changed.sort()).toEqual(['index.md', 'knowledge/prefers-bun.md', 'log.md']);
+    expect(readFileSync(paths.index, 'utf8')).toContain('knowledge/prefers-bun.md');
+    expect(readFileSync(paths.log, 'utf8')).toContain('proposed by agent');
+  });
+
+  test('an identical write commits nothing rather than an empty change', async () => {
+    const content = write('bun everywhere');
+    const first = await commitRecord(paths, 'knowledge/prefers-bun.md', content, {
+      proposedBy: 'agent',
+      now,
+    });
+    const second = await commitRecord(paths, 'knowledge/prefers-bun.md', content, {
+      proposedBy: 'agent',
+      now,
+    });
+    expect(second.committed).toBe(false);
+    expect(second.changed).toEqual([]);
+    expect(second.sha).toBe(first.sha);
+  });
+
+  test('a path that climbs out of the space is refused before anything is written', async () => {
+    await expect(
+      commitRecord(paths, '../other/leak.md', write('x'), { proposedBy: 'agent', now }),
+    ).rejects.toThrow('outside the space root');
+  });
+});
+
+describe('history and undo', () => {
+  test('history reads newest first and says who asked', async () => {
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('first version'), {
+      proposedBy: 'agent',
+      subject: 'Write the first version',
+      now,
+    });
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('second version'), {
+      proposedBy: 'user',
+      approvedBy: 'zara',
+      subject: 'Correct it by hand',
+      now,
+    });
+
+    const entries = await history(paths, 'knowledge/prefers-bun.md');
+    expect(entries).toHaveLength(2);
+    expect(entries[0]?.subject).toBe('Correct it by hand');
+    expect(entries[0]?.proposedBy).toBe('user');
+    expect(entries[0]?.approvedBy).toBe('zara');
+    expect(entries[1]?.subject).toBe('Write the first version');
+    expect(entries[1]?.approvedBy).toBeNull();
+  });
+
+  test('history of a file that was never written is empty, not an error', async () => {
+    expect(await history(paths, 'knowledge/never.md')).toEqual([]);
+  });
+
+  test('reverting a commit puts the earlier text back and keeps both commits', async () => {
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('first version'), {
+      proposedBy: 'agent',
+      now,
+    });
+    const second = await commitRecord(paths, 'knowledge/prefers-bun.md', write('second version'), {
+      proposedBy: 'agent',
+      now,
+    });
+
+    const undone = await revert(paths, second.sha, { proposedBy: 'zara', now });
+    expect(undone.committed).toBe(true);
+
+    const file = readFileSync(join(paths.knowledge, 'prefers-bun.md'), 'utf8');
+    expect(file).toContain('first version');
+    expect(file).not.toContain('second version');
+
+    const log = await git(paths.root, ['log', '--format=%s']);
+    expect(log).toContain('Revert');
+    expect(await history(paths, 'knowledge/prefers-bun.md')).toHaveLength(3);
+  });
+
+  test('reverting the removal of a record brings the record back', async () => {
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('bun everywhere'), {
+      proposedBy: 'agent',
+      now,
+    });
+    const removal = await commitRemoval(paths, 'knowledge/prefers-bun.md', {
+      proposedBy: 'zara',
+      now,
+    });
+    expect(existsSync(join(paths.knowledge, 'prefers-bun.md'))).toBe(false);
+
+    await revert(paths, removal.sha, { proposedBy: 'zara', now });
+    expect(existsSync(join(paths.knowledge, 'prefers-bun.md'))).toBe(true);
+  });
+
+  test('the version in the last commit is readable, and a new file has none', async () => {
+    expect(await readAtHead(paths, 'knowledge/prefers-bun.md')).toBeNull();
+    await commitRecord(paths, 'knowledge/prefers-bun.md', write('bun everywhere'), {
+      proposedBy: 'agent',
+      now,
+    });
+    expect(await readAtHead(paths, 'knowledge/prefers-bun.md')).toContain('bun everywhere');
+  });
+});
+
+describe('what a space may be called', () => {
+  test.each([
+    ['..', 'a name that is a way up the tree'],
+    ['../evil', 'a name that climbs out of the spaces root'],
+    ['a/b', 'a name with a separator in it'],
+    ['C:evil', 'a name that looks like a drive'],
+    ['Personal', 'a name that is not lowercase'],
+    ['', 'no name at all'],
+    ['.hidden', 'a name that starts with a dot'],
+  ])('refuses %p, %s', async (name) => {
+    await expect(initSpace(root, name)).rejects.toThrow('not a usable space name');
+  });
+
+  test.each(['personal', 'team-acme', 'work_2026', 'a.b'])('accepts %p', async (name) => {
+    const made = await initSpace(root, name);
+    expect(made.space).toBe(name);
+  });
+});
+
+describe('two writes to one space at the same time', () => {
+  const eight = Array.from({ length: 8 }, (_, i) => i);
+
+  test('all of them land, each in its own commit, each attributed to its own caller', async () => {
+    const results = await Promise.allSettled(
+      eight.map((i) =>
+        commitRecord(paths, `knowledge/r${i}.md`, write(`Body number ${i}.`), {
+          proposedBy: `agent-${i}`,
+          subject: `Write record ${i}`,
+          now,
+        }),
+      ),
+    );
+
+    expect(results.filter((r) => r.status === 'rejected')).toEqual([]);
+    for (const i of eight) {
+      expect(existsSync(join(paths.knowledge, `r${i}.md`))).toBe(true);
+    }
+
+    // One commit per write, plus the one that created the space. A write that
+    // was swept into somebody else's commit would show up as a shortfall here.
+    const log = await git(paths.root, ['log', '--format=%s']);
+    expect(log.trim().split('\n')).toHaveLength(eight.length + 1);
+  });
+
+  test('a record carries the trailer of the write that made it, not of its neighbour', async () => {
+    await Promise.all(
+      eight.map((i) =>
+        commitRecord(paths, `knowledge/r${i}.md`, write(`Body number ${i}.`), {
+          proposedBy: `agent-${i}`,
+          subject: `Write record ${i}`,
+          now,
+        }),
+      ),
+    );
+
+    for (const i of [0, 3, 7]) {
+      const entries = await history(paths, `knowledge/r${i}.md`);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.subject).toBe(`Write record ${i}`);
+      expect(entries[0]?.proposedBy).toBe(`agent-${i}`);
+    }
+  });
+
+  test('one write failing does not strand the writes queued behind it', async () => {
+    const results = await Promise.allSettled([
+      commitRecord(paths, '../outside.md', write('Escaping.'), { proposedBy: 'agent', now }),
+      commitRecord(paths, 'knowledge/after.md', write('The one behind it.'), {
+        proposedBy: 'agent',
+        now,
+      }),
+    ]);
+
+    expect(results[0]?.status).toBe('rejected');
+    expect(results[1]?.status).toBe('fulfilled');
+    expect(existsSync(join(paths.knowledge, 'after.md'))).toBe(true);
+  });
+});
+
+describe('erasing files from history', () => {
+  const VIEW = 'knowledge/k_01HZZZZZZZZZZZZZZZZZZZZZZZ.md';
+  const isView = (path: string) => /^knowledge\/k_[0-9A-Z]{26}\.md$/.test(path);
+  const everyObject = async () =>
+    (await runGit(paths.root, ['cat-file', '--batch-all-objects', '--batch'])).stdout;
+
+  test('takes every version of the files out of every commit and the object store', async () => {
+    await commitRecord(paths, 'knowledge/kept.md', write('a record the person keeps'), {
+      proposedBy: 'user',
+      now,
+    });
+    for (const value of ['Sister lives in Lisbon', 'Sister lives in Porto']) {
+      await Bun.write(join(paths.root, VIEW), `${value}\n`);
+      await git(paths.root, ['add', '--', VIEW]);
+      await git(paths.root, ['commit', '--quiet', '-m', 'Refresh memory inspection records']);
+    }
+    const kept = await history(paths, 'knowledge/kept.md');
+    expect(await everyObject()).toContain('Lisbon');
+
+    expect(await eraseFromHistory(paths, 'knowledge/k_*.md', isView)).toBe(true);
+
+    const objects = await everyObject();
+    expect(objects).not.toContain('Lisbon');
+    expect(objects).not.toContain('Porto');
+    expect(await git(paths.root, ['log', '--all', '--format=%H', '--', VIEW])).toBe('');
+    expect(await git(paths.root, ['ls-files', '--', VIEW])).toBe('');
+    // The person's own record keeps its history, message and contents.
+    const after = await history(paths, 'knowledge/kept.md');
+    expect(after.map((entry) => [entry.subject, entry.at, entry.proposedBy])).toEqual(
+      kept.map((entry) => [entry.subject, entry.at, entry.proposedBy]),
+    );
+    expect(await readAtHead(paths, 'knowledge/kept.md')).toContain('a record the person keeps');
+    // The file itself stays where it was; only its history went.
+    expect(readFileSync(join(paths.root, VIEW), 'utf8')).toContain('Porto');
+    // Nothing was left half-done for the next commit to sweep up.
+    expect((await git(paths.root, ['diff', '--cached', '--name-only'])).trim()).toBe('');
+  });
+
+  test('leaves something staged by the person staged, and does nothing twice', async () => {
+    await Bun.write(join(paths.root, VIEW), 'Allergic to penicillin\n');
+    await git(paths.root, ['add', '--', VIEW]);
+    await git(paths.root, ['commit', '--quiet', '-m', 'Refresh memory inspection records']);
+    await Bun.write(join(paths.root, 'notes.txt'), 'staged by hand');
+    await git(paths.root, ['add', '--', 'notes.txt']);
+
+    expect(await eraseFromHistory(paths, 'knowledge/k_*.md', isView)).toBe(true);
+    expect(await everyObject()).not.toContain('penicillin');
+    expect((await git(paths.root, ['diff', '--cached', '--name-only'])).trim()).toBe('notes.txt');
+    expect(await eraseFromHistory(paths, 'knowledge/k_*.md', isView)).toBe(false);
+  });
+
+  test('a message that only looks like a file change is kept as written', () => {
+    const message = `M 100644 0000000000000000000000000000000000000000 ${VIEW}\n`;
+    const stream = Buffer.from(
+      [
+        'commit refs/heads/main',
+        'mark :1',
+        'committer openduet <openduet@localhost> 0 +0000',
+        `data ${Buffer.byteLength(message)}`,
+        `${message}M 100644 1111111111111111111111111111111111111111 ${VIEW}`,
+        'M 100644 2222222222222222222222222222222222222222 knowledge/kept.md',
+        `D ${VIEW}`,
+        '',
+      ].join('\n'),
+    );
+    const kept = Buffer.from(dropPaths(stream, isView)).toString();
+    expect(kept).toContain(message);
+    expect(kept).toContain('knowledge/kept.md');
+    expect(kept).not.toContain('1111111111');
+    expect(kept).not.toContain(`D ${VIEW}`);
+  });
+});

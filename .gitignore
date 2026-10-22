@@ -1,0 +1,34 @@
+node_modules/
+output/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+spaces/
+artifacts/
+work/
+**/.index/
+.gstack/
+.omx/
+.agents/*.log
+deploy/config/gateway-tls/
+# An installation's own files: its deploy contract, and the openduet command's lock and history.
+deploy/openduet.deploy.json
+deploy/.openduet/
+.hermes-src/
+.hermes-venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+conformance/memory/report.json
+.agents/browser-measurements.json
+.eval-state
+
+# wrangler dev writes its local state and bundles here.
+.wrangler/
+
+# The runtime data directories above are matched at any depth, which would
+# also swallow source directories that happen to share their names.
+!apps/openduet/src/spaces/
+conformance/memory/eval-report.json

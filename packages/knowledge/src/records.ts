@@ -1,0 +1,122 @@
+/**
+ * The two ways a record stops being true, which are not the same thing.
+ *
+ * Retraction keeps the text and adds the reason: the person can still read what
+ * OpenDuet believed and why it stopped believing it. Deletion removes the file,
+ * commits the removal, and rebuilds the index in the same call, so the text is
+ * gone from the working tree and from the only derived copy together.
+ */
+import { lintStatusTransition } from '@openduet/contracts';
+import { serializeRecord } from './frontmatter.ts';
+import type { SpaceIndex } from './fts.ts';
+import type { SpacePaths } from './layout.ts';
+import { discardProposalsFor } from './mediation.ts';
+import { type CommitAttribution, commitRecord, commitRemoval, type SpaceCommit } from './space.ts';
+import {
+  type LoadedRecord,
+  markIndexFresh,
+  rebuild,
+  type SpaceContents,
+  toIndexed,
+} from './store.ts';
+
+export type RetractionRequest = {
+  reason: string;
+  /** Who asked. A person, or the agent that noticed the record was wrong. */
+  by: string;
+  now?: () => Date;
+};
+
+export type RetractionResult = {
+  commit: SpaceCommit;
+  /** The record as it now reads on disk. */
+  content: string;
+};
+
+const isoDate = (at: Date): string => at.toISOString().slice(0, 10);
+
+/**
+ * Retract a record: mark it retracted, write the reason into the body, commit,
+ * and drop it from the index. The drop is part of this call, so a job holding
+ * an open handle stops seeing the record at once rather than at the next
+ * restart.
+ */
+export async function retract(
+  paths: SpacePaths,
+  index: SpaceIndex,
+  record: LoadedRecord,
+  request: RetractionRequest,
+): Promise<RetractionResult> {
+  const now = request.now ?? (() => new Date());
+  const at = now();
+
+  // The contract treats a status that does not move as no transition at all, so
+  // retracting twice would quietly rewrite the reason. Say so instead.
+  if (record.frontmatter.status === 'retracted') {
+    throw new Error(`${record.frontmatter.id} is already retracted`);
+  }
+  const illegal = lintStatusTransition(record.frontmatter.status, 'retracted');
+  if (illegal.length > 0) {
+    throw new Error(illegal.map((f) => f.message).join('; '));
+  }
+
+  // `status` says what OpenDuet believes; `valid_until` says what was true in the
+  // world, and the whole point of keeping them apart is that they are different
+  // questions. Retracting means stop relying on this, which is not evidence
+  // about when the thing stopped being true: a record retracted because it was
+  // wrong from the start was never true at all. So the validity window is left
+  // exactly as the person left it rather than closed with today's date.
+  const frontmatter = {
+    ...record.frontmatter,
+    status: 'retracted' as const,
+    updated: isoDate(at),
+  };
+  const body = `${record.body.trim()}\n\n**Retracted ${isoDate(at)}:** ${request.reason.trim()}`;
+  const content = serializeRecord(frontmatter, body);
+
+  const attribution: CommitAttribution = {
+    proposedBy: request.by,
+    subject: `Retract ${record.frontmatter.title}`,
+    now,
+  };
+  const commit = await commitRecord(paths, record.path, content, attribution);
+  index.remove(record.frontmatter.id);
+  markIndexFresh(paths, index);
+  // A write still waiting to change it would bring back what was just retracted.
+  discardProposalsFor(paths, { ids: [record.frontmatter.id], paths: [record.path] });
+  return { commit, content };
+}
+
+export type DeletionResult = {
+  commit: SpaceCommit;
+  /** The space as it reads after the rebuild, so a caller can report the count. */
+  contents: SpaceContents;
+};
+
+/**
+ * Delete a record outright. The file goes, the removal is committed, and the
+ * index is rebuilt from what is left before this call returns.
+ */
+export async function hardDelete(
+  paths: SpacePaths,
+  index: SpaceIndex,
+  record: LoadedRecord,
+  request: RetractionRequest,
+): Promise<DeletionResult> {
+  const now = request.now ?? (() => new Date());
+  const commit = await commitRemoval(paths, record.path, {
+    proposedBy: request.by,
+    subject: `Delete ${record.frontmatter.title}: ${request.reason.trim()}`,
+    now,
+  });
+  // The rebuild drops everything and leaves the deleted record out, which
+  // erases it; removing it first would rewrite the whole file once more.
+  const contents = rebuild(paths, index);
+  // Staged writes hold the record's text too, and would write it back.
+  discardProposalsFor(paths, { ids: [record.frontmatter.id], paths: [record.path] });
+  return { commit, contents };
+}
+
+/** Put one record into the index without rebuilding the rest. */
+export const indexRecord = (index: SpaceIndex, record: LoadedRecord): void =>
+  index.upsert(toIndexed(record));

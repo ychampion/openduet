@@ -1,0 +1,1117 @@
+import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { HERMES_PINNED_COMMIT } from '@openduet/runtime-hermes';
+import {
+  DEFAULT_STDIO_IMAGES,
+  STDIO_LIMITS,
+  stdioContainerBody,
+} from '../connectors/mcp-stdio-docker.ts';
+import { EngineImageUnavailable } from '../runtime/cell-host.ts';
+import { LocalCellHost } from '../runtime/cell-host-local.ts';
+import { DockerError } from '../runtime/docker.ts';
+import { DockerSandboxHost } from '../sandbox/adapters/docker.ts';
+import { type CellsLookup, type CellsPolicyConfig, judge, redactContainer } from './policy.ts';
+import { RuntimeImages } from './runtime-images.ts';
+
+const PROJECT = 'openduet';
+const SANDBOX_PROJECT = 'openduet-ab12cd34';
+const RUNTIME_ID = `sha256:${'a'.repeat(64)}`;
+const SANDBOX_ID = `sha256:${'b'.repeat(64)}`;
+const SERVER_ID = `sha256:${'c'.repeat(64)}`;
+const LOCAL_ID = `sha256:${'d'.repeat(64)}`;
+
+/** Registry names as a resolver would answer them; any other name does not resolve. */
+const TEST_HOSTS: Record<string, string[]> = {
+  'registry-1.docker.io': ['198.51.100.1'],
+  'ghcr.io': ['198.51.100.2'],
+  'registry.acme.com': ['10.20.30.40'],
+  'rebound.example.net': ['203.0.113.7', '127.0.0.1'],
+  'metadata.example.net': ['169.254.169.254'],
+  'mapped.example.net': ['::ffff:127.0.0.1'],
+};
+async function resolveTestHost(host: string): Promise<string[]> {
+  const addresses = TEST_HOSTS[host];
+  if (!addresses) throw new Error(`getaddrinfo ENOTFOUND ${host}`);
+  return addresses;
+}
+
+const config: CellsPolicyConfig = {
+  project: PROJECT,
+  sandboxProject: SANDBOX_PROJECT,
+  runtimeImage: 'openduet-runtime:local',
+  sandboxImage: 'openduet-sandbox:local',
+  mcpImages: [DEFAULT_STDIO_IMAGES.node, DEFAULT_STDIO_IMAGES.python],
+  workVolume: `${PROJECT}_work`,
+  resolve: resolveTestHost,
+};
+
+type Labels = Record<string, string>;
+
+/**
+ * A small engine: what exists, judged by the policy before every call, so the
+ * real clients' requests are what is tested.
+ */
+class Engine {
+  containers = new Map<
+    string,
+    { Id: string; Name: string; Labels: Labels; Running: boolean; Image?: string }
+  >();
+  networks = new Map<string, { Id: string; Name: string; Internal: boolean; Labels: Labels }>();
+  volumes = new Map<string, { Name: string; Labels: Labels }>();
+  images = new Map<string, { Id: string; RepoDigests: string[]; Config: { Labels: Labels } }>();
+  execs = new Map<string, { ContainerID: string }>();
+  refused: string[] = [];
+
+  /** `policy`: the cell service's settings, the shared ones unless a test gives its own. */
+  constructor(readonly policy: CellsPolicyConfig = config) {
+    const runtime = {
+      Id: RUNTIME_ID,
+      RepoDigests: [],
+      Config: {
+        Labels: {
+          'com.openduet.hermes.commit': HERMES_PINNED_COMMIT,
+          'com.openduet.plugin.sha256': 'e'.repeat(64),
+        },
+      },
+    };
+    this.images.set('openduet-runtime:local', runtime).set(RUNTIME_ID, runtime);
+    const sandbox = { Id: SANDBOX_ID, RepoDigests: [], Config: { Labels: {} } };
+    this.images.set('openduet-sandbox:local', sandbox).set(SANDBOX_ID, sandbox);
+    const server = {
+      Id: SERVER_ID,
+      RepoDigests: [`ghcr.io/example/server@sha256:${'f'.repeat(64)}`],
+      Config: { Labels: {} },
+    };
+    this.images.set(SERVER_ID, server);
+    this.images.set(LOCAL_ID, { Id: LOCAL_ID, RepoDigests: [], Config: { Labels: {} } });
+    this.containers.set('self', {
+      Id: 'self',
+      Name: '/openduet-openduet-1',
+      Labels: { 'com.docker.compose.project': PROJECT, 'com.docker.compose.service': 'openduet' },
+      Running: true,
+    });
+    this.containers.set('postgres', {
+      Id: 'postgres',
+      Name: '/openduet-postgres-1',
+      Labels: { 'com.docker.compose.project': PROJECT, 'com.docker.compose.service': 'postgres' },
+      Running: true,
+    });
+    this.networks.set('openduet_edge', {
+      Id: 'openduet_edge',
+      Name: 'openduet_edge',
+      Internal: false,
+      Labels: { 'com.docker.compose.project': PROJECT },
+    });
+  }
+
+  lookup: CellsLookup = {
+    container: async (id) => {
+      const found = this.containers.get(id);
+      return found ? { Id: found.Id, Name: found.Name, Config: { Labels: found.Labels } } : null;
+    },
+    network: async (id) => this.networks.get(id) ?? null,
+    volume: async (name) => this.volumes.get(name) ?? null,
+    image: async (reference) => this.images.get(reference) ?? null,
+    exec: async (id) => this.execs.get(id) ?? null,
+  };
+
+  async ask(method: string, target: string, body?: unknown) {
+    const url = new URL(target, 'http://engine');
+    return judge(
+      { method, path: url.pathname, query: url.searchParams, body },
+      this.policy,
+      this.lookup,
+    );
+  }
+
+  /** A Docker client seam that is judged first, then served from the maps, as the cell service serves it. */
+  api = {
+    request: async (method: 'GET' | 'POST' | 'DELETE', target: string, body?: unknown) => {
+      const verdict = await this.ask(method, target, body);
+      if (!verdict.allow) {
+        this.refused.push(`${method} ${target}: ${verdict.reason}`);
+        // The service's client keeps a refusal's reason, as it does over the network.
+        throw new DockerError(
+          verdict.status,
+          method,
+          target,
+          verdict.status === 403 ? verdict.reason : undefined,
+        );
+      }
+      const answer = this.serve(method, target, body);
+      if (verdict.runtimeImage) {
+        const id = (answer as { Id?: unknown } | undefined)?.Id;
+        if (typeof id === 'string') await this.policy.runtimeImages?.add(id);
+      }
+      return answer;
+    },
+    startExec: async () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+    putArchive: async () => {},
+  };
+
+  private serve(method: string, target: string, body: unknown): unknown {
+    const url = new URL(target, 'http://engine');
+    const parts = url.pathname.split('/').slice(1);
+    const value = body as Record<string, unknown>;
+    if (url.pathname === '/version') return { ApiVersion: '1.48' };
+    if (url.pathname === '/volumes/create') {
+      const volume = { Name: String(value.Name), Labels: value.Labels as Labels };
+      this.volumes.set(volume.Name, volume);
+      return volume;
+    }
+    if (url.pathname === '/networks/create') {
+      const network = {
+        Id: String(value.Name),
+        Name: String(value.Name),
+        Internal: value.Internal === true,
+        Labels: value.Labels as Labels,
+      };
+      this.networks.set(network.Id, network);
+      return { Id: network.Id };
+    }
+    if (url.pathname === '/containers/create') {
+      const name = url.searchParams.get('name') ?? '';
+      this.containers.set(name, {
+        Id: name,
+        Name: `/${name}`,
+        Labels: value.Labels as Labels,
+        Running: false,
+        Image: this.images.get(String(value.Image))?.Id,
+      });
+      return { Id: name };
+    }
+    if (parts[0] === 'containers' && parts[2] === 'start') {
+      const found = this.containers.get(parts[1] ?? '');
+      if (found) found.Running = true;
+      return null;
+    }
+    if (parts[0] === 'containers' && parts[2] === 'stop') {
+      const found = this.containers.get(parts[1] ?? '');
+      if (found) found.Running = false;
+      return null;
+    }
+    if (parts[0] === 'containers' && parts.length === 2 && method === 'DELETE') {
+      this.containers.delete(parts[1] ?? '');
+      return null;
+    }
+    if (url.pathname === '/volumes' && method === 'GET')
+      return { Volumes: [...this.volumes.values()] };
+    if (parts[0] === 'containers' && parts[2] === 'json') {
+      const found = this.containers.get(parts[1] ?? '');
+      if (!found) throw new DockerError(404, 'GET', target);
+      return {
+        Id: found.Id,
+        Image: found.Image,
+        Config: { Labels: found.Labels, Env: ['SECRET=1'] },
+        State: { Running: found.Running, Status: found.Running ? 'running' : 'created' },
+        NetworkSettings: {
+          Networks: Object.fromEntries(
+            [...this.networks.values()]
+              .filter((network) => network.Name === `${found.Id}-net`)
+              .map((network) => [network.Name, { IPAddress: '172.30.0.2' }]),
+          ),
+        },
+      };
+    }
+    if (parts[0] === 'images' && parts[2] === 'json') {
+      const image = this.images.get(decodeURIComponent(parts[1] ?? ''));
+      if (!image) throw new DockerError(404, 'GET', target);
+      return image;
+    }
+    if (parts[0] === 'networks' && parts.length === 2 && method === 'GET')
+      return { ...this.networks.get(parts[1] ?? ''), Containers: {} };
+    return null;
+  }
+}
+
+const runtimeLabels = (attempt: string): Labels => ({
+  'com.openduet.attempt-supervisor': 'v1',
+  'com.openduet.project': PROJECT,
+  'com.openduet.attempt': attempt,
+  'com.openduet.job': 'job_01J00000000000000000000000',
+});
+
+/** What an attempt cell asks for, as the runtime supervisor builds it. */
+function attemptBody(name: string, overrides: Record<string, unknown> = {}, host: object = {}) {
+  return {
+    Image: RUNTIME_ID,
+    User: '10001:10001',
+    WorkingDir: '/work',
+    Labels: runtimeLabels('att_01j00000000000000000000000'),
+    Env: ['A=1'],
+    HostConfig: {
+      NetworkMode: `${name}-net`,
+      ReadonlyRootfs: true,
+      CapDrop: ['ALL'],
+      SecurityOpt: ['no-new-privileges:true'],
+      PidsLimit: 256,
+      Memory: 2 * 1024 ** 3,
+      Tmpfs: { '/tmp': 'size=64m,mode=1777' },
+      RestartPolicy: { Name: 'no' },
+      LogConfig: { Type: 'json-file', Config: {} },
+      Mounts: [
+        {
+          Type: 'volume',
+          Source: `${PROJECT}_work`,
+          Target: '/work',
+          VolumeOptions: { Subpath: 'job_01J00000000000000000000000', NoCopy: true },
+        },
+        { Type: 'volume', Source: `${name}-home`, Target: '/var/lib/hermes' },
+      ],
+      ...host,
+    },
+    NetworkingConfig: { EndpointsConfig: { [`${name}-net`]: {} } },
+    ...overrides,
+  };
+}
+
+const ATTEMPT = `${PROJECT}-att_01j00000000000000000000000`;
+
+async function engineWithAttemptNetwork() {
+  const engine = new Engine();
+  engine.networks.set(`${ATTEMPT}-net`, {
+    Id: `${ATTEMPT}-net`,
+    Name: `${ATTEMPT}-net`,
+    Internal: true,
+    Labels: runtimeLabels('att_01j00000000000000000000000'),
+  });
+  return engine;
+}
+
+describe('openduet-cells accepts the fixed profiles the service uses', () => {
+  test('the runtime supervisor provisions and starts an attempt cell through it', async () => {
+    const engine = new Engine();
+    const host = new LocalCellHost({
+      project: PROJECT,
+      image: 'openduet-runtime:local',
+      workRoot: '/nonexistent',
+      workVolume: `${PROJECT}_work`,
+      selfId: 'self',
+      docker: engine.api,
+    });
+    await host.verify();
+    await host.reconcile('start').catch(() => {});
+    const cell = host.cell({
+      cell: { attempt: 'att_01J00000000000000000000000', job: 'job_01J00000000000000000000000' },
+      environment: ['A=1'],
+    } as never);
+    // The workspace directory is the service's own filesystem, not the engine's.
+    const provision = host as unknown as {
+      provisionCell: (r: object, l: Labels, s: AbortSignal) => Promise<void>;
+      startContainer: (
+        r: object,
+        l: Labels,
+        e: string[],
+        w: string,
+        s: AbortSignal,
+      ) => Promise<string>;
+    };
+    const resources = { container: ATTEMPT, network: `${ATTEMPT}-net`, home: `${ATTEMPT}-home` };
+    const labels = runtimeLabels('att_01J00000000000000000000000');
+    await provision.provisionCell(resources, labels, new AbortController().signal);
+    const address = await provision.startContainer(
+      resources,
+      labels,
+      ['A=1'],
+      'job_01J00000000000000000000000',
+      new AbortController().signal,
+    );
+    expect(address).toBe('http://172.30.0.2:8790');
+    expect(engine.refused).toEqual([]);
+    expect(cell).toBeDefined();
+  });
+
+  test("an agent's computer is created with and without its network", async () => {
+    for (const egress of ['deny_all', 'open'] as const) {
+      const engine = new Engine();
+      const sandbox = new DockerSandboxHost(
+        {
+          socket: '/unused.sock',
+          project: SANDBOX_PROJECT,
+          cpus: 1,
+          memoryMb: 2048,
+          pids: 512,
+          diskMb: 4096,
+          idleSeconds: 600,
+          egressPort: 8789,
+          selfId: 'self',
+        },
+        engine.api,
+      );
+      // Only the create is under test; the guard's listener is not.
+      (sandbox as unknown as { grantEgress: () => Promise<void> }).grantEgress = async () => {};
+      await sandbox.create(
+        {
+          image: 'openduet-sandbox:local',
+          egress: egress === 'open' ? { kind: 'open' } : { kind: 'deny_all' },
+          region: null,
+          lifetimeSeconds: 3600,
+          idleSeconds: null,
+          workdir: '/work',
+          labels: {
+            'openduet.owner': 'v1',
+            'openduet.project': SANDBOX_PROJECT,
+            'openduet.session': 'sbs_01J00000000000000000000000',
+          },
+          env: {},
+        } as never,
+        new AbortController().signal,
+      );
+      expect(engine.refused).toEqual([]);
+    }
+  });
+
+  test("an agent's computer on an older image is made again from the current one, keeping its volumes", async () => {
+    for (const egress of ['deny_all', 'open'] as const) {
+      const engine = new Engine();
+      const sandbox = new DockerSandboxHost(
+        {
+          socket: '/unused.sock',
+          project: SANDBOX_PROJECT,
+          cpus: 1,
+          memoryMb: 2048,
+          pids: 512,
+          diskMb: 4096,
+          idleSeconds: 600,
+          egressPort: 8789,
+          selfId: 'self',
+        },
+        engine.api,
+      );
+      (sandbox as unknown as { grantEgress: () => Promise<void> }).grantEgress = async () => {};
+      const spec = (session: string) =>
+        ({
+          image: 'openduet-sandbox:local',
+          egress: egress === 'open' ? { kind: 'open' } : { kind: 'deny_all' },
+          region: null,
+          lifetimeSeconds: 3600,
+          idleSeconds: null,
+          workdir: '/work',
+          labels: {
+            'openduet.owner': 'v1',
+            'openduet.project': SANDBOX_PROJECT,
+            'openduet.session': session,
+          },
+          env: {},
+        }) as never;
+      const made = await sandbox.create(
+        spec('sbs_01J00000000000000000000000'),
+        new AbortController().signal,
+      );
+      const name = made.providerSandboxId;
+      const volumes = [...engine.volumes.keys()].sort();
+      // An update brings a newer image under the name the operator configured.
+      const NEW_ID = `sha256:${'9'.repeat(64)}`;
+      const newer = { Id: NEW_ID, RepoDigests: [], Config: { Labels: {} } };
+      engine.images.set('openduet-sandbox:local', newer).set(NEW_ID, newer);
+      const resumed = await sandbox.resume(
+        name,
+        spec('sbs_01J00000000000000000000001'),
+        new AbortController().signal,
+        { quiet: true },
+      );
+      expect(engine.refused).toEqual([]);
+      expect(resumed.recreatedFrom).toBe(SANDBOX_ID);
+      expect(engine.containers.get(name)?.Image).toBe(NEW_ID);
+      expect([...engine.volumes.keys()].sort()).toEqual(volumes);
+      // The image it ran before is no longer one a computer may be made from.
+      expect(
+        await engine.ask('POST', `/containers/create?name=${name}`, {
+          Image: SANDBOX_ID,
+          User: '10004:10004',
+          Labels: engine.containers.get(name)?.Labels,
+          NetworkDisabled: true,
+          HostConfig: {
+            NetworkMode: 'none',
+            ReadonlyRootfs: true,
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges:true'],
+            PidsLimit: 512,
+            Memory: 2 * 1024 ** 3,
+            RestartPolicy: { Name: 'no' },
+            LogConfig: { Type: 'json-file', Config: {} },
+            Mounts: [{ Type: 'volume', Source: `${name}-work`, Target: '/work' }],
+          },
+        }),
+      ).toEqual({
+        allow: false,
+        status: 403,
+        reason: 'the sandbox profile runs only the image the operator configured',
+      });
+    }
+  });
+
+  test('a stdio MCP server and its preparation are created', async () => {
+    const engine = new Engine();
+    const labels = {
+      'com.openduet.mcp-launcher': 'v1',
+      'com.openduet.project': PROJECT,
+      'com.openduet.connection': 'conn_01J00000000000000000000000',
+    };
+    engine.networks.set(`${PROJECT}-mcp-conn_01j00000000000000000000000-net`, {
+      Id: 'n',
+      Name: `${PROJECT}-mcp-conn_01j00000000000000000000000-net`,
+      Internal: true,
+      Labels: labels,
+    });
+    for (const network of [undefined, `${PROJECT}-mcp-conn_01j00000000000000000000000-net`]) {
+      const verdict = await engine.ask(
+        'POST',
+        `/containers/create?name=${PROJECT}-mcp-conn_01j00000000000000000000000${network ? '-prepare' : ''}`,
+        stdioContainerBody({
+          image: SERVER_ID,
+          command: { image: SERVER_ID, argv: ['server'] },
+          labels,
+          mounts: [
+            {
+              volume: `${PROJECT}-mcp-conn_01j00000000000000000000000-data`,
+              target: '/data',
+              readOnly: false,
+            },
+          ],
+          ...(network ? { network } : {}),
+          env: ['A=1'],
+          interactive: !network,
+          tmpfs: STDIO_LIMITS.tmpfs,
+          workdir: '/data',
+        }),
+      );
+      expect(verdict).toEqual({ allow: true });
+    }
+  });
+
+  test('the configured runner images and digest-pinned images may be pulled', async () => {
+    const engine = new Engine();
+    for (const reference of [
+      DEFAULT_STDIO_IMAGES.node,
+      `ghcr.io/example/server:1.0@sha256:${'1'.repeat(64)}`,
+      `docker.io/library/node:22-alpine@sha256:${'1'.repeat(64)}`,
+    ])
+      expect(
+        (await engine.ask('POST', `/images/create?fromImage=${encodeURIComponent(reference)}`))
+          .allow,
+      ).toBe(true);
+  });
+
+  test('pulls from any registry, except one that points back at the host', async () => {
+    const engine = new Engine();
+    const pull = async (name: string) =>
+      (
+        await engine.ask(
+          'POST',
+          `/images/create?fromImage=${encodeURIComponent(`${name}@sha256:${'1'.repeat(64)}`)}`,
+        )
+      ).allow;
+    for (const name of [
+      'registry.acme.com/tools/x:1',
+      '10.0.0.5:5000/x',
+      'alpine',
+      'org/image',
+      // A name this service cannot resolve rests on the name rules.
+      'registry.corp.example/x',
+    ])
+      expect([name, await pull(name)]).toEqual([name, true]);
+    for (const name of [
+      '127.0.0.1.nip.io:2375/x',
+      '169.254.169.254.nip.io/x',
+      'metadata.google.internal/x',
+      'host.docker.internal/x',
+      'localhost:5000/x',
+      'registry.acme.com:2376/x',
+      '[::1]:5000/x',
+      // Names that resolve to the host or its metadata service.
+      'rebound.example.net/x',
+      'metadata.example.net/x',
+      'mapped.example.net/x',
+    ])
+      expect([name, await pull(name)]).toEqual([name, false]);
+  });
+});
+
+describe('openduet-cells refuses a container outside its profiles', () => {
+  const refusals: Array<[string, (name: string) => object]> = [
+    ['privileged mode', (name) => attemptBody(name, {}, { Privileged: true })],
+    ['a host path mounted', (name) => attemptBody(name, {}, { Binds: ['/:/host'] })],
+    [
+      'a bind mount',
+      (name) =>
+        attemptBody(
+          name,
+          {},
+          {
+            Mounts: [
+              { Type: 'bind', Source: '/var/run/docker.sock', Target: '/var/run/docker.sock' },
+            ],
+          },
+        ),
+    ],
+    [
+      'host networking',
+      (name) => attemptBody(name, { NetworkingConfig: undefined }, { NetworkMode: 'host' }),
+    ],
+    ['another network', (name) => attemptBody(name, {}, { NetworkMode: 'openduet_edge' })],
+    ['an added capability', (name) => attemptBody(name, {}, { CapAdd: ['SYS_ADMIN'] })],
+    ['a device', (name) => attemptBody(name, {}, { Devices: [{ PathOnHost: '/dev/kmsg' }] })],
+    ['the host PID namespace', (name) => attemptBody(name, {}, { PidMode: 'host' })],
+    [
+      'an unconfined seccomp profile',
+      (name) =>
+        attemptBody(name, {}, { SecurityOpt: ['no-new-privileges:true', 'seccomp=unconfined'] }),
+    ],
+    ['a writable root', (name) => attemptBody(name, {}, { ReadonlyRootfs: false })],
+    ['root', (name) => attemptBody(name, { User: '0:0' })],
+    ['an arbitrary image', (name) => attemptBody(name, { Image: LOCAL_ID })],
+    ['a command of its own', (name) => attemptBody(name, { Cmd: ['sh', '-c', 'id'] })],
+    ['no profile labels', (name) => attemptBody(name, { Labels: { owner: 'someone' } })],
+    [
+      'the whole workspace volume',
+      (name) =>
+        attemptBody(
+          name,
+          {},
+          {
+            Mounts: [{ Type: 'volume', Source: `${PROJECT}_work`, Target: '/work' }],
+          },
+        ),
+    ],
+    [
+      "the database's volume",
+      (name) =>
+        attemptBody(
+          name,
+          {},
+          {
+            Mounts: [{ Type: 'volume', Source: `${PROJECT}_pgdata`, Target: '/var/lib/hermes' }],
+          },
+        ),
+    ],
+  ];
+  for (const [what, body] of refusals)
+    test(`refuses ${what}`, async () => {
+      const engine = await engineWithAttemptNetwork();
+      // The unchanged request is accepted, so each refusal is the one change's.
+      expect(
+        (await engine.ask('POST', `/containers/create?name=${ATTEMPT}`, attemptBody(ATTEMPT)))
+          .allow,
+      ).toBe(true);
+      const verdict = await engine.ask('POST', `/containers/create?name=${ATTEMPT}`, body(ATTEMPT));
+      expect(verdict.allow).toBe(false);
+    });
+
+  test('refuses an MCP server image built on this host', async () => {
+    const engine = new Engine();
+    const labels = {
+      'com.openduet.mcp-launcher': 'v1',
+      'com.openduet.project': PROJECT,
+      'com.openduet.connection': 'conn_01J00000000000000000000000',
+    };
+    const verdict = await engine.ask(
+      'POST',
+      `/containers/create?name=${PROJECT}-mcp-conn_01j00000000000000000000000`,
+      stdioContainerBody({
+        image: LOCAL_ID,
+        command: { image: LOCAL_ID },
+        labels,
+        mounts: [],
+        env: [],
+        interactive: true,
+        workdir: '/data',
+      }),
+    );
+    expect(verdict.allow).toBe(false);
+  });
+
+  test('refuses a volume with a driver option, which could name any host path', async () => {
+    const engine = new Engine();
+    const verdict = await engine.ask('POST', '/volumes/create', {
+      Name: `${ATTEMPT}-home`,
+      Labels: runtimeLabels('att_01j00000000000000000000000'),
+      DriverOpts: { type: 'none', o: 'bind', device: '/' },
+    });
+    expect(verdict.allow).toBe(false);
+  });
+
+  test('refuses a network with a route out', async () => {
+    const engine = new Engine();
+    const verdict = await engine.ask('POST', '/networks/create', {
+      Name: `${ATTEMPT}-net`,
+      Driver: 'bridge',
+      Internal: false,
+      Options: { 'com.docker.network.bridge.gateway_mode_ipv4': 'isolated' },
+      Labels: runtimeLabels('att_01j00000000000000000000000'),
+    });
+    expect(verdict.allow).toBe(false);
+  });
+
+  test('allows a network on one subnet of the pool, and no other addresses', async () => {
+    const engine = new Engine();
+    const network = (IPAM: unknown) =>
+      engine.ask('POST', '/networks/create', {
+        Name: `${ATTEMPT}-net`,
+        Driver: 'bridge',
+        Internal: true,
+        Options: { 'com.docker.network.bridge.gateway_mode_ipv4': 'isolated' },
+        Labels: runtimeLabels('att_01j00000000000000000000000'),
+        IPAM,
+      });
+    expect(
+      (await network({ Driver: 'default', Config: [{ Subnet: '10.215.4.16/28' }] })).allow,
+    ).toBe(true);
+    for (const IPAM of [
+      { Config: [{ Subnet: '192.168.1.0/28' }] },
+      { Config: [{ Subnet: '10.215.0.0/16' }] },
+      { Config: [{ Subnet: '10.215.4.16/28', Gateway: '192.168.1.1' }] },
+      { Config: [{ Subnet: '10.215.4.16/28' }, { Subnet: '10.215.4.32/28' }] },
+      { Driver: 'other', Config: [{ Subnet: '10.215.4.16/28' }] },
+      { Config: [{ Subnet: '10.215.4.16/28' }], Options: {} },
+      { Config: [{ Subnet: ' 10.215.4.16/28' }] },
+      { Config: [{ Subnet: '10.215.4.8/28' }] },
+      { Config: [{ Subnet: '10.215.4.16/28', IPRange: '10.215.4.16/29' }] },
+      { Config: [{ Subnet: '10.215.4.16/28', AuxiliaryAddresses: { a: '10.215.4.20' } }] },
+      { Config: [{ Subnet: 'fd00::/64' }] },
+      { Config: [{ Subnet: 168_100_000 }] },
+      { Config: [] },
+      null,
+      'default',
+    ])
+      expect((await network(IPAM)).allow).toBe(false);
+    // With the pool off, a network names no addresses of its own.
+    const off = await judge(
+      {
+        method: 'POST',
+        path: '/networks/create',
+        query: new URLSearchParams(),
+        body: {
+          Name: `${ATTEMPT}-net`,
+          Driver: 'bridge',
+          Internal: true,
+          Options: { 'com.docker.network.bridge.gateway_mode_ipv4': 'isolated' },
+          Labels: runtimeLabels('att_01j00000000000000000000000'),
+          IPAM: { Config: [{ Subnet: '10.215.4.16/28' }] },
+        },
+      },
+      { ...config, networkPool: null },
+      engine.lookup,
+    );
+    expect(off.allow).toBe(false);
+  });
+
+  test("refuses to act on containers outside the profiles, such as the database's", async () => {
+    const engine = new Engine();
+    for (const [method, target, body] of [
+      ['DELETE', '/containers/postgres?force=1', undefined],
+      ['POST', '/containers/postgres/stop', undefined],
+      ['POST', '/containers/postgres/exec', { Cmd: ['psql'] }],
+      ['PUT', '/containers/postgres/archive?path=/', undefined],
+      ['POST', '/containers/self/exec', { Cmd: ['sh'] }],
+    ] as const)
+      expect((await engine.ask(method, target, body)).allow).toBe(false);
+  });
+
+  test("joins only the service to a cell's network, and only under its alias", async () => {
+    const engine = await engineWithAttemptNetwork();
+    const network = `/networks/${ATTEMPT}-net/connect`;
+    expect(
+      (
+        await engine.ask('POST', network, {
+          Container: 'self',
+          EndpointConfig: { Aliases: ['openduet'] },
+        })
+      ).allow,
+    ).toBe(true);
+    expect(
+      (
+        await engine.ask('POST', network, {
+          Container: 'postgres',
+          EndpointConfig: { Aliases: ['openduet'] },
+        })
+      ).allow,
+    ).toBe(false);
+    expect(
+      (
+        await engine.ask('POST', network, {
+          Container: 'self',
+          EndpointConfig: { Aliases: ['postgres'] },
+        })
+      ).allow,
+    ).toBe(false);
+    expect(
+      (await engine.ask('POST', '/networks/openduet_edge/connect', { Container: 'self' })).allow,
+    ).toBe(false);
+  });
+
+  test('refuses engine calls outside the list, and pulls by tag alone', async () => {
+    const engine = new Engine();
+    for (const [method, target] of [
+      ['POST', '/build'],
+      ['POST', '/swarm/init'],
+      ['GET', '/containers/json?all=1'],
+      ['POST', '/images/create?fromImage=alpine:latest'],
+      ['POST', `/images/create?fromImage=127.0.0.1:5000/x@sha256:${'1'.repeat(64)}`],
+      ['POST', '/images/create?fromSrc=http://example.com/root.tar'],
+      ['POST', '/containers/..%2f..%2fversion/start'],
+      ['DELETE', '/images/openduet-runtime:local'],
+    ] as const)
+      expect((await engine.ask(method, target)).allow).toBe(false);
+  });
+
+  test('refuses a profile container labelled as a Compose service, and never takes one for the service', async () => {
+    const engine = new Engine();
+    const mcpLabels = {
+      'com.openduet.mcp-launcher': 'v1',
+      'com.openduet.project': PROJECT,
+      'com.openduet.connection': 'conn_01J00000000000000000000000',
+    };
+    const disguised = {
+      ...mcpLabels,
+      'com.docker.compose.project': PROJECT,
+      'com.docker.compose.service': 'openduet',
+    };
+    const name = `${PROJECT}-mcp-conn_01j00000000000000000000000`;
+    const body = (labels: Record<string, string>) =>
+      stdioContainerBody({
+        image: SERVER_ID,
+        command: { image: SERVER_ID },
+        labels,
+        mounts: [],
+        env: [],
+        interactive: true,
+        workdir: '/data',
+      });
+    // The same server, labelled honestly, is accepted.
+    expect(
+      (await engine.ask('POST', `/containers/create?name=${name}`, body(mcpLabels))).allow,
+    ).toBe(true);
+    expect(
+      (await engine.ask('POST', `/containers/create?name=${name}`, body(disguised))).allow,
+    ).toBe(false);
+    expect(
+      (
+        await engine.ask('POST', `/containers/create?name=${name}`, {
+          ...body({ ...mcpLabels, 'com.openduet.sandbox': 'v1' }),
+        })
+      ).allow,
+    ).toBe(false);
+    // Had one been made some other way, it still cannot join a cell's network as the service.
+    engine.containers.set('disguised', {
+      Id: 'disguised',
+      Name: '/x',
+      Labels: disguised,
+      Running: true,
+    });
+    const network = await engineWithAttemptNetwork();
+    network.containers.set('disguised', {
+      Id: 'disguised',
+      Name: '/x',
+      Labels: disguised,
+      Running: true,
+    });
+    expect(
+      (
+        await network.ask('POST', `/networks/${ATTEMPT}-net/connect`, {
+          Container: 'disguised',
+          EndpointConfig: { Aliases: ['openduet'] },
+        })
+      ).allow,
+    ).toBe(false);
+  });
+
+  test('an inspection of a container no profile owns keeps only its state and labels', async () => {
+    const engine = new Engine();
+    expect(await engine.ask('GET', '/containers/postgres/json')).toEqual({
+      allow: true,
+      redact: 'foreign',
+    });
+    expect(await engine.ask('GET', '/containers/self/json')).toEqual({
+      allow: true,
+      redact: 'foreign',
+    });
+    expect((await engine.ask('GET', '/containers/missing/json')).allow).toBe(false);
+    const inspected = {
+      Id: 'postgres',
+      Name: '/openduet-postgres-1',
+      Image: 'sha256:x',
+      State: { Running: true },
+      Config: {
+        Env: ['POSTGRES_PASSWORD=x'],
+        Labels: { 'com.docker.compose.service': 'postgres' },
+      },
+      HostConfig: { Binds: ['/srv/pg:/var/lib/postgresql/data'] },
+      Mounts: [{ Source: '/var/lib/docker/volumes/openduet_pgdata/_data' }],
+      NetworkSettings: { Networks: { openduet_database: { IPAddress: '172.20.0.2' } } },
+    };
+    expect(redactContainer(inspected, 'foreign')).toEqual({
+      Id: 'postgres',
+      Name: '/openduet-postgres-1',
+      Image: 'sha256:x',
+      State: { Running: true },
+      Config: { Labels: { 'com.docker.compose.service': 'postgres' } },
+    });
+  });
+
+  test("a container's inspection is passed back without its environment", () => {
+    expect(
+      redactContainer({ Id: 'x', Args: ['--password=x'], Config: { Env: ['A=1'], Labels: {} } }),
+    ).toEqual({ Id: 'x', Config: { Labels: {} } });
+  });
+});
+
+describe('openduet-cells reads a body the way the engine will', () => {
+  const EXEC = 'e'.repeat(64);
+  const SANDBOX_CELL = 'openduet-sbx-session1';
+  const sandboxLabels: Labels = {
+    'com.openduet.sandbox': 'v1',
+    'openduet.project': SANDBOX_PROJECT,
+  };
+  async function withSandboxExec() {
+    const engine = new Engine();
+    engine.containers.set(SANDBOX_CELL, {
+      Id: SANDBOX_CELL,
+      Name: `/${SANDBOX_CELL}`,
+      Labels: sandboxLabels,
+      Running: true,
+    });
+    engine.execs.set(EXEC, { ContainerID: SANDBOX_CELL });
+    return engine;
+  }
+
+  // Go's encoding/json matches a struct field to a key case-insensitively and
+  // takes the last match, so a field repeated under another case decodes to the
+  // later value though we validate the earlier one. The validated object must be
+  // the one the engine decodes.
+  test('refuses an exec that is detached under another case of the key', async () => {
+    const engine = await withSandboxExec();
+    // The honest, attached start is accepted.
+    expect(
+      (await engine.ask('POST', `/exec/${EXEC}/start`, { Detach: false, Tty: false })).allow,
+    ).toBe(true);
+    // Go would read Detach:true from the trailing lower-case key.
+    expect(
+      (await engine.ask('POST', `/exec/${EXEC}/start`, { Detach: false, Tty: false, detach: true }))
+        .allow,
+    ).toBe(false);
+    // And the exec start now carries no field but Detach and Tty.
+    expect(
+      (
+        await engine.ask('POST', `/exec/${EXEC}/start`, {
+          Detach: false,
+          Tty: false,
+          ConsoleSize: [1, 1],
+        })
+      ).allow,
+    ).toBe(false);
+  });
+
+  test('refuses a container body that repeats a field under another case', async () => {
+    const engine = await engineWithAttemptNetwork();
+    // The unchanged request is accepted.
+    expect(
+      (await engine.ask('POST', `/containers/create?name=${ATTEMPT}`, attemptBody(ATTEMPT))).allow,
+    ).toBe(true);
+    // RestartPolicy.Name carries no exact-case allow-list of its own, yet Go would
+    // read the trailing `name:"always"`; the collision is refused outright.
+    expect(
+      (
+        await engine.ask(
+          'POST',
+          `/containers/create?name=${ATTEMPT}`,
+          attemptBody(ATTEMPT, {}, { RestartPolicy: { Name: 'no', name: 'always' } }),
+        )
+      ).allow,
+    ).toBe(false);
+  });
+});
+
+/** The runtime supervisor on `engine`, started; and what starts an attempt's cell on it. */
+async function startedHost(engine: Engine) {
+  const host = new LocalCellHost({
+    project: PROJECT,
+    image: 'openduet-runtime:local',
+    workRoot: '/nonexistent',
+    workVolume: `${PROJECT}_work`,
+    selfId: 'self',
+    docker: engine.api,
+  });
+  await host.verify();
+  const seam = host as unknown as {
+    provisionCell: (r: object, l: Labels, s: AbortSignal) => Promise<void>;
+    startContainer: (
+      r: object,
+      l: Labels,
+      e: string[],
+      w: string,
+      s: AbortSignal,
+    ) => Promise<string>;
+  };
+  let next = 0;
+  const startCell = async () => {
+    const attempt = `att_01J0000000000000000000000${next++}`;
+    const name = `${PROJECT}-${attempt.toLowerCase()}`;
+    const resources = { container: name, network: `${name}-net`, home: `${name}-home` };
+    const labels = runtimeLabels(attempt);
+    const signal = new AbortController().signal;
+    await seam.provisionCell(resources, labels, signal);
+    await seam.startContainer(resources, labels, ['A=1'], 'job_01J00000000000000000000000', signal);
+    return engine.containers.get(name);
+  };
+  return { host, startCell };
+}
+
+/** A newer runtime image, pulled under the configured name. */
+function moveRuntimeName(engine: Engine) {
+  const NEW_ID = `sha256:${'7'.repeat(64)}`;
+  const newer = {
+    Id: NEW_ID,
+    RepoDigests: [],
+    Config: { Labels: engine.images.get(RUNTIME_ID)?.Config.Labels ?? {} },
+  };
+  engine.images.set('openduet-runtime:local', newer).set(NEW_ID, newer);
+  return NEW_ID;
+}
+
+describe('a moved runtime image name does not refuse a running service', () => {
+  test('an engine started after a pull moved the name runs the image the service started with', async () => {
+    const engine = new Engine({
+      ...config,
+      runtimeImages: new RuntimeImages('openduet-runtime:local'),
+    });
+    const { startCell } = await startedHost(engine);
+    expect((await startCell())?.Image).toBe(RUNTIME_ID);
+    // Another installation on the same engine pulls the name.
+    moveRuntimeName(engine);
+    const after = await startCell();
+    expect(engine.refused).toEqual([]);
+    expect(after?.Image).toBe(RUNTIME_ID);
+  });
+
+  test('a restart of the cell service alone still accepts the image the service holds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'openduet-cells-'));
+    try {
+      const file = join(dir, 'runtime-images.json');
+      const engine = new Engine({
+        ...config,
+        runtimeImages: new RuntimeImages('openduet-runtime:local', file),
+      });
+      const { startCell } = await startedHost(engine);
+      moveRuntimeName(engine);
+      // The cell service starts again, after the name moved; the OpenDuet service does not.
+      (engine as { policy: CellsPolicyConfig }).policy = {
+        ...config,
+        runtimeImages: new RuntimeImages('openduet-runtime:local', file),
+      };
+      expect((await startCell())?.Image).toBe(RUNTIME_ID);
+      expect(engine.refused).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a service started after the move runs the new image, and the old one stays accepted', async () => {
+    const images = new RuntimeImages('openduet-runtime:local');
+    const engine = new Engine({ ...config, runtimeImages: images });
+    await startedHost(engine);
+    const NEW_ID = moveRuntimeName(engine);
+    // The service restarts, so it pins what the name stands for now.
+    const { startCell } = await startedHost(engine);
+    expect((await startCell())?.Image).toBe(NEW_ID);
+    // A replica that started before the move still runs its own.
+    expect(images.has(RUNTIME_ID)).toBe(true);
+    expect(engine.refused).toEqual([]);
+  });
+
+  test('an image the runtime name never stood for is still refused', async () => {
+    const engine = await engineWithAttemptNetwork();
+    const policy = { ...config, runtimeImages: new RuntimeImages('openduet-runtime:local') };
+    await policy.runtimeImages.add(RUNTIME_ID);
+    const ask = (image: string) =>
+      judge(
+        {
+          method: 'POST',
+          path: '/containers/create',
+          query: new URLSearchParams({ name: ATTEMPT }),
+          body: attemptBody(ATTEMPT, { Image: image }),
+        },
+        policy,
+        engine.lookup,
+      );
+    expect(await ask(RUNTIME_ID)).toEqual({ allow: true });
+    for (const other of [LOCAL_ID, SANDBOX_ID, SERVER_ID])
+      expect(await ask(other)).toEqual({
+        allow: false,
+        status: 403,
+        reason: 'the runtime profile runs only the image the operator configured',
+      });
+    // Looking up any other name records nothing.
+    expect(
+      await judge(
+        {
+          method: 'GET',
+          path: `/images/${encodeURIComponent('openduet-sandbox:local')}/json`,
+          query: new URLSearchParams(),
+        },
+        policy,
+        engine.lookup,
+      ),
+    ).toEqual({ allow: true });
+    expect(
+      await judge(
+        {
+          method: 'GET',
+          path: `/images/${encodeURIComponent('openduet-runtime:local')}/json`,
+          query: new URLSearchParams(),
+        },
+        policy,
+        engine.lookup,
+      ),
+    ).toEqual({ allow: true, runtimeImage: true });
+  });
+
+  test('an engine whose pinned image was removed fails plainly, not as an engine error', async () => {
+    const engine = new Engine({
+      ...config,
+      runtimeImages: new RuntimeImages('openduet-runtime:local'),
+    });
+    const { startCell } = await startedHost(engine);
+    moveRuntimeName(engine);
+    // The image the service started with is pruned from the engine.
+    engine.images.delete(RUNTIME_ID);
+    const error = await startCell().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EngineImageUnavailable);
+    expect(error).toMatchObject({ why: 'removed', imageId: RUNTIME_ID });
+  });
+
+  test('an engine the cell service refuses its image fails plainly', async () => {
+    // A cell service that never recorded the service's image: its record was lost.
+    const engine = new Engine({
+      ...config,
+      runtimeImages: new RuntimeImages('openduet-runtime:local'),
+    });
+    const { startCell } = await startedHost(engine);
+    moveRuntimeName(engine);
+    (engine as { policy: CellsPolicyConfig }).policy = {
+      ...config,
+      runtimeImages: new RuntimeImages('openduet-runtime:local'),
+    };
+    const error = await startCell().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EngineImageUnavailable);
+    expect(error).toMatchObject({ why: 'refused', imageId: RUNTIME_ID });
+  });
+
+  test('another refusal of a create is passed on as it was', async () => {
+    const engine = new Engine({
+      ...config,
+      runtimeImages: new RuntimeImages('openduet-runtime:local'),
+    });
+    const { startCell } = await startedHost(engine);
+    // The workspace volume is not the one the cell service was configured with.
+    (engine as { policy: CellsPolicyConfig }).policy = {
+      ...engine.policy,
+      workVolume: 'other_work',
+    };
+    const error = await startCell().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DockerError);
+    expect(error).not.toBeInstanceOf(EngineImageUnavailable);
+  });
+});

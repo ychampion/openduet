@@ -1,0 +1,608 @@
+# Linux deployment. Run from the repository root using the README commands.
+#
+# The four OpenDuet images are built here from source and named openduet-*:local.
+# The service image also runs openduet-cells and the database-roles step.
+# With OPENDUET_IMAGE_TAG set (deploy/.env), the same services name the published
+# images instead, ghcr.io/ychampion/openduet-*:<tag> or OPENDUET_IMAGE_REGISTRY's,
+# which `docker compose pull` fetches and `up --no-build` starts without a build
+# (docs/DEPLOYMENT.md, "Using prebuilt images").
+name: ${COMPOSE_PROJECT_NAME:-openduet}
+
+# Docker's default log has no size limit. Every service rotates a bounded
+# json-file instead; attempt containers get the same limits from the supervisor.
+# Each line also names its Compose project and service, for a log shipper
+# (docker-compose.log-shipping.yml) to say where it came from.
+x-logging: &bounded-logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    labels: "com.docker.compose.project,com.docker.compose.service"
+
+# Health checks: every second while a service starts, so `up --wait` and the
+# start order stay quick, then every 30 seconds. Each check starts a process in
+# the container, and an installation that is doing nothing should cost nearly
+# nothing. Three failed checks in a row mark a service unhealthy.
+
+networks:
+  edge:
+    driver: bridge
+  database:
+    driver: bridge
+    internal: true
+  # A warm capability/probe cell. Actual attempts get separate networks with
+  # these same settings and only the trusted OpenDuet service as a peer. Its
+  # name is <project>_internal, so installations on one host stay apart.
+  internal:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+  # The service's one way to the Docker engine: openduet-cells holds the socket and
+  # answers only the service, here, with the fixed container profiles.
+  cells:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  spaces:
+  artifacts:
+  work:
+  runtime-home:
+  # Keep this independently of database snapshots: removals must survive restore.
+  restrictions:
+  # The service's two database addresses, written by database-roles on every start.
+  database-access:
+  # The key the service presents to openduet-cells, written by openduet-cells once.
+  cells-key:
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    restart: unless-stopped
+    logging: *bounded-logs
+    # Its log may be shipped (docs/DEPLOYMENT.md, "What the logs hold"), so an
+    # error names its reason alone: never the failing row, which may hold what
+    # someone wrote, nor the statement, which may set a role's password.
+    command: ["postgres", "-c", "log_error_verbosity=terse", "-c", "log_min_error_statement=panic"]
+    # Memory caps keep one runaway service from taking the machine; each is a
+    # setting in deploy/.env (docs/DEPLOYMENT.md, "Memory limits").
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-1g}
+    networks: [database]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openduet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run bun run deploy/scripts/configure.ts}
+      POSTGRES_DB: ${POSTGRES_DB:-openduet}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openduet} -d ${POSTGRES_DB:-openduet}"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      start_interval: 1s
+      retries: 3
+
+  # Runs before the service on every start, with the operator's DATABASE_URL:
+  # creates the database roles, hands the schema to openduet_migrate, runs every
+  # migration as it, grants, and writes the service's two addresses into
+  # database-access. The service is never given DATABASE_URL itself, and its
+  # own role cannot read the secret table (docs/DEPLOYMENT.md, "Database roles").
+  database-roles:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-service:${OPENDUET_IMAGE_TAG:-local}"
+    restart: "no"
+    logging: *bounded-logs
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?run bun run deploy/scripts/configure.ts}
+      OPENDUET_DATABASE_ACCESS_DIR: /data/database-access
+      # The demonstration's test connector keeps a table, made here by the schema's owner.
+      OPENDUET_ENABLE_TEST_CONNECTOR: ${OPENDUET_ENABLE_TEST_CONNECTOR:-false}
+      # Set all three only where the database's administrator made the roles.
+      OPENDUET_MIGRATE_DATABASE_URL: ${OPENDUET_MIGRATE_DATABASE_URL:-}
+      OPENDUET_API_DATABASE_URL: ${OPENDUET_API_DATABASE_URL:-}
+      OPENDUET_EFFECTS_DATABASE_URL: ${OPENDUET_EFFECTS_DATABASE_URL:-}
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - database-access:/data/database-access
+    command: ["bun", "run", "apps/openduet/src/db/roles-main.ts"]
+
+  # The only holder of the Docker socket. It starts attempt cells, agents'
+  # computers and stdio MCP servers from fixed profiles, for the service alone,
+  # and refuses any other image, mount, privilege or network. It has no
+  # database address and no service key.
+  openduet-cells:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-service:${OPENDUET_IMAGE_TAG:-local}"
+    restart: unless-stopped
+    logging: *bounded-logs
+    mem_limit: ${OPENDUET_CELLS_MEMORY_LIMIT:-512m}
+    networks: [cells]
+    environment:
+      OPENDUET_DOCKER_SOCKET: /var/run/docker.sock
+      OPENDUET_CELLS_BIND: 0.0.0.0:8791
+      OPENDUET_CELLS_KEY_FILE: /data/cells-key/key
+      OPENDUET_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-openduet}
+      OPENDUET_WORK_VOLUME: ${COMPOSE_PROJECT_NAME:-openduet}_work
+      OPENDUET_RUNTIME_IMAGE: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-runtime:${OPENDUET_IMAGE_TAG:-local}"
+      OPENDUET_SANDBOX_PROJECT: ${OPENDUET_SANDBOX_PROJECT:-}
+      OPENDUET_SANDBOX_DOCKER_IMAGE: "${OPENDUET_SANDBOX_DOCKER_IMAGE:-${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-sandbox:${OPENDUET_IMAGE_TAG:-local}}"
+      OPENDUET_MCP_NODE_IMAGE: ${OPENDUET_MCP_NODE_IMAGE:-}
+      OPENDUET_MCP_PYTHON_IMAGE: ${OPENDUET_MCP_PYTHON_IMAGE:-}
+      OPENDUET_NETWORK_POOL: ${OPENDUET_NETWORK_POOL:-}
+    group_add: ["${DOCKER_GID:?run bun run deploy/scripts/configure.ts}"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - cells-key:/data/cells-key
+      # The cell service only. No other service and no cell is given this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["bun", "run", "apps/openduet/src/cells/main.ts"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "process.exit((await fetch('http://127.0.0.1:8791/health')).ok?0:1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      start_interval: 1s
+      retries: 3
+
+  openduet:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-service:${OPENDUET_IMAGE_TAG:-local}"
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.openduet
+    restart: unless-stopped
+    logging: *bounded-logs
+    mem_limit: ${OPENDUET_MEMORY_LIMIT:-2g}
+    networks:
+      edge:
+        aliases: [openduet-api]
+        gw_priority: 1
+      database: {}
+      internal: {}
+      cells: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime-image:
+        condition: service_completed_successfully
+      database-roles:
+        condition: service_completed_successfully
+      openduet-cells:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8787
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Names this instance when several share one database (docs/DEPLOYMENT.md).
+      OPENDUET_INSTANCE_ID: ${OPENDUET_INSTANCE_ID:-}
+      OPENDUET_API_BIND: openduet-api
+      # The only peer believed about a browser's address, for login limits.
+      OPENDUET_TRUSTED_PROXY: web
+      # Its own role, which cannot read the secret table, and the effects role,
+      # which can, as database-roles wrote them. Never the operator's address.
+      DATABASE_URL_FILE: /data/database-access/api.url
+      OPENDUET_EFFECTS_DATABASE_URL_FILE: /data/database-access/effects.url
+      # The engine, through the cell service; the service has no socket.
+      OPENDUET_CELLS_URL: http://openduet-cells:8791
+      OPENDUET_CELLS_KEY_FILE: /data/cells-key/key
+      OPENDUET_NETWORK_POOL: ${OPENDUET_NETWORK_POOL:-}
+      OPENDUET_MASTER_KEY: ${OPENDUET_MASTER_KEY:?run bun run deploy/scripts/configure.ts}
+      OPENDUET_CAPABILITY_KEY: ${OPENDUET_CAPABILITY_KEY:?run bun run deploy/scripts/configure.ts}
+      OPENDUET_APPROVAL_KEY: ${OPENDUET_APPROVAL_KEY:?run bun run deploy/scripts/configure.ts}
+      OPENDUET_SPACES_DIR: /data/spaces
+      OPENDUET_ARTIFACTS_DIR: /data/artifacts
+      # Blobs stay on the artifacts volume unless OPENDUET_BLOB_STORE=s3 names a bucket.
+      OPENDUET_BLOB_STORE: ${OPENDUET_BLOB_STORE:-}
+      OPENDUET_BLOB_S3_ENDPOINT: ${OPENDUET_BLOB_S3_ENDPOINT:-}
+      OPENDUET_BLOB_S3_BUCKET: ${OPENDUET_BLOB_S3_BUCKET:-}
+      OPENDUET_BLOB_S3_REGION: ${OPENDUET_BLOB_S3_REGION:-}
+      OPENDUET_BLOB_S3_PREFIX: ${OPENDUET_BLOB_S3_PREFIX:-}
+      OPENDUET_BLOB_S3_ACCESS_KEY_ID: ${OPENDUET_BLOB_S3_ACCESS_KEY_ID:-}
+      OPENDUET_BLOB_S3_SECRET_ACCESS_KEY: ${OPENDUET_BLOB_S3_SECRET_ACCESS_KEY:-}
+      OPENDUET_RESTRICTIONS_DIR: /data/restrictions
+      OPENDUET_BROKER_BIND: 0.0.0.0:8788
+      # The service reads each attempt's tool catalog from its own broker listener.
+      OPENDUET_BROKER_URL: http://openduet:8788
+      OPENDUET_WORK_DIR: /work
+      OPENDUET_CONNECTIONS_FILE: /etc/openduet/connections.json
+      OPENDUET_GATEWAY_TLS_DIR: /etc/openduet/gateway-tls
+      OPENDUET_RUNTIME_ADAPTER: docker
+      OPENDUET_RUNTIME_URL: http://runtime:8790
+      OPENDUET_RUNTIME_KEY: ${OPENDUET_RUNTIME_KEY:?run bun run deploy/scripts/configure.ts}
+      OPENDUET_RUNTIME_IMAGE: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-runtime:${OPENDUET_IMAGE_TAG:-local}"
+      OPENDUET_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-openduet}
+      OPENDUET_WORK_VOLUME: ${COMPOSE_PROJECT_NAME:-openduet}_work
+      OPENDUET_DEFAULT_PROVIDER: ${OPENDUET_DEFAULT_PROVIDER:-fireworks}
+      OPENDUET_DEFAULT_MODEL: ${OPENDUET_DEFAULT_MODEL:-accounts/fireworks/models/deepseek-v4p1-flash}
+      OPENDUET_DEFAULT_MODEL_VISION: ${OPENDUET_DEFAULT_MODEL_VISION:-}
+      OPENDUET_DEFAULT_MODEL_NATIVE_SEARCH: ${OPENDUET_DEFAULT_MODEL_NATIVE_SEARCH:-}
+      # Web search (docs/CONNECTORS.md, "Web search"). Empty searches with the model's own
+      # search where it has one, and without a key otherwise.
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: ${OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS:-4096}
+      # Left empty, the service's own defaults apply (docs/DEPLOYMENT.md, "Engine limits").
+      OPENDUET_ENGINE_MAX_TURNS: ${OPENDUET_ENGINE_MAX_TURNS:-}
+      OPENDUET_COMPACTION_MAX_TOKENS: ${OPENDUET_COMPACTION_MAX_TOKENS:-}
+      OPENDUET_MODEL_CONTEXT_WINDOW: ${OPENDUET_MODEL_CONTEXT_WINDOW:-}
+      # Automatic memory (docs/DEPLOYMENT.md, "Memory model"). Empty uses the default model.
+      OPENDUET_MEMORY_MODEL: ${OPENDUET_MEMORY_MODEL:-}
+      OPENDUET_MEMORY_PROVIDER: ${OPENDUET_MEMORY_PROVIDER:-}
+      OPENDUET_MEMORY_DAILY_CALLS: ${OPENDUET_MEMORY_DAILY_CALLS:-}
+      # Semantic recall (docs/DEPLOYMENT.md, "Semantic recall"). Empty uses the default provider's embedding model.
+      OPENDUET_EMBEDDING_PROVIDER: ${OPENDUET_EMBEDDING_PROVIDER:-}
+      OPENDUET_EMBEDDING_MODEL: ${OPENDUET_EMBEDDING_MODEL:-}
+      OPENDUET_EMBEDDING_DIMENSIONS: ${OPENDUET_EMBEDDING_DIMENSIONS:-}
+      # A model on your own machine or network, for private conversations and `local`
+      # embeddings (docs/PRIVACY-ROUTER.md).
+      OPENDUET_LOCAL_MODEL_URL: ${OPENDUET_LOCAL_MODEL_URL:-}
+      OPENDUET_LOCAL_MODEL: ${OPENDUET_LOCAL_MODEL:-}
+      OPENDUET_LOCAL_MODEL_KEY: ${OPENDUET_LOCAL_MODEL_KEY:-}
+      # Auto-review of reversible actions (docs/DEPLOYMENT.md, "Auto-review"). Empty uses the default model.
+      OPENDUET_REVIEW_MODEL: ${OPENDUET_REVIEW_MODEL:-}
+      OPENDUET_REVIEW_PROVIDER: ${OPENDUET_REVIEW_PROVIDER:-}
+      OPENDUET_REVIEW_TIMEOUT_MS: ${OPENDUET_REVIEW_TIMEOUT_MS:-12000}
+      OPENDUET_REVIEW_HOURLY_LIMIT: ${OPENDUET_REVIEW_HOURLY_LIMIT:-60}
+      # Undo send: seconds a message waits before it is sent (docs/DEPLOYMENT.md, "Auto-review").
+      OPENDUET_SEND_HOLD_SECONDS: ${OPENDUET_SEND_HOLD_SECONDS:-20}
+      # Proactive work: confidence to act on its own, and chat-app messages (docs/DEPLOYMENT.md, "Auto-review").
+      OPENDUET_PROACTIVE_CONFIDENCE: ${OPENDUET_PROACTIVE_CONFIDENCE:-0.6}
+      OPENDUET_MESSAGES_TO_OTHERS: ${OPENDUET_MESSAGES_TO_OTHERS:-confidence}
+      # Spending caps on model calls (docs/DEPLOYMENT.md, "Spending caps"). Empty is no limit.
+      OPENDUET_SPEND_MONTHLY_USD: ${OPENDUET_SPEND_MONTHLY_USD:-}
+      OPENDUET_SPEND_DAILY_USD: ${OPENDUET_SPEND_DAILY_USD:-}
+      OPENDUET_SPEND_PERSON_MONTHLY_USD: ${OPENDUET_SPEND_PERSON_MONTHLY_USD:-}
+      OPENDUET_SPEND_PERSON_DAILY_USD: ${OPENDUET_SPEND_PERSON_DAILY_USD:-}
+      OPENDUET_SPEND_MONTHLY_TOKENS: ${OPENDUET_SPEND_MONTHLY_TOKENS:-}
+      OPENDUET_SPEND_DAILY_TOKENS: ${OPENDUET_SPEND_DAILY_TOKENS:-}
+      OPENDUET_SPEND_PERSON_MONTHLY_TOKENS: ${OPENDUET_SPEND_PERSON_MONTHLY_TOKENS:-}
+      OPENDUET_SPEND_PERSON_DAILY_TOKENS: ${OPENDUET_SPEND_PERSON_DAILY_TOKENS:-}
+      OPENDUET_SPEND_NOTICE_PERCENT: ${OPENDUET_SPEND_NOTICE_PERCENT:-}
+      OPENDUET_MODEL_PRICES: ${OPENDUET_MODEL_PRICES:-}
+      # Background spending, apart (docs/BACKGROUND-COMPUTE.md). Empty is no limit.
+      OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_USD: ${OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_USD:-}
+      OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_USD: ${OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_USD:-}
+      OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_TOKENS: ${OPENDUET_SPEND_PERSON_BACKGROUND_MONTHLY_TOKENS:-}
+      OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_TOKENS: ${OPENDUET_SPEND_PERSON_BACKGROUND_DAILY_TOKENS:-}
+      OPENDUET_JOB_USD_COUNTS_MODELS: ${OPENDUET_JOB_USD_COUNTS_MODELS:-}
+      # Rest the standing work of people unseen this many days, and cap routines per person
+      # and long work per space. Empty is off.
+      OPENDUET_REST_ROUTINES_AFTER_DAYS: ${OPENDUET_REST_ROUTINES_AFTER_DAYS:-}
+      OPENDUET_ROUTINES_PER_PERSON_MAX: ${OPENDUET_ROUTINES_PER_PERSON_MAX:-}
+      OPENDUET_RUNS_ACTIVE_PER_SPACE_MAX: ${OPENDUET_RUNS_ACTIVE_PER_SPACE_MAX:-}
+      OPENDUET_ATTACHMENT_MAX_MB: ${OPENDUET_ATTACHMENT_MAX_MB:-}
+      OPENDUET_ATTACHMENTS_PER_MESSAGE: ${OPENDUET_ATTACHMENTS_PER_MESSAGE:-}
+      OPENDUET_ATTACHMENT_UPLOADS_AT_ONCE: ${OPENDUET_ATTACHMENT_UPLOADS_AT_ONCE:-}
+      OPENDUET_ATTACHMENT_UPLOADS_PER_WINDOW: ${OPENDUET_ATTACHMENT_UPLOADS_PER_WINDOW:-}
+      OPENDUET_ATTACHMENT_UPLOAD_WINDOW_MINUTES: ${OPENDUET_ATTACHMENT_UPLOAD_WINDOW_MINUTES:-}
+      OPENDUET_ATTACHMENT_SERVER_UPLOADS: ${OPENDUET_ATTACHMENT_SERVER_UPLOADS:-}
+      OPENDUET_ATTACHMENT_SERVER_UPLOAD_MB: ${OPENDUET_ATTACHMENT_SERVER_UPLOAD_MB:-}
+      # Model routing and reasoning effort (docs/DEPLOYMENT.md, "Model routing").
+      OPENDUET_MODEL_FAST: ${OPENDUET_MODEL_FAST:-}
+      OPENDUET_MODEL_VISION: ${OPENDUET_MODEL_VISION:-}
+      OPENDUET_MODEL_FALLBACK: ${OPENDUET_MODEL_FALLBACK:-}
+      OPENDUET_REASONING_EFFORT_AGENT: ${OPENDUET_REASONING_EFFORT_AGENT:-}
+      OPENDUET_REASONING_EFFORT_SIDE: ${OPENDUET_REASONING_EFFORT_SIDE:-}
+      OPENDUET_ACK_AFTER_MS: ${OPENDUET_ACK_AFTER_MS:-0}
+      OPENDUET_MODEL_TRIAGE: ${OPENDUET_MODEL_TRIAGE:-}
+      OPENDUET_TRIAGE_INTERVAL_SECONDS: ${OPENDUET_TRIAGE_INTERVAL_SECONDS:-}
+      # Operator alerts (docs/DEPLOYMENT.md, "Alerts").
+      OPENDUET_ALERT_WEBHOOK_URL: ${OPENDUET_ALERT_WEBHOOK_URL:-}
+      OPENDUET_ALERT_EMAIL_TO: ${OPENDUET_ALERT_EMAIL_TO:-}
+      OPENDUET_ALERT_EMAIL_FROM: ${OPENDUET_ALERT_EMAIL_FROM:-}
+      OPENDUET_ALERT_SMTP_URL: ${OPENDUET_ALERT_SMTP_URL:-}
+      OPENDUET_ALERT_INTERVAL_SECONDS: ${OPENDUET_ALERT_INTERVAL_SECONDS:-}
+      OPENDUET_ALERT_REPEAT_MINUTES: ${OPENDUET_ALERT_REPEAT_MINUTES:-}
+      OPENDUET_ALERT_DISK_MIN_FREE_MB: ${OPENDUET_ALERT_DISK_MIN_FREE_MB:-}
+      OPENDUET_OPERATOR_TOKEN: ${OPENDUET_OPERATOR_TOKEN:-}
+      OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE: ${OPENDUET_ALERT_SPEND_HOURLY_MULTIPLE:-}
+      OPENDUET_ALERT_SPEND_PERSON_PERCENT: ${OPENDUET_ALERT_SPEND_PERSON_PERCENT:-}
+      OPENDUET_ALERT_SPEND_MIN_USD: ${OPENDUET_ALERT_SPEND_MIN_USD:-}
+      OPENDUET_FEEDBACK_WEBHOOK_URL: ${OPENDUET_FEEDBACK_WEBHOOK_URL:-}
+      # Account mail and the claim code (docs/DEPLOYMENT.md, "Account mail").
+      OPENDUET_SMTP_URL: ${OPENDUET_SMTP_URL:-}
+      OPENDUET_MAIL_FROM: ${OPENDUET_MAIL_FROM:-}
+      OPENDUET_SETUP_CODE_HASH: ${OPENDUET_SETUP_CODE_HASH:-}
+      OPENDUET_SETUP_OPEN: ${OPENDUET_SETUP_OPEN:-}
+      # What the installation and its assistant are called, and an identity
+      # file of its own (docs/DEPLOYMENT.md, "Names and look").
+      OPENDUET_INSTANCE_NAME: ${OPENDUET_INSTANCE_NAME:-}
+      OPENDUET_ASSISTANT_NAME: ${OPENDUET_ASSISTANT_NAME:-}
+      OPENDUET_IDENTITY_FILE: ${OPENDUET_IDENTITY_FILE:-}
+      OPENDUET_PUBLIC_URL: ${OPENDUET_PUBLIC_URL:-}
+      OPENDUET_WEB_ORIGIN: ${OPENDUET_WEB_ORIGIN:-}
+      OPENDUET_OAUTH_CLIENT_METADATA: ${OPENDUET_OAUTH_CLIENT_METADATA:-}
+      OPENDUET_GATE_MESSAGE: ${OPENDUET_GATE_MESSAGE:-}
+      # Signing in with your own identity provider (docs/DEPLOYMENT.md,
+      # "Sign-in with your identity provider").
+      OPENDUET_OIDC_ISSUER: ${OPENDUET_OIDC_ISSUER:-}
+      OPENDUET_OIDC_CLIENT_ID: ${OPENDUET_OIDC_CLIENT_ID:-}
+      OPENDUET_OIDC_CLIENT_SECRET: ${OPENDUET_OIDC_CLIENT_SECRET:-}
+      OPENDUET_OIDC_LABEL: ${OPENDUET_OIDC_LABEL:-}
+      OPENDUET_OIDC_SCOPES: ${OPENDUET_OIDC_SCOPES:-}
+      OPENDUET_OIDC_ACCOUNTS: ${OPENDUET_OIDC_ACCOUNTS:-}
+      OPENDUET_OIDC_EMAIL_LINK: ${OPENDUET_OIDC_EMAIL_LINK:-}
+      OPENDUET_OIDC_REQUIRE_CLAIM: ${OPENDUET_OIDC_REQUIRE_CLAIM:-}
+      OPENDUET_PASSWORD_SIGNIN: ${OPENDUET_PASSWORD_SIGNIN:-}
+      # Signing in with Google for Gmail and Google Calendar (docs/mail-calendar.md).
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      # Connecting GitHub from the app catalog (docs/CONNECTORS.md).
+      GITHUB_MCP_CLIENT_ID: ${GITHUB_MCP_CLIENT_ID:-}
+      GITHUB_MCP_CLIENT_SECRET: ${GITHUB_MCP_CLIENT_SECRET:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      # Only a private Composio region replaces its address.
+      COMPOSIO_BASE_URL: ${COMPOSIO_BASE_URL:-}
+      COMPOSIO_AUTH_CONFIG_GMAIL: ${COMPOSIO_AUTH_CONFIG_GMAIL:-}
+      COMPOSIO_AUTH_CONFIG_GOOGLECALENDAR: ${COMPOSIO_AUTH_CONFIG_GOOGLECALENDAR:-}
+      COMPOSIO_AUTH_CONFIG_GOOGLEDRIVE: ${COMPOSIO_AUTH_CONFIG_GOOGLEDRIVE:-}
+      COMPOSIO_AUTH_CONFIGS: ${COMPOSIO_AUTH_CONFIGS:-}
+      COMPOSIO_WEBHOOK_SECRET: ${COMPOSIO_WEBHOOK_SECRET:-}
+      # Limits on use through Composio, all unset by default (docs/CONNECTORS.md).
+      OPENDUET_COMPOSIO_TOOL_CALLS_MONTHLY_CAP: ${OPENDUET_COMPOSIO_TOOL_CALLS_MONTHLY_CAP:-}
+      OPENDUET_COMPOSIO_TRIGGER_EVENTS_MONTHLY_CAP: ${OPENDUET_COMPOSIO_TRIGGER_EVENTS_MONTHLY_CAP:-}
+      OPENDUET_COMPOSIO_ACCOUNTS_CAP: ${OPENDUET_COMPOSIO_ACCOUNTS_CAP:-}
+      OPENDUET_COMPOSIO_MONTHLY_CREDIT_USD: ${OPENDUET_COMPOSIO_MONTHLY_CREDIT_USD:-}
+      OPENDUET_COMPOSIO_TOOL_CALL_USD: ${OPENDUET_COMPOSIO_TOOL_CALL_USD:-}
+      OPENDUET_COMPOSIO_TRIGGER_EVENT_USD: ${OPENDUET_COMPOSIO_TRIGGER_EVENT_USD:-}
+      OPENDUET_COMPOSIO_BILLING_DAY: ${OPENDUET_COMPOSIO_BILLING_DAY:-}
+      OPENDUET_MANAGED_CALLS_MONTHLY_CAP: ${OPENDUET_MANAGED_CALLS_MONTHLY_CAP:-}
+      # Signing in with Microsoft for Outlook mail and calendar (docs/mail-calendar.md).
+      MICROSOFT_OAUTH_CLIENT_ID: ${MICROSOFT_OAUTH_CLIENT_ID:-}
+      MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
+      MICROSOFT_OAUTH_TENANT: ${MICROSOFT_OAUTH_TENANT:-}
+      # Web Push to phones and browsers (docs/DEPLOYMENT.md, "Phone notifications").
+      OPENDUET_VAPID_PUBLIC_KEY: ${OPENDUET_VAPID_PUBLIC_KEY:-}
+      OPENDUET_VAPID_PRIVATE_KEY: ${OPENDUET_VAPID_PRIVATE_KEY:-}
+      OPENDUET_VAPID_SUBJECT: ${OPENDUET_VAPID_SUBJECT:-}
+      OPENDUET_PUSH_EXTRA_ORIGINS: ${OPENDUET_PUSH_EXTRA_ORIGINS:-}
+      OPENDUET_DETECTORS: ${OPENDUET_DETECTORS:-true}
+      # Texts and calls to a person's own number (docs/SITUATIONAL-AWARENESS.md).
+      OPENDUET_TWILIO_ACCOUNT_SID: ${OPENDUET_TWILIO_ACCOUNT_SID:-}
+      OPENDUET_TWILIO_AUTH_TOKEN: ${OPENDUET_TWILIO_AUTH_TOKEN:-}
+      OPENDUET_TWILIO_FROM_NUMBER: ${OPENDUET_TWILIO_FROM_NUMBER:-}
+      OPENDUET_REACH_TEXT_USD: ${OPENDUET_REACH_TEXT_USD:-}
+      OPENDUET_REACH_CALL_USD_PER_MINUTE: ${OPENDUET_REACH_CALL_USD_PER_MINUTE:-}
+      OPENDUET_REACH_CODE_PREFIXES: ${OPENDUET_REACH_CODE_PREFIXES:-}
+      OPENDUET_REACH_CODES_PER_HOUR: ${OPENDUET_REACH_CODES_PER_HOUR:-}
+      # The company map's model and its daily allowance (docs/DEPLOYMENT.md, "Company map").
+      OPENDUET_COMPANIES_MODEL: ${OPENDUET_COMPANIES_MODEL:-}
+      OPENDUET_COMPANIES_PROVIDER: ${OPENDUET_COMPANIES_PROVIDER:-}
+      OPENDUET_COMPANIES_DAILY_CALLS: ${OPENDUET_COMPANIES_DAILY_CALLS:-}
+      # Sandboxes (docs/DEPLOYMENT.md, "Sandboxes"). Empty uses each default.
+      OPENDUET_SANDBOX_PROJECT: ${OPENDUET_SANDBOX_PROJECT:-}
+      OPENDUET_SANDBOX_LEASE_SECONDS: ${OPENDUET_SANDBOX_LEASE_SECONDS:-}
+      OPENDUET_SANDBOX_MAX_CONCURRENT: ${OPENDUET_SANDBOX_MAX_CONCURRENT:-}
+      OPENDUET_SANDBOX_MAX_CONCURRENT_PER_CONNECTION: ${OPENDUET_SANDBOX_MAX_CONCURRENT_PER_CONNECTION:-}
+      OPENDUET_SANDBOX_MAX_DISPLAYS: ${OPENDUET_SANDBOX_MAX_DISPLAYS:-}
+      OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS: ${OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS:-}
+      OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS: ${OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS:-}
+      OPENDUET_SANDBOX_ALLOW_PROXY_ENVIRONMENT: ${OPENDUET_SANDBOX_ALLOW_PROXY_ENVIRONMENT:-}
+      OPENDUET_PROCESS_MAX_PER_COMPUTER: ${OPENDUET_PROCESS_MAX_PER_COMPUTER:-}
+      OPENDUET_PROCESS_MAX_PER_SPACE: ${OPENDUET_PROCESS_MAX_PER_SPACE:-}
+      OPENDUET_PROCESS_DEFAULT_TTL_MINUTES: ${OPENDUET_PROCESS_DEFAULT_TTL_MINUTES:-}
+      OPENDUET_PROCESS_MAX_TTL_MINUTES: ${OPENDUET_PROCESS_MAX_TTL_MINUTES:-}
+      OPENDUET_PROCESS_OUTPUT_MAX_BYTES: ${OPENDUET_PROCESS_OUTPUT_MAX_BYTES:-}
+      OPENDUET_SANDBOX_AWAKE_SECONDS_PER_DAY: ${OPENDUET_SANDBOX_AWAKE_SECONDS_PER_DAY:-}
+      OPENDUET_E2B_PLAN: ${OPENDUET_E2B_PLAN:-}
+      OPENDUET_MARITIME_MAX_COMPUTERS: ${OPENDUET_MARITIME_MAX_COMPUTERS:-}
+      OPENDUET_MARITIME_MAX_AWAKE: ${OPENDUET_MARITIME_MAX_AWAKE:-}
+      # Voice (docs/VOICE.md). Empty leaves voice off, and each default in place.
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      ELEVENLABS_SECOND_VOICE_ID: ${ELEVENLABS_SECOND_VOICE_ID:-}
+      ELEVENLABS_SPEECH_MODEL: ${ELEVENLABS_SPEECH_MODEL:-}
+      ELEVENLABS_STREAMING_MODEL: ${ELEVENLABS_STREAMING_MODEL:-}
+      ELEVENLABS_TRANSCRIPTION_MODEL: ${ELEVENLABS_TRANSCRIPTION_MODEL:-}
+      OPENDUET_VOICE_DAILY_ASIDES: ${OPENDUET_VOICE_DAILY_ASIDES:-}
+      OPENDUET_VOICE_DAILY_SECONDS: ${OPENDUET_VOICE_DAILY_SECONDS:-}
+      OPENDUET_VOICE_DAILY_CHARACTERS: ${OPENDUET_VOICE_DAILY_CHARACTERS:-}
+      OPENDUET_VOICE_DAILY_SESSIONS: ${OPENDUET_VOICE_DAILY_SESSIONS:-}
+      ELEVENLABS_SPEECH_ENGINE_ID: ${ELEVENLABS_SPEECH_ENGINE_ID:-}
+      OPENDUET_CALL_MONTHLY_MINUTES: ${OPENDUET_CALL_MONTHLY_MINUTES:-}
+      # A computer for every agent on this engine (docs/sandbox-docker.md). Set
+      # OPENDUET_SANDBOX_PROVIDER=docker with OPENDUET_SANDBOX_PROJECT, and build the
+      # image with --profile sandbox.
+      OPENDUET_SANDBOX_PROVIDER: ${OPENDUET_SANDBOX_PROVIDER:-}
+      OPENDUET_SANDBOX_DOCKER_IMAGE: "${OPENDUET_SANDBOX_DOCKER_IMAGE:-${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-sandbox:${OPENDUET_IMAGE_TAG:-local}}"
+      OPENDUET_SANDBOX_DOCKER_CPUS: ${OPENDUET_SANDBOX_DOCKER_CPUS:-}
+      OPENDUET_SANDBOX_DOCKER_MEMORY_MB: ${OPENDUET_SANDBOX_DOCKER_MEMORY_MB:-}
+      OPENDUET_SANDBOX_DOCKER_PIDS: ${OPENDUET_SANDBOX_DOCKER_PIDS:-}
+      OPENDUET_SANDBOX_DOCKER_DISK_MB: ${OPENDUET_SANDBOX_DOCKER_DISK_MB:-}
+      OPENDUET_SANDBOX_DOCKER_EGRESS: ${OPENDUET_SANDBOX_DOCKER_EGRESS:-}
+      OPENDUET_SANDBOX_DOCKER_IDLE_SECONDS: ${OPENDUET_SANDBOX_DOCKER_IDLE_SECONDS:-}
+      OPENDUET_SANDBOX_EGRESS_PORT: ${OPENDUET_SANDBOX_EGRESS_PORT:-}
+      OPENDUET_SANDBOX_EGRESS_EXTRA_HOSTS: ${OPENDUET_SANDBOX_EGRESS_EXTRA_HOSTS:-}
+      OPENDUET_EGRESS_RECORD_DAYS: ${OPENDUET_EGRESS_RECORD_DAYS:-}
+      OPENDUET_RETENTION_DAYS: ${OPENDUET_RETENTION_DAYS:-}
+      OPENDUET_OBSERVATION_RETENTION_DAYS: ${OPENDUET_OBSERVATION_RETENTION_DAYS:-}
+      OPENDUET_OBSERVATION_TOMBSTONE_DAYS: ${OPENDUET_OBSERVATION_TOMBSTONE_DAYS:-}
+      OPENDUET_TRASH_DAYS: ${OPENDUET_TRASH_DAYS:-}
+      OPENDUET_TRASH_MAX_MB: ${OPENDUET_TRASH_MAX_MB:-}
+      OPENDUET_STORAGE_PER_PERSON_MB: ${OPENDUET_STORAGE_PER_PERSON_MB:-}
+      OPENDUET_EGRESS_HOLD_MAX_BYTES: ${OPENDUET_EGRESS_HOLD_MAX_BYTES:-}
+      OPENDUET_EGRESS_APPROVAL_HOLD_SECONDS: ${OPENDUET_EGRESS_APPROVAL_HOLD_SECONDS:-}
+      # Plugin runners (docs/DEPLOYMENT.md, "Isolation and image provenance"). Empty uses each default.
+      OPENDUET_MCP_NODE_IMAGE: ${OPENDUET_MCP_NODE_IMAGE:-}
+      OPENDUET_MCP_PYTHON_IMAGE: ${OPENDUET_MCP_PYTHON_IMAGE:-}
+      OPENDUET_MCP_EGRESS_PORT: ${OPENDUET_MCP_EGRESS_PORT:-}
+      OPENDUET_MCP_IDLE_MS: ${OPENDUET_MCP_IDLE_MS:-}
+      # How long an attempt's container may take to start (default 120000 ms).
+      OPENDUET_RUNTIME_START_TIMEOUT_MS: ${OPENDUET_RUNTIME_START_TIMEOUT_MS:-}
+      # Engines kept loaded ahead of the next attempts (default 1), and attempts run at once (default 4).
+      OPENDUET_ENGINE_PREWARM: ${OPENDUET_ENGINE_PREWARM:-}
+      OPENDUET_ATTEMPT_CONCURRENCY: ${OPENDUET_ATTEMPT_CONCURRENCY:-}
+      # The text-to-speech model, when an OpenAI or OpenAI-compatible key is set.
+      OPENDUET_SPEECH_MODEL: ${OPENDUET_SPEECH_MODEL:-}
+      OPENDUET_ENABLE_FAKE_PROVIDER: ${OPENDUET_ENABLE_FAKE_PROVIDER:-false}
+      OPENDUET_ENABLE_TEST_CONNECTOR: ${OPENDUET_ENABLE_TEST_CONNECTOR:-false}
+      # Rooms, shared spaces, guests and hand-offs (docs/ROOMS.md); off by default.
+      OPENDUET_PREVIEW_MULTIPLAYER: ${OPENDUET_PREVIEW_MULTIPLAYER:-false}
+      # Whole features turned on or off (docs/DEPLOYMENT.md); empty keeps each default.
+      OPENDUET_FEATURE_MULTIPLAYER: ${OPENDUET_FEATURE_MULTIPLAYER:-}
+      OPENDUET_FEATURE_VOICE: ${OPENDUET_FEATURE_VOICE:-}
+      OPENDUET_FEATURE_PHONE: ${OPENDUET_FEATURE_PHONE:-}
+      OPENDUET_FEATURE_SMS: ${OPENDUET_FEATURE_SMS:-}
+      OPENDUET_FEATURE_BROWSER: ${OPENDUET_FEATURE_BROWSER:-}
+      OPENDUET_FEATURE_COMPUTER: ${OPENDUET_FEATURE_COMPUTER:-}
+      OPENDUET_FEATURE_COMPANIES: ${OPENDUET_FEATURE_COMPANIES:-}
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      OPENAI_COMPAT_BASE_URL: ${OPENAI_COMPAT_BASE_URL:-}
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:-}
+      # Cloud metadata stays out of reach of every address set in the app unless this is true.
+      OPENDUET_ALLOW_CLOUD_METADATA: ${OPENDUET_ALLOW_CLOUD_METADATA:-false}
+      # Internal hosts every space may reach, not only the owner's; empty keeps them to public addresses.
+      OPENDUET_PRIVATE_HOSTS: ${OPENDUET_PRIVATE_HOSTS:-}
+      OPENDUET_CHATGPT_CLIENT_ID: ${OPENDUET_CHATGPT_CLIENT_ID:-}
+      OPENAI_COMPAT_OAUTH_ISSUER: ${OPENAI_COMPAT_OAUTH_ISSUER:-}
+      OPENAI_COMPAT_OAUTH_AUTHORIZE_URL: ${OPENAI_COMPAT_OAUTH_AUTHORIZE_URL:-}
+      OPENAI_COMPAT_OAUTH_TOKEN_URL: ${OPENAI_COMPAT_OAUTH_TOKEN_URL:-}
+      OPENAI_COMPAT_OAUTH_REVOKE_URL: ${OPENAI_COMPAT_OAUTH_REVOKE_URL:-}
+      OPENAI_COMPAT_OAUTH_CLIENT_ID: ${OPENAI_COMPAT_OAUTH_CLIENT_ID:-}
+      OPENAI_COMPAT_OAUTH_CLIENT_SECRET: ${OPENAI_COMPAT_OAUTH_CLIENT_SECRET:-}
+      OPENAI_COMPAT_OAUTH_SCOPES: ${OPENAI_COMPAT_OAUTH_SCOPES:-}
+      OPENAI_COMPAT_OAUTH_REDIRECT_URL: ${OPENAI_COMPAT_OAUTH_REDIRECT_URL:-}
+      OPENAI_COMPAT_OAUTH_LABEL: ${OPENAI_COMPAT_OAUTH_LABEL:-}
+    group_add: ["10001"]
+    volumes:
+      - spaces:/data/spaces
+      - artifacts:/data/artifacts
+      - work:/work
+      - restrictions:/data/restrictions
+      - ./config:/etc/openduet:ro
+      - database-access:/data/database-access:ro
+      - cells-key:/data/cells-key:ro
+    ports:
+      - "127.0.0.1:${OPENDUET_PORT:-3100}:8787"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://openduet-api:8787/health');const b=await r.json();process.exit(r.ok&&b.database==='ok'?0:1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      start_interval: 1s
+      retries: 3
+    stop_grace_period: 40s
+
+  # Builds the runtime image (or holds the pulled one) before the service can
+  # launch an attempt from it. Nothing runs here: no engine, no credential, no
+  # network.
+  runtime-image:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-runtime:${OPENDUET_IMAGE_TAG:-local}"
+    build:
+      context: ../packages/runtime-hermes
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/true"]
+    network_mode: none
+    restart: "no"
+    logging: *bounded-logs
+
+  # Builds the agents' computer image, only with --profile sandbox: it is large
+  # (a desktop and a browser) and only a docker sandbox provider uses it. The
+  # service starts one container per agent from it; nothing runs here. Zero
+  # replicas: build, pull and `up` still provide the image, and no container that
+  # exits at once makes `up --wait` fail on a healthy stack.
+  sandbox-image:
+    image: "${OPENDUET_SANDBOX_DOCKER_IMAGE:-${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-sandbox:${OPENDUET_IMAGE_TAG:-local}}"
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.sandbox
+    profiles: [sandbox]
+    deploy:
+      replicas: 0
+    entrypoint: ["/bin/true"]
+    network_mode: none
+    restart: "no"
+    logging: *bounded-logs
+
+  runtime:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-runtime:${OPENDUET_IMAGE_TAG:-local}"
+    restart: unless-stopped
+    logging: *bounded-logs
+    networks: [internal]
+    depends_on:
+      runtime-image:
+        condition: service_completed_successfully
+      openduet:
+        condition: service_healthy
+    environment:
+      OPENDUET_BROKER_URL: http://openduet:8788
+      HTTP_PROXY: http://openduet:8788
+      HTTPS_PROXY: http://openduet:8788
+      NO_PROXY: openduet,localhost,127.0.0.1
+      HERMES_EXEC_ASK: "1"
+      HERMES_HOME: /var/lib/hermes
+      API_SERVER_ENABLED: "1"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8790"
+      API_SERVER_KEY: ${OPENDUET_RUNTIME_KEY:?run bun run deploy/scripts/configure.ts}
+      # This warm cell has no valid capability and cannot act on a job.
+      OPENDUET_MODEL_KEY: openduet-surrogate-probe
+      OPENDUET_ATTEMPT_TOKEN: probe-without-authority
+      OPENDUET_ATTEMPT_ID: att_probe
+      OPENDUET_JOB_ID: job_probe
+      OPENDUET_MODEL_PROVIDER: ${OPENDUET_DEFAULT_PROVIDER:-fireworks}
+      OPENDUET_MODEL_NAME: ${OPENDUET_DEFAULT_MODEL:-accounts/fireworks/models/deepseek-v4p1-flash}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 2g
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - type: volume
+        source: work
+        target: /work
+        volume:
+          nocopy: true
+          subpath: _probe
+      - runtime-home:/var/lib/hermes
+    healthcheck:
+      test: ["CMD", "python", "/opt/openduet-runtime/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      start_interval: 1s
+      retries: 3
+
+  web:
+    image: "${OPENDUET_IMAGE_TAG:+${OPENDUET_IMAGE_REGISTRY:-ghcr.io/ychampion}/}openduet-web:${OPENDUET_IMAGE_TAG:-local}"
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        VITE_OPENDUET_API: /api
+    restart: unless-stopped
+    logging: *bounded-logs
+    mem_limit: ${WEB_MEMORY_LIMIT:-256m}
+    networks: [edge]
+    depends_on:
+      openduet:
+        condition: service_healthy
+    environment:
+      OPENDUET_WEB_ORIGIN: ${OPENDUET_WEB_ORIGIN:-}
+      # The reverse proxy whose X-Forwarded-For names each browser, for sign-in
+      # limits: an address, or `gateway` for a proxy on this host
+      # (docs/DEPLOYMENT.md, "Sign-in limits"). Unset, none is believed.
+      OPENDUET_WEB_TRUSTED_UPSTREAM: ${OPENDUET_WEB_TRUSTED_UPSTREAM:-}
+      # The page title. A brand folder is added by docker-compose.brand.yml.
+      OPENDUET_INSTANCE_NAME: ${OPENDUET_INSTANCE_NAME:-}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3101}:3000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "process.exit((await fetch('http://127.0.0.1:3000/')).ok?0:1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      start_interval: 1s
+      retries: 3

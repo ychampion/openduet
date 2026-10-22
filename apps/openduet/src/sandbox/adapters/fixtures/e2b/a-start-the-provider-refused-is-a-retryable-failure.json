@@ -1,0 +1,397 @@
+{
+  "fixture": "e2b",
+  "source": "authored-from-documented-api",
+  "note": "Authored from the documented E2B API before an account was available, not recorded from E2B. Re-record with OPENDUET_SANDBOX_LIVE=e2b, E2B_API_KEY and OPENDUET_SANDBOX_RECORD=1.",
+  "api": {
+    "control": "E2B REST API, spec/openapi.yml, e2b-dev/E2B at 3e5a48b",
+    "envd": "envd process and filesystem Connect services and /files, spec/envd, e2b-dev/E2B at 3e5a48b",
+    "sdk": "e2b 2.50.0 (JavaScript SDK), read for request shapes"
+  },
+  "exchanges": [
+    {
+      "request": {
+        "atMs": 1,
+        "method": "POST",
+        "url": "https://api.e2b.app/sandboxes",
+        "path": "/sandboxes",
+        "bodySha256": "c2f28e949c36c343a56b40792fcb7334ec8ede312b6611cdf6304f2ecaeec2fc",
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "templateID": "base",
+          "timeout": 600,
+          "autoPause": false,
+          "secure": true,
+          "allow_internet_access": false,
+          "network": {
+            "allowPublicTraffic": false
+          },
+          "metadata": {
+            "openduet.owner": "v1",
+            "openduet.project": "conformance",
+            "openduet.space": "sp_CONFORMANCE",
+            "openduet.job": "job_CONFORMANCE",
+            "openduet.attempt": "att_CONFORMANCE",
+            "openduet.session": "sbx_CONFORMANCE1"
+          },
+          "envVars": {
+            "LANG": "C.UTF-8"
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "eyJ0ZW1wbGF0ZUlEIjoiYmFzZSIsInNhbmRib3hJRCI6ImZha2Utc2J4LTAwMDEiLCJjbGllbnRJRCI6IjAwMDAwMDAwIiwiZW52ZFZlcnNpb24iOiIwLjYuNCIsImVudmRBY2Nlc3NUb2tlbiI6InJlZGFjdGVkIiwidHJhZmZpY0FjY2Vzc1Rva2VuIjoicmVkYWN0ZWQiLCJkb21haW4iOiJlMmIuYXBwIn0="
+          }
+        ],
+        "end": "complete",
+        "atMs": 1,
+        "body": {
+          "templateID": "base",
+          "sandboxID": "fake-sbx-0001",
+          "clientID": "00000000",
+          "envdVersion": "0.6.4",
+          "envdAccessToken": "redacted",
+          "trafficAccessToken": "redacted",
+          "domain": "e2b.app"
+        }
+      }
+    },
+    {
+      "request": {
+        "atMs": 2,
+        "method": "POST",
+        "url": "https://sandbox.e2b.app/process.Process/Start",
+        "path": "/process.Process/Start",
+        "bodySha256": "d946b171129feedee467aaa5519be4a36f5c398ac3c81c304ac30ddbdc570156",
+        "headers": {
+          "content-type": "application/connect+json",
+          "connect-protocol-version": "1",
+          "connect-timeout-ms": "60000",
+          "keepalive-ping-interval": "50",
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        },
+        "body": [
+          {
+            "process": {
+              "cmd": "/bin/sh",
+              "args": ["-c", "mkdir -p /work && chown user /work"],
+              "cwd": "/"
+            },
+            "stdin": false
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/connect+json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "AAAAACB7ImV2ZW50Ijp7InN0YXJ0Ijp7InBpZCI6MTAwMX19fQ=="
+          },
+          {
+            "atMs": 0,
+            "base64": "AAAAADp7ImV2ZW50Ijp7ImVuZCI6eyJleGl0ZWQiOnRydWUsInN0YXR1cyI6ImV4aXQgc3RhdHVzIDAifX19"
+          },
+          {
+            "atMs": 0,
+            "base64": "AgAAAAJ7fQ=="
+          }
+        ],
+        "end": "complete",
+        "atMs": 2,
+        "body": [
+          {
+            "event": {
+              "start": {
+                "pid": 1001
+              }
+            }
+          },
+          {
+            "event": {
+              "end": {
+                "exited": true,
+                "status": "exit status 0"
+              }
+            }
+          },
+          {
+            "end": {}
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "atMs": 2,
+        "method": "POST",
+        "url": "https://sandbox.e2b.app/process.Process/Start",
+        "path": "/process.Process/Start",
+        "bodySha256": "e10eb7af44e25934de808f8203f52c03d9ac19d47b5a87b3ebe24d132c292cf1",
+        "headers": {
+          "content-type": "application/connect+json",
+          "connect-protocol-version": "1",
+          "connect-timeout-ms": "50000",
+          "keepalive-ping-interval": "50",
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        },
+        "body": [
+          {
+            "process": {
+              "cmd": "setsid",
+              "args": [
+                "/bin/sh",
+                "-c",
+                "r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0CONFORMANCE00000000\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( 'sh' '-c' 'printf once >> /work/counter' ) 2>&1; printf '%s\\n' \"$?\" > \"$d/status\"; } | setsid -w sh -c 'head -c \"$1\"; exec cat > /dev/null' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '%s' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\""
+              ],
+              "cwd": "/work/not-a-directory"
+            },
+            "stdin": false
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/connect+json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "AgAAAFx7ImVycm9yIjp7ImNvZGUiOiJpbnZhbGlkX2FyZ3VtZW50IiwibWVzc2FnZSI6ImN3ZCAnL3dvcmsvbm90LWEtZGlyZWN0b3J5JyBkb2VzIG5vdCBleGlzdCJ9fQ=="
+          }
+        ],
+        "end": "cancelled",
+        "atMs": 2,
+        "body": [
+          {
+            "end": {
+              "error": {
+                "code": "invalid_argument",
+                "message": "cwd '/work/not-a-directory' does not exist"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "atMs": 2,
+        "method": "GET",
+        "url": "https://sandbox.e2b.app/files",
+        "path": "/files?path=%2Fwork%2Fcounter&username=user",
+        "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "headers": {
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "eyJjb2RlIjo0MDQsIm1lc3NhZ2UiOiJwYXRoICcvd29yay9jb3VudGVyJyBkb2VzIG5vdCBleGlzdCJ9"
+          }
+        ],
+        "end": "complete",
+        "atMs": 2,
+        "body": {
+          "code": 404,
+          "message": "path '/work/counter' does not exist"
+        }
+      }
+    },
+    {
+      "request": {
+        "atMs": 3,
+        "method": "POST",
+        "url": "https://sandbox.e2b.app/process.Process/Start",
+        "path": "/process.Process/Start",
+        "bodySha256": "4ad0379dcd95f58bc81a420f93ae345fe93de487a1f2e9e6e1a680a1cf068a1e",
+        "headers": {
+          "content-type": "application/connect+json",
+          "connect-protocol-version": "1",
+          "connect-timeout-ms": "50000",
+          "keepalive-ping-interval": "50",
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        },
+        "body": [
+          {
+            "process": {
+              "cmd": "setsid",
+              "args": [
+                "/bin/sh",
+                "-c",
+                "r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0CONFORMANCE00000000\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( 'sh' '-c' 'printf once >> /work/counter' ) 2>&1; printf '%s\\n' \"$?\" > \"$d/status\"; } | setsid -w sh -c 'head -c \"$1\"; exec cat > /dev/null' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '%s' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\""
+              ],
+              "cwd": "/work"
+            },
+            "stdin": false
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/connect+json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "AAAAACB7ImV2ZW50Ijp7InN0YXJ0Ijp7InBpZCI6MTAwMn19fQ=="
+          },
+          {
+            "atMs": 0,
+            "base64": "AAAAADp7ImV2ZW50Ijp7ImVuZCI6eyJleGl0ZWQiOnRydWUsInN0YXR1cyI6ImV4aXQgc3RhdHVzIDAifX19"
+          },
+          {
+            "atMs": 0,
+            "base64": "AgAAAAJ7fQ=="
+          }
+        ],
+        "end": "complete",
+        "atMs": 3,
+        "body": [
+          {
+            "event": {
+              "start": {
+                "pid": 1002
+              }
+            }
+          },
+          {
+            "event": {
+              "end": {
+                "exited": true,
+                "status": "exit status 0"
+              }
+            }
+          },
+          {
+            "end": {}
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "atMs": 3,
+        "method": "POST",
+        "url": "https://sandbox.e2b.app/filesystem.Filesystem/ListDir",
+        "path": "/filesystem.Filesystem/ListDir",
+        "bodySha256": "5dde1cd85cbd8bddba514d8270299ded90b672141b64b5ad650928a3883f78bc",
+        "headers": {
+          "content-type": "application/json",
+          "connect-protocol-version": "1",
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        },
+        "body": {
+          "path": "/var/tmp/.openduet-exec/act_01J0CONFORMANCE00000000",
+          "depth": 32
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "eyJlbnRyaWVzIjpbeyJuYW1lIjoiZXhpdCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ubWVsZXRlLWV4ZWMvYWN0XzAxSjBDT05GT1JNQU5DRTAwMDAwMDAwL2V4aXQiLCJzaXplIjoiMSIsIm1vZGUiOjQyMCwib3duZXIiOiJ1c2VyIiwiZ3JvdXAiOiJ1c2VyIn0seyJuYW1lIjoib3V0IiwidHlwZSI6IkZJTEVfVFlQRV9GSUxFIiwicGF0aCI6Ii92YXIvdG1wLy5tZWxldGUtZXhlYy9hY3RfMDFKMENPTkZPUk1BTkNFMDAwMDAwMDAvb3V0IiwibW9kZSI6NDIwLCJvd25lciI6InVzZXIiLCJncm91cCI6InVzZXIifV19"
+          }
+        ],
+        "end": "complete",
+        "atMs": 3,
+        "body": {
+          "entries": [
+            {
+              "name": "exit",
+              "type": "FILE_TYPE_FILE",
+              "path": "/var/tmp/.openduet-exec/act_01J0CONFORMANCE00000000/exit",
+              "size": "1",
+              "mode": 420,
+              "owner": "user",
+              "group": "user"
+            },
+            {
+              "name": "out",
+              "type": "FILE_TYPE_FILE",
+              "path": "/var/tmp/.openduet-exec/act_01J0CONFORMANCE00000000/out",
+              "mode": 420,
+              "owner": "user",
+              "group": "user"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "atMs": 4,
+        "method": "GET",
+        "url": "https://sandbox.e2b.app/files",
+        "path": "/files?path=%2Fwork%2Fcounter&username=user",
+        "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "headers": {
+          "e2b-sandbox-id": "fake-sbx-0001",
+          "e2b-sandbox-port": "49983"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/octet-stream"
+        },
+        "chunks": [
+          {
+            "atMs": 0,
+            "base64": "b25jZQ=="
+          }
+        ],
+        "end": "complete",
+        "atMs": 4,
+        "body": {
+          "bytes": 4
+        }
+      }
+    },
+    {
+      "request": {
+        "atMs": 4,
+        "method": "DELETE",
+        "url": "https://api.e2b.app/sandboxes/fake-sbx-0001",
+        "path": "/sandboxes/fake-sbx-0001",
+        "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "headers": {}
+      },
+      "response": {
+        "status": 204,
+        "headers": {},
+        "chunks": [],
+        "end": "complete",
+        "atMs": 4
+      }
+    }
+  ]
+}

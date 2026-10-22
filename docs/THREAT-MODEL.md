@@ -1,0 +1,1256 @@
+# Threat model
+
+This document names each attacker OpenDuet is built to withstand, the boundary in
+the way, the tests that check that boundary, and what lies beyond it. Two kinds
+of evidence appear throughout: fixture tests, which check a gate against the
+inputs they supply, and the live probes of conformance scenario 6, which check
+the deployed container boundary on a Linux Docker host.
+
+The host Docker socket is **host-root equivalent**: whoever holds it can ask
+the Docker daemon to launch privileged containers and mount host filesystems.
+In a Compose installation one service holds it, `openduet-cells`, which has no
+database address and no service key and answers only the `openduet` service, on
+a network the two share alone, with a key. The `openduet` service, which serves
+the API and holds the credentials, has no socket: it asks `openduet-cells` for
+containers, and `openduet-cells` starts only fixed profiles (an attempt's
+engine, an agent's computer, a stdio MCP server), each non-root on a read-only
+root with every capability dropped, and refuses any other image, host path,
+volume driver, privilege, device, namespace, network or reserved label, and any
+request to change, start, stop, enter or remove a container it did not start
+(`openduet-cells refuses a container outside its profiles`;
+[cells/policy.ts](../apps/openduet/src/cells/policy.ts)). Any container can be
+inspected, because the service finds its own id and labels that way; for a
+container no profile owns the answer is its id, name, image, state and labels
+only, without its environment, host settings, mounts or network addresses
+(`an inspection of a container no profile owns keeps only its state and
+labels`). A fault in
+the API therefore reaches containers only in those shapes, not the host.
+`openduet-cells` itself sits **inside the host trust boundary**: a compromise of
+it is a compromise of the host. Runtime attempts never receive the socket.
+`bun run compose:check` fails when the API has the socket or another service
+mounts it, Compose requires an explicit `DOCKER_GID` for `openduet-cells`, and
+the supervisor's launch argument tests check the restrictions applied to each
+runtime.
+
+## Attacker 1: hostile content in email or on a web page
+
+Hostile text can influence a model's proposed actions and summaries. OpenDuet does
+not rely on the model resisting injected instructions: the defence sits at the
+effect boundary, where text the model has read cannot widen what an attempt may
+do or change what an approval covers.
+
+The broker checks canonical payloads, approval hashes and attempt authority.
+Conformance 4, `An approval cannot be spent on different content`, tests
+payload/revision binding and cancellation fencing. `resume_action` carries only
+an action id: an attempt can carry out an action the owner approved for its own
+job and current revision, with the stored bytes, under its own live capability,
+and nothing else (`resume refuses whatever the owner has not approved for this
+job and revision`). An approval that can no longer be spent (its binding,
+generation or revision moved on, or it expired) ends its action as failed
+rather than leaving it approved, and an unanswered question whose request
+changed is withdrawn: Deny closes it, Allow is refused, and the next attempt is
+told nothing was refused. The memory/broker test `an address read off a page is
+refused as untrusted_recipient_origin` checks a planted address at admission.
+Origin is checked on the recognised
+recipient, destination, amount and resource fields; free prose, and a
+destination carried in any other field, have no origin check.
+
+The web connector rejects private/metadata addresses and rechecks redirects:
+`web SSRF guard denies private, metadata, CGNAT, multicast and mapped private
+addresses` and `redirects are checked hop by hop and never reach a private
+destination`. Private-context allowlists use exact hosts (`a closed or private
+space reads nothing, and a listed domain still works there`).
+A calendar feed is fetched under the same public-address rules, resolved again
+on every read, with redirects refused (`ics-feed.test.ts`).
+Public-compartment context assembly is tested by `approved shared context and
+public compartments are assembled before delivery`: a public-compartment job
+receives no private memory.
+
+Email hygiene matches the known shapes of one-time codes, password resets and
+magic links, tested by `withholds OTP, password resets and magic links from
+search and direct read`; a sensitive message in any other shape is read like
+any other message. The mail observations that wake waiting work keep that
+hygiene and add a stricter rule on the subject line, which withholds anything
+that names a code, a PIN or a verification, or sets a 4 to 8 digit number beside
+such a word (`every code-shaped subject is withheld, and ordinary mail is not`).
+Those observations carry headers only, marked as outside content, a watch tests
+them with a fixed, deterministic predicate before anything wakes, and revoking
+the connection removes every one no job took in
+([SITUATIONAL-AWARENESS.md](SITUATIONAL-AWARENESS.md)). A calendar feed is
+someone else's file, so expanding its repeating events is held to a fixed
+budget per read. Approval fatigue, misleading summaries, harmful reads within
+granted scope and social engineering of the owner rest on the owner's judgement
+rather than on these checks.
+
+## Attacker 2: a malicious skill file
+
+Skill text is not a capability credential. Broker admission still checks the
+attempt and connection scopes, and external effects still cross the approval
+gate (conformance 4). Initial skill selection is deterministic (`matches a
+trigger in the objective`, `loads at most three skills, however many match`);
+on-demand discovery can load a skill the model requests, but the broker filters
+it by the current job's scopes and withholds space skills in the public
+compartment, so a requested skill never supplies its own authority. Schema
+length limits are tested by `refuses a skill that is longer than the contract
+allows`.
+
+A skill that passes these checks can still influence permitted reads, draft
+contents and the owner's decisions. A skill file in a space loads once it passes
+schema and length validation, and skills carry no signature, so treat installed
+skill text as trusted prompt input and read it before installing it.
+
+## Attacker 3: a compromised model provider
+
+A provider sees the content of every request sent to it and can return
+misleading text. What it returns is model output with no authority of its own,
+subject to the same broker checks as any other proposal. Choose a provider you
+trust with the content of your jobs.
+
+The gateway tests enforce the configured forwarding boundary:
+`rejects missing capability, missing surrogate, wrong model, arbitrary paths
+and methods`; `reserves before injecting credentials and strips capability
+and caller headers`; and `stale epoch and concurrent budget exhaustion stop
+requests before transport`. The fake-provider test `streams the fake tool
+conversation end to end and records actual model and usage` checks recording
+of the response's reported model; the recorded model is the one the provider
+reports.
+
+`gpt-6-astra requires Responses and Anthropic drops sampling controls without
+rewriting history` tests request handling against a fake transport; the
+supported providers are listed in [DEPLOYMENT](DEPLOYMENT.md#providers).
+Conformance 8 runs against the Linux stack with the scripted provider: a cell
+capability can read the catalog but not approve, and an altered approval hash is
+refused. Its comparison against a second, real provider runs when the stack has
+that provider's credential and `OPENDUET_CONFORMANCE_REAL_PROVIDER` and
+`OPENDUET_CONFORMANCE_REAL_MODEL` select it; no recorded run has. API keys stay
+in the gateway, which forwards them. Tokens from a provider sign-in stay on the
+same side: they are sealed in Postgres, opened in the service when the gateway
+forwards a call, refreshed there, and redacted from what the provider returns,
+as `a signed-in provider sends its current token and account, redacts it, and
+refreshes after a refusal` tests. No API response, event or log line carries
+one; the fake-issuer tests in `credentials.test.ts` and
+`provider-signin.test.ts` search every answer, stored row and log line for each
+token the issuer handed out. Configuring provider OAuth inside Hermes
+would place those credentials in the runtime's auth store, outside this
+boundary: a runtime
+compromise exposes an OAuth token stored there, and it does not expose a
+provider API key kept in OpenDuet's gateway. The runtime image and Compose volumes
+carry no OAuth configuration.
+
+## Attacker 4: a compromised runtime container
+
+Conformance scenario 6 probes containment live, from a real claimed Hermes
+container and the warm probe container on a Linux Docker host: the internet, the
+host metadata address, a live host listener, Postgres (by DNS and by container
+IP), the web service and the owner control plane (`/setup`, `/login`, `/health`
+on port 8787) are unreachable; the broker and model gateway on port 8788 are the
+only reachable peers; the cell runs as UID 10001 with a read-only root, zero
+effective capabilities, no-new-privileges and no Docker socket. The table under
+[Linux deployment verification](#linux-deployment-verification) records each
+boundary, its evidence and what a breach would look like. The probes establish
+the boundary on a Linux host running Docker Engine; macOS, Windows and rootless
+Docker hosts are outside what they cover.
+
+The Compose file declares an internal-only runtime network with isolated
+bridge gateway mode, non-root UID, read-only root, dropped capabilities,
+no-new-privileges and process/memory limits. The static test `passes every
+boundary check` reads that configuration; the live probes above are what
+establish runtime behaviour.
+
+Writable paths are the current job's `/work` subpath (`work/<job>`, mounted
+with a volume subpath so sibling jobs' directories are hidden by the OS mount),
+the attempt's named `/var/lib/hermes` volume, and a size-limited `/tmp` tmpfs.
+The declared Hermes home is checked by `taking away the runtime writable
+Hermes home`. Inside the boundary, the shared kernel, the runtime volume's own
+contents and the reachable broker remain attack surface. The isolation boundary
+is the attempt container on the host's shared kernel; a kernel exploit or a
+compromised host is outside it.
+
+The capability gate has independent fixture evidence: conformance 2,
+`A stalled attempt cannot act after its lease expires`, verifies stale
+authority rejection and truthful late receipts. The gate governs what an attempt
+may ask the broker to do; code running inside the cell is bounded by the
+container, as the next section describes.
+
+### The runtime runs code on purpose
+
+The cell runs shell commands and Python snippets, with no approval in front of
+them, because the container is the boundary for code. It contains a command
+exactly as well as it contains the agent loop that started it: no route out, no
+credentials, non-root, read-only root filesystem, all capabilities dropped,
+`no-new-privileges`, process and memory limits, and `/work`, the attempt's
+Hermes home and a small `/tmp` as the only writable paths. An attacker who can
+make the model run a command gains nothing beyond what code execution in the
+container already gives. The tools that run code are among the default
+connections a space is given, and only where attempts run in a container; under
+the process supervisor that row offers nothing
+([CONNECTORS](CONNECTORS.md#default-connections)).
+
+What running code does add is a record. Every execution is a
+`write_reversible` action with the command, the working directory, the exit
+code, the duration and a digest of the output, so a command that ran is
+something the owner can see rather than something that happened inside a tool
+result. The plugin refuses a working directory outside the job's workspace
+before starting anything, the broker refuses the same thing again when the
+record arrives, and a stored output is re-hashed on the service side before the
+receipt says it verified.
+
+A command's effects on the filesystem are bounded by the container alone. Two
+consequences follow:
+
+- **A command can write anywhere the container can write.** That is `/work`,
+  the Hermes home and a small `/tmp`; the cell has no second sandbox inside it.
+- **`/work` is the job's own subpath.** Each per-attempt container mounts
+  `work/<job>` with a volume subpath, so a sibling job's directory is not
+  present in the cell at all. Scenario 6 plants a canary in a sibling
+  directory and reads it through three cell paths; all three return ENOENT
+  while the job's own workspace stays writable. Two jobs' workspaces are
+  separated by the OS mount, and the tool-level refusal is a second check
+  rather than the boundary.
+
+## Linux deployment verification
+
+Scenario 6 runs Python standard-library probes from a real claimed Hermes
+container and the warm probe container; the recorded run used Docker Engine
+29.1.3 on Linux. The claimed cell mounts only `work/<job>` and its private
+runtime home. What the table records holds for a Linux Docker host; macOS,
+Windows and rootless Docker hosts are outside it, as is a kernel exploit.
+
+| Boundary | Observed evidence | What a breach would look like |
+| --- | --- | --- |
+| External network | No default route; public IP, metadata IP and a live host listener were unreachable | A successful TCP connection to any blocked target |
+| Sibling services | Postgres failed by DNS and actual container IP; web DNS was unreachable | A reachable database or web listener from the cell |
+| Workspace | A sibling canary existed in the full volume; three read paths returned ENOENT while the job workspace was writable | Reading that canary through any cell path |
+| Sole peer | Network inspection showed only OpenDuet and the cell; broker/model routes answered | Another attached peer or an unmediated external route |
+| Runtime authority | A valid cell capability read the catalog (200) but could not approve (401); altered owner approval hashes were refused (409) | A cell capability spending an approval or changing its payload |
+| Owner control plane | Scenario 6 probes setup, login and health on port 8787 from both cells; the API binds only to edge and its transport guard denies other source subnets | Either cell receiving account state or any response other than connection refusal or the fixed 403 |
+| Process hardening | UID 10001, read-only root, zero effective capabilities, no-new-privileges, no Docker socket | Any failed assertion in the live hardening probe |
+
+The restore proof replaces only the stack's Postgres volume while retaining a
+newer independent restriction journal. Before normal startup, verification
+rejects the stale snapshot. Startup replays the restriction before opening
+memory and job workers; afterwards the forgotten fact is absent, an unrelated
+fact remains available, and the restored waiting job completes with one receipt.
+Serving the forgotten fact, or a second destination receipt, would mean the
+restore boundary had failed. Commands and measured results are in [deployment note 0020](../.agents/notes/0020-deployment-evidence.md).
+
+Two scenario 6 tests cover the owner control plane from inside the cells:
+`the warm cell cannot reach owner setup, login or health` and
+`a claimed attempt cannot reach the owner control plane and retains its job boundary`.
+An integration test verifies the transport rejection before and after owner
+creation. Sign-in limits and their tests are under Attacker 6.
+
+## Attacker 5: a hostile installed MCP server or generated wrapper
+
+MCP workers belong outside the runtime cell. A server can lie in its description,
+annotations or results, including calling a write read-only. The exposed tools,
+effect classes, scopes and audience come from the installation, either the row
+an owner installs through `POST /connections` or `POST /plugins/{id}`, or an
+entry in the operator's connections file, and a server cannot change them. A
+stdio server's tool definitions are recorded when it is installed, and a
+restarted server that describes different ones is refused. The
+default effect is `write_external`; `readOnlyHint` cannot remove an approval.
+The broker still checks every action's scope, intent identity, approval hash and
+trust origin. A server result cannot install a tool, load a schema or approve
+an action. The stdio fixture verifies that a dishonest write does not reach the
+server until the owner approves its canonical payload.
+
+Discovery is also inside this boundary. Postgres ranks only the scoped catalog;
+the model cannot supply schemas or scope declarations to `load_tool`. Loaded
+schemas are context, not grants. Revoked scopes and stale epochs are rejected
+again on use. A tool whose effect class changes between admission and dispatch
+is refused before its connector executes.
+
+Composition preflights only trusted read tools, and the broker checks the read
+classification again inside its proposal transaction. The script receives JSON
+data without a broker client or credentials. Each underlying read has its own
+action and receipt; generated result fields claiming owner origin do not change
+the enclosing inferred provenance or the original evidence handles.
+
+**A stdio server runs in a container of its own.** Whether it is a catalog
+plugin or a package or image the owner named, the service starts it through
+the Docker engine as uid 10001 on a read-only root, with every capability
+dropped, no privilege escalation, Docker's default seccomp profile and bounded
+memory, processes and CPU. Its mounts are its connection's volume and, for a
+package, the prepared package read-only: it never sees the Docker socket, the
+service's files, other connections' data or the service's environment. It
+receives only its home, its `/tmp` and the variables sealed for it, opened from
+the sealed store just before each start. With no destination named it has no
+network interface but loopback. With some, it sits on an internal network with
+the service's container, where it can open that container's listeners on the
+network and nothing else: the egress proxy, which needs its start's token and
+opens HTTPS tunnels to the named hosts alone, refusing any name that resolves
+to a private, loopback, link-local or metadata address; and the broker, which
+answers only an attempt's capability. Names outside the network do not
+resolve, and the host is not reachable through it.
+
+A package is fetched in a separate container that holds no secret, may reach
+only its registry, keeps its home and caches in memory, reads no npm or uv
+configuration, and writes only the package volume. It never mounts the
+server's volume, and the server can only read the package, so an install
+script cannot read the token the server will be given, and nothing a server
+writes reaches the next preparation or changes what runs. An image runs only
+if the host holds the content its pinned digest names. The engine pulls from
+the host's network, so a registry may be any public or private one except one
+that points back at the host: loopback, `0.0.0.0`, link-local and cloud
+metadata addresses, Docker's host aliases, the engine's ports 2375 and 2376,
+and wildcard-DNS names that spell those addresses. The service and
+`openduet-cells` both refuse such a pull, and the registry's name is resolved
+first and refused if it reaches one of those addresses (`pulls from any
+registry, except one that points back at the host`). The engine resolves the
+name again itself and follows a registry's redirects and sign-in address, so a
+registry that answers differently to the engine can still lead it elsewhere;
+the check narrows this, and a fixed set of registries needs the images placed
+on the host and the host's outbound traffic limited. The service reads back
+the engine's record of each container (user, root, capabilities, privilege,
+limits, network, mounts) and of each network it creates, and removes, unstarted,
+anything recorded with less isolation than asked. At most sixteen servers run at
+once across a deployment. A server that keeps crashing is left stopped, and a
+connection that goes, whether revoked or removed with its space, has its
+container stopped and its volumes removed at once. Conformance 10 observes these
+from inside real containers on every pull request.
+
+What stays with the server: it can read and change its own volume, use its own
+sealed variables against the destinations it was allowed, and write whatever
+it likes in its answers. Those answers are external content to the broker,
+and each call it is asked to make was admitted, and if it writes outside, was
+approved. A plugin allowed any public site, such as Fetch by default, can send
+what it reads or holds to any public address; a person who names sites keeps it
+to those. A named destination receives whatever the server sends it,
+including its own variables, so a destination is a grant of trust in both
+directions. Docker keeps a container's environment in the engine's own state
+while the container exists; the service removes each container when it stops,
+and host root can read that state, as it can everything under the socket's
+authority described at the top of this document. Tests launch fixture servers
+as child processes; `production stdio cannot launch under the service OS
+identity` shows that path is refused outside tests, before anything is spawned.
+
+Configured HTTP installations register with the `mcp` provider. They receive
+only protocol messages and admitted tool arguments, with no service credentials,
+vault paths, database connection strings or client-side capabilities. Their
+own host's filesystem and network policy remain the operator's responsibility.
+Owner-only tools are hidden in public compartments and the broker checks the
+persisted audience again at dispatch, including after approval.
+
+Composition needs a cell executor
+to run its script; the default service supplies none, so it does not offer the
+composition tool. The `node:vm` executor exists for deterministic tests, refuses
+to start outside them, and is not an OS or memory boundary.
+
+## Attacker 6: a remote client at the sign-in form
+
+This attacker reaches `/login` and `/setup` like any browser, from one address
+or many, and knows or guesses the owner's email. The aims are to guess the
+password, to learn which emails have accounts, and to keep the owner from
+signing in by exhausting whatever limits the guessing.
+
+Guessing meets three in-memory limiters in front of the argon2id check: one per
+client address, one per account shared by every browser that has not signed in
+to that account before, and one per known device. The client address is the
+socket source, or the address the web proxy states in
+`X-OpenDuet-Client-Address`. The proxy writes that header from its own socket over
+anything the browser sent, and the API believes it only on a connection from the
+peer named by `OPENDUET_TRUSTED_PROXY`, which Compose fixes to the edge-only `web`
+service. From any other peer the header is ignored, so inventing addresses mints
+no fresh buckets. An unknown email costs the same verification and returns the
+same 401 as a wrong password. `/setup` answers an installed service before it
+parses or hashes anything and has a limiter of its own.
+
+Lockout is the part a limiter can turn against the owner. A refused request
+changes no limiter state, so it cannot lengthen a wait or postpone a reset. A
+browser that has signed in to the account before carries a signed
+`openduet_device` cookie; with it, the browser bypasses the address and account
+limiters and spends an attempt budget of its own. The cookie authenticates
+nobody, is bound to one account by a keyed digest, and is signed with a key
+derived from `OPENDUET_MASTER_KEY`. The tests `strangers cannot lock a known
+browser out of its account`, `browsers behind the web proxy are throttled by
+their own address`, `a forged client address from a peer that is not the proxy
+mints no fresh bucket`, `setup answers an installed service before hashing and
+is throttled` and `an unknown email costs the same password verification as a
+known one` in [auth.test.ts](../apps/openduet/test/integration/auth.test.ts)
+exercise each property. Exact numbers are in
+[DEPLOYMENT](DEPLOYMENT.md#sign-in-limits).
+
+What remains: a stranger who keeps the shared account limiter closed delays a
+sign-in from a browser that is new to the account, to at most one admitted
+attempt per 60 seconds, for as long as the guessing continues. A known browser
+is unaffected. A stolen device cookie removes that protection for its holder
+and nothing else; it expires after 90 days and cannot be revoked singly. All
+limiter state is per process and is cleared by a restart. Behind the default
+loopback ports, an SSH tunnel or a host TLS proxy, every browser reaches the web
+server from the Docker gateway and therefore shares one client address. Sign-in
+is by password alone. Distributed guessing below the account limit is slowed,
+not stopped; the password remains the control.
+
+## Attacker 7: another account on the same installation
+
+The setup owner can provision further accounts. Such an account is a full
+person with a password, not a guest of the owner, and must not reach the
+owner's rows or act through the owner's connections.
+
+Nor may it reach the server's own network through an address it names. A local
+model in Settings → Privacy is the installation owner's to set; everyone else's
+private conversations use the operator's `OPENDUET_LOCAL_MODEL_URL`. Every other
+address another account names (an MCP server and its token endpoint, a CalDAV
+service, IMAP and SMTP servers) must be public: it is resolved on each
+connection, every answer must be globally routable, and the connection goes to
+the address that was checked, so a name cannot be re-pointed inside between the
+check and the connection. No redirect is followed. Cloud metadata is refused to
+every address set in the app, the owner's included, unless the operator sets
+`OPENDUET_ALLOW_CLOUD_METADATA=true`, which opens it to the owner's settings only.
+
+A session's space is derived from its authenticated principal on every request:
+that principal's own personal space, or a stored selection it is still a member
+of under the membership generation the selection was stored with. No path falls
+back to another account's space, and an account without a personal space
+receives its own on first use. Conversations, plans, routines, permissions,
+drafts, receipts, undo, search, quick answers, the event stream, artifacts,
+reactions and browser takeover or handback are also checked against the job's
+principal, so they stay private inside a shared space.
+[principal-scope.test.ts](../apps/openduet/test/integration/principal-scope.test.ts)
+drives each surface from a second account against the owner's rows, and from the
+owner against the second account's, and asserts that nothing was read, decided,
+sent, undone or steered.
+
+Inside a shared space, a job's memory and connections follow the job's
+principal too. A member's job recalls what the space shares with its members,
+never what is private to the owner, on every memory deployment. A shared
+space's connections serve its owner unless marked for the room, and the
+built-in tools a room is given are marked for the room's requests. A member's
+own job is offered none of them, cannot act through
+them, and cannot watch what they receive, and the broker checks this again
+before anything is sent. The service reads an account's changes only for
+triggers whose job the connection serves, and checks the rule again for each
+waiting job when an observation is delivered (`a room member's job never
+receives the owner's mail observations`). Every answer to a permission records the person who
+gave it; one made with the operator's approval key is recorded as the service's.
+[shared-space-scope.test.ts](../apps/openduet/test/integration/shared-space-scope.test.ts)
+drives a member's job against the owner's private memory and connections.
+
+What remains: the profile, tasks, saved rules, agents and connection reads are
+rows of a space rather than of a person, so a shared space offers them to its
+owner only. A file whose job row was deleted is scoped by its space alone.
+Accounts share one service process, one database role and one master key;
+isolation between them is an application check, not an operating-system or
+database boundary. That role is `openduet_api`, which cannot read the `secret`
+table of connected accounts' credentials
+([Database roles](DEPLOYMENT.md#database-roles)).
+
+## Attacker 8: an assistant connected over MCP
+
+A person can connect another assistant to OpenDuet as an MCP connector (see
+[MCP-SERVER](MCP-SERVER.md)). That assistant, the model behind it, or anyone
+who obtains its token may be hostile. The aims are to send mail the person
+never approved, to reach another account's work or memory, to reach routes
+beyond the six tools, and to keep access the person meant to end.
+
+The token is issued only after the signed-in person allows the request on
+OpenDuet's consent page. The page is answered only by the form it served to that
+session for that exact client, return address, state, PKCE challenge and
+resource: the form carries an HMAC over them and the session, and cannot be
+framed. The page names the space the grant will act in and the return host,
+marks a self-registered client's name as unverified, and shows a metadata
+document client's host. An unknown client or return address gets an error page
+and no redirect, and so does a request error for a return address nobody here
+has allowed yet (other than this computer or the metadata document's own host).
+Codes are single-use, expire after ten minutes, and need the PKCE verifier; a
+code presented twice ends the tokens it bought. Access tokens last an hour and
+are bound to the `/api/mcp` resource; refresh tokens rotate, a used one
+presented again ends the whole connection, and no token outlives 90 days from
+the consent. Only SHA-256 digests of codes and tokens are stored. A client ID
+metadata document is fetched only from a public address, pinned, without
+redirects and within 64 KB, and is recorded only when a person allows it. The
+authorization endpoint is rate-limited per address, and registrations nobody
+allowed are dropped after a day and capped.
+
+Each tool is answered by calling the owner API's own route in-process, as the
+token's person, in the space they consented from. Every request re-checks that
+space and the membership generation it was granted under; when either no longer
+holds, the request is refused with 401 and the connection ends, with no
+fallback to another space. Revoking a member deletes the assistant tokens and
+codes they hold in that space. The person rides on the
+request environment under a symbol only the MCP module holds; a request from the
+network gets its environment from the listener, so no header, cookie or body
+can claim to be an assistant's person. Route authority is therefore the same as
+the person's own session: another account's jobs, items and memory read as
+absent. Tool arguments are validated before any route is called, and an id is a
+single path segment. `safe_send` proposes an owner command through the broker;
+its key marks it as the assistant's, so no standing rule or chase scope admits
+it and its card offers no standing permission. The person approves the exact
+bytes in OpenDuet, and the broker sends them once. At most five such messages
+wait at once, and an assistant whose message was denied waits ten minutes
+before proposing another; each connection may make 60 tool calls a minute.
+`remember` records the detail as the assistant's external evidence, on a
+stream named for its client, so the claim's origin trust is `inferred`: a send
+that uses the value carries an origin warning, and no standing grant covers it.
+[mcp-server.test.ts](../apps/openduet/test/integration/mcp-server.test.ts) holds
+each OAuth refusal on its own, and
+[conformance scenario 11](../conformance/scenarios/11-mcp-server.test.ts) drives
+the whole flow with the reference MCP client, including a standing rule for the
+recipient that the assistant's message does not use, and a second account's
+token.
+
+What remains: a token acts as its person until it expires, is revoked, or the
+assistant is disconnected, and an assistant may read everything its person may
+read through the six tools. Registration is open to anyone who can reach the
+installation and is rate-limited per address; a registration alone grants
+nothing. Consent keys are per process, so a restart between showing the consent
+page and answering it asks the person to start again.
+
+## The agent's computer and its way out
+
+The Docker computer ([sandbox-docker](sandbox-docker.md#what-it-may-reach))
+reaches the network only through the service's egress guard, and only when its
+connection allows it. The guard knows a computer by its address on that
+computer's own network, and each command by a token in that command's proxy
+address.
+
+- **Attribution, not authority.** A command's token says which command a
+  connection belongs to. It is accepted only from the computer it was made for
+  and only until the command settles; a live token presented from another
+  computer is refused. A connection with no live token is let out under the same
+  rules and recorded as unattributed, so a token never widens what a computer
+  may reach.
+- **Borrowing inside one computer.** Every process in a computer runs as the
+  same user and can read another's environment, so code there can borrow a
+  running command's token. That changes only which command of the same computer
+  a connection is recorded against.
+- **Records.** Every tunnel and every refusal is recorded with its host, port,
+  verdict, reason, bytes each way and command. The guard never waits on the
+  record: a record that cannot be written is reported in the service log and the
+  connection proceeds. A computer that loops on connections is held to a record
+  budget: repeated refusals share one record with a count, at most 120 records a
+  minute are written per computer with the rest counted on one record, and
+  writes beyond a bounded queue are dropped and counted.
+- **Where it can go.** `open` is any public HTTPS host. `connected_hosts_only`
+  is the hosts the operator lists, read at each connection; a list that cannot
+  be read lets nothing out.
+  Reading data and sending it elsewhere is limited only by that choice, so a
+  person who wants a computer that reaches one site and nothing else chooses
+  `connected_hosts_only`.
+
+## Attacker 9: code in the agent's computer with a connected command-line account
+
+A person can connect an account for the Docker computer's command-line tools
+([COMMAND-LINE-ACCESS](COMMAND-LINE-ACCESS.md)). The egress relay terminates
+TLS for that account's hosts and adds the account on the way out; the computer
+holds only placeholders, the egress CA's certificate and per-command tokens.
+
+- **The secret.** It never enters the computer. Answers pass through a byte
+  redactor over every form of it, uncompressed so nothing hides it, and
+  `Set-Cookie` is dropped. `a computer uses a connected account through the
+  relay, and its environment, files and output never hold the secret` runs a
+  real computer in CI against an upstream that echoes the `Authorization`
+  header back.
+- **Misuse as the person (confused deputy).** Every request is classified at
+  the wire; anything the adapter cannot read or does not list counts as a
+  change, and every change asks, as an ordinary action under the
+  `write_external` class and the person's auto-review tier. The approval is
+  bound to the job's revision and to the request as it will be sent: method,
+  address, the digest of its exact body bytes and every forwarded header (a
+  short list of headers that say nothing about the change excepted), and only
+  those headers are forwarded. Headers that name another method are removed
+  from every request. A request that differs in any bound part is a different
+  approval. A re-run after approval is admitted once; a lost answer is never
+  sent again.
+- **After the command.** A token works only from its own computer and only
+  until its command ends; a connection opened under it is closed when it ends,
+  and every request on it checks the token again.
+- **Host confusion.** The `Host` header and any absolute address must name the
+  connection's host; upgrades and tunnels inside it are refused; requests are
+  re-originated to the host's pinned public address with certificate checks.
+- **The CA.** Its key is sealed with the master key for this purpose alone and
+  stays in the service. Its certificate is name-constrained to the adapters'
+  DNS names and excludes every IP address (`the egress CA cannot sign for a
+  host outside its constraints` checks a forged certificate against a real TLS
+  client). Host certificates last a day and stay in memory.
+- **Rooms.** An account is offered only to work in the person's own space, never
+  in a shared space or a public compartment, and only where the conversation's
+  agent may use that connection.
+- **What remains.** Reading with the account and sending what was read
+  elsewhere is limited by the account's own permissions and the computer's
+  egress setting; `connected_hosts_only` keeps such a computer to the account's
+  hosts and the operator's list. Holding a change for an answer holds its body
+  in memory: each body is bounded by `OPENDUET_EGRESS_HOLD_MAX_BYTES`, a computer
+  has at most four possible changes in hand (checked before a body is read),
+  and the bodies held stay within four such requests' worth per computer and
+  sixteen for the installation.
+- **GitHub.** A push is bound to its repository and its exact ref updates, old
+  and new commit, which name their content by hash; the pack that carries the
+  commits is not part of the approval, so a push can also carry objects no
+  pushed ref reaches, which GitHub keeps unreferenced in the repository, where
+  they can be fetched by hash (by anyone, in a public repository) until it
+  cleans them up. The
+  REST and GraphQL APIs are bound to the exact request, and a GraphQL document
+  with any mutation in it, or that does not parse, asks. `every mutation in the
+  gh corpus is classified as a write` runs the classifier over the requests
+  `gh` 2.83 and git sent for each command that changes something, recorded,
+  and over shapes written from the protocols. A standing rule covers only
+  pushes that create or move `openduet/` branches of one repository, never a
+  delete, a tag or a push to another branch (`a standing rule admits pushes to
+  openduet branches and never to the default branch`). **Limit:** a push the rule
+  covers starts the repository's push workflows without asking, and they run
+  the pushed code with the repository's secrets and workflow token; where that
+  token may write and the default branch is unprotected, that code can change
+  the default branch. The rule's text says so, and the docs advise a token
+  without the Workflows permission, read-only workflow permissions and a
+  protected default branch. A server error after a change was sent, and a
+  GraphQL answer of errors with no data, are recorded as possibly landed, never
+  as nothing changed. Signed download links GitHub returns reach the computer
+  as sent; each opens one object for minutes.
+- **AWS.** AWS signs requests with the key itself, so the relay signs each one
+  again: the computer signs with a placeholder key, the relay reads that
+  signature only for its service and region, and signs with the stored key or
+  with a session of the role the service assumes for that command (named
+  after it). A request signed with any other key, carrying its own session
+  token or presigned is refused; unsigned requests go out without the account.
+  A request's operation is believed only where its service reads it, from a
+  table generated from the AWS SDK's service definitions: `Action` for query
+  services, the service's own `X-Amz-Target` for JSON services, method and path
+  for REST services; a name in the wrong place, or two names, is refused, and
+  an unknown service asks for everything. Operations whose answer is a
+  credential (STS sessions, new IAM access keys, registry and database tokens,
+  GameLift access, S3 Express sessions, and any operation named as assuming a
+  role or getting, creating or generating credentials, a token or a presigned
+  sign-in link) are refused; other names that speak of a credential, token, key
+  pair, password or private key ask, and reading a stored secret asks. Every
+  answer to a signed request, but an S3 object's, is checked whole before the
+  computer sees it: one holding an AWS secret key or session token, an access,
+  refresh, identity or authorization token, a password, a client secret, a
+  private key or a `Secret` field is withheld and recorded (`the relay keeps an answer
+  holding a credential from the computer, and records it`). S3 is read by
+  method, bucket, key and subresource (`list and describe calls are reads, and
+  delete and run calls ask` runs the classifier over the requests the AWS SDK
+  builds for each operation). The approval binds the request as sent but for
+  the signing date, the SDK's request id and retry count and an idempotency
+  token the SDK makes up (blanked, with its name kept). Multipart parts pass
+  unasked only into an upload the same job started with an approval, within
+  10,000 parts and 64 GiB; its start and completion both ask. A signed request
+  to an EC2 instance's public name or a load balancer is refused. **Limits:**
+  chunk-signed uploads are refused; links AWS returns in an answer (Lambda's
+  code location) reach the computer as sent; other reads return what the
+  account may read, such as a Lambda function's environment variables; with
+  `connected_hosts_only`, the computer can reach resources others own under
+  `amazonaws.com`, sending them the account's key id and a short-lived session
+  token but never its secret. `aws in a real computer reads, asks before a change and
+  makes it once after approval, and the computer never holds the key` runs the
+  real `aws` command line in CI against a local stand-in that checks every
+  signature.
+- **GitLab and npm.** A GitLab push is bound like a GitHub one, push options
+  included; GitLab reads those to open or merge a merge request or to skip a
+  pipeline, so a push that carries any is never covered by a standing rule, on
+  either service, and no GitLab or npm change is covered by one at all; the
+  card says in plain words what the options make GitLab do. A request that asks
+  to act as another GitLab user (`Sudo`, in any part of the request) and glab's
+  usage reports are refused. So is every request that would hand the computer
+  a credential of its own: GitLab token creation and rotation, runners, trigger
+  tokens, SSH and deploy keys and OAuth tokens, and npm logins, tokens and
+  token exchanges. Behind those refusals, the relay withholds any answer that
+  holds a GitLab or npm token (`a read whose answer holds a token is withheld,
+  in its body or its headers`). **Limit:** reads return what the account can
+  read, CI/CD variable values included. The publish card reads install scripts
+  from the tarball's own `package.json` and flags a mismatch with the declared
+  manifest. An npm publish is bound to its exact bytes, tarball
+  included, and its card shows the scripts that run on install; unpublishing,
+  deprecating, maintainer, tag, access, team and organisation changes ask, and the
+  audit lookups npm sends as POSTs are the only POSTs that read.
+  `every change in the glab and git corpus is classified as a write` and
+  `every change in the npm corpus is classified as a write, and installs and
+  audits read` run the classifiers over requests recorded from glab 1.120, git
+  and npm 11, and over shapes written from the protocols.
+
+## Attacker 10: a published app and its viewers
+
+An app is a folder of web files the agent wrote and a person allowed to publish
+(see [APPS](APPS.md)). Its code may be hostile: written under a prompt
+injection, or changed by someone who manages it. The aims are to act as the
+viewer in OpenDuet, to read their session, storage or other work, to send what
+the app shows somewhere else, to keep showing it after the viewer was removed,
+and to frame OpenDuet itself to trick a person into a click.
+
+Every file of an app is served under `/api/apps/view/<token>/` with
+`Content-Security-Policy: sandbox allow-scripts allow-forms allow-downloads`,
+so the page runs with an opaque origin: it has no cookies, no storage, and no
+same-origin access to OpenDuet, however it is opened. The Apps screen also frames
+it with the same `sandbox` attribute and without `allow-same-origin`. The rest
+of the policy lets it load scripts, styles, images and fonts only from its own
+files, and fetch nothing (`connect-src 'none'`), post no form, frame nothing,
+open no window and move no page but its own frame. OpenDuet's own pages carry
+`frame-src 'self'`, so even that frame cannot be moved to another site. The
+headers are set in one place, and a response under that path that lacks the
+exact policy is replaced by a 500 before it leaves the service; the web server
+checks again and passes nothing on without it.
+
+A file is served only to a browser that says it is loading it inside a page
+(`Sec-Fetch-Dest`). A file asked for as a page of its own is refused, because a
+page opened on its own could move itself to another site and take what it
+holds with it.
+
+The page holds no credential. The token in its path names one person, one app,
+one version, the app's grant generation and the browser session it was opened
+from. It lasts at most twelve hours and is signed with a key derived from the
+master key; without a master key the key lasts as long as the process, so
+installations with more than one service instance need one. Every file
+request checks all of them again: any change to who may open the app, to the
+version it shows, or signing out ends the view on its next file request. A
+page already loaded keeps showing what it has until the Apps screen next
+checks, within a minute. The token names the person by their account id,
+which the app can read in its own address. The web server forwards these requests
+without the session cookie, and the app's own requests arrive marked
+cross-site, so no cookie travels with them anyway. Bytes are read whole and
+checked against the manifest's hash before they are sent.
+
+Data reaches an app only through the page around it, with the viewer's session,
+and only for the names its version declares, which the publish question listed.
+A data name resolves to the newest recorded version of one file in one
+conversation, and both the record and the conversation must belong to the
+space the app was published from, whatever the manifest says. Bytes on disk
+that no write recorded are not served. When the publisher reviews updates,
+viewers get only versions they let through, kept as blobs; a version can be let
+through only while it is the newest one and its bytes are the ones recorded.
+
+Responses are the app's way back in. An app's code can send them in the
+viewer's name without the viewer doing anything, so they are bounded: only for
+collections the version declares, at most the declared size (16 KiB at most),
+30 a minute per person per app, 500 kept per person per app, and 10,000 kept per
+app. The agent reads them
+only for apps in its own space that its person manages, and the receipt marks
+them as content OpenDuet read (`external_content`), not as the person's word.
+Reading them asks nothing and grants nothing: any action the agent takes about
+a response goes through the same admission and approvals as any other, and a
+recipient or destination lifted from one is not a trusted origin. Workspace
+writes usually do not ask, so one more rule closes the path from a viewer's text
+to what every viewer sees: in a conversation that has read responses, a write or
+move to a file an app's current version shows, and any command (code runner
+or the agent's computer) in a conversation whose files an app shows, waits for
+the person. The rule follows the conversation that read the responses: another
+conversation or a routine that is later steered by a summary of them can still
+write a bound file without asking. Update review closes that path for the data
+it covers. A deleted
+response is removed from the app; copies the agent already read stay in that
+conversation and in the record of the read.
+
+What the app may ask for, it asks the OpenDuet page around it with
+`postMessage`: the data the publish approval listed, read with the viewer's own
+session, and an https link, which opens in a new tab only after the person
+confirms it. The page answers only its own frame's window.
+
+OpenDuet's own pages send `frame-ancestors 'self'` and `X-Frame-Options:
+SAMEORIGIN`, so another site cannot frame them.
+
+**WebRTC is open.** Browsers let any page, sandboxed or not, open WebRTC
+connections, and no header in today's browsers stops them: an app can reach a
+STUN or TURN server it names, and send what it shows, or what a viewer types
+into it, to that server. Names the page looks up can carry data the same way.
+Neither carries the viewer's session. A publish whose code uses WebRTC by
+name (`RTCPeerConnection`, `RTCDataChannel`, `getUserMedia`) always asks, with
+a warning; code that hides those names is not found. Apps are for code the
+person trusts with the data it shows.
+
+**Publishing without a question.** By default a publish, a new version or a
+rollback goes ahead without asking when it reaches nobody new, its code names
+no WebRTC, and it shows its viewers no data they do not see now. A question for
+each version shows file counts, not code, so it adds a step without adding
+something a person can check. What still asks is what changes who is exposed: a wider audience (new people or everyone), WebRTC by name, and new
+data or responses. Those reasons are worked out by the service from the
+database, never taken from the agent, and are checked again at admission and
+dispatch, so a viewer added or data shared in between sends it back to the
+person. They are checked once more under the app's own lock as the version is
+written, the lock a change to its grants takes too, so a share that lands in
+between stops the publish. Who can open an app is counted as access counts it:
+the space's owner and the person who published it keep access whatever a
+publish's audience says, and the card names them. The paths of
+the files an app shows are left out of origin checking for this connection
+only, because the connector proves each is a recorded file of the publisher's
+own in this space, before asking and again before it runs; who will see them
+is one of the reasons above. Every
+publish leaves a receipt in the conversation and on the auto-review record,
+and the version before it is one step away. The person can switch the rule off
+in Settings → Approvals. What this accepts: a new version written under a
+prompt injection reaches the same viewers without a question, with the same
+data, and code that hides its use of WebRTC can send that data elsewhere. That
+was open before too, since the question showed file counts and not code. A
+conversation that read an app's responses, or that is set to ask before
+acting, still asks for every publish.
+
+## Attacker 11: a page served from the agent's computer
+
+A person can preview a web server a background process runs in the agent's
+computer (see [sandbox-docker](sandbox-docker.md#previewing-a-server)). The
+server and its pages were written by the agent, and may be hostile in the same
+ways an app may. The aims are those of Attacker 10, plus two of its own: to use
+the preview to reach something else on the computer's network, and to reach
+another person's computer.
+
+The preview reuses the app viewer's isolation unchanged. Every answer under
+`/api/previews/<token>/` carries the same `Content-Security-Policy: sandbox`
+policy, set in the same place, and the OpenDuet page frames it with the same
+`sandbox` attribute, so the page has an opaque origin, no cookies, no storage,
+fetches nothing and cannot move OpenDuet's page. An answer without the exact
+policy is replaced by a 500 in the service and by a 502 in the web server. A
+page asked for on its own, rather than in a frame, is refused.
+
+The service forwards only reads (GET and HEAD), with a short list of request
+headers: the OpenDuet cookie, any `Authorization`, `Origin` and every other
+header stay behind, and no connection upgrade is passed on. Answers come back
+with the isolation headers and a short list of the server's own; its cookies
+never reach the browser. A redirect is kept only when it points back at the
+same server, and made a path inside the preview.
+
+Each request goes to one address only: the computer's own address on the
+private network it shares with the service, at the port the process declared
+when it started. The address comes from the container engine, and the port from
+the process record; nothing in the request can choose either. A computer with
+no network (`deny_all`) cannot be previewed. On Docker that network holds only
+the computer and the service, so no other computer is reachable from it.
+
+The token in the path names one person, one process, the port and the computer
+it runs in, and the browser session it was opened from, and is signed with a
+key of its own. A preview lasts half an hour; the computer view opens a new
+one while it is on screen. Only the person whose job started the process can
+open one (a job with no recorded person is its space owner's), and only while
+the process runs and listens on its port. Every request checks again that the
+session is signed in, that the person may still use the space, that the
+computer's connection is active, and that the process record still says it
+runs, with that port, in that computer. Whether the process itself still
+listens is checked when the preview is opened, not on each request: if it
+stopped listening before the record caught up, another process in the same
+computer could answer on that port, and nothing outside that computer can.
+Stopping the process, revoking the connection, losing the space or signing out
+ends the preview on its next request.
+
+WebRTC and name lookups are open to a previewed page as they are to an app.
+The preview shows what the agent's own server serves, to the person who asked
+for it.
+## Attacker 12: another member of a room
+
+A room is a shared space where several people talk to one agent (see
+[ROOMS](ROOMS.md)). Another member may be hostile. The aims are to read what a
+person keeps outside the room, to make the room's agent act on someone else's
+behalf, to steer or withdraw someone else's request, and to keep reading after
+being removed.
+
+The room's agent acts as the room's own principal, not as any member. That
+principal has no password and never holds a session: sign-in refuses it before
+any password is checked, at the cost of an unknown email, and a session written
+for it by any other means is not accepted. It is never listed among people or a
+room's members, and it is never added to a room. Its membership generation is
+the room's roster generation, bumped with every change of who is in the room,
+so a capability minted before the change is refused at the broker.
+
+Every speaker is shown, to people and to the agent, as their chosen name
+followed by the handle the room gives them in angle brackets. The handle is
+derived from the room and the person's account, both made by the service, so
+nobody chooses it or takes another's, and it is what identifies a speaker; the
+agent is told the name before it is self-chosen. A name is one line of plain
+text without `<`, `>` or `@`, so it cannot pass for a handle or an email, and
+where a name enters the agent's input it is quoted; characters that read as
+`<`, `>` or `@` are refused as well. No label carries any part of an email;
+people who are not guests see emails only in the room's list of people. Each ask is its own request job, recorded with the person who asked, and only
+that person's words reach it: another member's message starts their own request
+or none, never touches someone else's, and so never withdraws their pending
+permission. A request reads the room's own material and the thread with each
+speaker's name, and acts only through the room's tools and the connections
+marked for the room. Nothing from a member's personal space reaches it.
+
+Every room route checks, on each request, that the caller is in the room now.
+A room's requests belong to the room's principal, so every personal surface
+(chats, plans, approvals, the job and event routes) hides them by its existing
+own-job rule; three paths admit room readers on purpose: a request's files, the
+room computer's view (owners alone take it over), and the room's own routes. A
+thread's live stream checks membership before every frame and closes when the
+reader is removed. Removing someone, or their leaving, fences work in flight,
+which starts again with the new roster; the requests they asked end.
+[rooms.test.ts](../apps/openduet/test/integration/rooms.test.ts) holds each of
+these as a test, including the room computer through the service's own routes.
+
+A room's memory holds what its people said there, each piece of evidence under
+the person who said it, at `external_content` trust, so a member's words never
+raise what an approval card trusts. A room's requests recall the room's shared
+details and never a `private` one, the room owner's included. A person's own
+memory reaches a room only through a share they made of one detail: a
+reference read through one narrow path while the share stands, they are still
+in the room and the detail is still remembered at its source, and capped at
+`external_content` trust. Forgetting the detail at its source invalidates any
+room attempt that held it. Members-only shares stay out while a guest is in the
+room. Only a room's owners forget another person's words from its memory; a
+person deletes only their own messages, and the deletion scrubs the copies the
+service made of them. Every such removal is journaled and replayed on restore
+([rooms-memory.test.ts](../apps/openduet/test/integration/rooms-memory.test.ts)).
+
+A guest is invited by an owner for a number of days, through a link that works
+once and names only the room; only the SHA-256 of its token is stored, and the
+token travels in request bodies and the link's fragment, never in a path. A link
+never sets the password of an account that already exists: a guest already here
+accepts while signed in, and a full account is added by an owner instead. A
+guest's sign-in reaches only the room routes, its own account and a room's files
+and computer view; every other route refuses it before it runs, so a surface
+that was never taught about guests never serves one. The public routes that read
+a sign-in themselves refuse a guest too: a guest connects no assistant, an
+assistant's access names only a person, and no space of their own is ever made
+for anyone but a person. Memory scopes refuse a guest and anyone whose place has
+run out. A sweep that cannot end one guest's place says so and goes on to the
+next. Owner-only checks ask
+whether the signed-in person owns the space rather than whether it is a member, so a new
+role is never taken for an owner. A guest never answers a permission, has no
+people list and starts no work of their own. Adding a guest fences the room's
+work like any other change of who is in it, and members-only shares leave the
+agent's next attempt. When the invite's time is up the guest reads nothing from
+that moment, and the expiry sweep ends the membership through the removal path.
+[room-guests.test.ts](../apps/openduet/test/integration/room-guests.test.ts) holds
+each of these as a test.
+
+A room's permissions are answered only by the people the room's rule names: the
+person who asked (the default), any member who is not a guest, or the room's
+owners. The broker checks the rule when it records an answer, whichever route
+the answer came by, against the room's people at that moment: an answer that
+names nobody, the service's own approval key, a guest, the room's principal,
+anyone the rule leaves out and anyone outside the room are all refused, a Deny
+included. A guest's request is answered by the room's owners. Auto-review
+never answers a room's permission, and no standing rule or scope covers room
+work. An answer names the card's version and the exact content's hash, so
+it covers only what the person saw, and it is recorded as theirs. A room never
+makes a standing rule. A recipient, address or amount counts as the asker's
+only when they typed it in their own request; a value another member typed is
+shown on the asker's card as that member's, with a warning, and no saved rule
+admits it. Auto-review judges a room's action against the asker's own words,
+and sees other members' messages labelled with their names. A decision push
+reaches only the people who may answer. Marking a connection for the room is an
+owner's act, and fences work in the room like a change of who is in it. A new
+file saved in a room's space waits for the room's rule: only a person's own
+space lets one through unasked. An app published from a room waits for the
+room's rule too, whatever the space's publishing setting. A connection that
+carries a person's own account serves only their own space, so a room's request
+cannot act through it under any rule; the room hands that person the task.
+[room-approvals.test.ts](../apps/openduet/test/integration/room-approvals.test.ts)
+holds each of these as a test.
+
+Nothing crosses between a room and a person's own space except through the
+built-in room connection, and each crossing is a person's own act. A room's
+request cannot reach anyone's mail, files or memory; it can only hand a person a
+task. The person sees the whole task and accepts it by its hash, so what runs in
+their own space is exactly the text they read, run as their own agent, OpenDuet,
+so it asks before acting wherever their agent would, and recorded as coming from the room:
+an address or amount it names carries a warning on their own card, and no
+standing rule they made admits it. The result reaches the room only when they
+approve that exact text, also by its hash; keeping it private tells the room
+only that they kept it, and a decline or an unanswered handoff tells the room
+nothing more. A result is held with the handoff only while it waits for that
+choice: sharing, keeping, seven days without an answer, the person forgetting
+anything in their own memory, or removing their space clears it, and a cleared
+result cannot be shared. A guest's request hands nothing to anyone, a person
+has at most three handoffs from one room waiting, and a handoff whose request
+was stopped or ended is withdrawn. Only the person a handoff names sees or answers it. From their own
+work a person posts to a room, or copies a checked file into its files, only
+with their approval of the exact room, thread and text or file, and only while
+they are in the room: membership is read again when the action is proposed,
+admitted and carried out. A file never replaces a different one of the same
+name in the room. A person's work lists only the rooms they are in and is
+refused, without detail, for any other
+([room-handoffs.test.ts](../apps/openduet/test/integration/room-handoffs.test.ts)).
+
+A chat platform reaches a room through the same three doors as the web: a
+message coming in, the room's frames going out, and an answer to a permission.
+Behind each door the room runs the same checks it runs for the web. A platform
+account counts only through a link, kept per platform, to a person or guest
+here; it is checked on every message, answer and outgoing frame. The platform's
+adapter makes a link after the platform's own sign-in proves who holds the
+account: that proof is the platform's, and the adapter is trusted to have it.
+An account with no link is refused and is never made a guest, a link is never
+moved to another person, the room's own principal takes none, and one
+platform's link means nothing on another. A person lists and removes their own
+links, and a new password, set by them or through a reset, removes them all, as
+it signs out their sessions. One platform's ids for its messages never reach
+another platform, and each platform's submission ids are kept apart from the
+web's. A platform's display name is dropped: speakers carry the
+room's label, and a button press answers only for the person its account is
+linked to, under the room's rule. Frames go out to one linked person at a time,
+and stop the moment that person leaves the room or the account is unlinked
+([room-surface.test.ts](../apps/openduet/test/integration/room-surface.test.ts)).
+
+What remains: what a member says in a room stays in the room after they leave,
+unless they delete it first or an owner forgets it. The words of a deleted
+message stay in any answer the agent already gave that quoted them, and in the
+agent's working session for the request that read them.
+Under the default rule a member answers the permissions of their own request,
+so a member can have the room's agent act through the room's connections with
+their own approval; owners who want to see every such action choose the
+`owners` rule. Isolation between a room and the rest of the installation is an
+application check, as it is between accounts.
+
+## Attacker 8: anyone who can reach the text-message webhook
+
+A connected Twilio number sends its incoming texts to
+`<OPENDUET_PUBLIC_URL>/api/sms/twilio/<connection>`, a route that takes no
+session because Twilio has none. Anyone on the internet can post to it. The aims
+are to put words in the owner's mouth, to have OpenDuet act on a stranger's text,
+or to make it text someone.
+
+Nothing in a request is believed before its `X-Twilio-Signature` checks out:
+Twilio's HMAC-SHA1 over the exact public address and every posted parameter,
+keyed with the connection's own sealed auth token, compared in constant time.
+The request must also name the connection's account SID and number. A forged
+or altered request, or one signed for another connection, is refused with the
+same 403 whichever check failed, and nothing is stored. The body is limited to
+16 KB like every other public route. Twilio's retry of a message is recognised
+by its `MessageSid` and handled once.
+
+A signed text is Twilio's word for what a phone sent. Only a text whose `From`
+is one of the numbers the owner gave as their own becomes a message in their
+conversation. Every other text is kept for the owner to read and never reaches
+a turn, so a stranger's text is data, never instructions, and nothing is texted
+back to a stranger. A reply goes only to the owner's number that asked. Sending
+to anyone else is `sms.send`, which waits for the owner's approval of the exact
+number and text in the app; nothing can be approved by text.
+
+The tests are `a text whose signature does not match is refused and kept
+nowhere`, `a text from an unknown number is kept for the person to read, never
+as instructions` and `the approval binds the number and the exact text; a
+changed one needs its own` in
+[sms.test.ts](../apps/openduet/test/integration/sms.test.ts), and `a valid
+signature passes and anything changed is refused` in `twilio.test.ts`.
+
+What remains: the owner's numbers are trusted as far as the phone network
+reports them. Someone who can make a text arrive at Twilio from the owner's
+number, by spoofing it or by holding the owner's phone or SIM, can talk to
+OpenDuet as the owner, though every external effect still waits for approval in
+the app. The auth token is both Twilio's credential and the webhook key, so
+whoever holds it can forge texts as well as send them; rotating it in Twilio
+means reconnecting. Anyone can make texts arrive from other numbers; they are
+kept, up to 1,600 characters each, and cost Twilio's inbound price.
+
+## Credentials, host and storage
+
+Connector secrets have tested sealing and scope checks: `stores randomized
+sealed boxes and only decrypts in the owning space` and `rejects a wrong
+master key, changed ciphertext and cross-row swaps`. Provider sign-in tokens use
+the same sealing, bound to the provider name and the row's generation: `a
+sealed record copied onto another provider does not open`. A refresh runs under
+one lock per provider, because an issuer that rotates refresh tokens revokes
+the grant when an old one is used twice: `two services on one database refresh
+once, under the row lock`. Only the setup owner can start, finish or end a
+sign-in, from the same origin, with PKCE and a one-time state checked: `only
+the setup owner manages sign-in, and only from the same origin` and `a
+returned address with another state, or another path, finishes nothing`.
+The broker, API and connectors share one trusted service process. It holds the
+master key and decrypts credentials in ordinary process memory at dispatch, so a
+compromise of that process, or of the host, exposes them. Its database role,
+`openduet_api`, cannot read the `secret` table that holds them sealed (`as
+openduet_api, SELECT on secret fails`); only the secret store reads it, on a
+second pool as `openduet_effects`, and the service refuses to start if its own
+role can (`a service role that can read secrets is refused at start`). A query
+the service runs as its own role, a forgotten clause or an injected one
+included, therefore never returns a row of `secret`. The process holds both
+roles' addresses and the master key, so code running in it reaches both; and
+model provider keys and sign-in tokens, the privacy vault and the relay's
+certificate authority key are sealed in tables its own role can read.
+
+Memory restrictions are checked in Postgres before recall, not merely in a
+filesystem search index. `source and space revocation invalidate delivered
+context and block stale serving` tests that boundary. The restriction journal
+exists to gate memory restore: it records removals, not actions. The action
+ledger is ordinary Postgres state, with no tamper-evident export. See
+[MEMORY](MEMORY.md) for what forgetting reaches.
+
+Removing a space is an owner request over the API. No connector manifest
+declares it and it creates no action, so a model has no path to it;
+`member_cannot_delete_space` and `model_cannot_reach_removal` test both. The
+removal is written to the restriction journal before anything is deleted, so a
+restored snapshot from before it is taken apart again at startup
+(`restore_does_not_resurrect_space`), and it reads complete only after a final
+count finds nothing of the space in any table, on disk or at a provider.
+Connection keys stay valid at the service that issued them until revoked there.
+
+## Verification
+
+Run from the repository root:
+
+```bash
+bun run compose:check
+bun test apps/openduet/src/connectors
+```
+
+The first command checks YAML only; the second uses temporary files, fake
+transports and local protocol fixtures. The container probes run as scenario 6
+when `OPENDUET_CONFORMANCE_COMPOSE=1` is set against a running Linux stack (see
+[service conformance](../conformance/README.md)). The Linux deployment and
+restoration checks use a scripted model and a test destination, so they
+exercise OpenDuet's side of each boundary rather than a live provider or an
+external account.
+
+## Browser worker boundary
+
+The browser worker is a connector process outside the runtime cell. A hostile
+page may influence the model's proposed actions, and a compromised Chromium or
+worker process may read the selected space's browser profile. The controller,
+broker, and container boundary have separate jobs:
+
+- **Controller authority.** Every dispatched input carries its planned
+  `control_epoch`. Takeover increments the epoch immediately, including while
+  another action is waiting for a locator; the next input is refused by the
+  controller. Handback increments it again and requires a fresh observation.
+  The service parks the job as `waiting_for_input`. The local fixture test
+  `controller refuses the second fill after takeover, and handback requires
+  fresh observation` races a second fill against takeover and requires that it
+  is refused with nothing submitted; `takeover during DNS is checked
+  immediately before transport and refuses the queued POST` covers the network
+  path.
+- **Consequential effects.** Form commits use `browser.submit` through the broker's
+  approval, intent-key, and trust-origin gates. The controller binds the observed
+  form and outgoing request to that approved intent. Reversible inputs have no
+  network budget; an approved submit has one matching mutation, and the fixture
+  ledger must record no request the owner did not approve. Unknown commit
+  outcomes are not replayed.
+- **Page networking.** Chromium's direct networking is pointed at a fail-closed
+  proxy, and trusted worker code relays checked requests. Public-address checks,
+  pinned DNS transport, redirect checks, and the private-context domain allow-list
+  apply there. WebSockets and service workers are denied. The public-web
+  compartment does not reuse a signed-in private profile. The fixture transports
+  must see no private-address traffic.
+- **Space and process isolation.** The browser override mounts only
+  `spaces/<space id>` at `/space`, runs uid 10003, and supplies no database URL,
+  vault key, provider key, runtime capability, all-spaces mount, global artifacts
+  root, or runtime work volume. It does not share the runtime or Postgres networks.
+  The YAML tests deliberately add each forbidden mount, credential, network, or
+  privilege and require the configuration check to reject it. The host operator
+  creates and permissions the intended volume subdirectory.
+- **Narrow worker listener.** The control network is shared only with the broker,
+  no control port is published, and a separate worker token is required. The
+  listener accepts bounded JSON requests for health, leases, semantic commands,
+  release, takeover, and handback; it exposes no CDP or arbitrary code endpoint.
+  Browser-originated requests are rejected. The owner-facing control routes use
+  the service's existing authentication and same-origin protection.
+- **The person's live view.** While a person holds control they drive the
+  worker's page through a live view bound to their principal, the session, the
+  control epoch and the client address it was opened from, all checked again on
+  every request along with their authority over the job. Input is a fixed set of
+  typed events; frames are written through and never stored. Their navigation
+  stays within a site scope: the job's allowed domains, the site they took over,
+  sites they allow, and sites an in-scope page leads to within fifteen seconds of
+  their own press, touch or keystroke, at most three for each burst of activity
+  and twelve in all; a site added this way is a public one. The public-address floor and
+  pinned DNS apply throughout. Nothing they type reaches an event, a recipe, a log or an
+  artifact. Until an automation action loads a new document, every observation
+  of the handed-back page keeps its roles and control names with no values, no
+  page text, no screenshot and no query string, and reading its text is refused.
+  `another principal in the same space cannot open, read or drive the live
+  view`, `no persisted event contains the typed secret or the identity-provider
+  host`, `a handed-back page is looked at without its contents until automation
+  leaves it` and `a page cannot walk the person to new sites without them
+  acting` cover these.
+
+The worker can reach the internet by design, for the person's authorised sites.
+The relay policy constrains an intact worker; a compromised Node process can
+use its own outbound sockets and can steal or alter its mounted browser profile.
+It can read whatever the configured uid may read within that one mounted space.
+It has no direct mount of the vault, runtime cell, or another space. The worker
+is a container on the host kernel rather than a virtual machine. Chromium runs
+with its renderer sandbox: each renderer is in user, pid and network namespaces
+of its own under a seccomp filter, so a compromised renderer must also escape
+that sandbox to gain the worker's access. The container's seccomp profile,
+`deploy/config/browser-seccomp.json`, is the engine default with only the
+namespace and `chroot` calls that sandbox needs added, and the renderer sandbox
+is checked in CI by the `browser-sandbox` job. A kernel compromise removes the
+remaining boundaries.
+
+Docker bridge membership is not directional. A compromised worker can reach the
+OpenDuet service ports on `browser-control`, even though it cannot directly join the
+runtime or database network. The worker token grants no authority to those ports;
+owner authentication and broker capability checks must continue to reject it.
+OpenDuet holds credentials in the same process as the API, so an exploitable
+service bug remains a route to them.
+
+Development on Windows uses a same-user child process with a restricted
+environment, not an OS isolation boundary. Production requires an explicitly
+configured isolated endpoint and never silently starts that development child.
+The endpoint address is trusted operator configuration, not an attestation of
+the remote deployment. Takeover supplies fencing, owner control routes and the
+live view through which a person signs in to a site. Recipes and episodes
+exclude authentication factors, while Chromium's private profile retains the
+cookies of a signed-in site. The space records which sites those are, never the
+cookies, and its owner can sign it out of one, which clears that site's cookies
+and stored data from the profile.
+
+`bun run deploy/scripts/browser-compose-check.ts` checks deployment
+configuration, including that the seccomp profile is the pinned engine default
+plus exactly its three additions; the browser and integration tests check live
+controller behaviour on local fixtures. Unlike the runtime cell, which scenario
+6 probes from inside, the worker's network boundary rests on that checked
+configuration: no conformance
+scenario builds the browser image, starts the stack with the browser override,
+or probes the worker's network from inside it. Installation and operation are
+described in [browser-worker.md](browser-worker.md).
+
+## Paired computer boundary
+
+A person can pair their own computer with a one-time code from Settings (see
+[connecting your computer](DEVICES.md)). The companion there holds one outbound connection and
+authenticates every call with a device token; nothing on the computer listens.
+
+- **Pairing.** A code is eight characters from a 31-letter alphabet, stored only as a SHA-256
+  hash, usable once, and valid for ten minutes. It is spent in the same statement that checks it,
+  so two companions racing with one code cannot both pair. Wrong codes are throttled per client
+  address. Only the owner of a personal space makes codes, and the code's maker must still own the
+  space when it is used.
+- **Token.** 32 random bytes, returned once to the companion, stored by the service only as a hash,
+  and kept on the computer in a file only its user can read. Revoking the device, or its
+  connection, makes every companion route answer 401 at once; the companion then deletes its copy.
+- **Authority.** A computer is an ordinary connection to the broker. Its scopes are the tools both
+  Settings and the companion allow, recomputed whenever either side changes. `device.run` and
+  `device.write_file` require payload-bound approval, or an owner rule that covers them.
+- **Paths.** The service refuses a path that is not a shared folder name followed by plain
+  segments before anything is queued. The companion checks the same rule again, refuses any
+  symbolic link or junction on the way, opens files with `O_NOFOLLOW` where the platform has it,
+  and confirms the resolved path is inside the folder's real location.
+- **What it does not contain.** An approved command runs as the person, with their rights, and is
+  not confined to the shared folder. The approval shows the exact command; that is the control.
+- **Lost answers.** A request the computer collected but did not answer is recorded as `unknown`
+  and never re-sent blindly. One it never collected waits for the computer (parked, like a rate
+  limit) and is sent when the computer connects again; a stopped conversation sends nothing that
+  waited.
+- **The person's browser.** Browser work goes to an extension the person installs and switches on,
+  through native messaging to the companion; no port is opened. The extension acts only in tabs it
+  opened, shows a bar with Stop on each, refuses password, one-time-code and card fields, and has
+  no cookie permission. Clicks and typing need approval. Page text it returns is untrusted content,
+  like any page the cloud browser reads.
+
+## Tailnet access boundary
+
+The optional Tailscale override puts one node in front of the web client so the
+installation can be reached from the owner's own devices without a published
+port. The node is an additional way in, and the boundary it adds is this.
+
+The node joins the `edge` network and no other, so it cannot address the
+database network, the runtime network, or the browser control network, and it
+receives no Docker socket, no database URL, no vault key and no provider key.
+Its serve configuration forwards the root of one host to `http://web:3000` and
+proxies nothing else, so a peer on the tailnet reaches the sign-in page and
+whatever a signed-in browser can reach through it, on the same routes a browser
+on `localhost:3101` reaches. `AllowFunnel` is false for that host, so the
+address answers peers on the tailnet rather than the public internet, and the
+node publishes no host port of its own. `bun run tailscale:compose:check`
+rejects a change to any of those properties, and a rejection test covers each
+one.
+
+Reaching the sign-in page is not signing in. The password, the per-address and
+per-account limits, and the device cookie apply to a tailnet peer as they apply
+to any other browser. Tailscale states the requesting user on a proxied
+request; the service reads no such header as identity, and the web server
+removes every `Tailscale-` header from every request before the API sees it,
+whichever socket it arrived on, because Serve rewrites only the names it owns
+and forwards the rest as the browser sent them. The address in
+`X-Forwarded-For` is believed on a connection from the node named in
+`OPENDUET_WEB_TRUSTED_UPSTREAM` and from nowhere else, so a browser cannot choose
+the bucket its sign-in attempts are counted in.
+
+What this leaves in place: every device on the tailnet can open the address
+unless the tailnet policy file restricts the node, and a peer that reaches it is
+an unauthenticated client at the sign-in form, which is
+[attacker 6](#attacker-6-a-remote-client-at-the-sign-in-form). A device already
+holding a valid session cookie carries the session, as it would anywhere. The
+node's own key on the `tailscale-state` volume authenticates the node to the
+tailnet, and a host user who can read that volume can impersonate the node
+there. Tailscale's control plane issues the certificate for the name, so the
+tailnet's own administration is part of this boundary. The node was verified
+from its YAML and from the checks above; a joined node on a real tailnet is a
+separate step, described in [deployment](DEPLOYMENT.md#tailscale).

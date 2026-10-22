@@ -1,0 +1,305 @@
+import { type CapabilityClaims, inputTokenAllowance, inputTokenCeiling } from '@openduet/contracts';
+import type { Sql } from 'postgres';
+import { asksForDepth, BRIEF_TURN_CHARS } from '../gateway/effort.ts';
+import type { PriceTable } from '../gateway/prices.ts';
+import { allowedWithRoutes } from '../gateway/routing.ts';
+import { settledCost } from '../gateway/spending.ts';
+import {
+  type GatewayBudget,
+  GatewayError,
+  type GatewayPrincipal,
+  type GatewayReservation,
+  type GatewayReservationRequest,
+  type GatewayRoutes,
+  type GatewaySettlement,
+} from '../gateway/types.ts';
+import { allowedRoutes, modelAllowed, spaceRulesFor } from '../spaces/policy.ts';
+import { dollarsSpentLocked, remainingOutputTokensLocked, reserveLocked } from './budget.ts';
+import { verifyCapability } from './capability.ts';
+import { BrokerFault } from './errors.ts';
+import { appendEvent, checkAttempt, lockJob, recordId } from './records.ts';
+
+type ModelChoice = { provider: string; model: string };
+
+/** Gateway evidence uses the existing event/attempt/ledger contracts; no parallel store. */
+export class PostgresGatewayBudget implements GatewayBudget {
+  private readonly claims = new WeakMap<GatewayPrincipal, CapabilityClaims>();
+
+  constructor(
+    private readonly options: {
+      sql: Sql;
+      capabilityKey: string;
+      /**
+       * The operator's alternatives for an attempt on this model: a vision
+       * model and fallbacks. None for a model the owner chose in the app.
+       * Called after the admission's transaction commits, so it may read the pool.
+       */
+      routes?: (
+        attempt: ModelChoice & { usageClass: 'interactive' | 'background' },
+      ) => Promise<GatewayRoutes | undefined>;
+      /**
+       * Set, each model call is charged its estimated cost from this price
+       * table against the job's dollar limit (`max_usd_est`), beside its
+       * actions; a call is refused once the limit is spent.
+       */
+      modelDollars?: PriceTable;
+    },
+  ) {}
+
+  async authenticate(token: string): Promise<GatewayPrincipal> {
+    let claims: CapabilityClaims;
+    try {
+      claims = verifyCapability(token, this.options.capabilityKey);
+    } catch {
+      throw new GatewayError(401, 'capability_denied');
+    }
+    try {
+      const admitted = await this.options.sql.begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        const [attempt] = await tx`select a.provider, a.model, a.class, t.text as turn_text
+          from attempt a left join experience_turn t on t.id = a.turn_id
+          where a.id = ${claims.attempt_id}`;
+        if (!attempt) throw new BrokerFault('stale_epoch');
+        const primary = { provider: String(attempt.provider), model: String(attempt.model) };
+        // A person's short message is answered thinking one step less.
+        const briefTurn =
+          typeof attempt.turn_text === 'string' &&
+          attempt.turn_text.trim().length > 0 &&
+          attempt.turn_text.length <= BRIEF_TURN_CHARS;
+        // One who asks for depth gets a step more, however short the message.
+        const deepTurn = typeof attempt.turn_text === 'string' && asksForDepth(attempt.turn_text);
+        // The space's rules bound every model a call may reach: one changed
+        // since the attempt started is refused, and a route they leave out is
+        // not offered.
+        const rules = await spaceRulesFor(tx, job.space_id);
+        if (!modelAllowed(rules, primary)) throw new GatewayError(403, 'model_denied');
+        return {
+          primary,
+          rules,
+          usageClass:
+            attempt.class === 'background' ? ('background' as const) : ('interactive' as const),
+          principal: {
+            jobId: job.id,
+            attemptId: claims.attempt_id,
+            privacy: { kind: 'job' as const },
+            epoch: claims.epoch,
+            revision: claims.revision,
+            maxRequests: job.budget.max_turns,
+            maxTokens: Math.min(job.budget.max_output_tokens, claims.budget.max_output_tokens),
+            remainingTokens: await remainingOutputTokensLocked(tx, job, claims),
+            maxInputTokens: Math.min(
+              inputTokenCeiling(attempt.model, job.budget),
+              inputTokenCeiling(attempt.model, claims.budget),
+            ),
+            ...(briefTurn ? { briefTurn } : {}),
+            ...(deepTurn ? { deepTurn } : {}),
+            // Every conversation of one person in one space shares a provider cache.
+            cacheScope: [job.space_id, job.principal_id ?? ''].join('\u0000'),
+          },
+        };
+      });
+      // The operator's routes come from the model settings, read on the pool,
+      // so they are read once the lock is released: a pool read while it is
+      // held waits behind every event writer queued on it. The rules read
+      // under the lock still decide which of them are offered.
+      const { primary, rules, usageClass } = admitted;
+      const routes = allowedRoutes(rules, await this.options.routes?.({ ...primary, usageClass }));
+      const principal: GatewayPrincipal = {
+        ...admitted.principal,
+        allowedModels: allowedWithRoutes(primary, routes),
+        ...(routes ? { routes } : {}),
+      };
+      this.claims.set(principal, claims);
+      return principal;
+    } catch (error) {
+      throw this.failure(error);
+    }
+  }
+
+  async reserve(request: GatewayReservationRequest): Promise<GatewayReservation> {
+    const claims = this.claims.get(request.principal);
+    if (!claims) throw new GatewayError(401, 'capability_denied');
+    if (
+      !request.principal.allowedModels.some(
+        (choice) => choice.provider === request.provider && choice.model === request.model,
+      )
+    ) {
+      throw new GatewayError(403, 'model_denied');
+    }
+    if (
+      !Number.isSafeInteger(request.estimatedTokens) ||
+      request.estimatedTokens < 1 ||
+      !Number.isSafeInteger(request.maxOutputTokens) ||
+      request.maxOutputTokens < 1 ||
+      request.maxOutputTokens > request.estimatedTokens
+    )
+      throw new GatewayError(429, 'budget_exceeded');
+    try {
+      return await this.options.sql.begin(async (tx) => {
+        const job = await lockJob(tx, claims.job_id);
+        await checkAttempt(tx, job, claims);
+        const dedup = `gateway:request:${claims.attempt_id}:${request.requestId}`;
+        const [previous] = await tx`select payload from event where dedup_key = ${dedup}`;
+        // HTTP retries are new calls; only an internal retry of reservation may reuse this id.
+        if (previous) throw new GatewayError(409, 'request_already_reserved');
+        const [attempt] =
+          await tx`select provider, model from attempt where id = ${claims.attempt_id}`;
+        if (!attempt) throw new BrokerFault('stale_epoch');
+        // Another model than the attempt's is served only on a route the
+        // principal was issued with, checked above against `allowedModels`.
+        const fallback = request.provider !== attempt.provider || request.model !== attempt.model;
+        const inputTokens = request.estimatedTokens - request.maxOutputTokens;
+        // The window less this request's own output. The job's output budget
+        // is spent across its requests and is checked by the reservation below.
+        const inputLimit = Math.min(
+          inputTokenAllowance(request.model, request.maxOutputTokens, job.budget),
+          inputTokenAllowance(request.model, request.maxOutputTokens, claims.budget),
+        );
+        if (inputTokens > inputLimit) throw new GatewayError(413, 'input_context_exceeded');
+        if (this.options.modelDollars && (await dollarsSpentLocked(tx, job, claims)))
+          throw new BrokerFault('budget_exceeded');
+        const reservations = await reserveLocked(tx, job, claims, null, [
+          { kind: 'calls', amount: 1 },
+          { kind: 'tokens', amount: request.maxOutputTokens },
+        ]);
+        const token = reservations.find((row) => row.kind === 'tokens');
+        const calls = reservations.find((row) => row.kind === 'calls');
+        if (!token || !calls) throw new Error('Incomplete gateway reservation');
+        await appendEvent(
+          tx,
+          job.id,
+          claims.attempt_id,
+          'notice',
+          {
+            phase: 'model_request',
+            reservation_id: token.id,
+            calls_ledger_id: calls.id,
+            request_id: request.requestId,
+            provider: request.provider,
+            model_requested: request.model,
+            estimated_tokens: request.estimatedTokens,
+            estimated_input_tokens: inputTokens,
+            max_input_tokens: inputLimit,
+            max_output_tokens: request.maxOutputTokens,
+            fallback,
+          },
+          dedup,
+        );
+        return { id: token.id };
+      });
+    } catch (error) {
+      throw this.failure(error);
+    }
+  }
+
+  async settle(reservation: GatewayReservation, result: GatewaySettlement): Promise<void> {
+    const sql = this.options.sql;
+    const [entry] =
+      await sql`select job_id, attempt_id from budget_ledger where id = ${reservation.id} and kind = 'tokens' and action_id is null`;
+    if (!entry) throw new GatewayError(409, 'reservation_not_found');
+    await sql.begin(async (tx) => {
+      const job = await lockJob(tx, entry.job_id);
+      const dedup = `gateway:receipt:${reservation.id}`;
+      const [settled] = await tx`select seq from event where dedup_key = ${dedup}`;
+      if (settled) return;
+      const [request] =
+        await tx`select payload from event where job_id = ${job.id} and attempt_id = ${entry.attempt_id}
+        and payload->>'phase' = 'model_request' and payload->>'reservation_id' = ${reservation.id}`;
+      if (
+        !request ||
+        request.payload.provider !== result.provider ||
+        request.payload.model_requested !== result.modelRequested
+      ) {
+        throw new GatewayError(409, 'reservation_mismatch');
+      }
+      const [attempt] =
+        await tx`select epoch, usage, outcome_detail from attempt where id = ${entry.attempt_id} for update`;
+      if (!attempt) throw new GatewayError(409, 'attempt_not_found');
+      const late = attempt.epoch !== job.lease_epoch;
+      const usage = result.usage;
+      if (
+        usage &&
+        (![usage.inputTokens, usage.outputTokens, usage.totalTokens, usage.cachedInputTokens].every(
+          (value) => Number.isSafeInteger(value) && value >= 0,
+        ) ||
+          usage.totalTokens < usage.inputTokens + usage.outputTokens)
+      )
+        throw new GatewayError(502, 'invalid_usage');
+      if (!Number.isFinite(result.latencyMs) || result.latencyMs < 0)
+        throw new GatewayError(502, 'invalid_latency');
+      if (usage)
+        await tx`update budget_ledger set settled = ${usage.outputTokens} where id = ${reservation.id}`;
+      await tx`update budget_ledger set settled = reserved where id = ${request.payload.calls_ledger_id}`;
+      // The call's dollars, against the job's dollar limit, where they count.
+      const dollars = this.options.modelDollars
+        ? settledCost(this.options.modelDollars, result)
+        : 0;
+      if (dollars > 0)
+        await tx`insert into budget_ledger (id, job_id, attempt_id, action_id, kind, reserved, settled)
+          values (${recordId('led')}, ${job.id}, ${entry.attempt_id}, null, 'usd_est', ${dollars}, ${dollars})`;
+      const previous = attempt.usage ?? {};
+      const accumulated = {
+        input_tokens: Number(previous.input_tokens ?? 0) + (usage?.inputTokens ?? 0),
+        output_tokens: Number(previous.output_tokens ?? 0) + (usage?.outputTokens ?? 0),
+        cached_input_tokens:
+          Number(previous.cached_input_tokens ?? 0) + (usage?.cachedInputTokens ?? 0),
+        // Input at full-price-equivalent tokens, cached input at its cached price.
+        // An attempt recorded before this was kept counts its raw input.
+        charged_input_tokens:
+          Number(previous.charged_input_tokens ?? previous.input_tokens ?? 0) +
+          (usage ? (usage.chargedInputTokens ?? usage.inputTokens) : 0),
+        requests: Number(previous.requests ?? 0) + 1,
+        usd_est: Number(previous.usd_est ?? 0) + dollars,
+      };
+      const detail = {
+        ...(attempt.outcome_detail ?? {}),
+        gateway_usage_uncertain:
+          attempt.outcome_detail?.gateway_usage_uncertain === true ||
+          usage === null ||
+          result.usageEstimated === true,
+      };
+      await tx`update attempt set model_actual = coalesce(${result.modelActual}, model_actual),
+        usage = ${JSON.stringify(accumulated)}::jsonb,
+        outcome_detail = ${JSON.stringify(detail)}::jsonb where id = ${entry.attempt_id}`;
+      await appendEvent(
+        tx,
+        job.id,
+        entry.attempt_id,
+        'notice',
+        {
+          phase: 'model_receipt',
+          reservation_id: reservation.id,
+          provider: result.provider,
+          model_requested: result.modelRequested,
+          model_actual: result.modelActual,
+          usage: usage
+            ? {
+                input_tokens: usage.inputTokens,
+                output_tokens: usage.outputTokens,
+                cached_input_tokens: usage.cachedInputTokens,
+                charged_input_tokens: usage.chargedInputTokens ?? usage.inputTokens,
+                total_tokens: usage.totalTokens,
+              }
+            : null,
+          latency_ms: result.latencyMs,
+          status: result.status,
+          http_status: result.httpStatus,
+          ...(result.failure ? { failure: result.failure } : {}),
+          usage_uncertain: usage === null || result.usageEstimated === true,
+          late,
+          ...(result.stopped ? { stopped: true } : {}),
+          ...(result.privacy ? { privacy: result.privacy } : {}),
+          ...(result.route ? { route: result.route, routed_from: result.routedFrom } : {}),
+        },
+        dedup,
+      );
+    });
+  }
+
+  private failure(error: unknown): unknown {
+    if (error instanceof BrokerFault)
+      return new GatewayError(error.code === 'budget_exceeded' ? 429 : 403, error.code);
+    return error;
+  }
+}

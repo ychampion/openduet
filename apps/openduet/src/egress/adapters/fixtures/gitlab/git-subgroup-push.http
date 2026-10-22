@@ -1,0 +1,18 @@
+# git push origin openduet/docs (a project in a subgroup)
+
+### read
+GET https://gitlab.com/acme/team/site.git/info/refs?service=git-receive-pack
+user-agent: git/2.53.0
+accept: */*
+
+### write base64
+POST https://gitlab.com/acme/team/site.git/git-receive-pack
+user-agent: git/2.53.0
+accept: application/x-git-receive-pack-result
+content-type: application/x-git-receive-pack-request
+
+MDBjYTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAgN2ZkZTg2MTVkNmNkODk3YzNiNDVhYWYyOWExZDU0
+Nzc5OTE2ODZhYiByZWZzL2hlYWRzL29wZW5kdWV0L2RvY3MAIHJlcG9ydC1zdGF0dXMtdjIgc2lkZS1iYW5kLTY0ayBxdWlldCBv
+YmplY3QtZm9ybWF0PXNoYTEgYWdlbnQ9Z2l0LzIuNTMuMC53aW5kb3dzLjItV2luZG93czAwMDBQQUNLAAAAAgAAAAGbC3icjYpB
+CgIxDADvfUXvgqTdbJuAiIIfadIsCtZd1go+3z7BOQ3D9N3Mo1CcqyaMKsmECySwGWWhmjgSLWKGDOi2sture56YQs6a40Riw0KS
+hXGGSrGoIQVNoU7oyqff191f/alc7Fva9rSjru3sQ2agEAnAH2DgRm2P3u2v2d1Wfbsfoto0YgrXieelnVD7xnSsY1DtSSlNptsW

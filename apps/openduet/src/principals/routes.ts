@@ -1,0 +1,206 @@
+import {
+  createPrincipalRequest,
+  createSharedSpaceRequest,
+  grantMembershipRequest,
+  space as spaceContract,
+  updateAccountRequest,
+} from '@openduet/contracts';
+import { eq } from 'drizzle-orm';
+import type { Hono } from 'hono';
+import { INVITE_PUBLIC_PATHS } from '../api/auth.ts';
+import { COMPOSIO_EVENTS_PATH } from '../api/composio.ts';
+import { ServiceError } from '../api/errors.ts';
+import type { Database } from '../db/client.ts';
+import {
+  action,
+  approval,
+  backgroundOperation,
+  connection,
+  notification,
+  owner,
+  question,
+  replyObligation,
+} from '../db/schema.ts';
+import { IDENTITY_JWKS_PATH } from '../identity/assertion.ts';
+import type { JobService } from '../jobs/service.ts';
+import { mcpPublicPath } from '../mcp-server/actor.ts';
+import { PAGE_REPORT_PATH } from '../pages/routes.ts';
+import { REACH_WEBHOOK_PATH } from '../reach/routes.ts';
+import { previewPath } from '../sandbox/preview-path.ts';
+import { SMS_WEBHOOK_PATH } from '../sms/routes.ts';
+import { viewPath } from '../viewer/headers.ts';
+import { managesConnection, requireJobAccess, spaceAuthority } from './authority.ts';
+import { PrincipalService } from './service.ts';
+
+/** Resource IDs and space headers select a resource; authenticated membership authorizes it. */
+export function mountPrincipals(
+  app: Hono,
+  db: Database | null,
+  spacesRoot: string,
+  jobs?: JobService,
+) {
+  if (!db) return;
+  const service = new PrincipalService(db, spacesRoot, jobs);
+  app.use('*', async (c, next) => {
+    if (
+      ['/health', '/health/detail', '/setup', '/login', '/oauth/client-metadata.json'].includes(
+        c.req.path,
+      ) ||
+      // A room invite is opened and accepted before its guest has an account; it checks itself.
+      INVITE_PUBLIC_PATHS.includes(c.req.path) ||
+      // An assistant's OAuth and MCP requests carry no session; their routes check for themselves.
+      (!c.get('owner') && mcpPublicPath(c.req.method, c.req.path))
+    )
+      return next();
+    // A paired computer's companion has no session; each of its routes checks its token.
+    if (c.req.path.startsWith('/device/')) return next();
+    // The telephony provider's webhooks carry no session; reach/routes.ts checks their signature.
+    if (c.req.method === 'POST' && REACH_WEBHOOK_PATH.test(c.req.path) && !c.get('owner'))
+      return next();
+    // A framed app's file read carries a token, not a session; apps/serve.ts checks it.
+    if (viewPath(c.req.method, c.req.path) && !c.get('owner')) return next();
+    // So does a preview's; sandbox/preview.ts checks its token.
+    if (previewPath(c.req.method, c.req.path) && !c.get('owner')) return next();
+    // A text to a person's own Twilio connection has none either; sms/routes.ts checks its signature.
+    if (c.req.method === 'POST' && SMS_WEBHOOK_PATH.test(c.req.path) && !c.get('owner'))
+      return next();
+    // So does a trigger delivery from Composio; api/composio.ts checks its signature.
+    if (c.req.method === 'POST' && c.req.path === COMPOSIO_EVENTS_PATH && !c.get('owner'))
+      return next();
+    // A connection's server reads the identity keys, and reports on its page,
+    // without a session; the report is believed only for its signature.
+    if (c.req.method === 'GET' && c.req.path === IDENTITY_JWKS_PATH && !c.get('owner'))
+      return next();
+    if (c.req.method === 'POST' && PAGE_REPORT_PATH.test(c.req.path) && !c.get('owner'))
+      return next();
+    const actor = c.get('owner').id;
+    const path = c.req.path;
+    const parts = path.split('/').filter(Boolean);
+    const resource = parts[0];
+    const id = parts[1];
+    const method = c.req.method;
+    const headerSpace = c.req.header('x-openduet-space');
+    const querySpace = c.req.query('space_id');
+    if (headerSpace) await spaceAuthority(db, headerSpace, actor);
+    if (querySpace) await spaceAuthority(db, querySpace, actor);
+    const queryJob = c.req.query('job_id');
+    if (queryJob) await requireJobAccess(db, queryJob, actor);
+    if (resource === 'jobs' && id) await requireJobAccess(db, id, actor);
+    // Asking for a removal, or how one is going, is answered by the removal
+    // itself: its fence checks the owner, and its record names who asked.
+    // Everything else under a space under removal is refused below.
+    const removalRequest =
+      resource === 'spaces' &&
+      ((method === 'DELETE' && parts.length === 2) ||
+        (method === 'GET' && parts.length === 3 && parts[2] === 'removal'));
+    // A space's activity log is read by its owners and by the person who set
+    // the installation up, who need not be in the space; spaces/audit.ts
+    // checks exactly that on both of its routes.
+    const auditRead =
+      resource === 'spaces' &&
+      method === 'GET' &&
+      parts[2] === 'audit' &&
+      (parts.length === 3 || (parts.length === 4 && parts[3] === 'export'));
+    // A space's rules answer for themselves too: the setup owner sets them for
+    // any space, including one they are not a member of (spaces/policy.ts).
+    const rulesRequest = resource === 'spaces' && parts.length === 3 && parts[2] === 'policy';
+    if (
+      resource === 'spaces' &&
+      id &&
+      id !== 'shared' &&
+      !removalRequest &&
+      !auditRead &&
+      !rulesRequest
+    ) {
+      const access = await spaceAuthority(db, id, actor);
+      if (method !== 'GET' && access.role !== 'owner')
+        throw new ServiceError('scope_denied', 'Space administration requires its owner.', 403);
+    }
+    if (resource === 'connections' && id) {
+      const [row] = await db.select().from(connection).where(eq(connection.id, id));
+      if (!row || !managesConnection(await spaceAuthority(db, row.spaceId, actor), row.sharedUse))
+        throw new ServiceError('scope_denied', 'Connection is not accessible.', 403);
+    }
+    if (resource === 'approvals' && id) {
+      const [row] = await db
+        .select({ jobId: action.jobId })
+        .from(approval)
+        .innerJoin(action, eq(action.id, approval.actionId))
+        .where(eq(approval.id, id));
+      if (!row) throw new ServiceError('not_found', 'Approval not found.', 404);
+      await requireJobAccess(db, row.jobId, actor);
+    }
+    if (
+      id &&
+      ['operations', 'notifications', 'reply-obligations', 'questions'].includes(resource ?? '')
+    ) {
+      const table =
+        resource === 'operations'
+          ? backgroundOperation
+          : resource === 'notifications'
+            ? notification
+            : resource === 'reply-obligations'
+              ? replyObligation
+              : question;
+      const [row] = await db.select({ jobId: table.jobId }).from(table).where(eq(table.id, id));
+      if (row?.jobId) await requireJobAccess(db, row.jobId, actor);
+      else if (resource === 'questions') {
+        const [entry] = await db.select().from(question).where(eq(question.id, id));
+        if (!entry?.spaceId || (await spaceAuthority(db, entry.spaceId, actor)).role !== 'owner')
+          throw new ServiceError('scope_denied', 'Question is not accessible.', 403);
+      } else throw new ServiceError('scope_denied', 'Resource is not accessible.', 403);
+    }
+    if (path.startsWith('/internal/')) {
+      const [installation] = await db.select({ id: owner.id }).from(owner).limit(1);
+      if (installation?.id !== actor)
+        throw new ServiceError(
+          'scope_denied',
+          'Internal administration requires the setup owner.',
+          403,
+        );
+    }
+    return next();
+  });
+
+  app.post('/principals', async (c) => {
+    const request = createPrincipalRequest.parse(await c.req.json());
+    const made = await service.create(c.get('owner').id, request.email, request.password);
+    c.set('createdSpaceId', made.spaceId);
+    return c.json({ principal: made.principal }, 201);
+  });
+  app.patch('/principals/:id', async (c) => {
+    const request = updateAccountRequest.parse(await c.req.json());
+    return c.json(await service.setAdmin(c.get('owner').id, c.req.param('id'), request.admin));
+  });
+  app.post('/spaces/shared', async (c) => {
+    const request = createSharedSpaceRequest.parse(await c.req.json());
+    const row = await service.createShared(c.get('owner').id, request.name);
+    if (!row) throw new Error('Space insert returned no row');
+    c.set('createdSpaceId', row.id);
+    return c.json(
+      {
+        space: spaceContract.parse({
+          id: row.id,
+          name: row.name,
+          kind: row.kind,
+          audience: row.audience,
+          owner_principal_id: row.ownerPrincipalId,
+          created_at: row.createdAt.toISOString(),
+        }),
+      },
+      201,
+    );
+  });
+  app.post('/spaces/:id/memberships', async (c) => {
+    const request = grantMembershipRequest.parse(await c.req.json());
+    return c.json(
+      {
+        membership: await service.grant(c.get('owner').id, c.req.param('id'), request.principal_id),
+      },
+      201,
+    );
+  });
+  app.delete('/spaces/:id/memberships/:principalId', async (c) =>
+    c.json(await service.revoke(c.get('owner').id, c.req.param('id'), c.req.param('principalId'))),
+  );
+}

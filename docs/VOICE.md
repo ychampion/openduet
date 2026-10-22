@@ -1,0 +1,247 @@
+# Voice
+
+OpenDuet can listen and speak. One ElevenLabs API key turns on these:
+
+| Feature | What it does |
+| --- | --- |
+| Speech (`audio.synthesize`) | Reads a script aloud and saves the audio as a WAV file in the space's finished work. |
+| Transcription (`audio.transcribe`) | Turns an audio or video file from the space's files into a transcript, with each speaker labelled and timed, saved as Markdown in the space's finished work. |
+| Push-to-talk | A microphone button in the chat's message box. Tap to record, tap again to stop. The words appear in the box for you to read, change and send. |
+| Voice mode | A hands-free call in a chat. You talk, OpenDuet answers out loud and keeps talking with you while it works, and you can talk over it to stop it. |
+| Calls | A live call with the chat's agent through ElevenLabs Speech Engine, when the installation has a public `https://` address. It takes the place of voice mode there. |
+
+Without a key none of these appear, and nothing else changes.
+
+## Set it up
+
+1. Create an API key in your ElevenLabs account. Give it access to text to
+   speech, speech to text and single-use tokens.
+2. Put it in `deploy/.env`:
+
+   ```bash
+   ELEVENLABS_API_KEY=your-key
+   ```
+
+   Or export it before the first `configure.ts` run, which writes it for you:
+
+   ```bash
+   read -rs ELEVENLABS_API_KEY && export ELEVENLABS_API_KEY
+   bun run deploy/scripts/configure.ts
+   unset ELEVENLABS_API_KEY
+   ```
+
+3. Recreate the service: `docker compose -f deploy/docker-compose.yml up -d openduet`.
+
+Every existing space gains a **Speech** and a **Transcription** connection at
+the next start. Either can be removed in Settings like any other connection,
+and a removed one is not added back.
+
+The key stays in the service. The browser never receives it: voice mode is
+given a single-use token that works once and expires after 15 minutes.
+
+The microphone needs a secure page: `https://`, or `localhost` on the machine
+itself. Over plain `http://` from another device, the browser refuses the
+microphone and OpenDuet says so.
+
+## Settings
+
+All optional. An empty value uses the default.
+
+| Setting | Default | What it sets |
+| --- | --- | --- |
+| `ELEVENLABS_VOICE_ID` | `JBFqnCBsd6RMkjVDRZzb` | The voice for speech and voice mode, from your ElevenLabs voice library. |
+| `ELEVENLABS_SECOND_VOICE_ID` | the first voice | The second voice in a two-person script. |
+| `ELEVENLABS_SPEECH_MODEL` | `eleven_multilingual_v2` | The model that makes speech files. |
+| `ELEVENLABS_STREAMING_MODEL` | `eleven_flash_v2_5` | The model that reads replies in voice mode, chosen for low delay. |
+| `ELEVENLABS_TRANSCRIPTION_MODEL` | `scribe_v2` | The model for transcription and push-to-talk. Voice mode listens with `scribe_v2_realtime`, the only realtime model. |
+| `OPENDUET_VOICE_DAILY_SECONDS` | not set (no cap) | Seconds of push-to-talk recording one person may have transcribed in a day, for example `1800`. |
+| `OPENDUET_VOICE_DAILY_CHARACTERS` | not set (no cap) | Characters of replies one person may have read aloud in a day, for example `20000`. |
+| `OPENDUET_VOICE_DAILY_SESSIONS` | not set (no cap) | Voice mode conversations one person may start in a day, for example `30`. |
+| `OPENDUET_VOICE_DAILY_ASIDES` | not set (no cap) | Asides (short words with the agent while it works in voice mode) one person may have in a day. |
+| `ELEVENLABS_SPEECH_ENGINE_ID` | made at the first call | A speech engine of your own for calls (`seng_…`). |
+| `OPENDUET_CALL_MONTHLY_MINUTES` | not set (no cap) | Minutes of calls one person may have in 30 days. A call that reaches the cap ends. |
+
+The caps are the operator's choice and none is set unless you set it; use is
+counted either way, so a cap set later holds from the first day. A day is the
+last 24 hours, counted per person across all their spaces. A request the
+speech service refuses does not count; one that was sent and never answered
+does, because the service may have done the work.
+
+## What each feature does
+
+### Speech and transcription
+
+These are capabilities an agent uses while it works, for example to turn a
+script into an episode or a recorded call into notes. Each one is a paid call,
+so each asks for your approval first, with the exact file and settings shown,
+and is held against the job's budget. The result is a file in the space's
+finished work, and the receipt records its size and content hash.
+
+Transcription reads files up to 100 MB in these formats: AAC, FLAC, M4A, MKV,
+MOV, MP3, MP4, MPEG, OGG, Opus, WAV and WebM. The transcript starts a new
+paragraph when the speaker changes, and after a minute of one speaker.
+
+If an OpenAI key is set and no ElevenLabs key, speech uses OpenAI and there is
+no transcription, push-to-talk or voice mode.
+
+### Push-to-talk
+
+- A recording can be up to 2 minutes. The recorder stops itself at 2 minutes.
+- A recording can be up to 5 MB. Two minutes of speech is well under that.
+- The words are never sent for you. They land in the message box, after
+  anything already typed there.
+- The recording is not kept. It is passed to ElevenLabs once and discarded.
+
+### Voice mode
+
+Voice mode is a call with the chat's agent. Open it with the voice button in a
+chat's header. In a new chat, the button starts the chat first.
+
+The call shows the agent's name and face, how long the call has run, and two
+captions: what you said last and what the agent said last.
+
+- **Listening**: say what you need. When you pause, what you said is sent as an
+  ordinary message in the chat, exactly as if you had typed it. Memory, rules,
+  approvals and the tool trail work the same way.
+- **Working**: the agent is on it, and the trail shows what it is doing. The
+  call keeps talking while it works:
+  - Ask how it is going, or anything quick, and you get a short answer out loud.
+  - Every so often, when a step finishes, it tells you where it has got to, for
+    example "I've read two of the three pages." It waits at least 25 seconds
+    between these, never talks over you, and says nothing in the first few
+    seconds of a quick answer.
+  - Say **stop**, **pause** or **carry on** and the work stops, pauses or
+    carries on, the same as the buttons.
+  - Anything else meant for the work, like "also check the second site" or
+    "make it shorter", is kept as your next message. The call says so, shows it
+    under the captions as **Next message**, and sends it the moment the current
+    work finishes. If you stopped the work, or the call ends first, it waits in
+    the message box instead.
+- **Speaking**: the reply is read aloud a sentence or two at a time, as it
+  arrives. Start talking and it stops.
+- **Mute** stops sending your microphone without ending the call. **Minimise**
+  shrinks the call to a bar above the message box, so you can read, scroll and
+  type in the chat while it goes on; **Open** brings it back. **End**, or
+  Escape, closes it and releases the microphone.
+
+The talking while it works is a separate, light model call alongside the
+work. It sees the conversation, what the work has done and is doing, and the
+agent's name. It has no tools: it cannot do anything, approve anything or
+change the work itself. A stop, pause or next message goes through the same
+controls and message box you use, and the work is stopped only when your own
+words ask for it. What it says never claims that something was sent,
+approved, booked, paid or deleted; it points you to the screen instead.
+One person may have 600 of these a day, counted like the other voice
+allowances.
+
+Decisions are never made by voice. When a reply needs your decision, voice
+mode says "This needs your decision. It is on the screen." and stops reading.
+The card is in the chat above; **Show the decision** brings it into view.
+Anything you ask for while a decision waits is kept as your next message until
+the decision is made.
+
+Neither your voice nor the spoken reply is stored. Your words are kept as the
+chat message they became, and the reply as the chat message it already is.
+What you say to the agent while it works, and what it says back, is not
+kept as text; only a next message it passed on becomes a chat message. Like
+every model call, each one leaves a privacy log entry (where it went and how
+many details were swapped out, never the details), and any details swapped
+out are kept in the conversation's own vault, the same one its chat uses. The
+daily allowance counts each one, with no words.
+
+### Calls
+
+A call is a live conversation with the chat's agent: the same agent, with the
+same tools, memory and rules as in the chat. It needs the ElevenLabs key and an
+`https://` `OPENDUET_PUBLIC_URL` that ElevenLabs can reach. With both, the voice
+button in a chat's header becomes **Call**; without them it stays voice mode.
+
+Press **Call** and talk. ElevenLabs listens, turns what you said into words and
+sends them to OpenDuet, and reads OpenDuet's reply aloud as it is written. OpenDuet
+does the thinking:
+
+- What you say is an ordinary message in the chat, sent the way a typed one
+  is. The tool rows and the answer appear in the chat as they happen.
+- When the agent needs a moment it says so ("Looking that up."), and while
+  long work goes on it says it is still working.
+- Talk over it and it stops reading. What you said goes to the work that is
+  running; **stop**, **pause** and **carry on** work the controls, and a quick
+  question while it works is answered the way voice mode answers it.
+- Decisions are never made by voice. When the agent needs your OK, it says so
+  out loud and the card waits in the chat. While it waits, the call says now
+  and then that it is still waiting; after about 45 seconds it says the
+  decision stays on the screen and goes quiet, and the rest of the answer lands
+  in the chat. The call stays open, and the work waits for you.
+- **Hang up**, or Escape, ends the call. Work the agent started carries on,
+  and its answer lands in the chat.
+- One call per chat: calling the same chat from another tab, or again after
+  the line dropped, moves the call there and hangs up the older one.
+
+How it connects: when a person starts a call, OpenDuet asks ElevenLabs for a
+token and hands the browser only that token, which starts the call within two
+minutes and is then useless. ElevenLabs then opens a WebSocket back to
+`OPENDUET_PUBLIC_URL/api/voice/call/upstream`, signed with the installation's
+key, and OpenDuet accepts only a call it started, once. At the first call OpenDuet
+creates a speech engine named after its address in the ElevenLabs account,
+with recording of voices turned off; set `ELEVENLABS_SPEECH_ENGINE_ID` to use
+one you made yourself.
+
+A call lasts at most 40 minutes. Calls are not capped per person unless
+`OPENDUET_CALL_MONTHLY_MINUTES` is set.
+
+## Privacy
+
+ElevenLabs is a cloud service. Voice sends it audio and text directly, not
+through the model gateway (voice mode's microphone goes from your browser
+straight to ElevenLabs), so the
+[privacy router](PRIVACY-ROUTER.md) does not redact or reroute any of it. What
+ElevenLabs receives:
+
+| Feature | Sent to ElevenLabs | Not sent |
+| --- | --- | --- |
+| Push-to-talk | The recording, under a generic file name such as `clip.webm`, and the model name. | The chat, the message box, your name, the space. |
+| Voice mode, listening | Your microphone as 16 kHz audio while voice mode is open and not muted, over a single-use token the service asked for. | The key; the chat's other messages. |
+| Voice mode, speaking | Each piece of the reply that is read aloud, as text, up to 2,000 characters a request. | The rest of the chat, memory, tool results that are not in the reply. |
+| Voice mode, while it works | What the agent says back, as text, to be read aloud. | The rest of the chat, memory, tool results. |
+| Speech (`audio.synthesize`) | The script you approved, and the voice and model settings. | Anything else from the space. |
+| Transcription (`audio.transcribe`) | The file you approved, and the model settings. | Anything else from the space. |
+
+The talking while OpenDuet works is different: it is a model call, not a
+speech call, so it goes through the model gateway and the privacy router like
+every chat turn. The conversation and the activity it is shown are redacted,
+or kept on your local model, exactly as the work's own requests are, and the
+call is refused wherever voice is off.
+
+Every request from the service carries its ElevenLabs key; the browser uses
+only the single-use token. OpenDuet keeps no push-to-talk or voice mode audio;
+ElevenLabs' own terms govern what it keeps.
+
+Because none of this can be kept on your own machine, push-to-talk and voice
+mode are off where the privacy router keeps work off cloud models:
+
+- a space marked private in **Settings → Privacy**;
+- a chat with an agent marked private there, including a new chat about to be
+  started with that agent;
+- a conversation the router found to be about therapy, health records or
+  personal finances.
+
+There the microphone and voice mode buttons say why instead of recording, and
+the service refuses the request before it reads any audio or text
+(`voice_private`, 403). If the privacy settings cannot be read, voice is off too.
+Speech and transcription as agent capabilities are not turned off this way:
+each one shows you the exact script or file and waits for your approval before
+anything is sent.
+
+## If something goes wrong
+
+Every problem is shown in the chat in plain words, for example:
+
+| You see | It means |
+| --- | --- |
+| OpenDuet can’t use your microphone. | The browser refused the microphone. Allow it for this site in the browser's site settings. |
+| Voice messages can be up to 2 minutes. | The recording was longer than the limit. |
+| You have used today’s allowance… | The person reached a daily limit above. It frees up as the day's use ages past 24 hours. |
+| The speech service could not … just now. | ElevenLabs refused or did not answer. Check the key and your ElevenLabs quota. |
+| The voice connection ended. | The realtime connection closed. Press **Start again**; it opens a new session. |
+| Voice is off here because this space or its agent is marked private. | See [Privacy](#privacy). Voice would send your words to ElevenLabs. |
+| Voice is off in this conversation because it looks like it is about a sensitive topic. | See [Privacy](#privacy). Start a new chat to use voice for something else. |

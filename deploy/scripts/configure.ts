@@ -1,0 +1,528 @@
+/**
+ * Generate local deployment secrets once, without logging or overwriting them.
+ *
+ *   bun run deploy/scripts/configure.ts [--provider name] [--model id]
+ *     [--tailscale [--tailscale-hostname name]]
+ *   bun run deploy/scripts/configure.ts --fake [--tailscale ...]
+ *   bun run deploy/scripts/configure.ts --connect-in-app [--provider name] [--model id]
+ *   ... [--public-url https://your.domain [--hosted]]
+ *   ... [--project name] [--api-port port] [--web-port port]
+ *
+ * `--project`, `--api-port` and `--web-port` give a second installation on
+ * this machine its own Compose project and ports (COMPOSE_PROJECT_NAME,
+ * OPENDUET_PORT and WEB_PORT); the first one keeps openduet, 3100 and 3101.
+ *
+ * `--public-url` writes the address people open as both OPENDUET_PUBLIC_URL and
+ * OPENDUET_WEB_ORIGIN. `--hosted`, for an installation other people use, also
+ * writes an operator token; `openduet init` then marks the installation hosted.
+ *
+ * The default is a production configuration: a real model provider, with its
+ * key read from this command's environment (FIREWORKS_API_KEY for the default
+ * provider) and written into deploy/.env, never printed. `--fake` is the
+ * explicit opt-in to the demonstration: the scripted provider and the test
+ * connector, and no key at all. `--connect-in-app` writes the production
+ * configuration without any key: the person pastes their key into Settings ›
+ * Models once OpenDuet is running, so it never passes through a shell.
+ *
+ * An ElevenLabs key in this command's environment (ELEVENLABS_API_KEY) is
+ * written too, which turns voice on; without one voice stays off.
+ *
+ * `--tailscale` settles the node name the tailnet overlay joins under. It
+ * writes no credential: the auth key is issued by the Tailscale admin console
+ * and is pasted into deploy/.env afterwards.
+ *
+ * DOCKER_GID is the group of the Docker socket as openduet-cells, the one service
+ * that holds it, will see it. On
+ * a Linux host running Docker Engine that is the host's own socket. Docker
+ * Desktop, on Windows, macOS or Linux, serves the socket from its VM, and an
+ * engine reached over ssh:// or tcp:// has it on its own machine; in both the
+ * host has no file to read, so the group is measured from a container.
+ */
+import { randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { readFile, stat, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { parse } from 'yaml';
+import {
+  newSetupCode,
+  SETUP_CODE_HOURS,
+  setupCodeHash,
+  setupLink,
+} from '../../apps/openduet/src/api/setup-code.ts';
+import {
+  OPENAI_COMPATIBLE,
+  PROVIDER_NAMES,
+  providerKeyProblem,
+  providerKeyVariables,
+  providerSelectionProblem,
+  providersFromEnv,
+} from '../../apps/openduet/src/gateway/providers.ts';
+import { generateVapidKeys } from '../../apps/openduet/src/push/webpush.ts';
+import {
+  type CommandOutput,
+  readHostDocker,
+  spawnCommand,
+} from '../../apps/openduet/src/runtime/docker-engine.ts';
+import {
+  type DockerHostFacts,
+  describeDockerHost,
+  engineElsewhere,
+  judgeDockerMachine,
+  judgeSocketProbe,
+  readDockerHost,
+  socketProbeCommand,
+} from '../../apps/openduet/src/runtime/docker-host.ts';
+import { parseEnvFile, providerWarnings } from './provider-settings.ts';
+import { tailscaleNodeName, tailscaleNotes } from './tailscale-origin.ts';
+
+export const CONFIGURE_USAGE =
+  'Usage: bun run deploy/scripts/configure.ts [--provider name] [--model id] [--connect-in-app] [--tailscale [--tailscale-hostname name]] [--public-url https://your.domain [--hosted]] [--project name] [--api-port port] [--web-port port], or --fake for the demonstration';
+
+/** A port on 127.0.0.1 the stack publishes: a whole number from 1 to 65535. */
+function portOption(name: string, value: string): string {
+  if (!/^\d{1,5}$/.test(value) || Number(value) < 1 || Number(value) > 65_535)
+    throw new Error(`${name} takes a port from 1 to 65535, not ${value}. ${CONFIGURE_USAGE}`);
+  return String(Number(value));
+}
+
+/**
+ * `--public-url`'s value as the origin both settings take: an http(s) address
+ * with no account, path, query or fragment. `--hosted` needs it to be https.
+ */
+export function publicOrigin(value: string, hosted: boolean): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`--public-url ${value} is not a web address. ${CONFIGURE_USAGE}`);
+  }
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash
+  )
+    throw new Error(
+      `--public-url takes the address people open, such as https://assistant.example.net, with no path. ${CONFIGURE_USAGE}`,
+    );
+  if (hosted && url.protocol !== 'https:')
+    throw new Error(`--hosted needs an https:// --public-url. ${CONFIGURE_USAGE}`);
+  return url.origin;
+}
+
+/** Printed after a `--connect-in-app` run, in place of the warning about an empty key. */
+export const CONNECT_IN_APP_NOTE =
+  'No model key was written. Once OpenDuet is running, create your account and connect a model in Settings › Models.';
+
+/**
+ * The options, refused whole when one is not known: the file is written once
+ * and never replaced, so a misspelt `--fake` would otherwise leave a real
+ * provider selected with no key, and the fix would be deleting the file.
+ */
+export function configureOptions(args: readonly string[]): {
+  fake: boolean;
+  nodeName: string | null;
+  provider?: string;
+  model?: string;
+  inApp?: true;
+  /** The origin `--public-url` names, written as OPENDUET_PUBLIC_URL and OPENDUET_WEB_ORIGIN. */
+  publicUrl?: string;
+  hosted?: true;
+  /** COMPOSE_PROJECT_NAME, OPENDUET_PORT and WEB_PORT, when given. */
+  install?: Record<string, string>;
+} {
+  let provider: string | undefined;
+  let model: string | undefined;
+  let publicUrl: string | undefined;
+  const install: Record<string, string> = {};
+  const VALUED = ['--provider', '--model', '--public-url', '--project', '--api-port', '--web-port'];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--tailscale-hostname') index += 1;
+    else if (argument !== undefined && VALUED.includes(argument)) {
+      const value = args[index + 1];
+      if (!value || value.startsWith('--'))
+        throw new Error(`${argument} needs a value. ${CONFIGURE_USAGE}`);
+      if (argument === '--provider') provider = value;
+      else if (argument === '--model') model = value;
+      else if (argument === '--public-url') publicUrl = value;
+      else if (argument === '--project') {
+        if (!/^[a-z0-9][a-z0-9_-]*$/.test(value))
+          throw new Error(
+            `--project takes a Compose project name: lower-case letters, digits, - and _, starting with a letter or a digit. ${CONFIGURE_USAGE}`,
+          );
+        install.COMPOSE_PROJECT_NAME = value;
+      } else if (argument === '--api-port') install.OPENDUET_PORT = portOption(argument, value);
+      else install.WEB_PORT = portOption(argument, value);
+      index += 1;
+    } else if (
+      argument !== '--fake' &&
+      argument !== '--tailscale' &&
+      argument !== '--connect-in-app' &&
+      argument !== '--hosted'
+    )
+      throw new Error(`Unknown option ${argument}. ${CONFIGURE_USAGE}`);
+  }
+  const fake = args.includes('--fake');
+  const inApp = args.includes('--connect-in-app');
+  const hosted = args.includes('--hosted');
+  if (hosted && publicUrl === undefined)
+    throw new Error(
+      `--hosted needs --public-url, the https address people will open. ${CONFIGURE_USAGE}`,
+    );
+  if (hosted && fake)
+    throw new Error(
+      `--fake is the demonstration; an installation for other people needs a real model. ${CONFIGURE_USAGE}`,
+    );
+  const origin = publicUrl === undefined ? undefined : publicOrigin(publicUrl, hosted);
+  if (fake && inApp)
+    throw new Error(
+      `--fake needs no model key, so --connect-in-app has nothing to do beside it. ${CONFIGURE_USAGE}`,
+    );
+  if (fake && (provider || model))
+    throw new Error(
+      `--fake runs the scripted demonstration provider; it takes no --provider or --model. ${CONFIGURE_USAGE}`,
+    );
+  if (provider !== undefined && !PROVIDER_NAMES.includes(provider))
+    throw new Error(
+      `--provider ${provider} is not a provider the gateway has. Use one of: ${PROVIDER_NAMES.join(', ')}.`,
+    );
+  // The defaults are the template's, 3100 and 3101.
+  if ((install.OPENDUET_PORT ?? '3100') === (install.WEB_PORT ?? '3101'))
+    throw new Error(
+      `The service and the web app would both take port ${install.WEB_PORT ?? '3101'}. Give --api-port and --web-port a port each. ${CONFIGURE_USAGE}`,
+    );
+  // Named before anything is written, so a misspelt node name costs nothing.
+  return {
+    fake,
+    nodeName: tailscaleNodeName(args),
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(inApp ? { inApp: true as const } : {}),
+    ...(origin ? { publicUrl: origin } : {}),
+    ...(hosted ? { hosted: true as const } : {}),
+    ...(Object.keys(install).length > 0 ? { install } : {}),
+  };
+}
+
+/**
+ * The address settings: the public address and the web origin are the same
+ * origin, so they are written together. A hosted installation also gets its
+ * operator token, which opens /health/detail; it is never printed.
+ */
+export function addressSettings(options: {
+  publicUrl?: string;
+  hosted?: boolean;
+}): Record<string, string> {
+  return {
+    ...(options.publicUrl
+      ? { OPENDUET_PUBLIC_URL: options.publicUrl, OPENDUET_WEB_ORIGIN: options.publicUrl }
+      : {}),
+    ...(options.hosted ? { OPENDUET_OPERATOR_TOKEN: randomBytes(32).toString('hex') } : {}),
+  };
+}
+
+/**
+ * The provider settings deploy/.env gets. The demonstration turns on the
+ * scripted provider and the test connector. Anything else is production: a
+ * real provider whose key is in this command's environment, the model it is
+ * asked for, and both demonstration switches written off. A production
+ * configuration without its key is refused, so the file is never written in a
+ * state where every model call would be refused.
+ */
+export function providerSettings(
+  options: { fake: boolean; provider?: string; model?: string; inApp?: boolean },
+  example: Record<string, string>,
+  environment: Record<string, string | undefined>,
+): Record<string, string> {
+  if (options.fake)
+    return {
+      OPENDUET_ENABLE_FAKE_PROVIDER: 'true',
+      OPENDUET_ENABLE_TEST_CONNECTOR: 'true',
+      OPENDUET_DEFAULT_PROVIDER: 'fake',
+      OPENDUET_DEFAULT_MODEL: 'scripted',
+    };
+  const provider = options.provider ?? example.OPENDUET_DEFAULT_PROVIDER ?? '';
+  const model =
+    options.model ??
+    (provider === example.OPENDUET_DEFAULT_PROVIDER ? example.OPENDUET_DEFAULT_MODEL : undefined);
+  if (!model)
+    throw new ConfigureRefusal(
+      `Name the model with --model, written exactly as the ${provider} API expects it.`,
+    );
+  const baseUrl = environment.OPENAI_COMPAT_BASE_URL?.trim() || undefined;
+  const variables = providerKeyVariables(provider, baseUrl);
+  const production = {
+    OPENDUET_DEFAULT_PROVIDER: provider,
+    OPENDUET_DEFAULT_MODEL: model,
+    OPENDUET_ENABLE_FAKE_PROVIDER: 'false',
+    OPENDUET_ENABLE_TEST_CONNECTOR: 'false',
+  };
+  // A provider reached by the owner's sign-in has no key to read; the owner
+  // signs in once the stack is up. With --connect-in-app the key is pasted into
+  // the app instead, so none is read here, even one the environment holds: a key
+  // in deploy/.env would be shown as set by the operator and could not be changed
+  // in the app.
+  if (options.inApp) {
+    if (provider !== OPENAI_COMPATIBLE) return production;
+    // The endpoint's address is not a secret, and the service needs it to start.
+    if (!baseUrl)
+      throw new ConfigureRefusal(
+        "Set OPENAI_COMPAT_BASE_URL in this command's environment; the key can still be pasted into the app.",
+      );
+    return { ...production, OPENAI_COMPAT_BASE_URL: baseUrl };
+  }
+  if (variables.length === 0) return production;
+  const keys = Object.fromEntries(
+    variables.flatMap((name) => {
+      const value = environment[name]?.trim();
+      if (!value) return [];
+      // A key never contains whitespace; one that does was pasted wrong, and a
+      // line break would write a second setting into deploy/.env. Only the
+      // variable is named, never what it holds.
+      if (/\s/.test(value))
+        throw new ConfigureRefusal(
+          `${name} contains a space or a line break, so it is not a key as written. Set it again and run this again.`,
+        );
+      return [[name, value]];
+    }),
+  );
+  const providers = providersFromEnv({ ...keys, OPENAI_COMPAT_BASE_URL: baseUrl });
+  const problem =
+    providerSelectionProblem(provider, providers) ?? providerKeyProblem(provider, providers);
+  if (problem)
+    throw new ConfigureRefusal(
+      provider === OPENAI_COMPATIBLE && !baseUrl
+        ? `Set OPENAI_COMPAT_BASE_URL and OPENAI_COMPAT_API_KEY in this command's environment, or pass --fake for the demonstration.`
+        : `Set ${variables[0]} in this command's environment, for example with read -rs ${variables[0]} && export ${variables[0]}, then run this again. Or pass --fake for the demonstration.`,
+    );
+  return {
+    ...production,
+    ...keys,
+    ...(baseUrl && provider === OPENAI_COMPATIBLE ? { OPENAI_COMPAT_BASE_URL: baseUrl } : {}),
+  };
+}
+
+/**
+ * The voice key, when this command's environment carries one. It is optional:
+ * without it the file keeps the template's empty value and voice stays off.
+ */
+export function voiceSettings(
+  environment: Record<string, string | undefined>,
+): Record<string, string> {
+  const value = environment.ELEVENLABS_API_KEY?.trim();
+  if (!value) return {};
+  if (/\s/.test(value))
+    throw new ConfigureRefusal(
+      'ELEVENLABS_API_KEY contains a space or a line break, so it is not a key as written. Set it again and run this again.',
+    );
+  return { ELEVENLABS_API_KEY: value };
+}
+
+export type SocketAccess = {
+  /** The host's own socket, as `stat` reports it. */
+  statHost: () => Promise<{ isSocket(): boolean; gid: number }>;
+  /** Runs the probe container; it may pull the image first, so it gets a long timeout. */
+  runProbe: (command: readonly string[]) => CommandOutput;
+  /** The image the probe runs: the stack's own pinned Postgres image. */
+  probeImage: () => Promise<string>;
+};
+
+/** The socket's group as the service will see it, or an error that says why there is none. */
+export async function dockerSocketGroup(host: DockerHostFacts, access: SocketAccess) {
+  if (host.platform === 'linux' && !engineElsewhere(host)) {
+    const socket = await access.statHost().catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+        throw new ConfigureRefusal(
+          'There is no /var/run/docker.sock on this machine, and the Compose file mounts it into openduet-cells. Start Docker Engine, or link its socket to that path.',
+        );
+      throw error;
+    });
+    if (!socket.isSocket())
+      throw new ConfigureRefusal('/var/run/docker.sock is not a Docker socket');
+    return socket.gid;
+  }
+  const probe = judgeSocketProbe(
+    access.runProbe(socketProbeCommand(await access.probeImage())),
+    host,
+  );
+  if ('problem' in probe) throw new ConfigureRefusal(probe.problem);
+  return probe.gid;
+}
+
+/** A label for this installation's sandboxes, unique enough to share a provider account. */
+export function sandboxProject(): string {
+  return `openduet-${randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * The service's database address, for the user and database the template
+ * names: Postgres creates both from POSTGRES_USER and POSTGRES_DB, so the
+ * address follows them rather than assuming the defaults.
+ */
+export function databaseUrl(template: Record<string, string>, password: string): string {
+  const user = template.POSTGRES_USER?.trim() || 'openduet';
+  const database = template.POSTGRES_DB?.trim() || 'openduet';
+  return `postgres://${encodeURIComponent(user)}:${encodeURIComponent(password)}@postgres:5432/${encodeURIComponent(database)}`;
+}
+
+/** A reason to stop that the operator acts on; printed as one line, without a stack. */
+export class ConfigureRefusal extends Error {}
+
+const ENV_EXISTS = 'deploy/.env already exists. Keep it; edit its settings to change providers.';
+
+/** What was written. Windows applies no owner-only mode, so the file keeps its folder's. */
+export function createdMessage(
+  platform: NodeJS.Platform,
+  fake: boolean,
+  provider?: string,
+): string {
+  const fakeProvider = fake
+    ? ' and the explicit fake provider'
+    : provider
+      ? ` for the ${provider} provider`
+      : '';
+  return platform === 'win32'
+    ? `Created deploy/.env${fakeProvider}. On Windows it has the permissions of its folder.`
+    : `Created deploy/.env with private permissions${fakeProvider}.`;
+}
+
+/**
+ * The one-time code that claims the new installation, said once: only its
+ * digest is written to deploy/.env. Whoever opens the link, or types the code,
+ * creates the first account; nobody else who reaches the address can.
+ */
+export function setupCodeNote(code: string, webUrl: string): string {
+  return [
+    'Create the first account with this one-time setup code. It is shown only now; keep it until the account exists:',
+    '',
+    `  ${code}`,
+    '',
+    `Once OpenDuet is running, open ${setupLink(webUrl, code)}`,
+    `It works once, for ${SETUP_CODE_HOURS} hours from OpenDuet's first start. Lost it, or too late? bun run openduet account setup-code issues another, and this one stops working.`,
+  ].join('\n');
+}
+
+/**
+ * deploy/.env from the template: each setting's line takes its value. A setting
+ * the template has only as an empty commented line, such as
+ * `# OPENDUET_SETUP_CODE_HASH=`, is written in that line's place.
+ */
+export function fillTemplate(template: string, values: Record<string, string>): string {
+  const written = new Set<string>();
+  const filled = template.replace(/^([A-Z_]+)=(.*)$/gm, (line, name: string) => {
+    if (!(name in values)) return line;
+    written.add(name);
+    return `${name}=${values[name]}`;
+  });
+  return filled.replace(/^# ?([A-Z_]+)=[ \t]*$/gm, (line, name: string) =>
+    name in values && !written.has(name) ? `${name}=${values[name]}` : line,
+  );
+}
+
+/** The line and exit code for a failed run: a refusal is its message alone. */
+export function failureReport(error: unknown): { text: string; code: number } | null {
+  return error instanceof ConfigureRefusal ? { text: `${error.message}\n`, code: 1 } : null;
+}
+
+async function configure(root: string) {
+  const target = resolve(root, 'deploy/.env');
+  let options: ReturnType<typeof configureOptions>;
+  try {
+    options = configureOptions(process.argv.slice(2));
+  } catch (error) {
+    throw new ConfigureRefusal(error instanceof Error ? error.message : String(error));
+  }
+  const { fake, nodeName } = options;
+  // Checked first so a second run is refused before it asks Docker anything;
+  // the exclusive write below still settles a race.
+  if (existsSync(target)) throw new ConfigureRefusal(ENV_EXISTS);
+  const template = await readFile(resolve(root, 'deploy/.env.example'), 'utf8');
+  // A production run without its key stops here, before Docker is asked anything.
+  const defaults = parseEnvFile(template);
+  const provider = providerSettings(options, defaults, process.env);
+  const voice = voiceSettings(process.env);
+  // An unsupported engine, Compose or host is named now, not as a failed `up` later.
+  const host = readDockerHost(spawnCommand, root);
+  const unsupported = judgeDockerMachine(readHostDocker(), host);
+  if (unsupported.length > 0) throw new ConfigureRefusal(unsupported.join(' '));
+  for (const note of describeDockerHost(host)) process.stdout.write(`${note}\n`);
+  const dockerGid = await dockerSocketGroup(host, {
+    statHost: () => stat('/var/run/docker.sock'),
+    runProbe: (command) => spawnCommand(command, 10 * 60_000),
+    probeImage: async () => {
+      const compose = parse(await readFile(resolve(root, 'deploy/docker-compose.yml'), 'utf8'));
+      return String(compose.services.postgres.image);
+    },
+  });
+  const password = randomBytes(24).toString('hex');
+  const setupCode = newSetupCode();
+  // This installation's own Web Push key pair: phones are reached without a third party.
+  const vapid = await generateVapidKeys();
+  const values: Record<string, string> = {
+    OPENDUET_VAPID_PUBLIC_KEY: vapid.publicKey,
+    OPENDUET_VAPID_PRIVATE_KEY: vapid.privateKey,
+    OPENDUET_MASTER_KEY: randomBytes(32).toString('base64'),
+    OPENDUET_CAPABILITY_KEY: randomBytes(32).toString('hex'),
+    // Labels this installation's sandboxes at a provider; written once, kept after.
+    OPENDUET_SANDBOX_PROJECT: sandboxProject(),
+    OPENDUET_APPROVAL_KEY: randomBytes(32).toString('hex'),
+    OPENDUET_RUNTIME_KEY: randomBytes(32).toString('hex'),
+    POSTGRES_PASSWORD: password,
+    OPENDUET_SETUP_CODE_HASH: setupCodeHash(setupCode),
+    DATABASE_URL: databaseUrl(defaults, password),
+    DOCKER_GID: String(dockerGid),
+    ...provider,
+    ...voice,
+    ...addressSettings(options),
+    ...options.install,
+    // TS_AUTHKEY stays as the template leaves it, which is empty: it is issued by
+    // the Tailscale admin console and nothing here can invent one.
+    ...(nodeName === null ? {} : { TS_HOSTNAME: nodeName }),
+  };
+  const content = fillTemplate(template, values);
+  try {
+    await writeFile(target, content, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+      throw new ConfigureRefusal(ENV_EXISTS);
+    }
+    throw error;
+  }
+  process.stdout.write(
+    `${createdMessage(process.platform, fake, provider.OPENDUET_DEFAULT_PROVIDER)}\n`,
+  );
+  const written = parseEnvFile(content);
+  const webUrl =
+    written.OPENDUET_PUBLIC_URL?.trim() || `http://127.0.0.1:${written.WEB_PORT?.trim() || '3101'}`;
+  process.stdout.write(`${setupCodeNote(setupCode, webUrl)}\n`);
+  if (nodeName !== null)
+    for (const note of tailscaleNotes(nodeName)) process.stdout.write(`${note}\n`);
+  if (options.publicUrl)
+    process.stdout.write(
+      `People open ${options.publicUrl}; point your HTTPS proxy at the web service (docs/DEPLOYMENT.md).\n`,
+    );
+  if (options.hosted)
+    process.stdout.write(
+      'An operator token was written. Name where alerts go before people sign up: export the webhook address as OPENDUET_ALERT_WEBHOOK_URL, then run bun run openduet set --from-env OPENDUET_ALERT_WEBHOOK_URL (docs/DEPLOYMENT.md, "Alerts").\n',
+    );
+  // A real provider is selected with its key still empty. Say so now, not at the first job,
+  // unless the key is meant to be pasted into the app.
+  if (options.inApp) process.stdout.write(`${CONNECT_IN_APP_NOTE}\n`);
+  else
+    for (const warning of providerWarnings(parseEnvFile(content)))
+      process.stderr.write(`WARNING: ${warning}\n`);
+}
+
+if (import.meta.main) {
+  try {
+    await configure(resolve(import.meta.dir, '../..'));
+  } catch (error) {
+    const report = failureReport(error);
+    if (!report) throw error;
+    process.stderr.write(report.text);
+    process.exit(report.code);
+  }
+}

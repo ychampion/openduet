@@ -1,0 +1,539 @@
+/**
+ * Publishing a finished artifact.
+ *
+ * A file in the job workspace is work in progress. Publishing is the step that
+ * takes it somewhere the job does not own: the space's artifacts directory,
+ * where the owner looks for finished things, or an email with the file
+ * attached. That is an external effect, so it is `write_external`, it needs an
+ * approval bound to the payload hash, and it produces a receipt.
+ *
+ * Two rules make the approval mean something.
+ *
+ * The bytes are never in the payload. Before approval the service binds the
+ * recorded artifact ID and hash; dispatch reads that exact version itself. A
+ * file that changed since it was recorded fails the publish rather than being
+ * sent, because the content hash the owner approved is the one on the record.
+ *
+ * Only a recorded artifact can be published. A write that declared nothing has
+ * no record, no validations, and nothing to point at, so it is not something
+ * this release will send anywhere.
+ */
+
+import { createHash } from 'node:crypto';
+import { constants, lstatSync } from 'node:fs';
+import { type FileHandle, mkdir, open, realpath } from 'node:fs/promises';
+import path from 'node:path';
+import {
+  type Action,
+  type ConnectorManifest,
+  type JsonObject,
+  type JsonValue,
+  publishDestination,
+  type Receipt,
+} from '@openduet/contracts';
+import type { Sql } from 'postgres';
+import { BrokerFault } from '../broker/errors.ts';
+import type { Query } from '../broker/records.ts';
+import { LocalWorkspaceFs } from '../runtime/workspace-fs.ts';
+import { noLinks, openBeneath, segmentsFor } from './files.ts';
+import type { MailAttachment } from './mail-transport.ts';
+import { alreadyInFiles, filesHold, inFilesTurn, onlyNewFiles } from './shared-files.ts';
+import type { Connector, ConnectorContext } from './types.ts';
+
+/** What the email destination needs, and nothing more. */
+export interface ArtifactMailer {
+  connectionId: string;
+  spaceId: string;
+  send(
+    message: {
+      to: string[];
+      subject: string;
+      body: string;
+      messageId: string;
+      attachments: MailAttachment[];
+    },
+    context: { space_id: string; connection_id: string },
+  ): Promise<{ messageId: string; accepted?: string[]; rejected?: string[] }>;
+}
+
+export type ArtifactsOptions = {
+  sql: Sql;
+  workRoot: string;
+  spacesRoot: string;
+  maxBytes?: number;
+  /** Absent means the email destination is refused rather than faked. */
+  mailer?: ArtifactMailer;
+  mailers?: ReadonlyMap<string, ArtifactMailer>;
+};
+
+const digest = (value: Buffer): string => createHash('sha256').update(value).digest('hex');
+const messageIdFor = (actionId: string) => `<${actionId}@openduet.invalid>`;
+
+const destinationSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind'],
+      properties: {
+        kind: { type: 'string', const: 'space_artifacts' },
+        path: { type: ['string', 'null'], minLength: 1, maxLength: 1024 },
+      },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind', 'to', 'subject'],
+      properties: {
+        kind: { type: 'string', const: 'email' },
+        // No `format: email` here. The validator this schema is handed does
+        // not know the keyword, ignores it, and says so on every call, which
+        // fills the test output with warnings about a check that was never
+        // being made. `publishDestination` is what actually rejects an address.
+        to: {
+          oneOf: [
+            { type: 'string', minLength: 3, maxLength: 320 },
+            {
+              type: 'array',
+              minItems: 1,
+              maxItems: 20,
+              items: { type: 'string', minLength: 3, maxLength: 320 },
+            },
+          ],
+        },
+        subject: { type: 'string', minLength: 1, maxLength: 500 },
+        body: { type: 'string', maxLength: 20000 },
+        filename: { type: ['string', 'null'], minLength: 1, maxLength: 200 },
+      },
+    },
+  ],
+};
+
+export const artifactsManifest: ConnectorManifest = {
+  name: 'artifacts',
+  version: '0.1.0',
+  provider: 'artifacts',
+  description: 'Publish a recorded artifact to the space or to an email recipient.',
+  credentials: [],
+  health: true,
+  tools: [
+    {
+      name: 'artifact.publish',
+      description: 'Publish a checked artifact to the space artifacts directory or by email.',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'destination'],
+        properties: {
+          path: { type: 'string', minLength: 1, maxLength: 1024 },
+          area: { type: 'string', enum: ['work', 'artifacts'] },
+          destination: destinationSchema,
+          mailbox_connection_id: { type: 'string', minLength: 1 },
+          mailbox_generation: { type: 'integer', minimum: 0 },
+          artifact_id: { type: 'string', minLength: 1 },
+          content_hash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        },
+      },
+      effect_class: 'write_external',
+      required_scopes: ['artifact.publish'],
+      verify: true,
+      requires_approval: true,
+    },
+  ],
+};
+
+type ArtifactRow = {
+  id: string;
+  area: string;
+  path: string;
+  kind: string;
+  mime: string;
+  content_hash: string;
+  size: number;
+};
+
+export function createArtifactsConnector(options: ArtifactsOptions): Connector {
+  const limit = options.maxBytes ?? 8 * 1024 * 1024;
+  /** A publish into the space's Files takes its turn there on every instance (`inFilesTurn`). */
+  const hold = filesHold(options.sql);
+  const mailers =
+    options.mailers ??
+    new Map(options.mailer ? [[options.mailer.connectionId, options.mailer]] : []);
+
+  const mailbox = async (
+    payload: JsonObject,
+    ctx: ConnectorContext,
+    tx: Query,
+    binding: boolean,
+  ) => {
+    const rows = await tx`select id, generation from connection where space_id = ${ctx.space_id}
+      and provider = 'imap' and status = 'active' and scopes @> '["email.send"]'::jsonb order by id for share`;
+    const selected = rows.find(
+      (row) =>
+        (!payload.mailbox_connection_id || row.id === payload.mailbox_connection_id) &&
+        mailers.get(row.id)?.spaceId === ctx.space_id &&
+        mailers.get(row.id)?.connectionId === row.id,
+    );
+    if (
+      !selected ||
+      (binding &&
+        (payload.mailbox_connection_id !== selected.id ||
+          payload.mailbox_generation !== selected.generation))
+    )
+      throw new BrokerFault(
+        'scope_denied',
+        'No authorized mailbox with the approved generation in this artifact space',
+      );
+    return selected;
+  };
+
+  const latest = async (
+    jobId: string,
+    spaceId: string,
+    area: string,
+    relative: string,
+    tx: Query,
+  ): Promise<ArtifactRow | undefined> => {
+    const [row] = await tx`select id, area, path, kind, mime, content_hash, size
+      from artifact where job_id = ${jobId} and space_id = ${spaceId} and area = ${area} and path = ${relative}
+      and expectation is not null order by created_at desc, id desc limit 1`;
+    return row as ArtifactRow | undefined;
+  };
+
+  const read = async (target: string): Promise<Buffer> =>
+    readHandle(
+      await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
+    );
+  const readHandle = async (file: FileHandle): Promise<Buffer> => {
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > limit)
+        throw new Error('the artifact is not a regular file or exceeds the publish limit');
+      return await file.readFile();
+    } finally {
+      await file.close();
+    }
+  };
+
+  const source = async (ctx: ConnectorContext, area: string, relative: string) => {
+    if (!/^job_[A-Za-z0-9]+$/.test(ctx.job_id) || !/^sp_[A-Za-z0-9]+$/.test(ctx.space_id))
+      throw new Error('invalid trusted file scope');
+    const { base, segments } =
+      area === 'work'
+        ? await new LocalWorkspaceFs(options.workRoot).location(ctx.job_id, relative)
+        : {
+            base: await realpath(options.spacesRoot),
+            segments: [ctx.space_id, 'artifacts', ...segmentsFor(relative)],
+          };
+    await noLinks(base, segments, false);
+    // Opened by walking the names, so a folder swapped for a link since the check opens nothing.
+    return openBeneath(base, segments, constants.O_RDONLY);
+  };
+
+  const checkIdentity = (action: Action, ctx: ConnectorContext) => {
+    if (
+      action.job_id !== ctx.job_id ||
+      action.id !== ctx.idempotency_key ||
+      action.id !== action.idempotency_key
+    )
+      throw new Error('connector action identity mismatch');
+  };
+
+  /** Resolve the payload to a recorded artifact and its unchanged bytes. */
+  const load = async (action: Action, ctx: ConnectorContext, tx: Query = options.sql) => {
+    const payload = action.canonical_payload;
+    const relative = typeof payload.path === 'string' ? payload.path : '';
+    const area = payload.area === 'artifacts' ? 'artifacts' : 'work';
+    if (!relative) throw new Error('path must be a string');
+    if (typeof payload.artifact_id !== 'string' || typeof payload.content_hash !== 'string')
+      throw new BrokerFault(
+        'payload_invalid',
+        'Publication needs a bound artifact ID and content hash',
+      );
+    const [row] = await tx`select id, area, path, kind, mime, content_hash, size from artifact
+      where id = ${payload.artifact_id} and content_hash = ${payload.content_hash}
+      and job_id = ${ctx.job_id} and space_id = ${ctx.space_id} and area = ${area} and path = ${relative}
+      and expectation is not null`;
+    const record = row as ArtifactRow | undefined;
+    if (!record)
+      throw new BrokerFault('payload_invalid', 'The approved artifact version is unavailable');
+    const bytes = await source(ctx, area, relative)
+      .then(readHandle)
+      .catch(() => {
+        throw new BrokerFault('payload_invalid', 'The approved artifact file is unavailable');
+      });
+    const hash = digest(bytes);
+    if (hash !== record.content_hash)
+      throw new BrokerFault(
+        'payload_invalid',
+        'The file differs from the approved artifact version; write and check it again',
+      );
+    return { record, bytes, hash, area, relative };
+  };
+
+  const receiptFor = (
+    action: Action,
+    detail: Record<string, JsonValue>,
+    externalRef: string | null,
+  ): Receipt => ({
+    action_id: action.id,
+    connection_id: action.connection_id,
+    external_ref: externalRef,
+    detail,
+    received_at: new Date().toISOString(),
+    late: false,
+  });
+
+  /** Where a publish to the space's Files goes, or null for one that goes elsewhere. */
+  const filesTarget = (payload: JsonObject): string | null => {
+    const destination = payload.destination;
+    if (
+      typeof destination !== 'object' ||
+      destination === null ||
+      Array.isArray(destination) ||
+      destination.kind !== 'space_artifacts'
+    )
+      return null;
+    const source = payload.path;
+    return typeof destination.path === 'string'
+      ? destination.path
+      : typeof source === 'string'
+        ? path.posix.basename(source)
+        : '';
+  };
+  /** Whether nothing, not even a link, is at `target` in the space's Files. */
+  const unused = (spaceId: string, target: string) => {
+    try {
+      // A link counts as something already there, wherever it points.
+      return (
+        lstatSync(path.join(options.spacesRoot, spaceId, 'artifacts', ...segmentsFor(target)), {
+          throwIfNoEntry: false,
+        }) === undefined
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  return {
+    manifest: artifactsManifest,
+    // Saved to the space as a new file, the person can open and delete it.
+    // Emailed it is gone, and saved over a file they have it replaces theirs.
+    staysInSpace(action, spaceId) {
+      const target = filesTarget(action.canonical_payload);
+      return action.kind === 'artifact.publish' && target !== null && unused(spaceId, target);
+    },
+    async prepare(payload, ctx, tx) {
+      const relative = typeof payload.path === 'string' ? payload.path : '';
+      const area = payload.area === 'artifacts' ? 'artifacts' : 'work';
+      const record = await latest(ctx.job_id, ctx.space_id, area, relative, tx);
+      if (!record)
+        throw new BrokerFault(
+          'payload_invalid',
+          `${relative} has no artifact record; declare expect before publishing`,
+        );
+      if (
+        (payload.artifact_id && payload.artifact_id !== record.id) ||
+        (payload.content_hash && payload.content_hash !== record.content_hash)
+      )
+        throw new BrokerFault(
+          'payload_invalid',
+          'The requested artifact version is no longer current',
+        );
+      const bound = { ...payload, artifact_id: record.id, content_hash: record.content_hash };
+      const destination = publishDestination.parse(payload.destination);
+      // In a shared space, anyone but its owner publishes to its Files only
+      // under a new name: refused before anyone is asked, checked again when it runs.
+      const target = filesTarget(payload);
+      if (
+        target !== null &&
+        !unused(ctx.space_id, target) &&
+        (await onlyNewFiles(tx, ctx.job_id, ctx.space_id))
+      )
+        throw new BrokerFault('payload_invalid', alreadyInFiles(target));
+      if (destination.kind !== 'email') return bound;
+      const selected = await mailbox(payload, ctx, tx, false);
+      return {
+        ...bound,
+        mailbox_connection_id: selected.id,
+        mailbox_generation: selected.generation,
+      };
+    },
+    async validateBinding(action, ctx, tx) {
+      await load(action, ctx, tx);
+      if (publishDestination.parse(action.canonical_payload.destination).kind === 'email')
+        await mailbox(action.canonical_payload, ctx, tx, true);
+    },
+    async execute(action, ctx) {
+      checkIdentity(action, ctx);
+      ctx.signal?.throwIfAborted();
+      if (action.kind !== 'artifact.publish') throw new Error('unknown artifacts tool');
+      const destination = publishDestination.parse(action.canonical_payload.destination);
+      const { record, bytes, hash, relative } = await load(action, ctx);
+      const publishedAt = new Date().toISOString();
+      let externalRef: string;
+      let detail: Record<string, JsonValue>;
+      if (destination.kind === 'space_artifacts') {
+        const target = destination.path ?? path.posix.basename(relative);
+        const base = await realpath(options.spacesRoot);
+        const segments = [ctx.space_id, 'artifacts', ...segmentsFor(target)];
+        await mkdir(path.join(base, ctx.space_id, 'artifacts'), { recursive: true });
+        const resolved = await noLinks(base, segments, true);
+        // Nobody was asked because the file was new, so it must still be new:
+        // one that appeared since is someone's, and is not replaced unasked.
+        // In a shared space, anyone but its owner makes only a new file, asked or not.
+        // Saved in its turn in the space's Files, so it never lands between
+        // another step's check of a file there and its change to it.
+        await inFilesTurn(
+          ctx.space_id,
+          async (query) => {
+            const unasked = !action.authorization_ref;
+            const limited = await onlyNewFiles(query ?? options.sql, ctx.job_id, ctx.space_id);
+            const exclusive = unasked || limited;
+            const file = await open(
+              resolved,
+              constants.O_WRONLY |
+                constants.O_CREAT |
+                constants.O_NOFOLLOW |
+                constants.O_NONBLOCK |
+                (exclusive ? constants.O_EXCL : 0),
+              0o600,
+            ).catch(async (error: unknown) => {
+              if (!exclusive || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+              // A retry of this same save finds its own bytes there and is done.
+              const there = await read(resolved).catch(() => null);
+              if (there && digest(there) === hash) return null;
+              throw new Error(
+                limited
+                  ? alreadyInFiles(target)
+                  : 'the space already has a file with that name; saving over it needs the person to approve',
+              );
+            });
+            if (file)
+              try {
+                const stat = await file.stat();
+                if (!stat.isFile()) throw new Error('the publish target is not a regular file');
+                await file.truncate(0);
+                await file.writeFile(bytes);
+                await file.sync();
+              } finally {
+                await file.close();
+              }
+          },
+          hold,
+        );
+        externalRef = target;
+        detail = { destination: 'space_artifacts', path: target, bytes: bytes.byteLength };
+      } else {
+        const selected = await mailbox(action.canonical_payload, ctx, options.sql, true);
+        const mailer = mailers.get(selected.id);
+        if (!mailer) throw new BrokerFault('scope_denied');
+        const recipients = Array.isArray(destination.to) ? destination.to : [destination.to];
+        const messageId = messageIdFor(action.id);
+        const sent = await mailer.send(
+          {
+            to: recipients,
+            subject: destination.subject,
+            body: destination.body,
+            messageId,
+            attachments: [
+              {
+                filename: destination.filename ?? path.posix.basename(relative),
+                content: bytes,
+                contentType: record.mime,
+              },
+            ],
+          },
+          { space_id: ctx.space_id, connection_id: selected.id },
+        );
+        externalRef = sent.messageId;
+        detail = {
+          destination: 'email',
+          message_id: sent.messageId,
+          to: recipients,
+          accepted: sent.accepted ?? null,
+          rejected: sent.rejected ?? null,
+          bytes: bytes.byteLength,
+        };
+      }
+      return {
+        outcome: 'succeeded',
+        receipt: receiptFor(
+          action,
+          {
+            ...detail,
+            artifact_id: record.id,
+            content_hash: hash,
+            // The broker persists this alongside the receipt, which is what
+            // links the artifact record to where its content ended up.
+            publication: {
+              destination: destination.kind,
+              action_id: action.id,
+              external_ref: externalRef,
+              content_hash: hash,
+              detail,
+              published_at: publishedAt,
+            },
+          },
+          externalRef,
+        ),
+      };
+    },
+    async verify(action, ctx) {
+      checkIdentity(action, ctx);
+      if (action.kind !== 'artifact.publish')
+        return { decision: 'unsupported', reason: 'only a publish has anything to verify' };
+      try {
+        const destination = publishDestination.parse(action.canonical_payload.destination);
+        if (destination.kind !== 'space_artifacts') {
+          // A mail server's acceptance is the email connector's question, not
+          // this one's; from here an unacknowledged send cannot be decided.
+          return {
+            decision: 'undecided',
+            reason: 'a mailed artifact cannot be confirmed from the artifact store',
+          };
+        }
+        const { record, hash, relative } = await load(action, ctx);
+        const target = destination.path ?? path.posix.basename(relative);
+        const base = await realpath(options.spacesRoot);
+        const resolved = await noLinks(
+          base,
+          [ctx.space_id, 'artifacts', ...segmentsFor(target)],
+          false,
+        );
+        const published = digest(await read(resolved));
+        if (published !== hash)
+          return { decision: 'undecided', reason: 'the published copy differs from the artifact' };
+        const detail = {
+          destination: 'space_artifacts',
+          path: target,
+          artifact_id: record.id,
+          content_hash: published,
+        };
+        return {
+          decision: 'succeeded',
+          evidence: detail,
+          receipt: receiptFor(action, detail, target),
+        };
+      } catch (error) {
+        return { decision: 'undecided', reason: (error as Error).message };
+      }
+    },
+    async health() {
+      try {
+        await Promise.all([realpath(options.workRoot), realpath(options.spacesRoot)]);
+        return {
+          status: 'ok',
+          detail: 'the artifact roots are available',
+          checked_at: new Date().toISOString(),
+        };
+      } catch {
+        return {
+          status: 'failing',
+          detail: 'an artifact root is missing',
+          checked_at: new Date().toISOString(),
+        };
+      }
+    },
+  };
+}

@@ -1,0 +1,2000 @@
+/**
+ * Connections a person installs through the API.
+ *
+ * Each credentialed kind has its own validated configuration and its own
+ * credential shape. A request carries exactly one configuration block; the
+ * service seals what is secret on arrival and no response carries it back. The
+ * descriptors at the end of this file say which fields a kind needs, so a
+ * client can draw its form from the contract instead of knowing the kinds.
+ */
+import { z } from 'zod';
+import { effectClass } from './broker.ts';
+import { err, ID_PREFIXES, ok, prefixedId, type Result, timestamp } from './common.ts';
+import { connectionProvider, connectionView } from './entities.ts';
+import {
+  MCP_STDIO_RUNNERS,
+  mcpConnectionConfig,
+  mcpHttpUrl,
+  mcpStdioConnectionConfig,
+} from './mcp.ts';
+import { MAX_DISCOVERED_TOOLS } from './mcp-catalog.ts';
+import { e164Number } from './reach.ts';
+
+export const CONNECTION_KINDS = [
+  'mail',
+  'caldav',
+  'ics',
+  'mcp',
+  'mcp_stdio',
+  'sandbox',
+  'command_line',
+  'sms',
+] as const;
+export const connectionKind = z.enum(CONNECTION_KINDS);
+export type ConnectionKind = z.infer<typeof connectionKind>;
+
+const LOOPBACK_HOSTS = ['127.0.0.1', '[::1]', 'localhost'];
+const singleLine = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .regex(/^[^\r\n]*$/);
+
+/** TLS everywhere; plain HTTP only reaches a loopback fixture. */
+const secureUrl = (protocols: readonly string[]) =>
+  z
+    .url()
+    .max(2048)
+    .refine((value) => {
+      // The format check above has already refused what is not an address.
+      if (!URL.canParse(value)) return true;
+      const url = new URL(value);
+      return (
+        !url.username &&
+        !url.password &&
+        !url.hash &&
+        (protocols.includes(url.protocol) ||
+          (url.protocol === 'http:' && LOOPBACK_HOSTS.includes(url.hostname)))
+      );
+    }, 'The address must use TLS and carry no credentials or fragment');
+
+/**
+ * A function rather than one shared schema: each endpoint is its own instance,
+ * so the generated API document inlines it instead of hoisting a shared entry.
+ */
+const mailEndpoint = () =>
+  z
+    .object({
+      host: z
+        .string()
+        .min(1)
+        .max(253)
+        .regex(/^[A-Za-z0-9._:-]+$/),
+      port: z.number().int().min(1).max(65535),
+      secure: z.boolean(),
+    })
+    .strict();
+
+/** One mailbox: IMAP to read and SMTP to send, under the same account. */
+export const mailConnectionConfig = z
+  .object({
+    username: singleLine(320),
+    from: z.email().max(320),
+    imap: mailEndpoint(),
+    smtp: mailEndpoint(),
+    inbox: singleLine(200).optional(),
+    sent: singleLine(200).optional(),
+  })
+  .strict();
+export type MailConnectionConfig = z.infer<typeof mailConnectionConfig>;
+/** As installed: the sender may be left out when the account name is an address. */
+const mailConnectionRequest = mailConnectionConfig.extend({
+  from: z.email().max(320).optional(),
+});
+
+export const passwordCredentials = z.object({ password: z.string().min(1).max(1024) }).strict();
+export type PasswordCredentials = z.infer<typeof passwordCredentials>;
+
+export const caldavConnectionConfig = z
+  .object({
+    calendar_url: secureUrl(['https:']).refine(
+      (value) => !URL.canParse(value) || !new URL(value).search,
+      'A calendar collection address carries no query string',
+    ),
+    username: singleLine(320),
+  })
+  .strict();
+export type CaldavConnectionConfig = z.infer<typeof caldavConnectionConfig>;
+/**
+ * As installed: one calendar's own address, or the address of the calendar
+ * service, from which the service finds the account's first calendar of events.
+ */
+const caldavConnectionRequest = caldavConnectionConfig
+  .extend({
+    calendar_url: caldavConnectionConfig.shape.calendar_url.optional(),
+    server_url: secureUrl(['https:']).optional(),
+  })
+  .refine((value) => (value.calendar_url === undefined) !== (value.server_url === undefined), {
+    message: 'Give either the calendar address or the calendar service address.',
+    path: ['calendar_url'],
+  });
+export type CaldavConnectionRequest = z.infer<typeof caldavConnectionRequest>;
+
+/**
+ * A read-only calendar feed. The address usually embeds a private token, so
+ * the whole address is sealed like a password and never returned.
+ */
+export const icsConnectionConfig = z
+  .object({
+    url: secureUrl(['https:', 'webcal:']).transform((value) =>
+      value.replace(/^webcal:/i, 'https:'),
+    ),
+  })
+  .strict();
+export type IcsConnectionConfig = z.infer<typeof icsConnectionConfig>;
+
+export const SANDBOX_ADAPTERS = ['e2b', 'daytona', 'modal', 'docker', 'maritime'] as const;
+export const sandboxAdapter = z.enum(SANDBOX_ADAPTERS);
+export type SandboxAdapter = z.infer<typeof sandboxAdapter>;
+
+/**
+ * The adapters that reach a provider account with a key. `docker` runs on the
+ * Docker engine this service already supervises attempts on, so it has none.
+ */
+export const sandboxAdapterTakesKey = (adapter: SandboxAdapter): boolean => adapter !== 'docker';
+
+/**
+ * Whether each adapter's computers have a desktop for the `computer.*` tools
+ * and for a person to take over. Every adapter says so here, so a new one
+ * cannot be added without deciding.
+ */
+export const SANDBOX_ADAPTER_DESKTOP: Readonly<Record<SandboxAdapter, boolean>> = {
+  docker: true,
+  maritime: true,
+  e2b: false,
+  daytona: false,
+  modal: false,
+};
+
+/** The adapters whose sandboxes have a desktop for the `computer.*` tools. */
+export const sandboxAdapterHasDesktop = (adapter: SandboxAdapter): boolean =>
+  SANDBOX_ADAPTER_DESKTOP[adapter] === true;
+
+/**
+ * `connected_hosts_only` lets out the hosts the operator lists in
+ * `OPENDUET_SANDBOX_EGRESS_EXTRA_HOSTS`, and nothing else. It needs the service's
+ * egress guard, so only the docker adapter offers it.
+ */
+export const SANDBOX_EGRESS_KINDS = [
+  'deny_all',
+  'cidr_allowlist',
+  'connected_hosts_only',
+  'open',
+] as const;
+export const SANDBOX_PERSISTENCE = ['ephemeral', 'pause', 'snapshot'] as const;
+
+/**
+ * One allowed range. Its shape is judged where it is used: the adapter's own
+ * manifest refuses anything that is not a CIDR block, with its own code, so
+ * this stays a plain line of text here.
+ */
+const allowedRange = singleLine(49);
+
+/**
+ * One remote sandbox provider, as the owner configured it. Egress is named here
+ * rather than left to the provider's default, and a configuration the adapter
+ * cannot honour is refused at installation instead of being quietly widened.
+ */
+export const sandboxConnectionConfig = z
+  .object({
+    adapter: sandboxAdapter,
+    /**
+     * A registry reference for Modal, a template name for E2B, a snapshot name for
+     * Daytona, and an image already on this service's Docker engine for docker.
+     */
+    image: singleLine(200),
+    egress: z.enum(SANDBOX_EGRESS_KINDS),
+    /** Used only with a CIDR allow-list, which needs at least one. */
+    cidrs: z.array(allowedRange).max(32).optional(),
+    persistence: z.enum(SANDBOX_PERSISTENCE),
+    /** How long one sandbox may run before the provider stops it. */
+    lifetime_seconds: z.number().int().min(60).max(86_400),
+    region: singleLine(40).optional(),
+  })
+  .strict();
+export type SandboxConnectionConfig = z.infer<typeof sandboxConnectionConfig>;
+
+/**
+ * One field for the provider key, sealed and never returned. E2B has a single
+ * API key; Modal has a token id and a token secret, given here as one value
+ * separated by a colon, because a form drawn from this contract offers a kind
+ * one credential field and installs from what it filled in.
+ */
+export const sandboxCredentials = z.object({ api_key: z.string().min(1).max(2048) }).strict();
+export type SandboxCredentials = z.infer<typeof sandboxCredentials>;
+
+/**
+ * Modal's half of that field: `<token id>:<token secret>`. Exactly one colon,
+ * with something on each side. A second colon means the value is not a Modal
+ * token, and splitting it at the first one would quietly keep half of somebody
+ * else's key, so it is refused rather than divided.
+ */
+export function modalTokenParts(key: string): { token_id: string; token_secret: string } | null {
+  const at = key.indexOf(':');
+  if (at <= 0 || at === key.length - 1 || key.lastIndexOf(':') !== at) return null;
+  return { token_id: key.slice(0, at), token_secret: key.slice(at + 1) };
+}
+
+/** What to paste in the one credential field, in the words the form shows. */
+export const SANDBOX_CREDENTIAL_FORMAT: Record<SandboxAdapter, string> = {
+  e2b: 'the API key on its own, which has no colon in it',
+  daytona: 'the API key on its own, which has no colon in it',
+  maritime: 'an API key with the computers scope, on its own, which has no colon in it',
+  modal: 'the token id and the token secret as one value, `token_id:token_secret`',
+  docker: "nothing: it runs on this service's own Docker engine and takes no key",
+};
+
+/** The one code a credential of the wrong shape is refused with. */
+export const SANDBOX_CREDENTIAL_CODE = 'credential_invalid';
+
+/**
+ * Why this key cannot be the named adapter's, or null. One field serves both
+ * adapters, so a value meant for the other one is caught here, while it is
+ * still only a request: before it is sealed, split or sent to a provider.
+ */
+export function sandboxCredentialRefusal(adapter: SandboxAdapter, key: string): string | null {
+  if (!sandboxAdapterTakesKey(adapter))
+    return `${SANDBOX_CREDENTIAL_CODE}: a ${adapter} sandbox takes ${SANDBOX_CREDENTIAL_FORMAT[adapter]}.`;
+  const wrong =
+    adapter === 'modal'
+      ? !modalTokenParts(key)
+      : // An E2B, Daytona or Maritime key carries no colon. One here is a Modal token in
+        // the wrong connection, and the provider would be handed it as a key.
+        key.includes(':');
+  return wrong
+    ? `${SANDBOX_CREDENTIAL_CODE}: a ${adapter} key is ${SANDBOX_CREDENTIAL_FORMAT[adapter]}.`
+    : null;
+}
+
+/**
+ * The services a command-line account reaches from the agent's computer. The
+ * egress relay holds the account and adds it on the wire; the computer only
+ * ever holds a placeholder.
+ */
+export const COMMAND_LINE_ADAPTERS = ['github', 'aws', 'gitlab', 'npm'] as const;
+export const commandLineConnectionConfig = z
+  .object({
+    adapter: z.enum(COMMAND_LINE_ADAPTERS),
+    /** AWS: the region commands use unless they name another, and where a role is assumed. */
+    region: z
+      .string()
+      .regex(/^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/)
+      .optional(),
+    /** AWS: a role this server assumes for each command, with the key. */
+    role_arn: z
+      .string()
+      .max(2048)
+      .regex(/^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/)
+      .optional(),
+    /** AWS: the external ID the role's trust policy asks for, if any. */
+    external_id: z
+      .string()
+      .regex(/^[\w+=,.@:/-]{2,1224}$/)
+      .optional(),
+  })
+  .strict()
+  .meta({ id: 'CommandLineConnectionConfig' });
+export type CommandLineConnectionConfig = z.infer<typeof commandLineConnectionConfig>;
+/** A token as the service issues it: printable, no spaces. */
+export const commandLineCredentials = z
+  .object({
+    token: z
+      .string()
+      .min(1)
+      .max(1024)
+      .regex(/^[!-~]+$/),
+  })
+  .strict();
+/** An AWS access key: its ID and its secret, as IAM issues them. */
+export const awsCommandLineCredentials = z
+  .object({
+    access_key_id: z.string().regex(/^[A-Z0-9]{16,128}$/),
+    secret_access_key: z.string().regex(/^[A-Za-z0-9/+=]{16,128}$/),
+  })
+  .strict();
+/**
+ * Text messages through Twilio. The numbers here are the person's own phones:
+ * a text from one of them is the person talking to OpenDuet, and a text from any
+ * other number is only kept for them to read. Left empty, nobody is.
+ */
+export const smsConnectionConfig = z
+  .object({ allowed_numbers: z.array(e164Number).max(10).default([]) })
+  .strict();
+export type SmsConnectionConfig = z.infer<typeof smsConnectionConfig>;
+
+/** The Twilio account, its auth token and the number texts come from, sealed together. */
+export const smsCredentials = z
+  .object({
+    account_sid: z.string().regex(/^AC[0-9a-fA-F]{32}$/, 'An account SID starts with AC'),
+    auth_token: z
+      .string()
+      .min(16)
+      .max(128)
+      .regex(/^[A-Za-z0-9]+$/),
+    from_number: e164Number,
+  })
+  .strict();
+export type SmsCredentials = z.infer<typeof smsCredentials>;
+
+/** The grants each kind may receive. MCP grants are declared in its own operator policy. */
+export const CONNECTION_KIND_SCOPES = {
+  mail: ['email.search', 'email.read', 'email.draft', 'email.discard', 'email.send'],
+  caldav: [
+    'calendar.list',
+    'calendar.freebusy',
+    'calendar.create',
+    'calendar.update',
+    'calendar.delete',
+  ],
+  ics: ['calendar.list', 'calendar.freebusy'],
+  sandbox: [
+    'terminal.run',
+    'computer.screenshot',
+    'computer.open',
+    'computer.click',
+    'computer.type',
+    'computer.key',
+    'computer.scroll',
+    'computer.batch',
+    'process.start',
+    'process.list',
+    'process.read',
+    'process.write',
+    'process.signal',
+    'process.stop',
+    'process.extend',
+    'process.wait',
+  ],
+  // Reading through the relay at all, and the changes it brings to the broker.
+  command_line: [
+    'egress.github_read',
+    'egress.github_write',
+    'egress.aws_read',
+    'egress.aws_write',
+    'egress.gitlab_read',
+    'egress.gitlab_write',
+    'egress.npm_read',
+    'egress.npm_write',
+  ],
+  sms: ['sms.send'],
+} as const satisfies Record<Exclude<ConnectionKind, 'mcp' | 'mcp_stdio'>, readonly string[]>;
+
+export const createConnectionRequest = z.object({
+  /** Left out, the space of the signed-in session. */
+  space_id: prefixedId(ID_PREFIXES.space).optional(),
+  provider: connectionProvider,
+  label: z.string().min(1).max(120),
+  /** Left empty, every grant the kind offers. An MCP installation declares its grants in `mcp`. */
+  scopes: z.array(z.string()).default([]),
+  /**
+   * Sealed with the master key on arrival and never returned. Mail and CalDAV
+   * take `password`; MCP takes its token fields; a calendar feed takes none.
+   */
+  credentials: z.record(z.string(), z.string()).optional(),
+  mcp: mcpConnectionConfig.optional(),
+  mail: mailConnectionRequest.optional(),
+  caldav: caldavConnectionRequest.optional(),
+  mcp_stdio: mcpStdioConnectionConfig.optional(),
+  ics: icsConnectionConfig.optional(),
+  sandbox: sandboxConnectionConfig.optional(),
+  command_line: commandLineConnectionConfig.optional(),
+  sms: smsConnectionConfig.optional(),
+});
+export type CreateConnectionRequest = z.infer<typeof createConnectionRequest>;
+
+export type ConnectionInstallation =
+  | {
+      kind: 'mail';
+      provider: 'imap';
+      config: MailConnectionConfig;
+      credentials: PasswordCredentials;
+      scopes: string[];
+    }
+  | {
+      kind: 'caldav';
+      provider: 'caldav';
+      /** With `server_url`, the calendar is found before anything is stored. */
+      config: CaldavConnectionRequest;
+      credentials: PasswordCredentials;
+      scopes: string[];
+    }
+  | { kind: 'ics'; provider: 'caldav'; config: IcsConnectionConfig; scopes: string[] }
+  | {
+      kind: 'mcp';
+      provider: 'mcp';
+      config: z.infer<typeof mcpConnectionConfig>;
+      credentials: Record<string, string> | undefined;
+    }
+  | {
+      kind: 'mcp_stdio';
+      provider: 'mcp';
+      config: z.infer<typeof mcpStdioConnectionConfig>;
+    }
+  | {
+      kind: 'sandbox';
+      provider: 'sandbox';
+      config: SandboxConnectionConfig;
+      /** Null for an adapter that takes no key. */
+      credentials: SandboxCredentials | null;
+      scopes: string[];
+    }
+  | {
+      kind: 'command_line';
+      provider: 'command_line';
+      config: CommandLineConnectionConfig;
+      credentials:
+        | z.infer<typeof commandLineCredentials>
+        | z.infer<typeof awsCommandLineCredentials>;
+      scopes: string[];
+    }
+  | {
+      kind: 'sms';
+      provider: 'twilio';
+      config: SmsConnectionConfig;
+      credentials: SmsCredentials;
+      scopes: string[];
+    };
+
+const KIND_PROVIDER = {
+  mail: 'imap',
+  caldav: 'caldav',
+  ics: 'caldav',
+  mcp: 'mcp',
+  mcp_stdio: 'mcp',
+  sandbox: 'sandbox',
+  command_line: 'command_line',
+  sms: 'twilio',
+} as const;
+const EXACTLY_ONE =
+  'Supply exactly one of mail, caldav, ics, mcp, mcp_stdio, sandbox, command_line or sms.';
+
+/** Decide which kind a parsed request installs, or say in plain words why it installs none. */
+export function connectionInstallation(
+  request: CreateConnectionRequest,
+): Result<ConnectionInstallation, string> {
+  const present = CONNECTION_KINDS.filter((kind) => request[kind] !== undefined);
+  const [kind] = present;
+  if (present.length !== 1 || !kind) return err(EXACTLY_ONE);
+  if (request.provider !== KIND_PROVIDER[kind])
+    return err(`A ${kind} connection uses the ${KIND_PROVIDER[kind]} provider.`);
+  if (kind === 'mcp') {
+    if (!request.mcp || request.scopes.length)
+      return err('Supply MCP endpoint and operator policy in mcp.');
+    return ok({ kind, provider: 'mcp', config: request.mcp, credentials: request.credentials });
+  }
+  if (kind === 'mcp_stdio') {
+    // Its secrets travel in `mcp_stdio.secret_env`, so each one is named for the variable it fills.
+    if (!request.mcp_stdio || request.scopes.length || request.credentials)
+      return err('Supply the launch, operator policy and secret variables in mcp_stdio.');
+    return ok({ kind, provider: 'mcp', config: request.mcp_stdio });
+  }
+  const allowed: readonly string[] = CONNECTION_KIND_SCOPES[kind];
+  if (
+    !request.scopes.every((scope) => allowed.includes(scope)) ||
+    new Set(request.scopes).size !== request.scopes.length
+  )
+    return err(`A ${kind} connection grants only: ${allowed.join(', ')}.`);
+  const scopes = request.scopes.length ? request.scopes : [...allowed];
+  if (kind === 'command_line') {
+    if (!request.command_line) return err('Supply the service in command_line.');
+    const adapter = request.command_line.adapter;
+    const { region, role_arn, external_id } = request.command_line;
+    if (adapter === 'aws' && !region) return err('An AWS account needs command_line.region.');
+    if (adapter !== 'aws' && (region || role_arn || external_id))
+      return err('Only an AWS account takes a region, a role or an external ID.');
+    if (external_id && !role_arn) return err('An external ID goes with a role to assume.');
+    const credentials =
+      adapter === 'aws'
+        ? awsCommandLineCredentials.safeParse(request.credentials)
+        : commandLineCredentials.safeParse(request.credentials);
+    if (!credentials.success)
+      return err(
+        adapter === 'aws'
+          ? 'An AWS account needs credentials.access_key_id and credentials.secret_access_key only.'
+          : 'A command-line account needs credentials.token only.',
+      );
+    // Left out, the grants are this service's own read and write.
+    const granted = request.scopes.length
+      ? scopes
+      : allowed.filter((scope) => scope.startsWith(`egress.${adapter}_`));
+    // Each service's grants are its own: egress.<service>_read and _write.
+    if (!granted.every((scope) => scope.startsWith(`egress.${adapter}_`)))
+      return err(
+        `A ${adapter} account grants only egress.${adapter}_read and egress.${adapter}_write.`,
+      );
+    return ok({
+      kind,
+      provider: 'command_line',
+      config: request.command_line,
+      credentials: credentials.data,
+      scopes: granted,
+    });
+  }
+  if (kind === 'sandbox') {
+    if (!request.sandbox) return err('Supply the sandbox configuration in sandbox.');
+    const { cidrs, ...rest } = request.sandbox;
+    // Ranges belong to the allow-list and to nothing else: a list a form left
+    // behind under another policy is dropped rather than stored unused.
+    if (rest.egress === 'cidr_allowlist' && !cidrs?.length)
+      return err('A CIDR allow-list needs at least one range.');
+    const config: SandboxConnectionConfig =
+      rest.egress === 'cidr_allowlist' ? { ...rest, cidrs: cidrs ?? [] } : rest;
+    // A desktop grant is kept only where the adapter's sandboxes have a desktop.
+    const granted = sandboxAdapterHasDesktop(config.adapter)
+      ? scopes
+      : scopes.filter((scope) => !scope.startsWith('computer.'));
+    if (!sandboxAdapterTakesKey(config.adapter)) {
+      // A key sent to an adapter that has no account would be sealed and never read.
+      if (request.credentials && Object.keys(request.credentials).length)
+        return err(sandboxCredentialRefusal(config.adapter, '') ?? EXACTLY_ONE);
+      return ok({ kind, provider: 'sandbox', config, credentials: null, scopes: granted });
+    }
+    const credentials = sandboxCredentials.safeParse(request.credentials);
+    if (!credentials.success) return err('A sandbox needs credentials.api_key only.');
+    const malformed = sandboxCredentialRefusal(config.adapter, credentials.data.api_key);
+    if (malformed) return err(malformed);
+    return ok({
+      kind,
+      provider: 'sandbox',
+      config,
+      credentials: credentials.data,
+      scopes: granted,
+    });
+  }
+  if (kind === 'sms') {
+    if (!request.sms) return err('Supply the phone numbers in sms.');
+    const credentials = smsCredentials.safeParse(request.credentials);
+    if (!credentials.success)
+      return err(
+        'Texting needs credentials.account_sid, credentials.auth_token and credentials.from_number only.',
+      );
+    return ok({
+      kind,
+      provider: 'twilio',
+      config: request.sms,
+      credentials: credentials.data,
+      scopes,
+    });
+  }
+  if (kind === 'ics') {
+    if (!request.ics || request.credentials)
+      return err('A calendar feed takes its address and no other credential.');
+    return ok({ kind, provider: 'caldav', config: request.ics, scopes });
+  }
+  const credentials = passwordCredentials.safeParse(request.credentials);
+  if (!credentials.success) return err(`A ${kind} connection needs credentials.password only.`);
+  if (kind === 'mail' && request.mail) {
+    const from = request.mail.from ?? request.mail.username;
+    if (!z.email().safeParse(from).success)
+      return err('Send as is needed when the account name is not an email address.');
+    return ok({
+      kind,
+      provider: 'imap',
+      config: { ...request.mail, from },
+      credentials: credentials.data,
+      scopes,
+    });
+  }
+  if (kind === 'caldav' && request.caldav)
+    return ok({
+      kind,
+      provider: 'caldav',
+      config: request.caldav,
+      credentials: credentials.data,
+      scopes,
+    });
+  return err(EXACTLY_ONE);
+}
+
+/**
+ * The outcome of testing a connection. The code is one of a fixed set and the
+ * detail is the sentence that belongs to that code, so a check can never carry
+ * a transport message, an address or a credential back to the caller.
+ */
+export const CONNECTION_CHECK_CODES = [
+  'ok',
+  'degraded',
+  'unavailable',
+  'credential_refused',
+  'sign_in_required',
+  'needs_sign_in',
+  'not_running',
+  'revoked',
+  'unreachable',
+  'not_mcp',
+  'tool_missing',
+] as const;
+export const connectionCheckCode = z.enum(CONNECTION_CHECK_CODES);
+export type ConnectionCheckCode = z.infer<typeof connectionCheckCode>;
+
+export const CONNECTION_CHECK_DETAIL: Record<ConnectionCheckCode, string> = {
+  ok: 'The connection answered.',
+  degraded: 'The connection answered with a warning.',
+  unavailable:
+    'The destination could not be reached or refused the credential. Check the address, the account and the password.',
+  credential_refused:
+    'The server refused the account name or password. Use an app password where the provider offers one, then test again. Outlook.com accepts only its own sign-in, so no password works there.',
+  sign_in_required:
+    "The account's sign-in has ended or its access was removed. Sign in again to reconnect it.",
+  needs_sign_in:
+    'This server asks you to sign in to it. Choose Sign in on this connection. If signing in does not work, ask whoever runs OpenDuet here to check the web address it is set up with.',
+  not_running: 'This isn’t running right now, so OpenDuet can’t use it yet. Test it again later.',
+  revoked: 'This connection was removed and can no longer be used.',
+  unreachable:
+    'OpenDuet could not reach this server, or it did not answer in time. Check the address and that the server is running, then test again.',
+  not_mcp:
+    'Something answered at this address, but not as an MCP server. Check that it is the server’s MCP address, which often ends in /mcp.',
+  tool_missing:
+    'The server no longer has a tool this connection uses. Disconnect it and add it again to pick from the tools it has now.',
+};
+
+export const connectionCheck = z
+  .object({
+    status: z.enum(['ok', 'degraded', 'failing']),
+    code: connectionCheckCode,
+    detail: z.string().max(240),
+    checked_at: timestamp,
+  })
+  .meta({ id: 'ConnectionCheck' });
+export type ConnectionCheck = z.infer<typeof connectionCheck>;
+
+export const connectionListResponse = z.object({ connections: z.array(connectionView) });
+/** Installing a connection tests it once, and says how that went. */
+export const connectionResponse = z.object({
+  connection: connectionView,
+  check: connectionCheck.optional(),
+});
+export type ConnectionResponse = z.infer<typeof connectionResponse>;
+export type McpConnectionConfig = z.infer<typeof mcpConnectionConfig>;
+
+/**
+ * Connecting a remote MCP server by signing in to it. The server's address
+ * and grants are the same block a pasted credential installs with; the sign-in
+ * earns the credential instead.
+ */
+/**
+ * A client the person registered with the server's authorization server
+ * themselves. Only needed for a server that offers no other way to register.
+ */
+const preRegisteredClient = z
+  .object({
+    client_id: z.string().min(1).max(1024),
+    client_secret: z.string().min(1).max(16_384).optional(),
+  })
+  .strict();
+
+/** An MCP installation's short name, which prefixes its grants. */
+const mcpServerShortName = z
+  .string()
+  .regex(/^[a-z][a-z0-9_]*$/)
+  .max(40);
+
+export const mcpSignInRequest = z.union([
+  z
+    .object({
+      /** Left out, the space of the signed-in session. */
+      space_id: prefixedId(ID_PREFIXES.space).optional(),
+      label: z.string().min(1).max(120),
+      mcp: mcpConnectionConfig,
+      client: preRegisteredClient.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      /**
+       * Sign in again for this connection, after its grant ended or when it
+       * needs more access. Everything granted before is asked for again.
+       */
+      connection_id: prefixedId(ID_PREFIXES.connection),
+      client: preRegisteredClient.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      /** Left out, the space of the signed-in session. */
+      space_id: prefixedId(ID_PREFIXES.space).optional(),
+      label: z.string().min(1).max(120),
+      /**
+       * Sign in to a server added by its address before its tools are known.
+       * After the sign-in its tools are read and the sign-in waits, `ready`,
+       * until `POST /mcp-sign-ins/{id}/install` says which to keep.
+       */
+      discover: z.object({ id: mcpServerShortName, url: mcpHttpUrl }).strict(),
+      client: preRegisteredClient.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      /**
+       * Connect an app from the catalog (`GET /connection-kinds`) in one step:
+       * its server, its tools and what each may do come from the catalog entry.
+       */
+      catalog_id: z.string().regex(/^[a-z][a-z0-9_]*$/),
+      /** Left out, the space of the signed-in session. */
+      space_id: prefixedId(ID_PREFIXES.space).optional(),
+    })
+    .strict(),
+]);
+
+/** One permission a sign-in asks for, with the plain words a person reads for it when known. */
+export const requestedScope = z.object({
+  scope: z.string(),
+  label: z.string().optional(),
+});
+export type RequestedScope = z.infer<typeof requestedScope>;
+
+export const mcpSignInStart = z.object({
+  sign_in_id: z.string(),
+  /** Open this in the person's browser. */
+  authorize_url: z.url(),
+  /** Where the authorization server sends the browser back. */
+  redirect_uri: z.url(),
+  expires_at: timestamp,
+  /**
+   * The authorization server the MCP server named, where the person will sign
+   * in. Show it, with `scopes`, before opening `authorize_url`.
+   */
+  issuer: z.url(),
+  /** What the sign-in asks the server for; empty when the server names no scopes. */
+  scopes: z.array(requestedScope),
+});
+
+/** One tool a server lists, with where OpenDuet suggests it starts. */
+export const discoveredMcpTool = z
+  .object({
+    /** The tool's name on the server. */
+    name: z.string().regex(/^[A-Za-z0-9_.-]{1,128}$/),
+    /** The server's own words for it, shortened. */
+    description: z.string().max(400).optional(),
+    /** A suggestion only: the person chooses before anything is installed. */
+    effect_class: effectClass,
+  })
+  .meta({ id: 'DiscoveredMcpTool' });
+export type DiscoveredMcpTool = z.infer<typeof discoveredMcpTool>;
+
+/** Reading the tools of a server added by its address, before installing it. */
+export const mcpToolDiscoveryRequest = z
+  .object({
+    /** Left out, the space of the signed-in session. */
+    space_id: prefixedId(ID_PREFIXES.space).optional(),
+    url: mcpHttpUrl,
+    /** A token the server's owner issued, when it takes one instead of a sign-in. */
+    access_token: z.string().min(1).max(16_384).optional(),
+  })
+  .strict();
+
+export const mcpToolDiscovery = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('ready'), tools: z.array(discoveredMcpTool) }),
+  /** The server wants a sign-in first: start one with `discover` on `POST /mcp-sign-ins`. */
+  z.object({ state: z.literal('needs_sign_in') }),
+]);
+export type McpToolDiscovery = z.infer<typeof mcpToolDiscovery>;
+
+/** The tools a person kept from a `ready` sign-in, and how far each may act. */
+export const mcpSignInInstall = z
+  .object({
+    tools: z
+      .array(
+        z
+          .object({ name: z.string().regex(/^[A-Za-z0-9_.-]{1,128}$/), effect_class: effectClass })
+          .strict(),
+      )
+      .min(1)
+      .max(MAX_DISCOVERED_TOOLS),
+  })
+  .strict();
+
+export const mcpSignInStatus = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('pending'), expires_at: timestamp }),
+  /** Signed in to a server added by its address; its tools wait for the person's choice. */
+  z.object({ state: z.literal('ready'), tools: z.array(discoveredMcpTool) }),
+  z.object({ state: z.literal('connected'), connection_id: prefixedId(ID_PREFIXES.connection) }),
+  z.object({ state: z.literal('failed'), error: z.string() }),
+]);
+/** Signing in once with Google or Microsoft to connect that account's mail and calendar. */
+export const accountSignInRequest = z
+  .object({
+    /** Left out, the space of the signed-in session. */
+    space_id: prefixedId(ID_PREFIXES.space).optional(),
+    mail_label: z.string().min(1).max(120).optional(),
+    calendar_label: z.string().min(1).max(120).optional(),
+    /**
+     * Ask Google only for Drive, beside what the account already granted: the
+     * step a person takes when they first keep a deadline on a Drive file.
+     */
+    documents: z.boolean().optional(),
+  })
+  .strict();
+export type AccountSignInRequest = z.infer<typeof accountSignInRequest>;
+
+export const accountSignInAvailability = z.object({
+  /** False until the operator configures this provider's OAuth client and a public address. */
+  available: z.boolean(),
+  /** The redirect address to register with that client. */
+  redirect_uri: z.url().nullable(),
+});
+
+export const accountSignInStart = z.object({
+  sign_in_id: z.string(),
+  /** Open this in the person's browser. */
+  authorize_url: z.url(),
+  redirect_uri: z.url(),
+  expires_at: timestamp,
+  /** Where the person will sign in. Show it, with `scopes`, before opening `authorize_url`. */
+  issuer: z.url(),
+  /** Everything the sign-in asks the provider for. */
+  scopes: z.array(requestedScope),
+  /** Why this sign-in asks for more than the person granted before, in plain words. */
+  reason: z.string().optional(),
+});
+
+/**
+ * Signing in with Google through Composio, whose own Google app asks for
+ * consent. One sign-in connects Gmail and Google Calendar, one consent page
+ * each; with `documents`, Google Drive alone.
+ */
+/** A toolkit's slug at Composio, such as `slack`. */
+export const composioToolkit = z.string().regex(/^[a-z0-9][a-z0-9_]{0,63}$/);
+
+export const managedSignInRequest = z.discriminatedUnion('provider', [
+  z
+    .object({
+      provider: z.literal('google'),
+      /** Left out, the space of the signed-in session. */
+      space_id: prefixedId(ID_PREFIXES.space).optional(),
+      documents: z.boolean().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      /** Another app Composio signs in to, named by its toolkit. */
+      provider: z.literal('app'),
+      toolkit: composioToolkit,
+      space_id: prefixedId(ID_PREFIXES.space).optional(),
+    })
+    .strict(),
+]);
+export type ManagedSignInRequest = z.infer<typeof managedSignInRequest>;
+
+export const managedSignInStart = z.object({
+  sign_in_id: z.string(),
+  /** Open this in the person's browser: the first consent page. */
+  authorize_url: z.url(),
+  expires_at: timestamp,
+  /** Where the person signs in. */
+  issuer: z.url(),
+  via: z.literal('composio'),
+  /** What the sign-in connects, one consent page each, in order; `tools` for an app. */
+  connects: z.array(z.enum(['mail', 'calendar', 'documents', 'tools'])),
+});
+
+/** One app that can be connected through Composio. */
+export const composioApp = z
+  .object({
+    toolkit: composioToolkit,
+    title: z.string(),
+    description: z.string(),
+    logo: z.url().nullable(),
+    categories: z.array(z.string()),
+  })
+  .meta({ id: 'ComposioApp' });
+
+export const composioAppSearchResponse = z.object({ apps: z.array(composioApp) });
+export type ComposioAppSearchResponse = z.infer<typeof composioAppSearchResponse>;
+
+export const accountSignInStatus = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('pending'), expires_at: timestamp }),
+  z.object({
+    state: z.literal('connected'),
+    connection_ids: z.array(prefixedId(ID_PREFIXES.connection)),
+  }),
+  z.object({ state: z.literal('failed'), error: z.string() }),
+]);
+
+export const connectionCheckResponse = z.object({
+  connection: connectionView,
+  check: connectionCheck,
+});
+
+// --------------------------------------------------------------------------
+// what a form needs to know about each kind
+// --------------------------------------------------------------------------
+
+const formValue = z.union([z.string(), z.number(), z.boolean()]);
+const formInput = z.enum([
+  'text',
+  'email',
+  'url',
+  'number',
+  'password',
+  'checkbox',
+  'select',
+  'string_list',
+]);
+const formFieldShape = {
+  /** Where the value goes in the create request, as a dotted path. Inside a list, relative to the row. */
+  path: z.string().min(1).max(120),
+  label: z.string().min(1).max(80),
+  help: z.string().max(240).optional(),
+  required: z.boolean(),
+  /** Sealed on arrival and never shown again. */
+  secret: z.boolean(),
+  placeholder: z.string().max(120).optional(),
+  default: formValue.optional(),
+  options: z.array(z.object({ value: z.string(), label: z.string() })).optional(),
+};
+const formItemField = z.object({ ...formFieldShape, input: formInput });
+export type ConnectionFormItemField = z.infer<typeof formItemField>;
+export const connectionFormField = z
+  .object({
+    ...formFieldShape,
+    input: z.union([formInput, z.literal('list')]),
+    /** The fields of one row when `input` is `list`. */
+    item_fields: z.array(formItemField).optional(),
+  })
+  .meta({ id: 'ConnectionFormField' });
+export type ConnectionFormField = z.infer<typeof connectionFormField>;
+
+export const connectionKindDescriptor = z
+  .object({
+    /**
+     * Names this entry. A kind can appear more than once: a provider's entry
+     * fixes its servers so the person gives only an address and an app password.
+     */
+    id: z.string().regex(/^[a-z][a-z0-9_-]*$/),
+    kind: connectionKind,
+    title: z.string(),
+    description: z.string(),
+    /** Values the request always carries for this kind; never shown as inputs. */
+    fixed: z.array(z.object({ path: z.string(), value: formValue })),
+    fields: z.array(connectionFormField),
+    /** Grants a person may untick. Empty when the kind declares its grants in its own fields. */
+    scopes: z.array(
+      z.object({
+        scope: z.string(),
+        label: z.string(),
+        effect_class: effectClass,
+        /** True when every use waits for the person's approval. */
+        asks_first: z.boolean(),
+        default: z.boolean(),
+      }),
+    ),
+  })
+  .meta({ id: 'ConnectionKind' });
+export type ConnectionKindDescriptor = z.infer<typeof connectionKindDescriptor>;
+
+/**
+ * One entry of the connector catalog: something a person can connect, how,
+ * and whether this installation offers it now. A sign-in entry starts at its
+ * sign-in route; a form entry opens the form of the kind it names.
+ */
+export const connectionCatalogEntry = z
+  .object({
+    id: z.string().regex(/^[a-z][a-z0-9_-]*$/),
+    title: z.string(),
+    description: z.string(),
+    /** What a connection made from this entry can do. */
+    covers: z.array(z.enum(['mail', 'calendar', 'documents', 'tools', 'execution', 'texts'])),
+    connect: z.discriminatedUnion('method', [
+      z.object({
+        method: z.literal('sign_in'),
+        provider: z.enum(['google', 'microsoft']),
+        /** `POST` here to start; the answer is the address to open in the browser. */
+        start: z.string(),
+        /** Where the person signs in. */
+        issuer: z.url(),
+        /** Everything the sign-in asks the provider for, in plain words. */
+        scopes: z.array(requestedScope),
+      }),
+      z.object({
+        method: z.literal('managed_sign_in'),
+        provider: z.enum(['google', 'app']),
+        /** For an app, its toolkit, sent back in the request that starts the sign-in. */
+        toolkit: composioToolkit.optional(),
+        /** Who handles the sign-in and keeps the account's tokens. */
+        via: z.literal('composio'),
+        /** `POST` here with `{ provider }` (and `toolkit` for an app) to start; the answer is the address to open. */
+        start: z.string(),
+        /** What the person reads about who signs them in, in plain words. */
+        note: z.string(),
+      }),
+      z.object({
+        method: z.literal('mcp_sign_in'),
+        /** The server's address, for the `mcp` block of `POST /mcp-sign-ins`. */
+        url: z.url(),
+        /** A short name for the installation's `mcp.id`, which prefixes its grants. */
+        suggested_id: z.string().regex(/^[a-z][a-z0-9_]*$/),
+        start: z.string(),
+        /**
+         * Present for an app whose tools OpenDuet already knows: `POST` to `start`
+         * with `{ catalog_id }` and nothing else, and these are what it may do.
+         * Tools the app's server does not offer when it is connected are left out.
+         */
+        tools: z
+          .array(
+            z.object({
+              label: z.string(),
+              effect_class: effectClass,
+              /** True when every use waits for the person's approval. */
+              asks_first: z.boolean(),
+            }),
+          )
+          .optional(),
+      }),
+      z.object({
+        method: z.literal('form'),
+        /** The `id` of the entry in `kinds` whose form connects it. */
+        kind_id: z.string(),
+      }),
+    ]),
+    available: z.boolean(),
+    /** When it is not available, why, in words for the person using this OpenDuet. */
+    unavailable_reason: z.string().optional(),
+    /**
+     * When it is not available, or offers less than it could, what the operator
+     * has to set. Sent only to the installation's owner, who runs it; everyone
+     * else reads `unavailable_reason` or `limited_reason`.
+     */
+    setup_hint: z.string().optional(),
+    /** Something the person should know before connecting it, such as that it can move money. */
+    warning: z.string().optional(),
+    /**
+     * When it is available but offers less than it could here, what is missing,
+     * in words for the person using this OpenDuet.
+     */
+    limited_reason: z.string().optional(),
+  })
+  .meta({ id: 'ConnectionCatalogEntry' });
+export type ConnectionCatalogEntry = z.infer<typeof connectionCatalogEntry>;
+
+export const connectionKindListResponse = z.object({
+  kinds: z.array(connectionKindDescriptor),
+  /** Everything a person can connect here, sign-ins first. Additive to `kinds`. */
+  catalog: z.array(connectionCatalogEntry).optional(),
+});
+
+/** A text that reached a Twilio number, as the person reads it. */
+export const smsText = z
+  .object({
+    id: z.string(),
+    /** The number it came from. */
+    from: z.string(),
+    body: z.string(),
+    /** True when it came from one of the person's own numbers and went to their conversation. */
+    from_you: z.boolean(),
+    /**
+     * Where the text went: into the conversation; only kept here to be read;
+     * or not taken, when it was from you but the conversation could not take it.
+     */
+    handling: z.enum(['conversation', 'kept', 'not_taken']),
+    received_at: timestamp,
+  })
+  .meta({ id: 'SmsText' });
+export const smsTextListResponse = z.object({ texts: z.array(smsText) });
+
+/**
+ * Account sign-ins: one consent connects the account's mail and calendar, and
+ * with Google its Drive. The
+ * issuer and scopes are the ones the service asks for, fixed in its connectors;
+ * a test holds the two lists equal.
+ */
+export const ACCOUNT_CATALOG = [
+  {
+    id: 'google',
+    title: 'Google',
+    description:
+      'Sign in with Google to connect Gmail and Google Calendar. Mail is read and searched, drafts stay here, and each message is sent and each event changed after you approve it. Google Drive is added the first time you keep a deadline on one of its files.',
+    covers: ['mail', 'calendar', 'documents'],
+    provider: 'google',
+    issuer: 'https://accounts.google.com',
+    scopes: [
+      { scope: 'openid', label: 'Confirm who you are' },
+      { scope: 'email', label: 'See your email address' },
+      {
+        scope: 'https://www.googleapis.com/auth/gmail.readonly',
+        label: 'Read your Gmail messages',
+      },
+      {
+        scope: 'https://www.googleapis.com/auth/gmail.send',
+        label: 'Send email as you, each message after you approve it',
+      },
+      {
+        scope: 'https://www.googleapis.com/auth/calendar.events',
+        label: 'See and change events in your Google calendars, each change after you approve it',
+      },
+    ],
+    /** Asked for later, once, when a person first keeps a deadline on a Drive file. */
+    later_scopes: [
+      {
+        scope: 'https://www.googleapis.com/auth/drive.metadata.readonly',
+        label: 'See the names, times and sharing of your Google Drive files, never their contents',
+      },
+    ],
+  },
+  {
+    id: 'microsoft',
+    title: 'Microsoft',
+    description:
+      'Sign in with Microsoft to connect Outlook mail and calendar, for Outlook.com and work or school accounts. Each message is sent and each event changed after you approve it.',
+    covers: ['mail', 'calendar'],
+    provider: 'microsoft',
+    issuer: 'https://login.microsoftonline.com',
+    scopes: [
+      { scope: 'openid', label: 'Confirm who you are' },
+      { scope: 'email', label: 'See your email address' },
+      { scope: 'offline_access', label: 'Stay connected until you disconnect' },
+      { scope: 'https://graph.microsoft.com/User.Read', label: 'Read your basic profile' },
+      { scope: 'https://graph.microsoft.com/Mail.Read', label: 'Read your Outlook mail' },
+      {
+        scope: 'https://graph.microsoft.com/Mail.Send',
+        label: 'Send email as you, each message after you approve it',
+      },
+      {
+        scope: 'https://graph.microsoft.com/Calendars.ReadWrite',
+        label: 'See and change your Outlook calendar, each change after you approve it',
+      },
+    ],
+  },
+] as const;
+
+/**
+ * What a person is told when they first keep a deadline on a Drive file and
+ * no Drive is connected yet, and again on the consent step that adds it.
+ */
+export const DRIVE_CONSENT_WORDS =
+  'To keep a deadline on a Drive file, OpenDuet needs to see your Google Drive files’ names, change times and sharing, never their contents. Sign in with Google once more to allow it.';
+
+const text = (
+  path: string,
+  label: string,
+  extra: Partial<ConnectionFormItemField> = {},
+): ConnectionFormItemField => ({
+  path,
+  label,
+  input: 'text',
+  required: true,
+  secret: false,
+  ...extra,
+});
+const EFFECT_OPTIONS = [
+  { value: 'read', label: 'Reads only' },
+  { value: 'write_reversible', label: 'Changes that can be undone' },
+  { value: 'write_external', label: 'Changes elsewhere (asks first)' },
+  { value: 'spend', label: 'Spends money (asks first)' },
+];
+
+type KindScopes = ConnectionKindDescriptor['scopes'];
+const MAIL_SCOPES: KindScopes = [
+  {
+    scope: 'email.search',
+    label: 'Search the mailbox',
+    effect_class: 'read',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'email.read',
+    label: 'Read a message',
+    effect_class: 'read',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'email.draft',
+    label: 'Prepare a draft',
+    effect_class: 'write_reversible',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'email.discard',
+    label: 'Discard a draft',
+    effect_class: 'write_reversible',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'email.send',
+    label: 'Send a message',
+    effect_class: 'write_external',
+    asks_first: true,
+    default: true,
+  },
+];
+const CALDAV_SCOPES: KindScopes = [
+  {
+    scope: 'calendar.list',
+    label: 'List events',
+    effect_class: 'read',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'calendar.freebusy',
+    label: 'See when you are busy, and with what',
+    effect_class: 'read',
+    asks_first: false,
+    default: true,
+  },
+  {
+    scope: 'calendar.create',
+    label: 'Create an event',
+    effect_class: 'write_external',
+    asks_first: true,
+    default: true,
+  },
+  {
+    scope: 'calendar.update',
+    label: 'Change an event',
+    effect_class: 'write_external',
+    asks_first: true,
+    default: true,
+  },
+  {
+    scope: 'calendar.delete',
+    label: 'Remove an event',
+    effect_class: 'write_external',
+    asks_first: true,
+    default: true,
+  },
+];
+const FEED_SCOPES: KindScopes = CALDAV_SCOPES.filter(
+  (scope) => scope.scope === 'calendar.list' || scope.scope === 'calendar.freebusy',
+);
+
+/** A mailbox whose servers are known: the person gives the address and an app password. */
+const mailProvider = (
+  id: string,
+  title: string,
+  imap: [host: string, port: number, secure: boolean],
+  smtp: [host: string, port: number, secure: boolean],
+  passwordHelp: string,
+  usernameHelp?: string,
+): ConnectionKindDescriptor => ({
+  id,
+  kind: 'mail',
+  title,
+  description: `Read, search and draft in ${title}, and send after you approve each message.`,
+  fixed: [
+    { path: 'provider', value: 'imap' },
+    { path: 'mail.imap.host', value: imap[0] },
+    { path: 'mail.imap.port', value: imap[1] },
+    { path: 'mail.imap.secure', value: imap[2] },
+    { path: 'mail.smtp.host', value: smtp[0] },
+    { path: 'mail.smtp.port', value: smtp[1] },
+    { path: 'mail.smtp.secure', value: smtp[2] },
+  ],
+  fields: [
+    text('mail.username', 'Email address', {
+      input: 'email',
+      placeholder: 'you@example.com',
+      ...(usernameHelp ? { help: usernameHelp } : {}),
+    }),
+    text('credentials.password', 'App password', {
+      input: 'password',
+      secret: true,
+      help: passwordHelp,
+    }),
+  ],
+  scopes: MAIL_SCOPES,
+});
+
+/** A calendar service that finds the account's calendar from the address and an app password. */
+const calendarProvider = (
+  id: string,
+  title: string,
+  serverUrl: string,
+  passwordHelp: string,
+  usernameHelp?: string,
+): ConnectionKindDescriptor => ({
+  id,
+  kind: 'caldav',
+  title,
+  description: `List the events of your ${title}, and create, change or remove an event after you approve it.`,
+  fixed: [
+    { path: 'provider', value: 'caldav' },
+    { path: 'caldav.server_url', value: serverUrl },
+  ],
+  fields: [
+    text('caldav.username', 'Email address', {
+      input: 'email',
+      placeholder: 'you@example.com',
+      ...(usernameHelp ? { help: usernameHelp } : {}),
+    }),
+    text('credentials.password', 'App password', {
+      input: 'password',
+      secret: true,
+      help: passwordHelp,
+    }),
+  ],
+  scopes: CALDAV_SCOPES,
+});
+
+/**
+ * What `GET /connection-kinds` serves, in the order a person reads it: the
+ * providers whose servers are known first, then each kind for any other server.
+ */
+export const CONNECTION_KIND_DESCRIPTORS: ConnectionKindDescriptor[] = [
+  mailProvider(
+    'gmail',
+    'Gmail',
+    ['imap.gmail.com', 993, true],
+    ['smtp.gmail.com', 465, true],
+    'Create one at myaccount.google.com/apppasswords. Google asks for 2-Step Verification first.',
+  ),
+  mailProvider(
+    'icloud-mail',
+    'iCloud Mail',
+    ['imap.mail.me.com', 993, true],
+    ['smtp.mail.me.com', 587, false],
+    'Create an app-specific password at account.apple.com, under Sign-In and Security.',
+    'Your iCloud Mail address, such as you@icloud.com, even when you sign in to Apple with another address.',
+  ),
+  mailProvider(
+    'fastmail',
+    'Fastmail',
+    ['imap.fastmail.com', 993, true],
+    ['smtp.fastmail.com', 465, true],
+    'Create one in Fastmail under Settings, then Privacy and Security.',
+  ),
+  mailProvider(
+    'yahoo-mail',
+    'Yahoo Mail',
+    ['imap.mail.yahoo.com', 993, true],
+    ['smtp.mail.yahoo.com', 465, true],
+    'Create one in your Yahoo account under Account security.',
+  ),
+  {
+    id: 'mail',
+    kind: 'mail',
+    title: 'Other mail (IMAP)',
+    description:
+      'Read and search one mailbox over IMAP, prepare drafts, and send over SMTP after you approve each message.',
+    fixed: [{ path: 'provider', value: 'imap' }],
+    fields: [
+      text('mail.username', 'Account name', { placeholder: 'you@example.com' }),
+      text('mail.from', 'Send as', {
+        input: 'email',
+        required: false,
+        placeholder: 'you@example.com',
+        help: 'Left empty, the account name, when that is an email address.',
+      }),
+      text('credentials.password', 'Password', {
+        input: 'password',
+        secret: true,
+        help: 'An app password where the provider offers one. Outlook.com accepts only its own sign-in and cannot be connected with a password.',
+      }),
+      text('mail.imap.host', 'IMAP server', { placeholder: 'imap.example.com' }),
+      text('mail.imap.port', 'IMAP port', { input: 'number', default: 993 }),
+      text('mail.imap.secure', 'IMAP uses TLS from the first byte', {
+        input: 'checkbox',
+        default: true,
+        help: 'Off means the connection upgrades with STARTTLS.',
+      }),
+      text('mail.smtp.host', 'SMTP server', { placeholder: 'smtp.example.com' }),
+      text('mail.smtp.port', 'SMTP port', { input: 'number', default: 465 }),
+      text('mail.smtp.secure', 'SMTP uses TLS from the first byte', {
+        input: 'checkbox',
+        default: true,
+        help: 'Off means the connection upgrades with STARTTLS.',
+      }),
+      text('mail.inbox', 'Inbox folder', { required: false, placeholder: 'INBOX' }),
+      text('mail.sent', 'Sent folder', { required: false, placeholder: 'Sent' }),
+    ],
+    scopes: MAIL_SCOPES,
+  },
+  calendarProvider(
+    'icloud-calendar',
+    'iCloud Calendar',
+    'https://caldav.icloud.com/',
+    'Create an app-specific password at account.apple.com, under Sign-In and Security.',
+    'The email address you sign in to Apple with.',
+  ),
+  calendarProvider(
+    'fastmail-calendar',
+    'Fastmail Calendar',
+    'https://caldav.fastmail.com/',
+    'Create one in Fastmail under Settings, then Privacy and Security.',
+  ),
+  {
+    id: 'google-calendar-feed',
+    kind: 'ics',
+    title: 'Google Calendar (read only)',
+    description:
+      'Read the events of a Google calendar through its private address. A feed can be read but never changed.',
+    fixed: [{ path: 'provider', value: 'caldav' }],
+    fields: [
+      text('ics.url', 'Secret address in iCal format', {
+        input: 'url',
+        secret: true,
+        placeholder: 'https://calendar.google.com/calendar/ical/.../basic.ics',
+        help: 'In Google Calendar settings, open the calendar and copy its secret address in iCal format.',
+      }),
+    ],
+    scopes: FEED_SCOPES,
+  },
+  {
+    id: 'caldav',
+    kind: 'caldav',
+    title: 'Other calendar (CalDAV)',
+    description:
+      'List the events of one calendar collection, and create, change or remove an event after you approve it.',
+    fixed: [{ path: 'provider', value: 'caldav' }],
+    fields: [
+      text('caldav.calendar_url', 'Calendar address', {
+        input: 'url',
+        placeholder: 'https://dav.example.com/calendars/you/personal/',
+        help: 'The address of one calendar collection, over HTTPS.',
+      }),
+      text('caldav.username', 'Account name'),
+      text('credentials.password', 'Password', { input: 'password', secret: true }),
+    ],
+    scopes: CALDAV_SCOPES,
+  },
+  {
+    id: 'ics',
+    kind: 'ics',
+    title: 'Calendar feed (ICS)',
+    description: 'Read the events of a published calendar feed. A feed can never be changed.',
+    fixed: [{ path: 'provider', value: 'caldav' }],
+    fields: [
+      text('ics.url', 'Feed address', {
+        input: 'url',
+        secret: true,
+        placeholder: 'https://calendar.example.com/feed.ics',
+        help: 'Kept like a password, because a private feed address is one.',
+      }),
+    ],
+    scopes: FEED_SCOPES,
+  },
+  {
+    id: 'sms',
+    kind: 'sms',
+    title: 'Text messages (Twilio)',
+    description:
+      'Text OpenDuet from your phone and get its answer back by text, and send a text to someone else after you approve it. Texts from other numbers are kept for you to read, never followed.',
+    fixed: [{ path: 'provider', value: 'twilio' }],
+    fields: [
+      text('credentials.account_sid', 'Account SID', {
+        secret: true,
+        placeholder: 'AC…',
+        help: 'On the front page of the Twilio Console.',
+      }),
+      text('credentials.auth_token', 'Auth token', {
+        input: 'password',
+        secret: true,
+        help: 'Beside the account SID in the Twilio Console. It also proves that an incoming text came from Twilio.',
+      }),
+      text('credentials.from_number', 'Twilio number', {
+        secret: true,
+        placeholder: '+15551234567',
+        help: 'A number on this Twilio account that can send and receive texts, with + and the country code.',
+      }),
+      text('sms.allowed_numbers', 'Your phone numbers', {
+        input: 'string_list',
+        required: false,
+        placeholder: '+15557654321',
+        help: 'A text from one of these is you talking to OpenDuet. Texts from any other number are only kept for you to read.',
+      }),
+    ],
+    scopes: [
+      {
+        scope: 'sms.send',
+        label: 'Send a text to someone',
+        effect_class: 'write_external',
+        asks_first: true,
+        default: true,
+      },
+    ],
+  },
+  {
+    id: 'sandbox',
+    kind: 'sandbox',
+    title: 'Sandbox (remote execution)',
+    description:
+      'Run commands in a remote sandbox this service owns. The provider key stays here, the sandbox has the egress you choose, and a command never sees a credential.',
+    fixed: [{ path: 'provider', value: 'sandbox' }],
+    fields: [
+      text('sandbox.adapter', 'Provider', {
+        input: 'select',
+        options: [
+          { value: 'e2b', label: 'E2B' },
+          { value: 'daytona', label: 'Daytona' },
+          { value: 'modal', label: 'Modal' },
+          { value: 'maritime', label: 'Maritime computers' },
+          { value: 'docker', label: 'This server (Docker)' },
+        ],
+        default: 'e2b',
+      }),
+      text('sandbox.image', 'Image or template', {
+        placeholder: 'base',
+        help: 'A template name on E2B, a snapshot name on Daytona, a registry reference on Modal, linux or linux-arm64 on Maritime, an image on this server for Docker.',
+      }),
+      text('credentials.api_key', 'Provider key', {
+        input: 'password',
+        secret: true,
+        required: false,
+        help: `E2B, Daytona or Maritime: ${SANDBOX_CREDENTIAL_FORMAT.e2b}. Modal: ${SANDBOX_CREDENTIAL_FORMAT.modal}. Docker: leave it empty.`,
+      }),
+      text('sandbox.egress', 'What the sandbox may reach', {
+        input: 'select',
+        options: [
+          { value: 'deny_all', label: 'Nothing at all' },
+          { value: 'cidr_allowlist', label: 'Only the ranges below' },
+          {
+            value: 'connected_hosts_only',
+            label: 'Only the sites this installation allows (Docker)',
+          },
+          { value: 'open', label: 'Anything (not recommended)' },
+        ],
+        default: 'deny_all',
+      }),
+      text('sandbox.cidrs', 'Allowed ranges', {
+        input: 'string_list',
+        required: false,
+        placeholder: '203.0.113.0/24',
+        help: 'Only with the allow-list policy.',
+      }),
+      text('sandbox.persistence', 'What a sandbox keeps', {
+        input: 'select',
+        options: [
+          { value: 'ephemeral', label: 'Nothing: a fresh sandbox each time' },
+          { value: 'pause', label: 'Files kept between attempts' },
+          { value: 'snapshot', label: 'Files, snapshotted between attempts' },
+        ],
+        default: 'ephemeral',
+        help: 'E2B also keeps running processes; on Daytona they end. An unused workspace goes after OPENDUET_SANDBOX_WORKSPACE_RETENTION_SECONDS; Daytona and Modal keep one at most OPENDUET_SANDBOX_SNAPSHOT_TTL_SECONDS.',
+      }),
+      text('sandbox.lifetime_seconds', 'How long one sandbox may run, in seconds', {
+        input: 'number',
+        default: 3600,
+      }),
+      text('sandbox.region', 'Region', {
+        required: false,
+        help: 'Only where the provider offers one.',
+      }),
+    ],
+    scopes: [
+      {
+        scope: 'terminal.run',
+        label: 'Run a command in the sandbox',
+        effect_class: 'write_reversible',
+        asks_first: false,
+        default: true,
+      },
+      {
+        scope: 'computer.screenshot',
+        label: "Look at the sandbox's screen",
+        effect_class: 'read',
+        asks_first: false,
+        default: true,
+      },
+      ...(
+        [
+          ['computer.open', 'Open a page in the sandbox browser'],
+          ['computer.click', "Click on the sandbox's screen"],
+          ['computer.type', 'Type into the sandbox'],
+          ['computer.key', 'Press keys in the sandbox'],
+          ['computer.scroll', "Scroll the sandbox's screen"],
+          ['computer.batch', 'Do a few steps in the sandbox at once'],
+        ] as const
+      ).map(([scope, label]) => ({
+        scope,
+        label,
+        effect_class: 'write_reversible' as const,
+        asks_first: false,
+        default: true,
+      })),
+      ...(
+        [
+          ['process.start', 'Start long-running work in the sandbox', 'write_reversible'],
+          ['process.list', 'See the work running in the sandbox', 'read'],
+          ['process.read', 'Read what that work printed', 'read'],
+          ['process.write', 'Type into that work', 'write_reversible'],
+          ['process.signal', 'Send a signal to that work', 'write_reversible'],
+          ['process.stop', 'Stop that work', 'write_reversible'],
+          ['process.extend', 'Give that work more time', 'write_reversible'],
+          ['process.wait', 'Wait for that work to finish, print or listen', 'read'],
+        ] as const
+      ).map(([scope, label, effect_class]) => ({
+        scope,
+        label,
+        effect_class,
+        asks_first: false,
+        default: true,
+      })),
+    ],
+  },
+  {
+    id: 'command_line',
+    kind: 'command_line',
+    title: 'GitHub for the agent’s computer',
+    description:
+      'Lets git and gh in the agent’s computer use your GitHub account. The token stays on this server and the computer never holds it. Reads just work; every push, pull request, comment and other change asks you first. Works with the computer on this server (Docker).',
+    fixed: [
+      { path: 'provider', value: 'command_line' },
+      { path: 'command_line.adapter', value: 'github' },
+    ],
+    fields: [
+      text('credentials.token', 'Fine-grained token', {
+        input: 'password',
+        secret: true,
+        help: 'Create one at github.com/settings/personal-access-tokens. Choose only the repositories it needs, and give read and write on Contents and Pull requests.',
+      }),
+    ],
+    scopes: [
+      {
+        scope: 'egress.github_read',
+        label: 'Read your repositories',
+        effect_class: 'read',
+        asks_first: false,
+        default: true,
+      },
+      {
+        scope: 'egress.github_write',
+        label: 'Push and make changes (asks you each time)',
+        effect_class: 'write_external',
+        asks_first: true,
+        default: true,
+      },
+    ],
+  },
+  {
+    id: 'command_line_aws',
+    kind: 'command_line',
+    title: 'AWS for the agent’s computer',
+    description:
+      'Lets the aws command line and AWS SDKs in the agent’s computer use your AWS account. The key stays on this server and the computer never holds it: this server signs each request. Reads just work; every change asks you first. Works with the computer on this server (Docker).',
+    fixed: [
+      { path: 'provider', value: 'command_line' },
+      { path: 'command_line.adapter', value: 'aws' },
+    ],
+    fields: [
+      text('credentials.access_key_id', 'Access key ID', {
+        help: 'An access key of an IAM user that has only the permissions the agent needs.',
+      }),
+      text('credentials.secret_access_key', 'Secret access key', {
+        input: 'password',
+        secret: true,
+      }),
+      text('command_line.region', 'Default region', { placeholder: 'us-east-1' }),
+      text('command_line.role_arn', 'Role to assume', {
+        required: false,
+        placeholder: 'arn:aws:iam::123456789012:role/agent',
+        help: 'This server assumes the role for each command and names the session after it, so CloudTrail shows which command made each call.',
+      }),
+      text('command_line.external_id', 'External ID for the role', { required: false }),
+    ],
+    scopes: [
+      {
+        scope: 'egress.aws_read',
+        label: 'Read your AWS resources',
+        effect_class: 'read',
+        asks_first: false,
+        default: true,
+      },
+      {
+        scope: 'egress.aws_write',
+        label: 'Make changes (asks you each time)',
+        effect_class: 'write_external',
+        asks_first: true,
+        default: true,
+      },
+    ],
+  },
+  {
+    id: 'command_line_gitlab',
+    kind: 'command_line',
+    title: 'GitLab for the agent’s computer',
+    description:
+      'Lets git and glab in the agent’s computer use your GitLab.com account. The token stays on this server and the computer never holds it. Reads just work; every push, merge request, comment and other change asks you first. Works with the computer on this server (Docker).',
+    fixed: [
+      { path: 'provider', value: 'command_line' },
+      { path: 'command_line.adapter', value: 'gitlab' },
+    ],
+    fields: [
+      text('credentials.token', 'Personal access token', {
+        input: 'password',
+        secret: true,
+        help: 'Create one at gitlab.com/-/user_settings/personal_access_tokens with the api, read_repository and write_repository scopes, and an expiry date. A project access token keeps it to one project.',
+      }),
+    ],
+    scopes: [
+      {
+        scope: 'egress.gitlab_read',
+        label: 'Read your projects',
+        effect_class: 'read',
+        asks_first: false,
+        default: true,
+      },
+      {
+        scope: 'egress.gitlab_write',
+        label: 'Push and make changes (asks you each time)',
+        effect_class: 'write_external',
+        asks_first: true,
+        default: true,
+      },
+    ],
+  },
+  {
+    id: 'command_line_npm',
+    kind: 'command_line',
+    title: 'npm for the agent’s computer',
+    description:
+      'Lets npm in the agent’s computer use your npm account. The token stays on this server and the computer never holds it. Installs and lookups just work; every publish, unpublish, deprecation, tag, owner and access change asks you first. Works with the computer on this server (Docker).',
+    fixed: [
+      { path: 'provider', value: 'command_line' },
+      { path: 'command_line.adapter', value: 'npm' },
+    ],
+    fields: [
+      text('credentials.token', 'Granular access token', {
+        input: 'password',
+        secret: true,
+        help: 'Create one at npmjs.com under Access Tokens. Choose only the packages it needs, read and write, and an expiry date.',
+      }),
+    ],
+    scopes: [
+      {
+        scope: 'egress.npm_read',
+        label: 'Install and look up packages',
+        effect_class: 'read',
+        asks_first: false,
+        default: true,
+      },
+      {
+        scope: 'egress.npm_write',
+        label: 'Publish and change packages (asks you each time)',
+        effect_class: 'write_external',
+        asks_first: true,
+        default: true,
+      },
+    ],
+  },
+  {
+    id: 'mcp',
+    kind: 'mcp',
+    title: 'MCP server (HTTP)',
+    description:
+      'Expose named tools of an MCP server you operate. You choose each tool, its grant and how far it may act; the server cannot.',
+    fixed: [
+      { path: 'provider', value: 'mcp' },
+      { path: 'mcp.audience', value: 'owner' },
+    ],
+    fields: [
+      text('mcp.id', 'Short name', {
+        placeholder: 'notes',
+        help: 'Lower-case letters, digits and underscores. Tools appear as mcp_<name>.<alias>.',
+      }),
+      text('mcp.url', 'Server address', {
+        input: 'url',
+        placeholder: 'https://mcp.example.com/mcp',
+      }),
+      text('credentials.access_token', 'Access token', {
+        input: 'password',
+        secret: true,
+        required: false,
+        help: 'Only sent over HTTPS.',
+      }),
+      text('mcp.allowed_scopes', 'Grants', {
+        input: 'string_list',
+        placeholder: 'mcp_notes.search',
+        help: 'One per tool, written mcp_<name>.<alias>.',
+      }),
+      {
+        path: 'mcp.tools',
+        label: 'Tools',
+        input: 'list',
+        required: true,
+        secret: false,
+        item_fields: [
+          text('name', 'Tool name on the server', { placeholder: 'search' }),
+          text('alias', 'Alias', { placeholder: 'search' }),
+          text('required_scopes', 'Grants it needs', {
+            input: 'string_list',
+            placeholder: 'mcp_notes.search',
+          }),
+          text('effect_class', 'How far it may act', {
+            input: 'select',
+            options: EFFECT_OPTIONS,
+            default: 'write_external',
+          }),
+        ],
+      },
+    ],
+    scopes: [],
+  },
+  {
+    id: 'mcp_stdio',
+    kind: 'mcp_stdio',
+    title: 'MCP server from a package or image (advanced)',
+    description:
+      'Run an MCP server from npm, PyPI or a container image in its own container, with no network unless you name a destination. You choose each tool, its grant and how far it may act.',
+    fixed: [
+      { path: 'provider', value: 'mcp' },
+      { path: 'mcp_stdio.audience', value: 'owner' },
+    ],
+    fields: [
+      text('mcp_stdio.id', 'Short name', {
+        placeholder: 'files',
+        help: 'Lower-case letters, digits and underscores. Tools appear as mcp_<name>.<alias>.',
+      }),
+      text('mcp_stdio.runner', 'Runs with', {
+        input: 'select',
+        options: MCP_STDIO_RUNNERS.map((runner) => ({
+          value: runner,
+          label:
+            runner === 'npx'
+              ? 'npx (an npm package)'
+              : runner === 'uvx'
+                ? 'uvx (a PyPI package)'
+                : 'A container image',
+        })),
+        default: 'npx',
+      }),
+      text('mcp_stdio.source', 'Package or image', {
+        placeholder: '@modelcontextprotocol/server-filesystem',
+        help: 'An npm or PyPI package with an optional version, or an image with its registry and digest, such as ghcr.io/example/server:1.0@sha256:….',
+      }),
+      text('mcp_stdio.command', 'Command', {
+        required: false,
+        help: "Left empty, the package's own command or the image's entry command.",
+      }),
+      text('mcp_stdio.args', 'Arguments', {
+        input: 'string_list',
+        required: false,
+        placeholder: '/data',
+        help: 'One per line. The server can write to /data, which is kept between runs.',
+      }),
+      text('mcp_stdio.egress', 'Destinations it may reach', {
+        input: 'string_list',
+        required: false,
+        placeholder: 'api.example.com',
+        help: 'HTTPS host names, one per line. Left empty, the server has no network.',
+      }),
+      {
+        path: 'mcp_stdio.secret_env',
+        label: 'Secret variables',
+        input: 'list',
+        required: false,
+        secret: false,
+        help: 'Sealed on arrival and given only to this server.',
+        item_fields: [
+          text('name', 'Variable', { placeholder: 'API_TOKEN' }),
+          text('value', 'Value', { input: 'password', secret: true }),
+        ],
+      },
+      text('mcp_stdio.allowed_scopes', 'Grants', {
+        input: 'string_list',
+        placeholder: 'mcp_files.read',
+        help: 'One per tool, written mcp_<name>.<alias>.',
+      }),
+      {
+        path: 'mcp_stdio.tools',
+        label: 'Tools',
+        input: 'list',
+        required: true,
+        secret: false,
+        item_fields: [
+          text('name', 'Tool name on the server', { placeholder: 'read_file' }),
+          text('alias', 'Alias', { placeholder: 'read' }),
+          text('required_scopes', 'Grants it needs', {
+            input: 'string_list',
+            placeholder: 'mcp_files.read',
+          }),
+          text('effect_class', 'How far it may act', {
+            input: 'select',
+            options: EFFECT_OPTIONS,
+            default: 'write_external',
+          }),
+        ],
+      },
+    ],
+    scopes: [],
+  },
+];
+
+// --------------------------------------------------------------------------
+// saying why a request was refused
+// --------------------------------------------------------------------------
+
+type RequestIssue = {
+  code: string;
+  path: readonly PropertyKey[];
+  message: string;
+  origin?: string;
+  format?: string;
+};
+
+/** The generic entries come last, so their labels win over a provider's. */
+const FIELD_LABELS: ReadonlyMap<string, string> = new Map(
+  [
+    ...CONNECTION_KIND_DESCRIPTORS.filter((kind) => kind.id !== kind.kind),
+    ...CONNECTION_KIND_DESCRIPTORS.filter((kind) => kind.id === kind.kind),
+  ].flatMap((kind) => kind.fields.map((field) => [field.path, field.label] as const)),
+);
+const ITEM_LABELS: ReadonlyMap<string, { label: string; items: Map<string, string> }> = new Map(
+  CONNECTION_KIND_DESCRIPTORS.flatMap((kind) =>
+    kind.fields
+      .filter((field) => field.input === 'list')
+      .map(
+        (field) =>
+          [
+            field.path,
+            {
+              label: field.label,
+              items: new Map((field.item_fields ?? []).map((item) => [item.path, item.label])),
+            },
+          ] as const,
+      ),
+  ),
+);
+
+/** The form's own name for a field, so the person can find it; a row in a list by its position. */
+function fieldLabel(path: readonly PropertyKey[]): string {
+  const parts = path.map(String);
+  for (let at = parts.length; at > 0; at--) {
+    const head = parts.slice(0, at).join('.');
+    const list = ITEM_LABELS.get(head);
+    const row = Number(parts[at]);
+    if (list && Number.isInteger(row)) {
+      const item = list.items.get(parts.slice(at + 1).join('.'));
+      return item ? `${list.label}, row ${row + 1}: ${item}` : `${list.label}, row ${row + 1}`;
+    }
+    const label = FIELD_LABELS.get(head);
+    if (label && at === parts.length) return label;
+  }
+  return parts.length ? `The setting ${parts.join('.')}` : 'The request';
+}
+
+function problem(issue: RequestIssue): string {
+  switch (issue.code) {
+    case 'invalid_type':
+      return /received undefined/.test(issue.message) ? 'is needed' : 'has the wrong kind of value';
+    case 'too_big':
+      return issue.origin === 'string'
+        ? 'is too long'
+        : issue.origin === 'array'
+          ? 'has too many entries'
+          : 'is too large';
+    case 'too_small':
+      return issue.origin === 'string'
+        ? 'is needed'
+        : issue.origin === 'array'
+          ? 'needs at least one entry'
+          : 'is too small';
+    case 'invalid_format':
+      return issue.format === 'email'
+        ? 'is not an email address'
+        : issue.format === 'url'
+          ? 'is not a web address'
+          : 'has characters it cannot contain';
+    case 'unrecognized_keys':
+      return 'has a setting this kind does not take';
+    default:
+      return 'is not valid';
+  }
+}
+
+/**
+ * One sentence a person can act on, naming the field as the form labels it.
+ * Only the service's own words are used, never a value from the request, so a
+ * password typed into the wrong box cannot come back in an error.
+ */
+export function connectionRequestProblem(issues: readonly RequestIssue[]): string {
+  const [first] = issues;
+  if (!first) return 'The request could not be read.';
+  const label = fieldLabel(first.path);
+  if (first.code === 'custom') return `${label}: ${first.message.replace(/\.?$/, '.')}`;
+  return `${label} ${problem(first)}.`;
+}

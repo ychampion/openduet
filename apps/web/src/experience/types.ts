@@ -1,0 +1,334 @@
+/**
+ * The shapes the interface renders, derived from the generated client types
+ * for the experience contract (packages/contracts/src/experience.ts, through
+ * packages/client/src/schema.d.ts). Nothing here is hand-written: change the
+ * contract, regenerate the client, and these names follow or stop compiling.
+ *
+ * The interface shows outcomes, receipts and the one decision only the person
+ * can make. Nothing in the contract carries a tool name, a model name, a token
+ * count or a log line, and nothing here adds one.
+ */
+import type { paths } from '@openduet/client';
+
+type Json<T> = T extends { content: { 'application/json': infer B } } ? B : never;
+type Ok<P, M extends keyof P> = P[M] extends { responses: infer R }
+  ? R extends Record<200, unknown>
+    ? Json<R[200]>
+    : R extends Record<201, unknown>
+      ? Json<R[201]>
+      : never
+  : never;
+type Body<P, M extends keyof P> = P[M] extends { requestBody?: infer B }
+  ? Json<NonNullable<B>>
+  : never;
+
+/** A response that says the capability is not connected, with a plain reason. */
+export type NotAvailable = { status: 'not_available'; reason: string };
+export type Success<T> = Exclude<T, NotAvailable>;
+export const isNotAvailable = (value: unknown): value is NotAvailable =>
+  typeof value === 'object' &&
+  value !== null &&
+  (value as { status?: unknown }).status === 'not_available';
+
+/* ---------- conversations ---------- */
+
+export type Conversation = Success<Ok<paths['/conversations/{id}'], 'get'>>['conversation'];
+export type TurnStatus = Conversation['status'];
+export type ComposerState = Conversation['composer'];
+export type ConversationCreate = Body<paths['/conversations'], 'post'>;
+export type ConversationDeleted = Success<Ok<paths['/conversations/{id}'], 'delete'>>;
+export type AgentDeleted = Success<Ok<paths['/agents/{id}'], 'delete'>>;
+export type ActivityList = Success<Ok<paths['/activity'], 'get'>>;
+export type SpaceMembers = Success<Ok<paths['/space/members'], 'get'>>;
+export type SpaceMember = SpaceMembers['members'][number];
+/** What work in a space may use, and whether the person asking may change it. */
+export type SpaceRulesView = Ok<paths['/spaces/{id}/policy'], 'get'>;
+export type SpaceRulesChange = Body<paths['/spaces/{id}/policy'], 'put'>;
+export type Turn = Success<Ok<paths['/conversations/{id}/messages'], 'get'>>['turns'][number];
+/** A page of a chat's turns: `next_cursor` is absent when the service sent every turn. */
+export type TurnPage = Success<Ok<paths['/conversations/{id}/messages'], 'get'>>;
+export type DeliveryState = NonNullable<Turn['delivery']>;
+export type MessageAcceptance = Success<Ok<paths['/conversations/{id}/messages'], 'post'>>;
+export type ExperienceEvent = Success<
+  Ok<paths['/conversations/{id}/events'], 'get'>
+>['events'][number];
+export type EventItem = ExperienceEvent['item'];
+/** Local stream state shared by the adapter and the environment-independent reducer. */
+export type StreamGap = {
+  after: number;
+  next: number | null;
+  reason: 'reconnect' | 'sequence_skip';
+};
+/** Which way a permission or question went, as the stream records it. */
+export type ExperienceDecision = Extract<EventItem, { type: 'decision' }>['decision'];
+/** A step in the trail. Reasoning arrives in pieces and is kept as one step until something else happens. */
+export type TrailStep = Extract<
+  EventItem,
+  { type: 'say' | 'action' | 'note' | 'done' | 'reasoning' }
+>;
+export type Source = Extract<EventItem, { type: 'action' }>['sources'][number];
+export type ResultCard = Success<Ok<paths['/conversations/{id}/cards'], 'get'>>['cards'][number];
+export type CardAction = NonNullable<ResultCard['primary_action']>;
+export type Receipt = Success<Ok<paths['/conversations/{id}/receipts'], 'get'>>['receipts'][number];
+export type Draft = Success<Ok<paths['/conversations/{id}/drafts'], 'get'>>['drafts'][number];
+export type SendOutcome = Success<Ok<paths['/drafts/{id}/send'], 'post'>>;
+export type Permission = Success<Ok<paths['/permissions'], 'get'>>['permissions'][number];
+/**
+ * A task a room handed the person to run with their own setup, or the result
+ * of one that waits for them to share it with the room or keep it.
+ */
+export type RoomHandoff = NonNullable<
+  Success<Ok<paths['/permissions'], 'get'>>['handoffs']
+>[number];
+export type PermissionOption = Permission['options'][number];
+export type PermissionDecision = Body<paths['/permissions/{id}'], 'post'>;
+export type RuleBounds = Extract<PermissionDecision, { option: 'always' }>['bounds'];
+export type PermissionOutcome = Success<Ok<paths['/permissions/{id}'], 'post'>>;
+export type Rule = Success<Ok<paths['/rules'], 'get'>>['rules'][number];
+/** Which of an agent's actions auto-review may decide without asking the person. */
+export type ApprovalSettingsView = Success<Ok<paths['/approval-settings'], 'get'>>;
+export type ApprovalSettings = Body<paths['/approval-settings'], 'put'>;
+/** What auto-review decided about one action, on its card or receipt. */
+export type ActionReview = NonNullable<Permission['review']>;
+/** A computer the person connected, with what Settings and the computer itself allow. */
+export type Device = Ok<paths['/devices'], 'get'>['devices'][number];
+export type DeviceCapabilities = Device['capabilities'];
+export type DevicePairing = Ok<paths['/devices/pairings'], 'post'>;
+export type PushSettings = Ok<paths['/push/settings'], 'get'>['settings'];
+export type PushSettingsUpdate = Body<paths['/push/settings'], 'patch'>;
+export type PushDevice = Ok<paths['/push/subscriptions'], 'get'>['subscriptions'][number];
+export type PushSubscriptionInput = Body<paths['/push/subscriptions'], 'post'>;
+/** Where the account is signed in, and the computers, browsers and assistants that reach it. */
+export type AccountAccess = Success<Ok<paths['/account/sessions'], 'get'>>;
+/** The person's own number, their agreement to texts and calls, and what OpenDuet sent. */
+export type ReachState = Ok<paths['/reach'], 'get'>['reach'];
+/** Another assistant the person let use OpenDuet over MCP. */
+export type ConnectedAssistant = Ok<paths['/mcp/clients'], 'get'>['clients'][number];
+/** What OpenDuet learned from the person's corrections, and skills it wrote for itself. */
+export type LearnedList = Ok<paths['/learned'], 'get'>;
+export type LearnedItem = LearnedList['items'][number];
+export type LearnedChange = NonNullable<LearnedList['last_change']>;
+export type LearnedItemResult = Ok<paths['/learned/{id}/pause'], 'post'>;
+export type EngineSkill = Ok<paths['/engine-skills'], 'get'>['skills'][number];
+/** A standing "don't do this" on a skill OpenDuet wrote, until the person lifts it. */
+export type SkillProhibition = Ok<
+  paths['/engine-skills/prohibitions'],
+  'get'
+>['prohibitions'][number];
+/** One file OpenDuet holds for the person, and what a delete of one gives back. */
+export type PersonFile = Ok<paths['/files'], 'get'>['files'][number];
+/** How much the person keeps against their limit; only where the installation sets one. */
+export type PersonStorage = NonNullable<Ok<paths['/files'], 'get'>['storage']>;
+export type PersonFileDeleted = Ok<paths['/files/{id}'], 'delete'>;
+/** One of the person's own skills, read whole, with the version a change must name. */
+export type OwnSkill = Ok<paths['/own-skills'], 'get'>['skills'][number];
+export type OwnSkillEdit = Body<paths['/own-skills/{name}/edit'], 'post'>;
+export type Question = Success<Ok<paths['/quick-answers'], 'get'>>['questions'][number];
+/** How much the agent does on its own for each kind of task that reaches other people. */
+export type TaskAutonomyList = Success<Ok<paths['/autonomy'], 'get'>>;
+export type TaskAutonomyUpdate = Body<paths['/autonomy'], 'put'>;
+export type AutonomyLevel = TaskAutonomyList['tasks'][number]['level'];
+export type TaskKind = TaskAutonomyList['tasks'][number]['task'];
+/** The card that asks once about a kind of task. */
+export type AutonomyAsk = Extract<ExperienceEvent['item'], { type: 'autonomy' }>['autonomy'];
+
+/* ---------- agents, memory ---------- */
+
+export type Agent = Success<Ok<paths['/agents'], 'get'>>['agents'][number];
+export type AgentInput = Body<paths['/agents'], 'post'>;
+export type AgentTemplate = Success<Ok<paths['/agents/templates'], 'get'>>['templates'][number];
+export type MemoryItem = Success<Ok<paths['/memory/items'], 'get'>>['items'][number];
+export type MemoryExplanation = Success<Ok<paths['/memory/items/{id}/why'], 'get'>>;
+export type MemoryItemCreate = Body<paths['/memory/items'], 'post'>;
+export type Belief = Success<Ok<paths['/memory/beliefs'], 'get'>>['beliefs'][number];
+export type BeliefCategory = Belief['category'];
+export type BeliefHistory = Success<Ok<paths['/memory/beliefs/{id}/history'], 'get'>>;
+export type BeliefBlock = Success<Ok<paths['/memory/blocks'], 'get'>>['blocks'][number];
+export type BeliefBlockScope = BeliefBlock['scope'];
+export type AgentNote = Success<Ok<paths['/memory/notes'], 'get'>>['notes'][number];
+export type MemoryTimeline = Success<Ok<paths['/memory/timeline'], 'get'>>;
+export type MemoryDay = MemoryTimeline['days'][number];
+export type RewindTarget = Body<paths['/memory/rewind'], 'post'>;
+export type RewindPreview = Success<Ok<paths['/memory/rewind/preview'], 'post'>>;
+export type MemoryRewind = Success<Ok<paths['/memory/rewind'], 'post'>>['rewind'];
+export type MemoryDigestResponse = Success<Ok<paths['/memory/digest'], 'get'>>;
+export type MemoryDigest = NonNullable<MemoryDigestResponse['digest']>;
+export type BeliefExport = Success<Ok<paths['/memory/export'], 'get'>>;
+export type BeliefImport = Body<paths['/memory/import'], 'post'>;
+export type BeliefImportResult = Success<Ok<paths['/memory/import'], 'post'>>;
+export type BecauseLink = NonNullable<Receipt['because']>[number];
+
+/* ---------- plans, tasks, home, routines ---------- */
+
+export type Plan = Success<Ok<paths['/plans/{id}'], 'get'>>['plan'];
+export type Milestone = Plan['milestones'][number];
+export type PlanCreate = Body<paths['/plans'], 'post'>;
+export type Task = Success<Ok<paths['/tasks'], 'get'>>['tasks'][number];
+export type TaskInput = Body<paths['/tasks'], 'post'>;
+export type Home = Success<Ok<paths['/home'], 'get'>>;
+export type CalendarEvent = Success<Home['upcoming']>[number];
+export type Profile = Success<Ok<paths['/profile'], 'get'>>['profile'];
+/** What a profile save sends: the sending address is read from the mailbox, not set. */
+export type ProfileInput = Body<paths['/profile'], 'patch'>;
+export type Automation = Success<Ok<paths['/automations'], 'get'>>['automations'][number];
+export type AutomationRun = Automation['runs'][number];
+export type AutomationCreate = Body<paths['/automations'], 'post'>;
+/** Long work an assistant keeps at in the background, and what it has done so far. */
+export type Run = Success<Ok<paths['/runs/{id}'], 'get'>>['run'];
+export type RunStatus = Run['status'];
+export type RunEntry = Success<Ok<paths['/runs/{id}/record'], 'get'>>['entries'][number];
+export type RunRecordPage = Success<Ok<paths['/runs/{id}/record'], 'get'>>;
+export type RunCreate = Body<paths['/runs'], 'post'>;
+export type RunLimit = NonNullable<Run['limit']>;
+export type Connection = Success<
+  Ok<paths['/experience/connections'], 'get'>
+>['connections'][number];
+/** A kind of connection that can be installed, with the fields its form needs. */
+export type ConnectionKind = Ok<paths['/connection-kinds'], 'get'>['kinds'][number];
+/** Something a person can connect here, with how and whether it is offered now. */
+export type CatalogEntry = NonNullable<Ok<paths['/connection-kinds'], 'get'>['catalog']>[number];
+export type AccountSignInStart = Ok<paths['/google-sign-ins'], 'post'>;
+export type AccountSignInStatus = Ok<paths['/google-sign-ins/{id}'], 'get'>;
+/** Signing in to Google through Composio, one consent page per part. */
+export type ManagedSignInStart = Ok<paths['/managed-sign-ins'], 'post'>;
+export type ComposioAppSearchResponse = Ok<paths['/composio/apps'], 'get'>;
+/** Signing in to a remote MCP server, for a connection that is already installed. */
+export type McpSignInStart = Ok<paths['/mcp-sign-ins'], 'post'>;
+export type McpSignInStatus = Ok<paths['/mcp-sign-ins/{id}'], 'get'>;
+/** The tools a server added by its address lists, or that it wants a sign-in first. */
+export type McpToolDiscovery = Ok<paths['/mcp-servers/discover'], 'post'>;
+export type DiscoveredMcpTool = Extract<McpToolDiscovery, { state: 'ready' }>['tools'][number];
+export type ConnectionField = ConnectionKind['fields'][number];
+export type ConnectionItemField = NonNullable<ConnectionField['item_fields']>[number];
+export type ConnectionCreate = Body<paths['/connections'], 'post'>;
+export type ConnectionInstalled = Ok<paths['/connections'], 'post'>;
+export type ConnectionChecked = Ok<paths['/connections/{connectionId}/health'], 'post'>;
+/** A disconnection, and whether the provider also withdrew OpenDuet's access. */
+export type ConnectionLifecycle = Ok<paths['/connections/{id}/lifecycle'], 'post'>;
+export type ProviderAccess = NonNullable<ConnectionLifecycle['provider_access']>;
+
+/** Taking everything along, emptying one's space, and deleting an account. */
+export type AccountRemovalPreview = Ok<paths['/account/removal/preview'], 'get'>['preview'];
+export type AccountRemoval = Ok<paths['/principals/{id}/removal'], 'get'>['removal'];
+export type AccountSummary = Ok<paths['/principals'], 'get'>['accounts'][number];
+export type SpaceRemovalPreview = Ok<paths['/spaces/{id}/removal/preview'], 'get'>['preview'];
+export type SpaceRemovalReport = Ok<paths['/removals/{id}'], 'get'>;
+/** A removal as it started; the same record its progress reports. */
+export type SpaceRemovalStarted = SpaceRemovalReport['removal'];
+/** A site the agent's browser is signed in to. */
+export type BrowserSite = Ok<paths['/browser/sites'], 'get'>['sites'][number];
+/** What a conversation's agent is doing on its computer: its browser and its terminal. */
+export type AgentComputer = Success<Ok<paths['/conversations/{id}/computer'], 'get'>>;
+export type ComputerBrowser = NonNullable<AgentComputer['browser']>;
+export type ComputerCommand = AgentComputer['terminal'][number];
+/** One background process in the agent's computer, as the person may see it. */
+export type ComputerProcess = AgentComputer['processes'][number];
+export type ProcessPreview = Ok<paths['/sandbox/processes/{id}/previews'], 'post'>;
+export type ConnectionPageList = Ok<paths['/conversations/{id}/pages'], 'get'>;
+export type ConnectionPage = ConnectionPageList['pages'][number];
+export type ConnectionPageView = Ok<paths['/pages/{id}/views'], 'post'>;
+export type ProcessOutput = Ok<paths['/sandbox/processes/{id}/output'], 'get'>;
+export type ProcessStopped = Ok<paths['/sandbox/processes/{id}/stop'], 'post'>;
+export type BrowserControl = Ok<paths['/browser/sessions/{id}/takeover'], 'post'>;
+export type LiveOpen = Ok<paths['/browser/sessions/{id}/live'], 'post'>;
+export type LiveUp = Body<paths['/browser/sessions/{id}/live/input'], 'post'>;
+export type LiveInput = LiveUp['events'][number];
+/** The desktop in a job's sandbox, with who is driving it. */
+export type SandboxComputer = Ok<paths['/sandbox/computers'], 'get'>['computers'][number];
+export type SandboxControl = Ok<paths['/sandbox/sessions/{id}/takeover'], 'post'>;
+export type SandboxViewer = Ok<paths['/sandbox/sessions/{id}/viewer'], 'post'>;
+export type SearchResult = Success<Ok<paths['/search'], 'get'>>['results'][number];
+/**
+ * An entry in the broker's action ledger. The interface reads it only for
+ * effects resting at `unknown` or `unresolved`, and never shows its `kind`.
+ */
+export type LedgerAction = Ok<paths['/actions'], 'get'>['actions'][number];
+/**
+ * A glyph on a message, from the person or the assistant. A message is
+ * addressed by the seq of the event that carries it; a conversation's
+ * reactions are listed under its job, which is the conversation's id.
+ */
+export type Reaction = Ok<paths['/jobs/{jobId}/reactions'], 'get'>['reactions'][number];
+export type ActionResolution = Body<paths['/actions/{actionId}/resolve'], 'post'>['resolution'];
+
+/* ---------- what the interface decides on its own ---------- */
+
+/**
+ * Which surfaces exist on this instance. Nothing in the contract lists them;
+ * each is learned from the one call that would serve it answering
+ * not_available, and a surface whose call is unavailable is not drawn.
+ */
+export type Capabilities = {
+  calendar: boolean;
+  browser: boolean;
+  /** Rooms, shared spaces, guests and hand-offs, as the server's switch has them. */
+  multiplayer: boolean;
+  /**
+   * The features the operator can turn on or off, as the setup status names
+   * them for whoever is signed in; read through `featureOn` (features.ts).
+   */
+  features: Record<string, boolean>;
+};
+
+export type TourStage = 'calendar' | 'drafting' | 'browser' | 'plans' | 'memory';
+
+/* ---------- companies ---------- */
+
+export type CompanyMap = Ok<paths['/spaces/{spaceId}/companies'], 'get'>;
+export type CompanyMapTotals = CompanyMap['totals'];
+export type Company = CompanyMap['companies'][number];
+export type LedgerItem = CompanyMap['items'][number];
+export type LedgerItemKind = LedgerItem['kind'];
+export type LedgerDirection = LedgerItem['direction'];
+export type LedgerItemStatus = LedgerItem['status'];
+export type LedgerEvidence = LedgerItem['evidence'][number];
+export type Confidence = LedgerItem['confidence'];
+export type LedgerDetail = Ok<paths['/ledger/{id}'], 'get'>;
+/**
+ * The stored message a figure was read out of, when the installation still
+ * holds it. `LedgerDetail.message` is nullable for the case where it does not.
+ */
+export type LedgerMessage = NonNullable<LedgerDetail['message']>;
+/* ---------- privacy ---------- */
+
+export type PrivacySettings = Success<Ok<paths['/privacy/settings'], 'get'>>;
+export type PrivacySettingsUpdate = Body<paths['/privacy/settings'], 'put'>;
+export type PrivacyCategory = PrivacySettings['enabled'][number];
+export type SensitiveTopic = PrivacySettings['sensitive_topics'][number];
+export type PrivacyPreview = Success<Ok<paths['/privacy/preview'], 'post'>>;
+export type LocalModelCheck = Success<Ok<paths['/privacy/local-model/check'], 'post'>>;
+export type LocalModelCheckRequest = Body<paths['/privacy/local-model/check'], 'post'>;
+export type ConversationPrivacy = Success<Ok<paths['/conversations/{id}/privacy'], 'get'>>;
+export type PrivacyReveal = Success<Ok<paths['/conversations/{id}/privacy/reveal'], 'post'>>;
+
+export type ScanStarted = Ok<paths['/spaces/{spaceId}/companies/scan'], 'post'>;
+export type ScanProgress = Ok<paths['/spaces/{spaceId}/companies/scan/{scanId}'], 'get'>;
+/** What the person is waiting on: money owed to them, and replies nobody has sent. */
+export type WaitingOn = Ok<paths['/waiting-on'], 'get'>;
+export type WaitingOnEntry = WaitingOn['top'][number];
+/** What needs the person: sorted mail and calendar changes, and what OpenDuet noticed. */
+export type NeedsYou = Ok<paths['/needs-you'], 'get'>;
+export type NeedsYouItem = NeedsYou['items'][number];
+/** What the person asked OpenDuet to see through, with every detail it guessed marked. */
+export type Intents = Ok<paths['/intents'], 'get'>;
+export type IntentItem = Intents['intents'][number];
+export type IntentCancelled = Ok<paths['/intents/{id}/cancel'], 'post'>;
+
+/* ---------- problem reports ---------- */
+
+export type FeedbackList = Ok<paths['/feedback'], 'get'>;
+export type FeedbackReport = FeedbackList['reports'][number];
+export type FeedbackStatus = FeedbackReport['status'];
+export type FeedbackCreate = Body<paths['/feedback'], 'post'>;
+export type FeedbackForwarding = Ok<paths['/feedback/forwarding'], 'get'>;
+
+/* ---------- voice ---------- */
+
+export type VoiceStatus = Ok<paths['/voice'], 'get'>;
+export type VoiceTranscription = Ok<paths['/voice/transcriptions'], 'post'>;
+export type VoiceSession = Ok<paths['/conversations/{id}/voice/session'], 'post'>;
+/** A call's short-lived token, for the speech service's browser client. */
+export type CallSession = Ok<paths['/conversations/{id}/call'], 'post'>;
+export type VoiceAside = Ok<paths['/conversations/{id}/voice/aside'], 'post'>;
+export type VoiceAsideRequest = Body<paths['/conversations/{id}/voice/aside'], 'post'>;
+export type VoiceActivity = VoiceAsideRequest['activity'];

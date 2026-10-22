@@ -1,0 +1,388 @@
+# Capabilities
+
+This matrix maps each capability to the test that establishes it. The engine pin
+is Hermes `v2026.9.7`, commit `2237be355906fbe6065ce1815711eee52b2d646e`, with
+the hash-checked observer patch (`hermes@v2026.9.7+openduet-observers.3`) applied
+by the image and process supervisor. An upstream interface becomes a
+OpenDuet capability only after it is connected to OpenDuet's authority and tested.
+
+**implemented-and-tested** means the named behaviour has an executed OpenDuet
+test in this repository. A row whose scope is narrower — local protocol
+fixtures, or a capability the default service does not expose — says so in its
+own words.
+
+## Requested capability matrix
+
+| Capability | Status | Evidence |
+|---|---|---|
+| Dynamic tool discovery through `search_tools` / `load_tool` | implemented-and-tested | The real capability test's `dynamic discovery and broker receipt` stage passes search, load, continuation, one MCP call and a durable receipt. MCP HTTP exchanges use dedicated connections to avoid the pinned Windows Bun pool stalling a request while Hermes streams. |
+| MCP connect after session start | implemented-and-tested | The real proof installs through authenticated `POST /connections` during a running attempt, then searches, loads and calls in that attempt. `an operator installs an HTTP MCP connection into the live registry` in [runtime-mcp.test.ts](../apps/openduet/test/integration/runtime-mcp.test.ts) covers authenticated setup. [runtime-mcp-revocation.test.ts](../apps/openduet/test/integration/runtime-mcp-revocation.test.ts) pauses initialisation, revokes through the lifecycle route, and proves both successful and failed handshakes preserve revocation, dispose any opened worker and deny fresh-attempt calls. Stdio servers run in containers of their own, described in the row for plugins below. |
+| MCP disconnect recovery | implemented-and-tested | The real Hermes proof terminates an HTTP session, then observes broker-managed reconnect, a fresh initialisation, one call and a durable receipt. `a terminated HTTP MCP session reconnects through repair before one receipted call` in [mcp-repair.test.ts](../apps/openduet/test/integration/mcp-repair.test.ts) covers the same boundary. HTTP and stdio fixtures bound repeated termination to three attempts. A lost acknowledgement stays unknown without replay. |
+| Connection auth refresh and reconnect | implemented-and-tested | The real Hermes proof refreshes an expired credential once through the sealed store and receives one action receipt. Revocation makes no call, leaves an open question and commits waiting for input. The expired, revoked and revoked-during-refresh cases in [mcp-repair.test.ts](../apps/openduet/test/integration/mcp-repair.test.ts) cover both HTTP and stdio, token rotation and bounded repeated expiry. |
+| Lifecycle hooks persisted with dedup and replay | implemented-and-tested | `adapter capture persists in order, deduplicates delivery and replays from the stored cursor` in `hooks.test.ts` and the real capability proof exercise session start/end and pre/post tool events, including distinct continuation capture IDs. Python fixtures prove observer failure isolation. Compaction is covered by the row below. |
+| Long conversations compacted inside an attempt | implemented-and-tested | `real Hermes compacts inside an attempt through the gateway and records on_compaction` in [compaction-real.test.ts](../apps/openduet/test/integration/compaction-real.test.ts) drives the pinned engine past its trigger, and proves the summary call is metered through the model gateway under the attempt, that the next request carries the summary and is smaller, that nothing was refused for size, and that the compaction is a durable observation carrying its own count. Run it with `OPENDUET_HERMES_E2E=1 bun test apps/openduet/test/integration/compaction-real.test.ts --max-concurrency=1 --timeout=180000`. A summary is lossy by nature; every durable fact stays on the ledger. |
+| Automatic skill selection in a job | implemented-and-tested | The real capability test's `teammate audience isolation and revocation` stage selects exactly `alpha`, `beta`, `gamma` despite a matching private skill. Actual provider requests exclude the private canary. `principals.test.ts` also tests membership and audience filtering. |
+| Correction → candidate → evaluation → promotion → rollback | implemented-and-tested | The real capability test performs correction, bounded proposal, validation and sealed evaluation, private owner canary reuse, explicit activation and rollback. Both evaluation phases require held-out improvement without regression; the scripted provider responds to the actual HTTP prompt. |
+| Teammate reuse of an evaluated shared skill | implemented-and-tested | `correction, evaluation, private canary and evaluated teammate reuse` proves A's evaluated procedure reaches B's materially different task only after explicit space promotion. [shared-procedure.test.ts](../apps/openduet/test/integration/shared-procedure.test.ts) proves private defaults, principal-bound source access, compiled-body-only delivery, other-space/public refusal, and no delivery or dispatch after revoking B. |
+| Revocation prevents subsequent shared-space use | implemented-and-tested | The real capability test proves queued work cancellation, refused reads and admission, an old capability's refusal, and personal context without shared skills. `principals.test.ts` additionally covers delivered-context invalidation, gateway fencing and stale capabilities after regrant. |
+
+## Other capabilities with named evidence
+
+The rows for rooms, guests, hand-offs and chat platforms describe a preview
+that is off unless `OPENDUET_PREVIEW_MULTIPLAYER=true`; their suites run with it
+on. [multiplayer-switch.test.ts](../apps/openduet/test/integration/multiplayer-switch.test.ts)
+holds the default: the room routes answer 404 `not_available`, no room tool is
+offered, a new space gets none, stored rooms stay as they were, and a personal
+chat runs as before. See [ROOMS](ROOMS.md#turning-rooms-on).
+
+| Capability | Status | Evidence and limit |
+|---|---|---|
+| Rooms: several people, one agent | implemented-and-tested | [rooms.test.ts](../apps/openduet/test/integration/rooms.test.ts) runs through the service routes on real Postgres: `a member reads and posts in a room thread, and a non-member reads nothing and posts nothing`, `each message records its author, and the provider request names each speaker` (the rendered request carries each speaker's name), `only a message that asks the agent starts a request, and a thread runs one request at a time`, `a follow-up from the requester reaches their request, and another member's message never does`, `another member's message does not withdraw a pending approval`, `removing a member fences the running request and closes their stream`, `a room principal cannot sign in, and is never listed`, `room jobs appear on no personal surface, the room owner's included`, `nobody reads as someone else: each speaker carries the handle the room gives them, and a name is one line`, `the room's computer can be watched by its members and taken over only by its owners`, `a live thread resumes after the last frame it saw, in order`, `a request is stopped by the person who asked it or an owner, and by nobody else`, `adding someone fences the running request, which starts again with the new roster`, `an ask from someone who has left is dropped, and the next ask in the thread starts`, a request's file read by the room's people only, and a shared space made before rooms becoming a room, its built-in tools included. See [ROOMS](ROOMS.md). |
+| Rooms: who answers a room's permissions | implemented-and-tested | [room-approvals.test.ts](../apps/openduet/test/integration/room-approvals.test.ts) runs through the service routes on real Postgres: `only the requester decides under the requester policy, and a guest never decides` (every other route, the service's key and an answer naming nobody are refused too), `any member decides under the any-member policy, and owners under the owners policy` (a new rule covers permissions already waiting, and a room's card offers no standing rule), `a recipient another member typed carries an origin warning on the requester's card`, `the reviewer's instruction is the requester's words, and another member's text is labelled as theirs`, `when the only eligible approver leaves, the approval is withdrawn and the request is told`, `a decision push goes to the eligible approvers and nobody else`, `a room's settings are read by its people, changed by its owners, and hold its asks to them`, and `a connection serves the room's requests only once an owner marks it for the room`, and `auto-review never answers a room's permission, whoever the room's rule names`. What the room's team accounts send follows the room's team-account rule: `a member approves another member's send through a team account, whatever the room's general rule`, `the person who asked approves their own team-account send under the any-member rule`, `a guest never approves a team-account send, under either team-account rule, even their own`, `under the owners' team-account rule only owners approve a team-account send, and only they are told`, `an action outside the team accounts still follows the room's general rule`, and `when approvers leave, a team-account permission is withdrawn and the request is told`. See [ROOMS](ROOMS.md#permissions-in-a-room). |
+| Rooms: guests | implemented-and-tested | [room-guests.test.ts](../apps/openduet/test/integration/room-guests.test.ts) runs through the service routes on real Postgres: `an invite works once, expires, and names only the room` (only its token's digest is kept, a second room's invite reaches an existing guest only while signed in, and a withdrawn or late link makes no account), `a guest reads and posts only in their rooms, and cannot start personal work, list people or decide` (no label shows a guest anyone's email), `a guest is refused every owner surface and every member-only surface`, `adding a guest fences the running request, which starts again with the new roster` and `an expired guest loses access and fences room work like a revocation`. [rooms-memory.test.ts](../apps/openduet/test/integration/rooms-memory.test.ts) `a members-only share stays out while a guest is in the room` uses an invited guest. See [ROOMS](ROOMS.md#guests). |
+| Room memory and shared details | implemented-and-tested | [rooms-memory.test.ts](../apps/openduet/test/integration/rooms-memory.test.ts) runs through the room routes and the attempt's own assembly on real Postgres: `every member's words in a room become room memory with their author`, `a room request recalls room memory and shared items, and never a member's or the owner's private memory`, `forgetting a shared personal claim removes it from the room, and a restored old database keeps it out`, `an author deletes their message and nothing of it is recalled, replayed or shown`, `a members-only share stays out while a guest is in the room` and `an owner forgets any room claim, and a member forgets only claims from their own words`. See [MEMORY](MEMORY.md#rooms). |
+| Rooms: running a room's task with your own setup, and posting to a room | implemented-and-tested | [room-handoffs.test.ts](../apps/openduet/test/integration/room-handoffs.test.ts) runs through the handoff routes and the broker on real Postgres: `a handoff runs exactly the text the person accepted, in their own space, with their own approvals` (the task's hash is checked, the room's addresses carry a warning on the person's own card, and only the person named sees it, on Home and with their approvals), `a handoff result reaches the room only after its owner approves that exact text` (keeping it posts only that it was kept), `a declined or expired handoff tells the room request, which settles without it`, `room.post publishes the approved text as the person, and only while they are a member`, `room.add_file copies the checked file into the room's files` (never over a different file of the same name) and `a personal job cannot read a room it is not a member of`. See [ROOMS](ROOMS.md#with-your-own-setup). |
+| Rooms: talking to a room from a chat platform | implemented-and-tested | [room-surface.test.ts](../apps/openduet/test/integration/room-surface.test.ts) plugs a test chat platform into the service and runs on real Postgres: `a second surface posts, receives answers and decides approvals as a linked person` (the platform's display name is dropped, a repeated platform event posts once, and the permission card it receives is answered by its owner alone) and `an unlinked platform user cannot post or decide` (nor follow a thread, and no account is made; a link holds on its own platform only and is never moved; a linked person outside the room, or a guest, keeps the web's limits; unlinking or leaving the room stops what goes out), `a person lists and unlinks only their own platform accounts, and a new password unlinks them all` and `a platform hears another surface's messages by name only, and its submission ids never meet the web's`. [stream.test.ts](../apps/openduet/src/rooms/stream.test.ts) holds the web's thread stream to its order, its reader's pace, its membership check and its keepalive. See [ROOMS](ROOMS.md#talking-to-a-room-from-a-chat-platform). |
+| Brokered MCP over HTTP | implemented-and-tested | `MCP HTTP transport supports JSON and SSE while pinning session and rejecting redirects`, `MCP readOnlyHint cannot bypass approval, and repeated intent dispatches once`, `MCP owner-only tools disappear and reject direct calls in a public compartment`. Configured servers receive protocol messages and admitted arguments only. |
+| Publishing apps with versions and grants | implemented-and-tested | `publishing asks with the file count, viewers and data bindings, and nothing is visible before approval`, `a changed file after approval is a new version that asks`, `rolling back serves the earlier version at once`, `a bundle with a disallowed file type or over the size limit is refused before asking` and `the Apps routes list an app, show its versions and grants to managers, re-grant it and delete it`, `proposing the same new app again is the same request, before and after it is approved`, `a new version is asked for by the name the app has now, and a rename only as shown`, `a rollback is asked for with the earlier version's data and today's viewers` and `a publish that sets who may open the app keeps the managers its publisher chose` in [apps.test.ts](../apps/openduet/test/integration/apps.test.ts); the size, count and link rules in [service.test.ts](../apps/openduet/src/apps/service.test.ts). Files are stored by hash in the blob store, each version refers to its own, and a space removal takes them with it. See [APPS.md](APPS.md). |
+| Opening apps, isolated from OpenDuet | implemented-and-tested, except WebRTC, which no header stops: an app can send data to a server it names that way, and the publish question warns when its code uses WebRTC by name; the browser proof runs in CI in Chromium and Firefox | `an app cannot read OpenDuet's cookies, storage or API, opened framed or directly`, `an app cannot fetch, load or navigate anywhere outside its bundle` (HTTP requests, forms, frames, popups, workers, pings, speculation rules and every way of moving its frame, against a different site that the page around it does reach; WebRTC is recorded as reaching it) and `the OpenDuet app refuses to be framed by another site` in [app-isolation.test.ts](../apps/openduet/test/browser/app-isolation.test.ts) load an adversarial app through the real web server and isolation headers. `publishing code that opens WebRTC connections asks with a warning, and is not refused` and `an open view keeps loading its files for as long as its session lasts` are in `app-views.test.ts`. `revoking a viewer stops their open view on the next request`, `a new current version ends the views of the one before` and `a file asked for as a page of its own, rather than framed, is refused` in [app-views.test.ts](../apps/openduet/test/integration/app-views.test.ts) hold the view tokens against a database. `every response under the app view path carries the isolation policy` in `serve.test.ts` and the tests in `viewer/headers.test.ts` hold the fail-closed rule. See [APPS.md](APPS.md). |
+| App data and responses | implemented-and-tested | `a binding serves the newest version a routine wrote, without a republish` in [app-routine-data.test.ts](../apps/openduet/test/integration/app-routine-data.test.ts) creates a routine through the automations path, binds an app to it before its first run, and runs it twice; `a binding serves the newest version its conversation wrote, without a republish`, `with update review on, a new data version reaches viewers only after the publisher approves it`, `a binding cannot read a file outside the app's space`, `submissions beyond the rate or size are refused`, `the agent reads a collection's submissions in the app's space and nowhere else` and `after reading responses, writing a file an app shows asks first` in [app-data.test.ts](../apps/openduet/test/integration/app-data.test.ts); how a file is given to an app and what a new version changes in [data.test.ts](../apps/openduet/src/apps/data.test.ts). An app's code can send responses in the viewer's name within those limits. See [APPS.md](APPS.md). |
+| Default tools on a fresh or upgraded installation | implemented-and-tested | `a fresh installation offers a useful catalog without any hand-made connection` boots the service entry point on an empty database, sets up an owner over HTTP, and finds files, web fetch and artifact publishing in a new attempt's bundle and in the broker's catalog, with a workspace write admitted and publication still `write_external`; the same rows reach Settings marked as kept by the service. `an existing installation gains the default tools once, and a removal stays removed` starts on rows an earlier release left, keeps a hand-made grant undoubled, skips procedure-evaluation spaces, adds speech when a speech-capable provider is configured, and shows a revoked default is not recreated at the next start. `in-cell execution and speech are defaults only where the deployment supports them` in `builtin.test.ts` covers the container and provider conditions. The integration tests are in [default-connections.test.ts](../apps/openduet/test/integration/default-connections.test.ts). |
+| Web search (`web.search`) on every agent, on by default | implemented-and-tested against stub providers and search pages | Every space's default Web connection grants `web.search` beside `web.fetch`, and a row an earlier release made gains it at start. Both are always in the agent's core tool list (`web search and web fetch are always in the core, never pushed out by the budget`). A configured `TAVILY_API_KEY` or `BRAVE_SEARCH_API_KEY` is used first, Tavily before Brave, and Tavily's results carry each page's matching passages; with the Tavily key, `web.fetch` also reads a page that gave a direct read no text through Tavily Extract, after the same address and privacy checks (`tavily.test.ts`); then the model's own search tool, through a metered gateway call, where the provider has one; then a keyless search (DuckDuckGo, then Wikipedia). The integration test [web-search.test.ts](../apps/openduet/test/integration/web-search.test.ts) covers the native path with its budget reservation, ledger notices and trail sources, the keyless path with no key, key precedence, and a private space or sensitive conversation sending the query nowhere. Results carry the outside-text notice. Limit: the keyless search depends on DuckDuckGo serving its results page to the server's address; Wikipedia, its fallback, covers only encyclopedia articles. See [CONNECTORS](CONNECTORS.md#web-search). |
+| Speech with ElevenLabs (`audio.synthesize`) | implemented-and-tested against a stub fetch | With `ELEVENLABS_API_KEY` set, speech uses ElevenLabs in preference to an OpenAI key. `asks for plain PCM with the key in xi-api-key, and returns a playable WAV`, `the second voice reads the tenor lines, and falls back to the first` and `a refusal carries the status and never what the provider wrote` in [elevenlabs.test.ts](../apps/openduet/src/connectors/elevenlabs.test.ts) hold the request shape. No test calls ElevenLabs. See [VOICE](VOICE.md). |
+| Transcription (`audio.transcribe`) | implemented-and-tested | A file from the job's workspace or the space artifacts becomes a Markdown transcript with numbered, timed speakers, through the same approval, budget, receipt and verify path as speech: `transcribes a recording from the workspace into the space artifacts`, `reads a recording from the space artifacts, and verify reads the transcript back` and `a file that is not a recording, a path outside the area, and a bad name are refused` in [transcribe.test.ts](../apps/openduet/src/connectors/transcribe.test.ts), with the fake adapter reading back a fake speech file's script. `posts the file as multipart with word timestamps, and keeps only the words` in `elevenlabs.test.ts` holds the Scribe request. It is a default connection of its own beside Speech when a provider that transcribes is configured (`builtin.test.ts`). |
+| Push-to-talk and voice mode | implemented-and-tested for the service routes; the browser flow checked by hand against the mock | [voice.test.ts](../apps/openduet/src/api/voice.test.ts) covers the size and length refusals, a WAV judged by its own header, the daily allowance and a provider refusal given back. [voice.test.ts](../apps/openduet/test/integration/voice.test.ts) runs through the real session: another person's conversation answers 404 with nothing counted, the session address carries only a single-use token, each allowance holds per person, and `voice_usage` keeps amounts only. The mock's realtime socket is covered by `the realtime socket commits an utterance after sound and then silence` in `apps/mock-api/src/voice.test.ts`. |
+| Installing mail, CalDAV, calendar feed and HTTP MCP connections through the API | implemented-and-tested against local protocol fixtures | [connection-kinds.test.ts](../apps/openduet/test/integration/connection-kinds.test.ts) covers each kind: per-kind validation errors, the sealed secret, no secret in any response or in the stored configuration, the typed test result, the connector's tools in a new attempt's bundle and broker catalog, and their absence after revocation. It also covers a failed first test that a later test repairs, a restart that needs no connections file, the connections file as an override, owner and audience authorisation, refusal in a public compartment, a service without a master key, and a calendar feed refused for plain HTTP or a private or loopback destination before anything is stored. `ics-feed.test.ts` covers the feed's address checks on every read, the pinned request and the refused redirect. `a form drawn only from the served descriptors installs every kind` runs the web form's logic against the contract, and `the form draws exactly what a served descriptor carries` renders the Settings form from a descriptor the application has never seen. Mail and CalDAV sign in with an account name and a password or app password. |
+| Text messages through Twilio | implemented-and-tested against a stub of Twilio's published API | `matches Twilio's documented example` and `a valid signature passes and anything changed is refused` in `twilio.test.ts` check the webhook signature against the worked example in Twilio's security documentation. [sms.test.ts](../apps/openduet/test/integration/sms.test.ts) covers, through the API: installing that proves the credential, points the number at `/api/sms/twilio/<connection>` and seals the SID, token and number; a forged, altered or wrongly addressed webhook refused with nothing kept; a text from an unknown number kept for the person and never turned into a message; a text from the person's number becoming one message in their conversation however often Twilio delivers it; the answer texted back once, split to fit; and `sms.send` bound to the exact number and text, dispatched once, and left unknown then verified when Twilio's answer is lost. Incoming texts need an `https://` `OPENDUET_PUBLIC_URL`; no test has been run against a live Twilio account. |
+| Plugins and stdio MCP servers | implemented-and-tested; the container on a real engine in CI | `GET /plugins` lists a pinned starter catalog (files, fetch, time, GitHub) and `POST /plugins/{id}` adds one with only the values it asks for; the owner's advanced path is an `mcp_stdio` block on `POST /connections`. [mcp-stdio.test.ts](../apps/openduet/test/integration/mcp-stdio.test.ts) covers, through the API, broker and registry with a fake launcher: sealed variables that reach only the server, broker admission and approval, a restart that starts nothing until a call, a crash loop that stops restarting until the owner tests, one-tap plugins with plain-word refusals, the move to a release's pinned version, and revocation that stops the server and removes its volume. `mcp-stdio-docker.test.ts` holds the container's restrictions against a recording engine, and `mcp-egress.test.ts` the proxy's grants. Conformance 10 observes uid, capabilities, seccomp, the read-only root, its own volume and the read-only package, no network, route or outside name, or only the named destination and the service's proxy and broker, and container removal from inside real containers, and fetches a real npm package. Stdio servers run where attempts run in containers (`OPENDUET_RUNTIME_ADAPTER=docker`), and images are pulled without registry credentials. |
+| OpenDuet as an MCP server for other assistants | implemented-and-tested | [Conformance 11](../conformance/scenarios/11-mcp-server.test.ts) connects two accounts' assistants with the reference MCP client library through the web proxy: discovery from the endpoint's 401, dynamic registration, PKCE, consent and the code exchange, then `tools/list` and every tool. `each tool acts as the person the token names`, `another person's token is refused the first person's work`, `safe_send waits for approval in OpenDuet and never sends on its own` (with a standing rule for the same recipient in place) and `the person approves the exact text in OpenDuet and the broker sends it once`. [mcp-server.test.ts](../apps/openduet/test/integration/mcp-server.test.ts) holds PKCE, single-use codes, refresh rotation and reuse, resource binding, public-client registration, client metadata documents on public addresses only, and the consent form's binding to its session. It also holds `a member revoked from the space loses the assistant, and re-adding them does not revive it`, `a token from an earlier membership is refused and its sign-in ends, with no fallback`, `remember records the assistant as the source, and a send using it keeps its warning`, the 90-day connection limit, redirects only to trusted return addresses, and the per-address, per-connection and registration limits; conformance 11 adds `an assistant cannot flood the approval queue, and waits after a denial`. See [MCP-SERVER](MCP-SERVER.md). |
+| Browser worker with takeover | implemented-and-tested | `approval binds the exact browser intent and repeated proposals dispatch one effect`, `an unapproved submit has no external effects and its warning identifies the observed destination`, `configured browser connections require an isolated endpoint in production` in `browser-broker.test.ts`; the controller fixtures inject a takeover between locator wait and dispatch and require zero submissions. Local Chromium fixtures establish the controller, and the configuration checks cover the browser image and the combined Compose stack, which no scenario starts. See [the browser worker](browser-worker.md). |
+| Signing in to a site through the live view | implemented-and-tested against local Chromium fixtures | `human mode allows the identity-provider redirect and refuses an off-scope host` and `a top-level navigation to an off-scope site is still refused` in `browser-live-worker.test.ts`; `another principal in the same space cannot open, read or drive the live view`, `the live view refuses a request from another address`, `no persisted event contains the typed secret or the identity-provider host` and `a handed-back page is looked at without its contents until automation leaves it` in `browser-live.test.ts` and `browser-live-worker.test.ts`; `a page cannot walk the person to new sites without them acting` in `live-protocol.test.ts`; `a takeover that ends signed in records the site` and `forgetting a site removes its cookies and the profile row` in `browser-sites.test.ts`. The renderer sandbox is `every renderer is under a seccomp filter, in its own user namespace` in `browser-sandbox.test.ts`, which runs in the `browser-sandbox` CI job on a Linux Docker host. |
+| Command-line tools using a connected account | implemented-and-tested with the test adapter; the computer proof on a real engine in CI | The relay terminates TLS only for a connected account's hosts and keeps every other host a blind tunnel. `a read through a connected host is injected, recorded and redacted`, `a host with no connection stays a blind tunnel`, `a request whose Host differs from the tunnel's is refused`, `a credentialed tunnel carries no account once its command has settled` and `a push larger than the hold limit is refused with a plain message` in [intercept.test.ts](../apps/openduet/src/egress/intercept.test.ts); `the egress CA cannot sign for a host outside its constraints` in [ca.test.ts](../apps/openduet/src/egress/ca.test.ts); `a write waits for approval within the hold and proceeds when approved`, `a write not approved in time fails the command with a plain message, and the job waits for approval` and `a re-run after approval is admitted once, and a third run is refused as already done` in [egress-credentials.test.ts](../apps/openduet/test/integration/egress-credentials.test.ts) against the real broker; `a computer uses a connected account through the relay, and its environment, files and output never hold the secret` in the `docker-sandbox` CI job. Docker computers only. See [COMMAND-LINE-ACCESS](COMMAND-LINE-ACCESS.md). |
+| GitHub from the agent's computer (git and gh) | implemented-and-tested against recorded requests and fixture servers; a real computer in CI; the run against GitHub itself is opt-in | `every mutation in the gh corpus is classified as a write` in [github.test.ts](../apps/openduet/src/egress/adapters/github.test.ts) over requests recorded from gh 2.83 and git; `a push asks with its exact ref updates, and a re-run after approval pushes once`, `a branch delete is shown as a delete and always asks`, `a standing rule admits pushes to openduet branches and never to the default branch` and `gh pr create opens the pull request after approval and the receipt links it` in [egress-github.test.ts](../apps/openduet/test/integration/egress-github.test.ts) against the real broker; `git and gh in a real computer clone, push and change GitHub through the relay, and the computer never holds the token` in the `docker-sandbox` CI job; `OPENDUET_EGRESS_LIVE=github` runs [github.live.test.ts](../apps/openduet/src/egress/adapters/github.live.test.ts) against a throwaway repository. Docker computers only. See [COMMAND-LINE-ACCESS](COMMAND-LINE-ACCESS.md#github). |
+| AWS from the agent's computer (the aws command line and SDKs) | implemented-and-tested against requests the AWS SDK builds and a local stand-in that checks signatures; a real computer in CI; the run against AWS itself is opt-in | `list and describe calls are reads, and delete and run calls ask`, `a request signed with the placeholder is re-signed and a stray real key is refused`, `chunk-signed uploads are refused with a plain message` and `an assumed-role session names the command in its session name` in [aws.test.ts](../apps/openduet/src/egress/adapters/aws.test.ts), over requests captured from the AWS SDK for Python and with its signatures checked against the SDK's own; `an S3 delete asks with its bucket and key, and a re-run after approval deletes once` in [egress-aws.test.ts](../apps/openduet/test/integration/egress-aws.test.ts) against the real broker; `aws in a real computer reads, asks before a change and makes it once after approval, and the computer never holds the key` in the `docker-sandbox` CI job against moto; `OPENDUET_EGRESS_LIVE=aws` runs [aws.live.test.ts](../apps/openduet/src/egress/adapters/aws.live.test.ts) against a sandbox account. Docker computers only. See [COMMAND-LINE-ACCESS](COMMAND-LINE-ACCESS.md#aws). |
+| GitLab and npm from the agent's computer (git, glab and npm) | implemented-and-tested against recorded requests and fixture servers; a real computer in CI against a git server and a Verdaccio registry | `every change in the glab and git corpus is classified as a write` in [gitlab.test.ts](../apps/openduet/src/egress/adapters/gitlab.test.ts) over requests recorded from glab 1.120 and git; `every change in the npm corpus is classified as a write, and installs and audits read` in [npm.test.ts](../apps/openduet/src/egress/adapters/npm.test.ts) over requests recorded from npm 11; `a push asks with its ref updates and push options, then goes through once with the oauth2 account` and `a publish asks with its package and version, goes through once, and the package then installs` in [gitlab-npm.relay.test.ts](../apps/openduet/src/egress/adapters/gitlab-npm.relay.test.ts) with the real git and npm clients through the relay; `git and glab in a real computer push and change GitLab through the relay, and the computer never holds the token` and `npm in a real computer publishes to and installs from the registry through the relay, and the computer never holds the token` in the `docker-sandbox` CI job. GitLab.com and the public npm registry; Docker computers only. See [COMMAND-LINE-ACCESS](COMMAND-LINE-ACCESS.md#gitlab). |
+| Remote sandbox on Daytona | implemented-and-tested against fixtures written from Daytona's published API | [daytona.test.ts](../apps/openduet/src/sandbox/adapters/daytona.test.ts) replays the provider-neutral conformance suite (`a lost acknowledgement after the marker is unknown and is never re-run`, `deny-all egress holds from inside the sandbox`, `a symbolic link returned by the provider is refused` and the rest) and the workspace suite with `pause`, plus `a poll lost after the command started is unknown and the command is never run again`, `the key is sent only to the API and the configured toolbox proxy` and `a sandbox whose recorded egress differs from the request is refused and destroyed`. Replay fails on any missing, extra or different request. The live suite, [daytona.live.test.ts](../apps/openduet/src/sandbox/adapters/daytona.live.test.ts), runs with `OPENDUET_SANDBOX_LIVE=daytona`; Daytona sets a sandbox's egress only for organisations on Tier 3 or Tier 4. This adapter has not yet been run against a lower tier. |
+| Background processes in the agent's computer | implemented-and-tested | [sandbox-process.test.ts](../apps/openduet/src/connectors/sandbox-process.test.ts): `a process started in one attempt is read and stopped from a later job of the same agent`, `starting the same command twice starts two processes`, `each read of process output is kept in the job workspace with its digest`, `a fifth process on one computer is refused, and an expired one is stopped and recorded`, `a computer restart marks its running processes lost`, `the sweep stops a process whose job was cancelled, and not one whose job completed`, `a computer with a live process is neither suspended at attempt end nor idle-stopped`, `the next attempt adopts a computer its processes kept awake`, `a computer held by processes counts toward the concurrency limit` and `when the day's awake allowance is used, processes stop with a notice and new starts are refused`. The Docker idle stop reads the running processes from the service's records ([docker.test.ts](../apps/openduet/src/sandbox/adapters/docker.test.ts): `a container its processes keep awake is not idle-stopped, and its idle clock starts when they end`). The helper in the computer runs for real in [process-helper.test.ts](../apps/openduet/src/sandbox/process-helper.test.ts) on Linux (`process output is a ring of the configured size, and a read past it says what was dropped`, `a stopped process records 143, and nothing it started is left`). [docker-processes.live.test.ts](../apps/openduet/src/sandbox/adapters/docker-processes.live.test.ts) runs a three-minute process across three attempts in a real Docker sandbox in the `docker-sandbox` CI job, and shows a computer with a running process kept through the idle stop and taken over by the next attempt. On E2B, Daytona and Modal the same helper runs through the provider's ordinary command channel. An E2B computer with running processes is kept running by extending its timeout ([e2b.test.ts](../apps/openduet/src/sandbox/adapters/e2b.test.ts): `a sandbox kept alive for its processes runs past the timeout it was created with`). E2B holds a sandbox to its plan's continuous runtime, one hour on Hobby and 24 hours on Pro, so on Hobby a background process keeps its computer running for at most an hour. On Daytona and Modal, suspending a computer ends its processes, so they stop when the turn ends, and `process.start` says so (`where a computer cannot be kept running, its processes stop when the attempt ends, and the start says so`); those providers have not yet been run with processes. |
+| Picking a conversation up when its background process finishes | implemented-and-tested | [process-monitor.test.ts](../apps/openduet/src/sandbox/process-monitor.test.ts): `a process exit wakes the waiting job with its exit code and last lines`, `a quiet process wakes nothing, and a matching line wakes the job once a minute at most`, `a listening port is reported once`, `a process trigger disappears when its process ends`, `a job watches at most four processes at once, and the same watch twice is one watch`, `process.wait returns when the line appears, or says plainly that it has not yet` and `a wake on a process exit never reaches or adopts a computer while it is being suspended`. [docker-process-wakes.live.test.ts](../apps/openduet/src/sandbox/adapters/docker-process-wakes.live.test.ts) runs `sleep 20; echo READY` in a real Docker sandbox in the `docker-sandbox` CI job and shows the waiting job woken by the line, with no attempt in between. |
+| Previewing a server in the agent's computer | implemented-and-tested | [preview.test.ts](../apps/openduet/src/sandbox/preview.test.ts): `a preview never forwards the OpenDuet cookie, and the page runs in an opaque origin`, `a preview cannot reach a port the process did not declare`, `a preview link stops working when its process stops or the viewer loses access`, `a preview opened as a page of its own, or asked for a live connection, is refused`, `a preview lasts half an hour from when it was opened, and is refused after` and `a page, script or style past the rewrite limit is passed on unchanged as it arrives, not held whole`. [preview-access.test.ts](../apps/openduet/src/sandbox/preview-access.test.ts) checks who may open, read and stop a process against a real database, and that losing the space, the connection or the browser session ends a preview. [preview-isolation.test.ts](../apps/openduet/test/browser/preview-isolation.test.ts) runs a hostile page through the real web server and proxy in Chromium and Firefox in the `app-isolation` CI job. Docker computers with network access only; WebRTC is open to a previewed page as it is to an app. |
+| In-cell execution with artifact validation | implemented-and-tested | `admission reserves once, claims once, and accepts only its matching late result` and `two concurrent execution settlements produce one durable result` in `execution-admission.test.ts`; artifact checks in `artifacts.test.ts`. The launcher selects an available Python executable on each supported development host. |
+| Read composition (`compose`) | implemented-and-tested, not exposed by default | `HTTP composition is discovered, loaded and produces only a compact join with broker evidence` and `a join has separate actions, settled reservations and real receipt handles` in `compose.test.ts` run with the test executor. The default service injects no cell executor, so `HTTP composition is unavailable without the service-owned cell executor` describes the shipped entry point. |
+| One pinned engine per attempt | implemented-and-tested | `pins the image, mounts only the job subpath, and isolates its sole broker peer` and `concurrent jobs never share a network or writable Hermes home` in `runtime/docker.test.ts` (Docker CLI faked); the live boundary was probed on a Linux host as scenario 6. The scripted HTTP proof through a real local engine is `wired-assistant.test.ts` (skips itself without `.hermes-venv`). |
+| Broker plugin registration and forwarding | implemented-and-tested | `test_registers_one_tool_per_catalog_entry`, `test_a_dispatched_call_returns_the_receipt`, `test_a_broker_refusal_keeps_the_brokers_own_code` in `packages/runtime-hermes/tests/test_plugin.py`, using a test broker. |
+| Approval results tell the runtime to park | implemented-and-tested | `test_a_parked_action_tells_the_model_to_stop` and `test_an_unknown_dispatch_is_never_presented_as_either_outcome` in the Python plugin suite; `a parked action turns a completion into waiting_for_approval` in the adapter suite. |
+| An approved action is carried out by id | implemented-and-tested | `resume_action` sends no payload; the broker replays the stored canonical bytes through ordinary admission. `an approved action is carried out by id, with the stored bytes and the new attempt authority` and `an unknown outcome is never replayed through resume` in `resume-action.test.ts`; `test_resume_sends_only_the_action_id_and_returns_the_receipt` in the plugin suite. The broker behaves this way for whichever caller uses it. |
+| Built-in skills reach the attempt that needs them | implemented-and-tested | `a first attempt reads the skill its words call for, and a skill it cannot use takes no place` in [default-connections.test.ts](../apps/openduet/test/integration/default-connections.test.ts) boots the service, claims an attempt and finds the research skill in its instructions, a skill that waits on a trigger offered because the wait is the broker's own tool, and three better-matching skills that need an unconnected mailbox leaving the place to the one that can run. `are all tools a connector, a capability or the broker provides` in `skill-tools.test.ts` holds every built-in to tools that exist. The same test records the `tool_trace` notice that names the skills followed. |
+| Skill choice on a first-week request set | implemented-and-tested | [selection-eval.ts](../packages/skills/src/selection-eval.ts) holds 59 requests a person makes in their first week, each with the skill that should reach the model or none. Over the tools of an installation with mail, a CalDAV calendar and speech, the built-ins deliver precision 0.98 (48 of 49 picks) and recall 1.00 (48 of 48); `is delivered with high precision and recall` in `selection-eval.test.ts` holds that line. The triggers were written against this set. A second set of 32 requests, written afterwards and never used to change a trigger, measures wording the triggers were not written for: 1 of its 28 expected skills is delivered, and 1 of 3 picks is right. Trigger phrases reach the wording they list, so every attempt also carries a skill index naming each skill it may use: on the held-out set all 28 expected skills are visible to the attempt, given in full or named in its index (`every held-out expected skill is visible to the attempt, given in full or in its index`). The set counts what the attempt can see; which skill a model then reads depends on the model. The index names every usable built-in today: the 16 built-ins take 423 of its 500 estimated tokens. With ten skills of a person's own beside them, it names 19 of the 26 and the rest are found through `search_tools`. A learned procedure's precedence decides what is given in full and what the index names; `skills.read` and tool search serve any skill the attempt may read. `skills.read reads an indexed skill by name, once per read, with a tool entry` in [catalog.test.ts](../apps/openduet/test/integration/catalog.test.ts) covers reading one. Triggers match whole words, so "chase" is not found in "purchase" (`a trigger matches whole words, never the inside of another word`). |
+| Core catalog chosen from the job's own words | implemented-and-tested | `the core is chosen from the objective, the latest owner message and the registered trigger`, `relevance to the objective and the latest owner message outranks usage` and `the lifecycle wait and the reaction are pinned when the turn needs them` in `catalog.test.ts`. The ranking is deterministic and involves no model call; these tests measure the ranking itself. |
+| Tool search matches any term and explains an empty result | implemented-and-tested | `search matches any term, stems it, and reads identifier segments` and `a search with no match names what can be loaded instead of returning nothing` in `catalog.test.ts`. |
+| The agent asks the person and waits | implemented-and-tested | `ask_person` is a broker tool in the OpenDuet toolset; the broker records one question per attempt and refuses a second, one while another is open, and one beside a wait. The attempt then settles `waiting_for_input` with the question in the queue; a routine rests on its schedule instead and the answer wakes it. [ask-person.test.ts](../apps/openduet/test/integration/ask-person.test.ts): `a chat waits for input, shows the choices, and resumes with the chosen answer`, `an answer in the person’s own words is accepted; an unknown choice is not`, `stopping the conversation withdraws its question`, `deleting the conversation takes its question with it`, `a cancelled responsibility withdraws its open question`, `a routine rests on its schedule while its question waits, and the answer wakes it`, `a question about an unconfirmed send outlives a stop and a cancel`, `a question asked in a turn that parked for approval is kept beside the approval`, `answering a routine with no agent of its own still opens a turn`; `test_a_question_for_the_person_is_forwarded_to_the_broker_native_gate` in the Python suite. Whether a given model asks only when it should is **not claimed**. |
+| An ask that proposes nothing is not a completion | implemented-and-tested | The adapter gives one continuation, then settles `waiting_for_input`: `a drafted reply that asks to send gets one continuation, and its proposal parks` and `an ask that still proposes nothing settles waiting for input, never completed` in the adapter suite. After a refusal in the same wake there is no continuation, only the question: `an effect the owner refused in this wake is not asked for again`. The detection is a documented pattern, not a model. |
+| A wait names its trigger by id or event name | implemented-and-tested | The attempt input lists the job's enabled triggers (`the job's enabled triggers arrive with their event name and a plain description`); `resolves the event name to the enabled trigger of this job, broker-side` and `an unknown, disabled or ambiguous name is refused, and nothing is recorded` in `runtime-wait.test.ts`. |
+| A wait cancelled by a correction is named and restored | implemented-and-tested | `the next attempt is told, and completing without a new wait restores it`, `an event delivered between the correction and the completion wakes the restored wait at once`, `a retryable failure hands the cancelled wait to the retry, and only once it is restored does it stop` and `a replaced wait, a disabled trigger or a lapsed timer is not restored; a future timer is` in `waits.test.ts`. The service restores the wait whether or not the model asks for it again. |
+| Constraints rendered as prose, defaults omitted | implemented-and-tested | `constraints read as short prose, and a default is never written down` in the runtime client suite. |
+| `react` without a message target | implemented-and-tested | `a reaction with no target lands on the owner's latest message, and only this job's` in `broker.test.ts`, which covers the targeting rule with a fixture reaction. |
+| Audience-qualified skills | implemented-and-tested | `preserves a qualified audience and refuses a different container` in `packages/contracts/src/principals.test.ts`; the integration test excludes private and incorrectly qualified files. |
+| Existing account upgrade | implemented-and-tested | `additive migration preserves the setup guard, login and an issued personal-space capability` now upgrades through production `migrateDatabase`. `production migration upgrades the integration schema with MCP setup and procedure promotion` starts with a real ledger through 0032, verifies all three new columns, and checks a second startup is idempotent. Migrations 0033/0034 have increasing timestamps after 0032. |
+| Adapter sequencing and prompt assembly | implemented-and-tested | `every event carries the one dedup key format` and `the identity is the engine home's SOUL.md, whole, and the instructions do not repeat it` in the runtime adapter and client suites, with recorded HTTP responses. |
+| Whole end-to-end capability proof against the real engine | implemented-and-tested | `real Hermes capability chain: discovery, hooks, learning, teammate context and revocation` passes all five stages. It runs pinned Hermes with a scripted HTTP provider and verifies actual provider requests, broker receipts, learning, member context and revocation, so it establishes the chain rather than a model's answers. |
+
+## Authority and observer behaviour
+
+Hooks observe; the broker enforces tools, approvals, budgets and generations.
+The plugin registers lifecycle observers and the adapter stores their events in
+its ordinary sequence before fan-out. Identical captures are deduplicated;
+conflicting reuse of a capture ID fails the stream. Records contain bounded
+names, attempt and tool identity, capture time, outcome and a digest of an
+argument shape with all values erased. Full payloads, credentials and exception
+text are never copied into hook records.
+
+Hermes has 37 hook names at the audited pin. The hash-checked observer patch
+adds a real `on_compaction` dispatch after committed compaction progress and a
+per-run HTTP queue bridge. The dispatch carries the compaction count, whether
+the session id survived it and whether a fallback wrote the summary, and it
+also fires when the middle was dropped deterministically instead of summarised,
+which it reports as observed rather than as a success. `on_session_end` still
+means turn finalisation. The
+source audit, MCP retry analysis and reuse, patch or replace decisions are in
+[note 0021](../.agents/notes/0021-hermes-capability-audit.md).
+
+The installation keeps its singleton setup owner. Additional accounts live in
+`principal`; a session, job and new capability name the authenticated
+principal. Personal spaces are private. Shared-space membership has a retained,
+monotonic generation. Revocation advances the space policy generation, clears
+cached delivered memory, invalidates prepared outputs, fences active attempts
+and cancels the revoked member's queued and waiting work. A regrant gets a new
+generation. Checks occur at API reads, bundle construction, broker admission
+and model-budget reservation.
+
+Jobs and their timelines remain private to the principal who owns the job,
+including inside a shared space. Membership shares published skills and
+knowledge; it does not expose another principal's private attempt context.
+
+A session speaks for one space, and that space is derived from the authenticated
+principal on every request: the principal's own personal space, or a space the
+session stored that the principal is still a member of under the membership
+generation it was stored with. A revocation ends a stored selection and a later
+regrant does not revive it; whatever fails falls back to the principal's own
+personal space, never to another account's. An account without a personal space
+receives exactly one on first use. Conversations, plans, routines, permissions,
+drafts, receipts, undo, search, the event stream, artifacts, reactions and
+browser takeover or handback are additionally checked against the job's
+principal. The profile, tasks, saved rules, agents and connection reads belong
+to the space, so a shared space offers them to its owner only. Saved details are
+stored under the setup owner's memory catalog; another account's personal space
+reports them as not connected. A session's space follows its principal, and no
+route selects a shared space for it.
+[principal-scope.test.ts](../apps/openduet/test/integration/principal-scope.test.ts)
+exercises each of these surfaces from a second account and from the owner.
+
+Published shared skills use `audience: space:<space-id>`; plain `space` remains
+valid within its checked container. Missing skill audiences are private. The
+bundle reads only the job's authorised space and at most three selected skills.
+It also includes bounded, active published Markdown knowledge with matching
+container and audience. Derived memory Markdown is excluded: its authoritative
+recall path supplies the current claim revision. The service preserves the
+actual reader principal and membership generation in memory scopes. Catalog
+enrichment preserves the already authorised selection and evaluated procedures;
+it can remove skills whose tools are unavailable. Membership is granted through
+the API; there is no invitation interface.
+
+Evaluated procedure activation accepts `scope: private | space`, defaulting to
+`private`. Its promotion record also stores the authenticated principal; callers
+cannot nominate another principal. Canary delivery stays private. Explicit
+space activation requires the source space's owner, a shared space, the sealed
+evaluation gate and a completed private canary. Task applicability remains a
+separate evaluated object and grants no access by itself. A current member can
+receive only the verified compiled procedure body for a matching task, model and
+runtime in that space. Episodes, corrections, evaluations and job timelines stay
+private. Selection rechecks membership under the existing revocation lock;
+revocation cancels queued reuse and fences already delivered context. Rollback
+removes subsequent procedure delivery.
+
+## Agents
+
+Every space has OpenDuet, its default agent. It takes a new chat, a message from
+Home and a routine whenever no other agent is named. Its name is fixed and it
+cannot be removed; its tone, standing instruction and "asks before acting" can
+change. In a personal space it reaches every connection, including ones
+connected later, the computer and memory, and that cannot be narrowed. In a
+shared space it starts with no connections, and the space's owner chooses what
+it may use; members cannot change any agent. Migration `0070_default_agent`
+gives every existing space its OpenDuet and hands chats and routines without an
+agent in personal spaces to it; in a shared space they stay without one, as
+before. A space made later receives OpenDuet the first time its agents are read
+or a chat is started.
+
+A specialist (one added from the agent library, or one made from scratch)
+has its own name, role, look, tone and standing instruction, and four limits
+the service enforces:
+
+- **Connections.** `allowed_connection_ids` lists what it may use; null means
+  every connection. The catalog offers nothing else and the broker refuses
+  anything else (`scope_denied`).
+- **Computer.** With `uses_computer` off, the agent's own computer and the
+  person's paired computers (`browser.*`, `computer.*`, `terminal.*`, `exec.*`,
+  `device.*`) are neither offered nor admitted.
+- **Reading memory.** With `reads_memory` off, nothing is recalled or recorded
+  as used, no correction is briefed (it stays pending for an agent that reads
+  memory), and no handle to a remembered source is passed on.
+- **Keeping memory.** With `writes_memory` off, nothing said to it is captured
+  into memory. A request to forget is still carried out.
+
+A message that starts with an agent's name after `@` ("@Scout find trains to
+Porto") is answered by that agent for that one turn; the chat keeps its own
+agent for the next message. In a shared space only the owner's mention does
+this; a member's message stays with the chat's agent. Each turn records the agent that answered it, and
+that agent's limits apply to the turn.
+[agents.test.ts](../apps/openduet/test/integration/agents.test.ts) covers each
+of these.
+
+### Agent library
+
+`GET /agents/templates` lists ready-made agents on twelve shelves, from
+Personal to Shopping & subscriptions. Each template carries a one-line
+benefit, what it does and what it won't do, the kinds of thing it works best
+with (mail, calendar, files, web pages, a browser, its own computer, your
+computer, apps you connect), a brief of up to 500 characters, and its
+switches. Adding one opens a draft to name and review; saving it makes that
+one agent.
+
+- **Nothing is granted by the template.** Every template carries no
+  connections. The draft starts with the person's connected connections that
+  match "works best with" ticked and marked as suggested, so they see exactly
+  what it will reach and can untick any before creating it; setup does the
+  same for the agents picked there and lists what each will reach. An agent without the computer is never
+  offered as working with a browser, its own computer or your computer.
+- **The starter routine is offered, not made.** After the agent is saved its
+  routine is shown with its schedule; `POST /automations` runs only when the
+  person presses Set it up, and the routine then runs as that agent.
+- **Getting-to-know-you answers are the person's own statements.** Each
+  answer is saved through `POST /memory/items` on the question's
+  `pref.<purpose>.<name>` key, with the question and answer as its statement;
+  a blank answer saves nothing. Only templates whose agent reads memory ask.
+
+The library promises only what the connectors, the browser worker, the
+agent's computer and paired computers do today; health and money templates
+organise and remind, and give no medical, financial or tax advice.
+[agent-library.test.ts](../apps/openduet/src/experience/agent-library.test.ts)
+checks every template (unique names, known kinds, no granted connection, a
+brief within the persona cap, built-in skills, one memory purpose each), and
+[the integration test](../apps/openduet/test/integration/agent-library.test.ts)
+adds one: exactly one agent, no routine until asked, and the answers saved on
+their keys.
+
+## Auto-review
+
+Auto-review decides some actions that would otherwise wait for the person.
+Before the person is asked, the broker puts each such action in one of four
+tiers, from the tool, the exact payload and where its values came from. It
+works this out again at admission and does not trust what the proposal decided.
+
+- **Sandbox.** Reads, and changes that stay in the agent's own workspace:
+  commands, files, filling or clicking in its own browser, and mail drafts. A
+  fixed rule approves these when the person's `sandbox` switch is on (the
+  default). With the switch off, those changes ask. No model is called.
+- **Apps.** Publishing an app, a new version of one, or going back to an
+  earlier version, through the built-in Apps connection. The connector binds
+  the reasons it should ask before anyone is asked: new people could open the
+  app, its code uses WebRTC, it shows its viewers data they do not see now, or
+  it starts collecting responses from them. The files an app shows are proved
+  by the connector to be recorded files of the publisher's own conversations
+  or routines in this space, at the proposal and again before it runs, so
+  origin checking leaves those paths to it (`verifiedFields`); every other
+  value keeps its origin check.
+  With none, a fixed rule approves it when the person's `apps` switch is on (the
+  default), with a receipt. With any, it asks, and the card leads with the
+  reason. The connector works the reasons out again at admission and dispatch,
+  and refuses a publish that gained one since it was decided. A conversation
+  set to ask before acting, or one that read an app's responses, asks. A tool
+  of the same name on any other connection is not in this tier. No model is
+  called.
+  [app-auto-publish.test.ts](../apps/openduet/test/integration/app-auto-publish.test.ts)
+  covers each case.
+- **Own calendar.** An event with no guests on the person's own calendar, or
+  removing an event OpenDuet made, when it can be undone and touches nothing
+  important: nothing in the next 4 hours, no repeating meeting, no event with
+  guests or marked important, and none of the person's own events that blocks
+  the time. A fixed rule approves it when the `own_calendar` switch is on (the
+  default), with a receipt that offers Undo. Anything important asks, and the
+  card leads with the reason. No model is called. [UNDO.md](UNDO.md) has the
+  details and the tests.
+- **Reviewable.** A reversible change in a connected app, or an event with no
+  guests on a calendar OpenDuet cannot read for its context. An independent
+  reviewer judges it. It goes ahead only when the person switched that class on
+  (`app_changes` or `calendar`, both off by default) and the reviewer approves at low risk. The
+  reviewer's approval is stored as an ordinary approval, bound to the payload
+  hash, job revision and expiry. A change to an event that already exists is
+  reviewable only when its calendar says the event has no guests now; when it
+  has guests, or the calendar cannot say, the change asks. This is checked again
+  before the change runs. An agent set to ask before acting keeps asking for
+  calendar changes.
+- **Person.** Anything that spends, sends, submits or publishes (other than an
+  app in the tier above), deletes or
+  removes, or carries a password, key, code or card detail. Also any recipient,
+  destination or amount whose origin is not the person or a verified connection.
+  These always ask. The reviewer is never called, and admission withdraws a
+  reviewer's approval for an action that now falls here.
+
+The reviewer is a separate call to the installation's model (the one chosen in
+Settings → Models, unless the operator names one for reviews), made through the
+service's own gateway. Each call names the space whose action it carries. Its system prompt is fixed. The action, the person's
+instruction, recent messages and the origin of each deciding value travel in
+one JSON document that the prompt declares untrusted. The answer must be exactly
+one JSON object with a verdict, a risk, a reason and a nonce drawn after the
+payload was fixed. A timeout, a failed call, a wrong nonce, extra text or an
+unknown key sends the action to the person, and so does an approval above low
+risk. The reviewer can approve or escalate. It never denies for the person.
+
+An escalation reaches the agent as its tool result, with the reason and an
+instruction to wait rather than look for another way. The person sees the same
+reason on the card ("Escalated: ..."). A space may ask for 60 reviews an hour.
+After three escalations in a row, a job's actions go straight to the person.
+Every decision is an `action_review` row and a `notice` event. A receipt for an
+action auto-review approved says so ("Auto-reviewed: ..."), next to its undo
+where one exists. Settings → Approvals offers "Ask me for everything" (every
+change waits), "Auto-review low-risk", and a switch for each class.
+[auto-review.test.ts](../apps/openduet/test/integration/auto-review.test.ts)
+exercises each tier, every reviewer failure, both limits and recovery after a
+restart.
+
+Auto-review never approves a room's permission: the people the room's rule
+names answer it. The review input for a room's request still keeps people apart: the instruction is the words of the
+person who asked, every message of theirs in that request. What other people
+said in the thread reaches the reviewer as `other_member` messages with their
+names, and the prompt says they are never the instruction. A recipient,
+destination or amount only another member typed is `external_content`, so the
+action stays with a person. `the reviewer's instruction is the requester's
+words, and another member's text is labelled as theirs` in
+[room-approvals.test.ts](../apps/openduet/test/integration/room-approvals.test.ts)
+holds this.
+
+## Spending caps, routing and alerts
+
+- **Spending caps.** Daily and monthly limits in estimated dollars and in
+  tokens, for the installation and for each person, over every model call:
+  agent turns, routines, background jobs and the service's own calls. At 80% the
+  person sees a quiet notice; at the limit new calls are refused with a plain
+  sentence that says when it resets, while a call in flight finishes. Settings ›
+  Models shows this month's usage. Evidence: `test/integration/spending.test.ts`.
+- **Model routing.** A fast model for memory reads, voice asides, reviews and
+  scans; a vision model for agent requests that carry pictures; fallbacks when a
+  provider limits or fails. A model the owner chose in the app wins. Every
+  rerouted call's receipt names the model that served it. Reasoning effort is
+  set per role. Evidence: `apps/openduet/src/gateway/routing.test.ts`.
+- **Alerts.** A webhook and/or email when the database, the runtime, the job
+  queue or the error rate is unhealthy, and `GET /health/detail` for the
+  operator. Evidence: `apps/openduet/src/health/monitor.test.ts`.
+
+See [DEPLOYMENT](DEPLOYMENT.md#spending-caps) for the settings.
+
+## Verification
+
+```sh
+bun test apps/openduet/test/integration/principals.test.ts apps/openduet/test/integration/principal-scope.test.ts apps/openduet/test/integration/shared-procedure.test.ts packages/contracts/src/principals.test.ts --max-concurrency=2
+bun test apps/openduet/test/integration/hooks.test.ts packages/runtime-hermes/src --max-concurrency=2
+bun test apps/openduet/test/integration/catalog.test.ts apps/openduet/test/integration/mcp.test.ts apps/openduet/test/integration/runtime-mcp.test.ts apps/openduet/test/integration/runtime-mcp-revocation.test.ts apps/openduet/test/integration/mcp-repair.test.ts --max-concurrency=2
+bun test apps/openduet/test/integration/learning-three-act.test.ts apps/openduet/test/integration/learning-evaluation.test.ts --max-concurrency=1
+bun run test:plugin
+bun run lint
+bun run typecheck
+bun run compose:check
+```
+
+The combined real-engine proof runs with the pinned local engine prepared as
+CONTRIBUTING.md describes under "Run the agent runtime locally":
+
+```sh
+OPENDUET_CAPABILITY_PROOF=1 bun test apps/openduet/test/integration/capability-proof.test.ts --max-concurrency=1
+```
+
+It uses ports 3160 and 3162, a local HTTP MCP fixture, PostgreSQL, pg-boss and a
+scripted provider. Validation and sealed evaluation use separate held-out
+tasks and memory regression checks; promotion requires improvement without
+regression and a completed private
+canary. The chain is established by running it; the suites above cover each part
+separately. The separate Windows
+hook fixture is `OPENDUET_HERMES_E2E=1 bun test apps/openduet/test/integration/hooks-real.test.ts --max-concurrency=2`.
+
+Compaction is proved against the real engine by
+`OPENDUET_HERMES_E2E=1 bun test apps/openduet/test/integration/compaction-real.test.ts --max-concurrency=1 --timeout=180000`.
+
+Stdio MCP servers are proved in two parts: the service's side of them, with a
+fake launcher, by `mcp-stdio.test.ts`, and the container itself on a real
+Docker engine by conformance 10, which CI runs on every pull request:
+
+```sh
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/repo -w /repo \
+  -e OPENDUET_CONFORMANCE_DOCKER=1 oven/bun:$(cat .bun-version) \
+  bun test conformance/scenarios/10-stdio-mcp.test.ts --timeout=300000
+```
+
+Stdio recovery and credential refresh are tested with explicit fixtures (see
+[CONNECTORS](CONNECTORS.md#plugins-and-stdio-mcp-servers)).
+
+Tests use disposable PostgreSQL 17 and pg-boss; on Linux set `DATABASE_URL` to
+a server where the test account can create disposable databases, as described
+in the root README. A database test that cannot start is reported as skipped,
+and `bun run doctor` names the missing prerequisite.

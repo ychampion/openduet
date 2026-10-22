@@ -1,0 +1,511 @@
+import {
+  canonicalTimeZone,
+  experienceCalendarEvent,
+  experienceConnection,
+  experienceSearch,
+  experienceTask,
+  profileInput,
+  readReplyVoice as storedVoice,
+  taskInput,
+  unavailable,
+} from '@openduet/contracts';
+import { and, desc, eq, ilike, inArray, isNotNull, ne, sql } from 'drizzle-orm';
+import { builtinLabel } from '../connectors/builtin.ts';
+import { describeDate } from '../dates.ts';
+import type { Database } from '../db/client.ts';
+import {
+  action,
+  agent,
+  connection,
+  experienceProfile,
+  job,
+  principal,
+  space,
+  task,
+} from '../db/schema.ts';
+import { newId } from '../ids.ts';
+import { assistantName } from '../names.ts';
+import { ownJob } from '../principals/authority.ts';
+import { watchedByDefault } from '../signals/poller.ts';
+import { sourceCursor } from '../signals/schema.ts';
+import { watchable } from '../signals/watching.ts';
+import type { ExperienceEffects } from './effects.ts';
+import {
+  actionLabel,
+  appName,
+  catalogId,
+  object,
+  plainText,
+  safeUrl,
+  senderAddress,
+} from './projectors.ts';
+import { experienceMissing } from './service.ts';
+
+export const taskView = (row: typeof task.$inferSelect) =>
+  experienceTask.parse({
+    id: row.id,
+    title: plainText(row.title, 'Task'),
+    due_at: row.dueAt?.toISOString() ?? null,
+    done: row.done,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+  });
+
+export function dayGreeting(profile: ReturnType<typeof profileInput.parse>, now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: profile.time_zone,
+    hourCycle: 'h23',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).formatToParts(now);
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value ?? 0);
+  const minute = hour * 60 + Number(parts.find((part) => part.type === 'minute')?.value ?? 0);
+  const minutes = (at: string) => {
+    const [hours, minutes] = at.split(':').map(Number);
+    return (hours ?? 0) * 60 + (minutes ?? 0);
+  };
+  const start = minutes(profile.day_hours.start),
+    end = minutes(profile.day_hours.end);
+  const salutation = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  return {
+    greeting:
+      profile.name === 'there' ? salutation : `${salutation}, ${plainText(profile.name, 'there')}`,
+    date: describeDate(now, profile.time_zone),
+    time_zone: profile.time_zone,
+    within_day_hours:
+      start === end ||
+      (start < end ? minute >= start && minute < end : minute >= start || minute < end),
+  };
+}
+
+/**
+ * Whether a connector runs for an active connection on this server. `unknown`
+ * when it could not be found out in time; that is never shown as a problem.
+ */
+export type ConnectionLiveness = (
+  row: typeof connection.$inferSelect,
+) => Promise<'running' | 'not_running' | 'unknown'>;
+
+const NOT_RUNNING = `Installed, but not running right now, so ${assistantName()} can’t use it yet.`;
+const FAILING = 'Its last check failed. Press Test to check it again, or reconnect it.';
+const NEEDS_ACCESS = `It asked for more access than it was given. Sign in again to grant it, or ${assistantName()} keeps going without that part.`;
+
+export class ExperienceHome {
+  constructor(
+    readonly db: Database,
+    readonly effects?: ExperienceEffects,
+    /** Left out, the stored state is all there is to show. */
+    readonly liveness?: ConnectionLiveness,
+  ) {}
+  async profile(spaceId: string) {
+    const [row] = await this.db
+      .select()
+      .from(experienceProfile)
+      .where(eq(experienceProfile.spaceId, spaceId));
+    // A space set up before setup was recorded here has an agent to show for it.
+    const onboarded =
+      Boolean(row?.onboardedAt) ||
+      // Read only while setup is not recorded, so a set-up account's profile needs no agent list.
+      (
+        await this.db
+          .select({ id: agent.id })
+          .from(agent)
+          // OpenDuet is in every space from the start, so only an agent the person made counts.
+          .where(and(eq(agent.spaceId, spaceId), eq(agent.isDefault, false)))
+          .limit(1)
+      ).length > 0;
+    return {
+      profile: {
+        ...profileInput.parse(
+          row
+            ? {
+                name: row.name,
+                // A zone stored before names were required reads as its canonical name, or UTC.
+                time_zone: canonicalTimeZone(row.timeZone),
+                day_hours: { start: row.dayStart, end: row.dayEnd },
+              }
+            : { name: 'there', time_zone: 'UTC', day_hours: { start: '08:00', end: '22:00' } },
+        ),
+        onboarded,
+        time_zone_confirmed: Boolean(row?.timeZoneConfirmedAt),
+        voice: storedVoice(row?.voice),
+        sending_address: await this.sendingAddress(spaceId),
+        role: 'owner' as const,
+      },
+    };
+  }
+  /**
+   * What a member of a shared space is shown: their own name and the space's
+   * clock, which every time in it is read on. Nothing of the owner's is in
+   * it, not their name and not the mailbox the space sends from. Setup and
+   * the clock are the owner's to change, so both read as settled.
+   */
+  async memberProfile(spaceId: string, principalId: string) {
+    const [row] = await this.db
+      .select({
+        timeZone: experienceProfile.timeZone,
+        dayStart: experienceProfile.dayStart,
+        dayEnd: experienceProfile.dayEnd,
+        voice: experienceProfile.voice,
+      })
+      .from(experienceProfile)
+      .where(eq(experienceProfile.spaceId, spaceId));
+    const [person] = await this.db
+      .select({ displayName: principal.displayName })
+      .from(principal)
+      .where(eq(principal.id, principalId));
+    const name = person?.displayName?.trim().slice(0, 80) || 'there';
+    return {
+      profile: {
+        ...profileInput.parse({
+          name,
+          time_zone: canonicalTimeZone(row?.timeZone),
+          day_hours: row
+            ? { start: row.dayStart, end: row.dayEnd }
+            : { start: '08:00', end: '22:00' },
+        }),
+        onboarded: true,
+        time_zone_confirmed: true,
+        // The space's agent has one voice, and its owner picks it.
+        voice: storedVoice(row?.voice),
+        sending_address: null,
+        role: 'member' as const,
+      },
+    };
+  }
+  /**
+   * The mailbox a message from this space leaves from: its active connection
+   * that can send, chosen the way a company chase chooses it.
+   */
+  async sendingAddress(spaceId: string): Promise<string | null> {
+    const [mailbox] = await this.db
+      .select({ configuration: connection.configuration })
+      .from(connection)
+      .where(
+        and(
+          eq(connection.spaceId, spaceId),
+          eq(connection.status, 'active'),
+          sql`${connection.scopes} ? 'email.send'`,
+        ),
+      )
+      .orderBy(connection.id)
+      .limit(1);
+    return mailbox ? senderAddress(mailbox.configuration) : null;
+  }
+  /**
+   * Saves the profile. Setup and a chosen time zone are recorded once and
+   * never forgotten by a later save that leaves them out. Changing the zone
+   * counts as choosing it. Says whether the zone moved, so the caller can move
+   * the routines that follow it.
+   */
+  async saveProfile(spaceId: string, raw: unknown) {
+    const input = profileInput.parse(raw);
+    const [before] = await this.db
+      .select()
+      .from(experienceProfile)
+      .where(eq(experienceProfile.spaceId, spaceId));
+    const timeZone = canonicalTimeZone(input.time_zone);
+    const moved = timeZone !== canonicalTimeZone(before?.timeZone ?? 'UTC');
+    const now = new Date();
+    const values = {
+      spaceId,
+      name: input.name,
+      timeZone,
+      dayStart: input.day_hours.start,
+      dayEnd: input.day_hours.end,
+      onboardedAt: before?.onboardedAt ?? (input.onboarded ? now : null),
+      timeZoneConfirmedAt:
+        before?.timeZoneConfirmedAt ?? (input.time_zone_confirmed || moved ? now : null),
+      // A save that leaves the voice out keeps the one already picked.
+      voice: input.voice ?? storedVoice(before?.voice),
+    };
+    await this.db
+      .insert(experienceProfile)
+      .values(values)
+      .onConflictDoUpdate({ target: experienceProfile.spaceId, set: values });
+    return { ...(await this.profile(spaceId)), moved: moved ? timeZone : null };
+  }
+  async tasks(spaceId: string) {
+    const rows = await this.db
+      .select()
+      .from(task)
+      .where(eq(task.spaceId, spaceId))
+      .orderBy(task.done, task.dueAt, desc(task.createdAt))
+      .limit(200);
+    return { tasks: rows.map(taskView) };
+  }
+  async saveTask(spaceId: string, raw: unknown, id?: string) {
+    const input = taskInput.parse(raw);
+    const values = {
+      title: input.title,
+      dueAt: input.due_at ? new Date(input.due_at) : null,
+      done: input.done,
+      updatedAt: new Date(),
+    };
+    const [row] = id
+      ? await this.db
+          .update(task)
+          .set(values)
+          .where(and(eq(task.id, id), eq(task.spaceId, spaceId)))
+          .returning()
+      : await this.db
+          .insert(task)
+          .values({ id: newId('task'), spaceId, ...values })
+          .returning();
+    if (!row) throw experienceMissing();
+    return { task: taskView(row) };
+  }
+  async deleteTask(spaceId: string, id: string) {
+    const rows = await this.db
+      .delete(task)
+      .where(and(eq(task.id, id), eq(task.spaceId, spaceId)))
+      .returning({ id: task.id });
+    if (!rows.length) throw experienceMissing();
+    return { status: 'ok' };
+  }
+  async connections(spaceId: string) {
+    const rows = await this.db
+      .select()
+      .from(connection)
+      // A removed connection stays a row for the ledger, and is no longer something to show.
+      .where(and(eq(connection.spaceId, spaceId), ne(connection.status, 'revoked')))
+      .orderBy(connection.label);
+    const [parent] = await this.db
+      .select({ kind: space.kind })
+      .from(space)
+      .where(eq(space.id, spaceId));
+    const settled = (row: typeof connection.$inferSelect) =>
+      row.setupState !== 'connecting' && row.setupState !== 'available';
+    // Why a watched account is read less often, or could not be read, as its reads left it.
+    const notes = new Map<string, string>();
+    if (rows.length)
+      for (const note of await this.db
+        .select({ id: sourceCursor.connectionId, note: sourceCursor.lastError })
+        .from(sourceCursor)
+        .where(
+          and(
+            inArray(
+              sourceCursor.connectionId,
+              rows.map((row) => row.id),
+            ),
+            isNotNull(sourceCursor.lastError),
+          ),
+        )
+        .orderBy(sourceCursor.connectionId, sourceCursor.stream))
+        if (note.note && !notes.has(note.id)) notes.set(note.id, note.note.slice(0, 400));
+    // A stored "active" says it was installed, not that it runs: each is asked, together.
+    const live = await Promise.all(
+      rows.map((row) =>
+        this.liveness && row.status === 'active' && settled(row)
+          ? this.liveness(row).catch(() => 'unknown' as const)
+          : ('unknown' as const),
+      ),
+    );
+    return {
+      connections: rows.map((row, index) => {
+        const needsAccess =
+          Array.isArray(row.configuration.needs_scope) && row.configuration.needs_scope.length > 0;
+        const problem = !settled(row)
+          ? undefined
+          : row.status === 'active' && live[index] === 'not_running'
+            ? { kind: 'not_running' as const, detail: NOT_RUNNING }
+            : row.status !== 'active' || row.health === 'failing'
+              ? { kind: 'failing' as const, detail: needsAccess ? NEEDS_ACCESS : FAILING }
+              : undefined;
+        const catalog = catalogId(row);
+        return experienceConnection.parse({
+          id: row.id,
+          app: appName(row),
+          label: builtinLabel(row.configuration) ?? plainText(row.label, appName(row)),
+          status: !settled(row) ? row.setupState : problem ? 'error' : 'connected',
+          access: row.scopes.some((scope) =>
+            // Running commands and driving a desktop act too, not only writes.
+            /(?:send|create|update|delete|write|move|run|click|type|key|scroll|open)$/.test(scope),
+          )
+            ? 'asks_before_acting'
+            : row.scopes.some((scope) => scope.endsWith('.draft'))
+              ? 'draft_only'
+              : 'read_only',
+          ...(row.configuration.builtin === undefined ? {} : { builtin: true }),
+          ...(watchable(row.provider)
+            ? { watching: watchedByDefault(parent?.kind ?? 'personal', row.watchChanges) }
+            : {}),
+          ...(problem ? { problem } : {}),
+          ...(catalog ? { catalog_id: catalog } : {}),
+          ...(row.configuration.via === 'composio' ? { via: 'composio' } : {}),
+          ...(notes.has(row.id) ? { reading_note: notes.get(row.id) } : {}),
+        });
+      }),
+    };
+  }
+  calendarEvents(connectionId: string, detail: unknown) {
+    const rows = object(detail).events;
+    if (!Array.isArray(rows)) return [];
+    return rows.flatMap((raw) => {
+      const item = object(raw);
+      const url = safeUrl(item.url);
+      const parsed = experienceCalendarEvent.safeParse({
+        id: `${connectionId}:${plainText(item.uid, 'event', 160)}`,
+        title: plainText(item.summary, 'Calendar event'),
+        starts_at: item.start,
+        ends_at: item.end,
+        connection_id: connectionId,
+        ...(url ? { url } : {}),
+      });
+      return parsed.success ? [parsed.data] : [];
+    });
+  }
+  async upcoming(spaceId: string) {
+    const rows = await this.db
+      .select()
+      .from(connection)
+      .where(
+        and(
+          eq(connection.spaceId, spaceId),
+          eq(connection.status, 'active'),
+          inArray(connection.provider, ['caldav', 'ics']),
+        ),
+      );
+    if (!rows.length || !this.effects)
+      return unavailable('Connect a calendar to see upcoming events.');
+    const events = [];
+    for (const row of rows) {
+      const result = await this.effects.read(spaceId, row.id, 'calendar.list', { limit: 100 });
+      if ('reason' in result || result.status !== 'succeeded')
+        return unavailable('Your calendar could not be read just now.');
+      events.push(...this.calendarEvents(row.id, result.receipt?.detail));
+    }
+    return events
+      .filter((event) => Date.parse(event.ends_at) >= Date.now())
+      .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
+      .slice(0, 30);
+  }
+  async home(spaceId: string) {
+    const { profile } = await this.profile(spaceId);
+    const { tasks } = await this.tasks(spaceId);
+    const [counts] = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(task)
+      .where(and(eq(task.spaceId, spaceId), eq(task.done, false)));
+    return {
+      ...dayGreeting(profile),
+      upcoming: await this.upcoming(spaceId),
+      tasks: tasks.filter((item) => !item.done).slice(0, 20),
+      open_task_count: counts?.count ?? 0,
+    };
+  }
+  /**
+   * A member's Home: the day on the space's clock, greeted by their own name.
+   * The calendar, tasks and their counts are the owner's, so none are here.
+   */
+  async memberHome(spaceId: string, principalId: string) {
+    const { profile } = await this.memberProfile(spaceId, principalId);
+    return {
+      ...dayGreeting(profile),
+      upcoming: unavailable('The calendar here is the space owner’s.'),
+      tasks: [],
+      open_task_count: 0,
+    };
+  }
+  /**
+   * Conversations, plans and actions are the caller's own jobs. Tasks and
+   * connections belong to the space, so only its owner finds them here.
+   */
+  async search(spaceId: string, query: string, spaceOwner = true) {
+    const pattern = `%${query.replace(/[\\%_]/g, (value) => `\\${value}`)}%`;
+    const results = [];
+    const jobs = await this.db
+      .select()
+      .from(job)
+      .where(
+        and(
+          eq(job.spaceId, spaceId),
+          inArray(job.kind, ['chat', 'plan']),
+          ilike(job.title, pattern),
+          ownJob(),
+        ),
+      )
+      .orderBy(desc(job.updatedAt))
+      .limit(50);
+    for (const row of jobs)
+      results.push({
+        id: row.id,
+        kind: row.kind === 'chat' ? 'conversation' : 'plan',
+        title: plainText(row.title, 'Conversation'),
+        meta: row.kind === 'chat' ? 'Conversation' : 'Plan',
+        conversation_id: row.kind === 'chat' ? row.id : null,
+      });
+    const tasks = spaceOwner
+      ? await this.db
+          .select()
+          .from(task)
+          .where(and(eq(task.spaceId, spaceId), ilike(task.title, pattern)))
+          .limit(50)
+      : [];
+    for (const row of tasks)
+      results.push({
+        id: row.id,
+        kind: 'task',
+        title: plainText(row.title, 'Task'),
+        meta: row.done ? 'Completed task' : 'Task',
+        conversation_id: null,
+      });
+    const connections = spaceOwner ? (await this.connections(spaceId)).connections : [];
+    const matches = (value: string) =>
+      value.toLocaleLowerCase().includes(query.toLocaleLowerCase());
+    for (const row of connections.filter((item) => matches(`${item.label} ${item.app}`)))
+      results.push({
+        id: row.id,
+        kind: 'connection',
+        title: row.label,
+        meta: row.app,
+        conversation_id: null,
+      });
+    const effects = await this.db
+      .select({ action, job, connection })
+      .from(action)
+      .innerJoin(job, eq(job.id, action.jobId))
+      .innerJoin(connection, eq(connection.id, action.connectionId))
+      .where(
+        and(
+          eq(job.spaceId, spaceId),
+          eq(connection.spaceId, spaceId),
+          eq(action.status, 'succeeded'),
+          ownJob(),
+        ),
+      )
+      .orderBy(desc(action.createdAt))
+      .limit(500);
+    const calendars = new Set<string>();
+    for (const row of effects) {
+      const title = actionLabel(row.action);
+      const subject = plainText(
+        object(row.action.canonicalPayload).subject ?? object(row.action.canonicalPayload).summary,
+        '',
+      );
+      if (matches(`${title} ${subject}`))
+        results.push({
+          id: row.action.id,
+          kind: 'action',
+          title,
+          meta: subject || appName(row.connection),
+          conversation_id: row.job.kind === 'chat' ? row.job.id : row.job.experienceParentId,
+        });
+      if (row.action.kind === 'calendar.list' && !calendars.has(row.connection.id)) {
+        calendars.add(row.connection.id);
+        for (const event of this.calendarEvents(
+          row.connection.id,
+          object(row.action.receipt).detail,
+        ).filter((item) => matches(item.title)))
+          results.push({
+            id: event.id,
+            kind: 'event',
+            title: event.title,
+            meta: event.starts_at,
+            conversation_id: null,
+          });
+      }
+    }
+    return experienceSearch.parse({ results: results.slice(0, 100) });
+  }
+}
