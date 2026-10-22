@@ -6,7 +6,7 @@
   <p>
     <a href="https://github.com/ychampion/openduet/actions/workflows/ci.yml"><img src="https://github.com/ychampion/openduet/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-d97757" alt="Apache 2.0 license" /></a>
-    <a href="https://github.com/ychampion/openduet/releases"><img src="https://img.shields.io/github/v/release/ychampion/openduet?color=d97757" alt="Latest release" /></a>
+    <a href="https://github.com/ychampion/openduet/releases"><img src="docs/media/release-badge.svg" alt="Release v0.2.1" /></a>
   </p>
   <p><a href="#get-started">Install</a> · <a href="docs/SHOWCASE.md">Watch the walkthroughs</a> · <a href="docs/USE_CASES.md">Try a workflow</a> · <a href="docs/CLAUDE_DUET_COMPARISON.md">Compare with Claude Duet</a></p>
 </div>
