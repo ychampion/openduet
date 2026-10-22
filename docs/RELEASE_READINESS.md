@@ -44,53 +44,53 @@ The [committed screenshots](../apps/web/docs/screens/README.md) show the current
 production UI. The static design-reference screenshots were also regenerated
 with the OpenDuet mark. Old demo recordings were removed.
 
-## Full-suite status
+## Full suite
 
-The initial full CI run completed 9,934 tests across 922 files: 9,635 passed,
-222 skipped, 13 todo and 64 failed. Every failure came from the three optional
-sandbox adapters' replay fixtures: readable names had changed, but request
-hashes and encoded response bodies still represented the original brand.
-Those fixtures have now been regenerated through their documented stand-ins;
-all 109 authoring tests and all 109 subsequent replay tests passed. The release
-branding check now also inspects encoded payloads. A fresh full CI result is
-required before final verification. The second full run passed 9,698 tests with
-one timeout in a backup-stream fixture. That fixture opened a Bun pipe writer
-without closing it, which can keep its child process alive; it now calls
-[`FileSink.end()`](https://bun.sh/reference/bun/FileSink) after its deliberate
-delay. All 19 streaming-file tests and 20 consecutive runs of the previously
-hanging case passed afterward. Production streaming code was unchanged.
+The complete [Bun suite on the verified code revision](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512467)
+passed: **9,699 passed, 222 skipped, 13 todo and 0 failed**, across 9,934 tests in
+922 files, with 223,636 assertions. It completed in 1,135.65 seconds.
+The Python runtime-plugin suite then passed **254 tests, with 7 skipped**, in
+53.54 seconds. All nine jobs in that CI run passed.
 
 The 13 todo entries identify missing Chromium or opt-in Docker proof
 prerequisites in the full-suite job; separate real-browser CI jobs passed.
+The 222 skipped cases remain unexecuted in that suite's environment; their
+optional provider, browser and host prerequisites still apply.
 
-Earlier affected-file reruns corrected fixed-length branding assertions, a
-DNS-dependent browser fixture and database-wake time budgets. The browser file
-passed all 12 tests. Two database clock-skew tests now advance their stored
-deadlines explicitly rather than racing a 30 ms registration window; both
-complete files passed all 62 tests. A machine interruption invalidated the
-disposable sessions in the initial local full run; it is not a passing result.
+Rebranding repairs included regenerating sandbox replay fixtures through their
+documented stand-ins: all 109 authoring tests and all 109 subsequent replay
+tests passed. The branding check now inspects encoded payloads too. The backup
+test's child pipe now closes explicitly with
+[`FileSink.end()`](https://bun.sh/reference/bun/FileSink); all 19 streaming tests
+and 20 consecutive runs of its previously hanging case passed. Production
+streaming code was unchanged. Database clock-skew fixtures now advance stored
+deadlines explicitly; both complete files passed all 62 tests. These repairs
+are included in the passing full run.
 
 ## Published installation and independent checks
 
-The initial code revision is
-`bd0f0ef586ffbacbfd1c7f588f7473a0f1f15b2a`. These checks ran on fresh GitHub
+The verified code revision is
+`e2690bfdf8c98e1f7a930811dfb41bee86f4c4d1`. These checks ran on fresh GitHub
 runners against that revision:
 
 | Check | Result |
 | --- | --- |
-| [Images](https://github.com/ychampion/openduet/actions/runs/39834651121) | All five images built and published; anonymous requests to every `main` manifest returned HTTP 200 |
-| [One-line installer](https://github.com/ychampion/openduet/actions/runs/39835200682) | Passed without Bun on the installer's PATH: public-image pull, first account, browser enablement, repeat installation, separate installation and relocated installation |
-| [Setup guide](https://github.com/ychampion/openduet/actions/runs/39835200560) | Passed the guide's own commands, account setup, browser enablement and repeat setup |
-| [Deployment conformance](https://github.com/ychampion/openduet/actions/runs/39834651215) | 69 passed, 5 skipped, 0 failed; external Postgres and S3-compatible backup/restore passed in both required and verify-full modes |
-| [Scripted capability evaluations](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019641489) | 24 passed, 1 skipped, 0 failed; all baseline scenarios held |
-| [Docker sandboxes](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019641809) | Passed real-engine execution, persistent background processes, wake-up, brokered internet and GitLab/npm access, and isolation between users |
-| [Browser renderer](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019641911) | Sandbox proof passed inside the shipped browser container |
-| [App isolation](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019641772) | Published apps and agent-server previews stayed inside their frames and permitted ports in real Chromium and Firefox |
-| [Browser sign-out](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019641678) | Passed profile clearing and the signed-in-sites UI check |
-| [Containerized stdio MCP](https://github.com/ychampion/openduet/actions/runs/39834651116/job/120019642074) | Separate Docker launcher conformance passed |
+| [Full CI](https://github.com/ychampion/openduet/actions/runs/39844620826) | All nine jobs passed, including 9,699 Bun tests and 254 Python tests; skip and prerequisite counts are recorded above |
+| [Images](https://github.com/ychampion/openduet/actions/runs/39844620664) | All five images built and published; clean-machine checks pulled them without credentials |
+| [One-line installer](https://github.com/ychampion/openduet/actions/runs/39844874071) | Passed without Bun on the installer's PATH: public-image pull, first account, browser enablement, repeat installation, separate installation and relocated installation |
+| [Setup guide](https://github.com/ychampion/openduet/actions/runs/39844874242) | Passed the guide's own commands, account setup, browser enablement and repeat setup |
+| [Deployment conformance](https://github.com/ychampion/openduet/actions/runs/39844620742) | 69 passed, 5 skipped, 0 failed; external Postgres and S3-compatible backup/restore passed in both required and verify-full modes |
+| [Upgrade](https://github.com/ychampion/openduet/actions/runs/39844620742/job/120054511397) | Upgraded a disposable installation from the preceding OpenDuet commit; service health and the internal network held |
+| [Scripted capability evaluations](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512433) | 24 passed, 1 skipped, 0 failed; all baseline scenarios held |
+| [Docker sandboxes](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512417) | Passed real-engine execution, persistent background processes, wake-up, brokered internet and GitLab/npm access, and isolation between users |
+| [Browser renderer](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512357) | Sandbox proof passed inside the shipped browser container |
+| [App isolation](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512087) | Published apps and agent-server previews stayed inside their frames and permitted ports in real Chromium and Firefox |
+| [Browser sign-out](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512412) | Passed profile clearing and the signed-in-sites UI check |
+| [Containerized stdio MCP](https://github.com/ychampion/openduet/actions/runs/39844620826/job/120054512683) | Separate Docker launcher conformance passed |
 
-The upgrade job was deliberately skipped for the parentless initial commit:
-there is no preceding OpenDuet release to upgrade from.
+The upgrade check starts from `0cf55ce`, the preceding OpenDuet commit, because
+there was no earlier versioned OpenDuet release. It does not test migration from
+an installation under the inherited project's name.
 
 ## Evidence limits
 
@@ -103,8 +103,14 @@ there is no preceding OpenDuet release to upgrade from.
 - The S3 checks used an S3-compatible fixture service. They do not establish
   compatibility with every cloud storage vendor. Optional external sandbox
   providers still require their own operator configuration and verification.
+- Generated-app frame isolation is not complete network confinement: the real
+  Chromium test observed WebRTC datagrams leaving the page. The existing
+  [app trust and WebRTC limits](APPS.md) still apply.
 - Mobile testing used Chromium viewports, not physical iOS/Android devices.
   Native apps, wallet integrations and Claude-account context sync are absent.
+- Published images target `linux/amd64`. Clean-machine installation ran on
+  Linux; native ARM, macOS and Windows Docker Desktop installations were not
+  executed in this release verification.
 - The release starts a new installation. Backups, HTTPS, external connectors,
   spending limits and keeping the host online remain operator setup tasks.
 
