@@ -692,6 +692,14 @@ export class ToolCatalog {
     }
     const resumable = await hasResumableAction(tx, job);
     for (const tool of [...(this.options.nativeTools ?? []), ...(access.chat ? [SAY_TOOL] : [])]) {
+      // A thread responsibility authorizes one preparation, never further delegated work.
+      if (
+        access.followupConnection &&
+        (RUN_TOOL_NAMES.includes(tool.name) ||
+          INTENT_TOOL_NAMES.includes(tool.name) ||
+          tool.name === CHASE_FOLLOW_UP_TOOL.name)
+      )
+        continue;
       if (tool.name === RUNTIME_WAIT_TOOL.name && !claims.scopes.includes(tool.name)) continue;
       // Long work's tools belong to the kinds of job its scopes were given to.
       if (RUN_TOOL_NAMES.includes(tool.name) && !claims.scopes.includes(tool.name)) continue;

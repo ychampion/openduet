@@ -302,6 +302,67 @@ export async function readOwnSkills(spacesRoot: string, spaceId: string): Promis
 }
 
 /**
+ * The owner saves reviewed steps without asking a model to author a second copy.
+ * Exclusive creation keeps concurrent saves from replacing an existing skill;
+ * identical bytes are a safe retry. No tool grant or recurring work is created.
+ */
+export async function createOwnSkill(
+  spacesRoot: string,
+  spaceId: string,
+  definition: Omit<Definition, 'tools'>,
+): Promise<OwnSkill> {
+  if (
+    (BUILT_IN_SKILLS as readonly string[]).includes(definition.name) ||
+    TAKEN_NAMES.has(definition.name)
+  )
+    throw new BrokerFault(
+      'payload_invalid',
+      'That name belongs to a built-in skill or tool. Choose another name.',
+    );
+  const file = checkedSkillFile({ ...definition, tools: [] });
+  const skills = await skillsDirectory(spacesRoot, spaceId, true);
+  const existing = (await readOwnSkills(spacesRoot, spaceId)).find(
+    (skill) => skill.name === definition.name,
+  );
+  if (existing) {
+    const there = await readFile(
+      path.join(skills, existing.entry, ...(existing.folder ? ['SKILL.md'] : [])),
+      'utf8',
+    );
+    if (there !== file)
+      throw new BrokerFault(
+        'payload_invalid',
+        'A different skill already has that name. Edit it or choose another name.',
+      );
+    return existing;
+  }
+  const folder = path.join(skills, definition.name);
+  await mkdir(folder).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  const info = await lstat(folder);
+  if (!info.isDirectory() || info.isSymbolicLink())
+    throw new BrokerFault('scope_denied', 'The skill folder is not a plain folder.');
+  const target = path.join(folder, 'SKILL.md');
+  await writeFile(target, file, { flag: 'wx' }).catch(async (error: NodeJS.ErrnoException) => {
+    if (error.code !== 'EEXIST') throw error;
+    const info = await lstat(target);
+    if (!info.isFile() || info.isSymbolicLink())
+      throw new BrokerFault('scope_denied', 'The skill is not a plain file.');
+    if ((await readFile(target, 'utf8')) !== file)
+      throw new BrokerFault(
+        'payload_invalid',
+        'A different skill already has that name. Nothing was replaced.',
+      );
+  });
+  const saved = (await readOwnSkills(spacesRoot, spaceId)).find(
+    (skill) => skill.name === definition.name,
+  );
+  if (!saved) throw new Error('The skill was not readable after saving.');
+  return saved;
+}
+
+/**
  * Rewrite one of the person's own skills from what changed. A folder keeps the
  * words it replaces beside it (`PREVIOUS.md`); a single-file skill is written
  * whole and moved into place.

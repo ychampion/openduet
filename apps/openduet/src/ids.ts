@@ -35,7 +35,9 @@ export function newId(
     | 'rch'
     | 'rcn'
     | 'file'
-    | 'sms',
+    | 'sms'
+    | 'watch'
+    | 'prep',
 ): string {
   let value = (BigInt(Date.now()) << 80n) | BigInt(`0x${randomBytes(10).toString('hex')}`);
   let encoded = '';

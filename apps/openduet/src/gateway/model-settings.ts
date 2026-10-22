@@ -42,14 +42,17 @@
  * missing or old answer is fetched in the background when Settings is read.
  */
 
+import { createHash } from 'node:crypto';
 import {
   effectiveVision,
   listedVisionByModel,
   MODEL_PROVIDERS,
   type ModelConnectionTest,
   type ModelProvider,
+  type ModelReadiness,
   type ModelRole,
   type ModelSettings,
+  modelReadiness as modelReadinessContract,
   type SecondaryModel,
   type SecondaryWork,
 } from '@openduet/contracts';
@@ -68,6 +71,7 @@ import type { Database } from '../db/client.ts';
 import {
   modelDefault,
   modelProviderKey,
+  modelReadiness,
   modelSecondary,
   modelVision,
   modelVisionReport,
@@ -78,7 +82,9 @@ import {
 import type { Transaction } from '../db/transaction.ts';
 import type { Env } from '../env.ts';
 import { allowedChoices, modelAllowed, modelRefusal, readSpaceRules } from '../spaces/policy.ts';
+import { withSignIn } from './configured.ts';
 import type { ProviderSignIn } from './credentials.ts';
+import { checkModelRuntime, type ReadinessProbeOptions } from './model-readiness.ts';
 import {
   CHATGPT_PROVIDER,
   compatibleBaseUrl,
@@ -97,7 +103,12 @@ import {
   sameModel,
   withPersonRoles,
 } from './routing.ts';
-import type { GatewayProvider, GatewayRoutes, SignedInCredential } from './types.ts';
+import type {
+  GatewayProvider,
+  GatewayRoutes,
+  GatewaySpending,
+  SignedInCredential,
+} from './types.ts';
 import type { UsageClass } from './usage-class.ts';
 
 export const MODEL_PROVIDER_LABELS: Record<ModelProvider, string> = {
@@ -181,6 +192,8 @@ export interface ModelSettingsOptions {
    */
   resolve?: Resolve;
   timeoutMs?: number;
+  /** Scripted test seam; never selected by an API request. Production always launches Hermes. */
+  readinessProbe?: typeof checkModelRuntime;
 }
 
 export class ModelSettingsService {
@@ -190,6 +203,8 @@ export class ModelSettingsService {
   private readonly refreshedAt = new Map<string, number>();
   /** The background fetch in flight, if any, per provider. */
   private readonly refreshing = new Map<string, Promise<void>>();
+  private readinessSpending?: GatewaySpending;
+  private readonly checking = new Map<string, Promise<ModelReadiness>>();
 
   constructor(private readonly options: ModelSettingsOptions) {
     this.masterKey = options.masterKey ?? (() => options.env.OPENDUET_MASTER_KEY);
@@ -198,6 +213,170 @@ export class ModelSettingsService {
 
   private get env() {
     return this.options.env;
+  }
+
+  configureReadiness(options: { spending?: GatewaySpending }): void {
+    this.readinessSpending = options.spending;
+  }
+
+  /** Key material participates only in this one-way fingerprint, never in a response. */
+  private async readinessConfiguration(provider: ModelProvider, model: string): Promise<string> {
+    const row = this.usableRow(provider, await this.keyRows());
+    const selection = await this.chosen();
+    const [credential] = this.options.signIn?.handles(provider)
+      ? await this.options.db
+          .select()
+          .from(providerCredential)
+          .where(eq(providerCredential.provider, provider))
+      : [];
+    return createHash('sha256')
+      .update(
+        JSON.stringify({
+          provider,
+          model,
+          selection: selection
+            ? [selection.provider, selection.model, selection.updatedAt]
+            : [this.env.OPENDUET_DEFAULT_PROVIDER, this.env.OPENDUET_DEFAULT_MODEL],
+          key: this.operatorKey(provider) ?? row?.ciphertext ?? null,
+          endpoint: await this.configuredBase(provider),
+          // Credential rotation conservatively invalidates this bounded observation.
+          signIn: credential
+            ? [credential.status, credential.account, credential.createdAt, credential.generation]
+            : null,
+          vision: await this.visionFor(provider, model),
+          runtime: [
+            this.env.OPENDUET_RUNTIME_ADAPTER,
+            this.env.OPENDUET_RUNTIME_SUPERVISOR,
+            this.env.OPENDUET_RUNTIME_IMAGE,
+            this.env.OPENDUET_HERMES_ROOT,
+          ],
+        }),
+      )
+      .digest('hex');
+  }
+
+  private async readinessFor(provider: string, model: string): Promise<ModelReadiness | null> {
+    if (!isModelProvider(provider)) return null;
+    const [row] = await this.options.db
+      .select()
+      .from(modelReadiness)
+      .where(and(eq(modelReadiness.provider, provider), eq(modelReadiness.model, model)));
+    if (!row || row.configuration !== (await this.readinessConfiguration(provider, model)))
+      return null;
+    const parsed = modelReadinessContract.safeParse(row.result);
+    return parsed.success ? parsed.data : null;
+  }
+
+  /** A model list is connectivity evidence only. Inference and tools run through Hermes separately. */
+  async checkReadiness(
+    ownerId: string,
+    input: { provider: ModelProvider; model: string },
+  ): Promise<ModelReadiness> {
+    const key = `${input.provider}/${input.model}`;
+    const current = this.checking.get(key);
+    if (current) return current;
+    const check = this.runReadiness(ownerId, input).finally(() => this.checking.delete(key));
+    this.checking.set(key, check);
+    return check;
+  }
+
+  private async runReadiness(
+    ownerId: string,
+    input: { provider: ModelProvider; model: string },
+  ): Promise<ModelReadiness> {
+    const configuration = await this.readinessConfiguration(input.provider, input.model);
+    const initial: ModelReadiness = {
+      ...input,
+      credentials: 'not_checked',
+      inference: 'not_checked',
+      tools: 'not_checked',
+      checked_at: new Date().toISOString(),
+      code: 'authentication',
+      message: 'Connect a provider credential before checking this model.',
+      usage: { requests: 0, output_tokens: 0 },
+    };
+    let result = initial;
+    if (await this.isConnected(input.provider)) {
+      const listed =
+        input.provider === CHATGPT_PROVIDER || this.operatorSignIn(input.provider)
+          ? null
+          : await this.test({ provider: input.provider });
+      if (listed?.ok) initial.credentials = 'passed';
+      const refused =
+        listed &&
+        !listed.ok &&
+        ['key_refused', 'no_key', 'invalid_address', 'unreachable'].includes(listed.code);
+      if (refused && listed && !listed.ok) {
+        result = {
+          ...initial,
+          credentials: 'failed',
+          code: ['key_refused', 'no_key'].includes(listed.code) ? 'authentication' : 'endpoint',
+          message: listed.message,
+        };
+      } else {
+        const [personal] = await this.options.db
+          .select({ id: space.id })
+          .from(space)
+          .where(and(eq(space.ownerPrincipalId, ownerId), eq(space.kind, 'personal')))
+          .limit(1);
+        if (!personal)
+          throw new ServiceError(
+            'space_required',
+            'Finish account setup before checking the model.',
+            409,
+          );
+        const providers = await this.providers(
+          withSignIn(
+            providersFromEnv({
+              OPENAI_API_KEY: this.env.OPENAI_API_KEY,
+              ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY,
+              GOOGLE_API_KEY: this.env.GOOGLE_API_KEY,
+              FIREWORKS_API_KEY: this.env.FIREWORKS_API_KEY,
+              OPENAI_COMPAT_BASE_URL: this.env.OPENAI_COMPAT_BASE_URL,
+              OPENAI_COMPAT_API_KEY: this.env.OPENAI_COMPAT_API_KEY,
+            }),
+            this.options.signIn,
+          ),
+        );
+        const probe: ReadinessProbeOptions = {
+          env: this.env,
+          ...input,
+          actor: ownerId,
+          spaceId: personal.id,
+          providers,
+          spending: this.readinessSpending,
+          ...(this.options.fetch ? { fetch: this.options.fetch } : {}),
+        };
+        const checked = await (this.options.readinessProbe ?? checkModelRuntime)(probe);
+        const { credentialsAccepted, ...observation } = checked;
+        result = {
+          ...initial,
+          ...observation,
+          credentials:
+            checked.code === 'authentication'
+              ? 'failed'
+              : credentialsAccepted || initial.credentials === 'passed'
+                ? 'passed'
+                : 'not_checked',
+        };
+      }
+    }
+    if (configuration !== (await this.readinessConfiguration(input.provider, input.model))) {
+      return {
+        ...initial,
+        code: 'configuration_changed',
+        message: 'Model settings changed during the check. Check the current configuration again.',
+      };
+    }
+    result.checked_at = new Date().toISOString();
+    await this.options.db
+      .insert(modelReadiness)
+      .values({ ...input, configuration, result, checkedAt: new Date(result.checked_at) })
+      .onConflictDoUpdate({
+        target: [modelReadiness.provider, modelReadiness.model],
+        set: { configuration, result, checkedAt: new Date(result.checked_at) },
+      });
+    return result;
   }
 
   /** The environment's key for a provider, which always wins over one entered in the app. */
@@ -599,6 +778,9 @@ export class ModelSettingsService {
         409,
       );
     await this.options.db.transaction(async (tx) => {
+      await tx
+        .delete(modelReadiness)
+        .where(and(eq(modelReadiness.provider, provider), eq(modelReadiness.model, active.model)));
       if (supportsVision === null) {
         await tx
           .delete(modelVision)
@@ -686,6 +868,7 @@ export class ModelSettingsService {
       providers,
       can_edit: canEdit,
       can_store_keys: Boolean(this.masterKey()),
+      readiness: await this.readinessFor(active.provider, active.model),
       secondary: await this.secondaryView(person ?? null, rows),
     };
   }
@@ -919,11 +1102,13 @@ export class ModelSettingsService {
     // Another key can see other models, and a compatible endpoint's key may
     // come with a new address: what the old list said no longer holds.
     await this.forgetReports(provider);
+    await this.options.db.delete(modelReadiness).where(eq(modelReadiness.provider, provider));
   }
 
   async removeKey(provider: string): Promise<void> {
     await this.options.db.delete(modelProviderKey).where(eq(modelProviderKey.provider, provider));
     await this.forgetReports(provider);
+    await this.options.db.delete(modelReadiness).where(eq(modelReadiness.provider, provider));
   }
 
   async setDefault(
@@ -959,10 +1144,12 @@ export class ModelSettingsService {
       .insert(modelDefault)
       .values(values)
       .onConflictDoUpdate({ target: modelDefault.id, set: values });
+    await this.options.db.delete(modelReadiness);
   }
 
   async clearDefault(): Promise<void> {
     await this.options.db.delete(modelDefault).where(eq(modelDefault.id, 'installation'));
+    await this.options.db.delete(modelReadiness);
   }
 
   /**

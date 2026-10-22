@@ -24,6 +24,12 @@ import { newPasswordInput } from './common.ts';
 import { PROCESS_STATES } from './execution.ts';
 import { roomHandoff } from './handoffs.ts';
 import { memoryKey } from './memory.ts';
+import {
+  personalSessionAcceptance,
+  personalSessionMessage,
+  personalSessionRead,
+  personalSessionResponse,
+} from './personal-session.ts';
 import { privacyOperations } from './privacy.ts';
 import { MESSAGE_SPAN_LIMIT, messageId, messageSpan } from './reactions.ts';
 import { replyVoice } from './reply-voice.ts';
@@ -1380,6 +1386,13 @@ export const homeResponse = z.strictObject({
 });
 export const experienceAutomation = z.strictObject({
   id,
+  purpose: z.literal('personal.daily_brief').optional(),
+  /** Actual trigger time; clients must not infer it from a separate preference. */
+  at: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+    .optional(),
+  time_zone: z.string().optional(),
   title: text,
   schedule: text,
   enabled: z.boolean(),
@@ -1563,6 +1576,15 @@ export const passwordResetConsume = z.strictObject({
 
 /** Shared operation table makes the mock and OpenAPI cover precisely the same surface. */
 export const experienceOperations = {
+  'GET /personal-session': { response: personalSessionResponse },
+  'POST /personal-session/messages': {
+    request: personalSessionMessage,
+    response: personalSessionAcceptance,
+  },
+  'PATCH /personal-session/read': {
+    request: personalSessionRead,
+    response: personalSessionResponse,
+  },
   'GET /conversations': { query: conversationListQuery, response: conversationList },
   'POST /conversations': { request: conversationCreate, response: conversationResponse },
   'GET /conversations/{id}': { response: conversationResponse },

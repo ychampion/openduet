@@ -22,7 +22,7 @@ import {
   pushPayload,
   type pushSettingsUpdate,
 } from '@openduet/contracts';
-import { and, asc, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import type { PgBoss } from 'pg-boss';
 import type { z } from 'zod';
 import { ServiceError } from '../api/errors.ts';
@@ -75,6 +75,10 @@ export type PushConfig = {
 
 export const DEFAULT_SETTINGS = {
   decisions: true,
+  taskResults: true,
+  requestedReminders: true,
+  dailyBrief: true,
+  proactiveSuggestions: false,
   settled: true,
   weeklySummary: true,
   dailyCap: 4,
@@ -162,6 +166,7 @@ export async function recordSettled(
            ${item.jobId ? `/#/chat/${item.jobId}` : '/#/companies'}, ${`settled:${item.id}`}
     where exists (select 1 from push_subscription s where s.principal_id = ${item.principalId})
       and coalesce((select p.settled from push_setting p where p.principal_id = ${item.principalId}), true)
+      and coalesce((select p.task_results from push_setting p where p.principal_id = ${item.principalId}), true)
     on conflict (dedup_key) do nothing`);
 }
 
@@ -331,8 +336,8 @@ export class PushService {
     return row ?? { start: '08:00', end: '22:00', timeZone: 'UTC' };
   }
 
-  private async pacingOf(principalId: string) {
-    const [row] = await this.db
+  private async pacingOf(principalId: string, reader: Database | Transaction = this.db) {
+    const [row] = await reader
       .select()
       .from(pushSetting)
       .where(eq(pushSetting.principalId, principalId));
@@ -343,6 +348,10 @@ export class PushService {
     const [row, day] = await Promise.all([this.pacingOf(principalId), this.dayOf(principalId)]);
     return {
       decisions: row.decisions,
+      task_results: row.taskResults,
+      requested_reminders: row.requestedReminders,
+      daily_brief: row.dailyBrief,
+      proactive_suggestions: row.proactiveSuggestions,
       settled: row.settled,
       weekly_summary: row.weeklySummary,
       daily_cap: row.dailyCap,
@@ -353,27 +362,58 @@ export class PushService {
   }
 
   async updateSettings(principalId: string, patch: z.infer<typeof pushSettingsUpdate>) {
-    const current = await this.pacingOf(principalId);
-    const next = {
-      principalId,
-      decisions: patch.decisions ?? current.decisions,
-      settled: patch.settled ?? current.settled,
-      weeklySummary: patch.weekly_summary ?? current.weeklySummary,
-      dailyCap: patch.daily_cap ?? current.dailyCap,
-      batchMinutes: patch.batch_minutes ?? current.batchMinutes,
-    };
-    await this.db
-      .insert(pushSetting)
-      .values(next)
-      .onConflictDoUpdate({ target: pushSetting.principalId, set: next });
-    // A kind turned off stops what of it was still waiting.
+    const next = await this.db.transaction(async (tx) => {
+      // Two device settings saves must merge their patches instead of undoing an opt-out.
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`push-settings:${principalId}`}, 0))`,
+      );
+      const current = await this.pacingOf(principalId, tx);
+      const legacyOptOut =
+        patch.settled === false &&
+        patch.task_results === undefined &&
+        patch.requested_reminders === undefined &&
+        patch.daily_brief === undefined;
+      const next = {
+        principalId,
+        decisions: patch.decisions ?? current.decisions,
+        taskResults: patch.task_results ?? (legacyOptOut ? false : current.taskResults),
+        requestedReminders:
+          patch.requested_reminders ?? (legacyOptOut ? false : current.requestedReminders),
+        dailyBrief: patch.daily_brief ?? (legacyOptOut ? false : current.dailyBrief),
+        proactiveSuggestions: patch.proactive_suggestions ?? current.proactiveSuggestions,
+        settled: patch.settled ?? current.settled,
+        weeklySummary: patch.weekly_summary ?? current.weeklySummary,
+        dailyCap: patch.daily_cap ?? current.dailyCap,
+        batchMinutes: patch.batch_minutes ?? current.batchMinutes,
+      };
+      await tx
+        .insert(pushSetting)
+        .values(next)
+        .onConflictDoUpdate({ target: pushSetting.principalId, set: next });
+      return next;
+    });
+    await this.dropDisabled(principalId, next);
+    return this.settings(principalId);
+  }
+
+  private async dropDisabled(
+    principalId: string,
+    next: Awaited<ReturnType<PushService['pacingOf']>>,
+  ) {
+    // An opt-out discards pending delivery, so opting back in never floods the phone with old news.
     const off: IntentKind[] = [
       ...(next.decisions ? [] : (['decision', 'needs_you'] as const)),
-      ...(next.settled ? [] : (['settled', 'progress', 'done', 'reminder'] as const)),
+      ...(next.settled && next.taskResults ? [] : (['settled'] as const)),
+      ...(next.taskResults ? [] : (['progress', 'done'] as const)),
+      ...(next.requestedReminders ? [] : (['reminder'] as const)),
+      ...(next.dailyBrief ? [] : (['daily_brief'] as const)),
+      ...(next.proactiveSuggestions ? [] : (['weekly'] as const)),
       ...(next.weeklySummary ? [] : (['weekly'] as const)),
     ];
     if (off.length) await this.dropWaiting(principalId, off);
-    return this.settings(principalId);
+    await this.db.execute(sql`update push_intent set dropped_at = now()
+      where principal_id = ${principalId} and kind = 'situation' and sent_at is null and dropped_at is null
+        and ((person_set and not ${next.requestedReminders}) or (not person_set and not ${next.proactiveSuggestions}))`);
   }
 
   private async dropWaiting(principalId: string, kinds?: IntentKind[]) {
@@ -559,13 +599,15 @@ export class PushService {
             where p.dedup_key = 'status:needs_you:' || j.id || ':' || j.state_version
               and ${STOPPED_ON_PERSON})`);
     }
-    if (pacing.settled) {
+    if (pacing.taskResults || pacing.requestedReminders || pacing.dailyBrief) {
       // A turn its own timer or schedule opened (see jobs/wake-turn.ts), or a routine's run.
       const timed = sql`((j.kind = 'chat' and starts_with(t.submission_id, 'wake:'))
         or (j.kind = 'routine' and starts_with(t.submission_id, 'routine:')))`;
       const answered = (await this.db.execute(sql`
         select t.id as turn_id, j.id as job_id, j.kind, j.title, t.answer,
                ${timed} as timed,
+               exists (select 1 from personal_daily_brief b join trigger daily_trigger on daily_trigger.id = b.trigger_id
+                 where daily_trigger.job_id = j.id) as daily_brief,
                ${pageOf(sql`j`)} as url
         from experience_turn t
         join job j on j.id = t.job_id
@@ -574,6 +616,10 @@ export class PushService {
           and j.audience = 'principal'
           and j.experience_parent_id is null
           and t.status = 'done'
+          -- A scoped watch owns the receipt for its prepared result; polling the
+          -- same completed turn must not send a second generic "answer ready".
+          and not exists (select 1 from customer_followup_preparation prepared
+            where prepared.conversation_id = j.id and (prepared.turn_id = t.id or prepared.turn_id is null))
           and t.finished_at >= ${since}::timestamptz
           and length(trim(t.answer)) > 0
           -- A window that is open is not a person looking: what they timed still reaches them.
@@ -588,11 +634,18 @@ export class PushService {
         title: string;
         answer: string;
         timed: boolean;
+        daily_brief: boolean;
         url: string;
       }>;
       for (const row of answered) {
         // What the person timed comes due as a reminder; any other answer is news OpenDuet tells.
-        const kind: IntentKind = row.timed ? 'reminder' : 'done';
+        const kind: IntentKind = row.daily_brief ? 'daily_brief' : row.timed ? 'reminder' : 'done';
+        if (
+          (kind === 'done' && !pacing.taskResults) ||
+          (kind === 'reminder' && !pacing.requestedReminders) ||
+          (kind === 'daily_brief' && !pacing.dailyBrief)
+        )
+          continue;
         candidates.push({
           kind,
           key: `status:${kind}:${row.job_id}:${row.turn_id}`,
@@ -620,7 +673,7 @@ export class PushService {
         insert into push_intent (id, principal_id, kind, title, body, because, url, dedup_key, urgency, dropped_at)
         values (${newId('pint')}, ${principalId}, ${row.kind}, ${row.title}, ${row.body}, ${row.because},
           ${row.url}, ${row.key}, 'soon',
-          case when ${row.kind} <> 'reminder' and exists (select 1 from push_intent p
+          case when ${row.kind} not in ('reminder', 'daily_brief') and exists (select 1 from push_intent p
             where p.principal_id = ${principalId} and p.kind = ${row.kind}
               and starts_with(p.dedup_key, ${prefix}) and p.dropped_at is null
               and p.created_at > now() - make_interval(mins => ${STATUS_THROTTLE_MINUTES}))
@@ -635,7 +688,7 @@ export class PushService {
    */
   async collectWeekly(principalId: string, now: Date): Promise<void> {
     const pacing = await this.pacingOf(principalId);
-    if (!pacing.weeklySummary) return;
+    if (!pacing.weeklySummary || !pacing.proactiveSuggestions) return;
     const day = await this.dayOf(principalId);
     const local = localTime(now, day.timeZone);
     if (local.weekday !== 1) return;
@@ -725,13 +778,16 @@ export class PushService {
   async dispatch(principalId: string, now: Date): Promise<'sent' | string> {
     if (!this.config.keys) return 'not_configured';
     const pacing = await this.pacingOf(principalId);
+    await this.dropDisabled(principalId, pacing);
     // Only the kinds turned on, whatever was recorded around the moment one went off.
-    // What OpenDuet noticed has no switch of its own: it is paced by its urgency.
+    // Delivery switches never stop jobs; routine pause controls its actual trigger separately.
     const on: IntentKind[] = [
       ...(pacing.decisions ? (['decision', 'needs_you'] as const) : []),
-      ...(pacing.settled ? (['settled', 'progress', 'done', 'reminder'] as const) : []),
-      ...(pacing.weeklySummary ? (['weekly'] as const) : []),
-      'situation',
+      ...(pacing.settled && pacing.taskResults ? (['settled'] as const) : []),
+      ...(pacing.taskResults ? (['progress', 'done'] as const) : []),
+      ...(pacing.requestedReminders ? (['reminder'] as const) : []),
+      ...(pacing.dailyBrief ? (['daily_brief'] as const) : []),
+      ...(pacing.proactiveSuggestions && pacing.weeklySummary ? (['weekly'] as const) : []),
     ];
     // A situation that was resolved, dismissed or removed has nothing left to say.
     await this.db.execute(sql`update push_intent p set dropped_at = now()
@@ -739,19 +795,31 @@ export class PushService {
         and p.sent_at is null and p.dropped_at is null
         and not exists (select 1 from situation x where x.id = p.situation_id
           and x.state in ('open', 'routed'))`);
-    const waiting = on.length
-      ? await this.db
-          .select()
-          .from(pushIntent)
-          .where(
-            and(
-              eq(pushIntent.principalId, principalId),
-              isNull(pushIntent.sentAt),
-              isNull(pushIntent.droppedAt),
-              inArray(pushIntent.kind, on),
-            ),
-          )
-      : [];
+    const waiting =
+      on.length || pacing.proactiveSuggestions || pacing.requestedReminders
+        ? await this.db
+            .select()
+            .from(pushIntent)
+            .where(
+              and(
+                eq(pushIntent.principalId, principalId),
+                isNull(pushIntent.sentAt),
+                isNull(pushIntent.droppedAt),
+                or(
+                  on.length ? inArray(pushIntent.kind, on) : undefined,
+                  pacing.requestedReminders || pacing.proactiveSuggestions
+                    ? and(
+                        eq(pushIntent.kind, 'situation'),
+                        or(
+                          pacing.requestedReminders ? eq(pushIntent.personSet, true) : undefined,
+                          pacing.proactiveSuggestions ? eq(pushIntent.personSet, false) : undefined,
+                        ),
+                      )
+                    : undefined,
+                ),
+              ),
+            )
+        : [];
     const day = await this.dayOf(principalId);
     const plan = planPush({
       waiting: waiting.map(

@@ -87,6 +87,7 @@ import {
   readConnectionConfig,
 } from './connectors/configured.ts';
 import { startTrashSweep } from './connectors/files-trash.ts';
+import { loadCurrentConnector } from './connectors/lazy.ts';
 import { managedRevocation, startManagedRemovalSweep } from './connectors/managed-accounts.ts';
 import { DockerStdioLauncher } from './connectors/mcp-stdio-docker.ts';
 import type { ConnectorRegistry } from './connectors/registry.ts';
@@ -229,6 +230,8 @@ import { reachConfigFromEnv } from './reach/provider.ts';
 import { mountReach } from './reach/routes.ts';
 import { ReachService } from './reach/service.ts';
 import { requestFailureText } from './request-failure.ts';
+import { CustomerFollowupService } from './responsibilities/customer-followups.ts';
+import { mountCustomerFollowups } from './responsibilities/routes.ts';
 import { mountRooms } from './rooms/routes.ts';
 import type { RoomSurface } from './rooms/surface.ts';
 import { attachRuns, RunService } from './runs/service.ts';
@@ -371,6 +374,8 @@ export type AppDeps = {
   attachments?: AttachmentService;
   /** Sorting what came in, for "Needs you". Left out, the list reads what is stored. */
   triage?: TriageService;
+  /** Only one service instance checks due customer responsibilities at a time. */
+  followupLeads?: () => Promise<boolean>;
   /** Sends sign-in and reset links. Left out, the sender OPENDUET_SMTP_URL configures, if any. */
   accountMail?: AccountMailer;
   /**
@@ -382,6 +387,7 @@ export type AppDeps = {
 
 /** Each app's calls, for the server that takes their upstream WebSockets. */
 const callServices = new WeakMap<object, CallService>();
+const customerFollowupServices = new WeakMap<object, CustomerFollowupService>();
 /** The calls an app built, or null when it offers none. */
 export const callServiceOf = (app: object): CallService | null => callServices.get(app) ?? null;
 
@@ -529,6 +535,7 @@ export function createApp(deps: AppDeps) {
   const modelSettings =
     deps.modelSettings ??
     (deps.db ? new ModelSettingsService({ db: deps.db, env: deps.env, signIn }) : undefined);
+  modelSettings?.configureReadiness({ spending: deps.spending });
   if (deps.db && modelSettings) {
     mountProviderSignIn(app, { db: deps.db, signIn });
     mountModelSettings(app, { db: deps.db, settings: modelSettings });
@@ -773,6 +780,35 @@ export function createApp(deps: AppDeps) {
       ...(connections ? { liveness: connectorLiveness(connections) } : {}),
     });
   callExperience = experience || null;
+  if (
+    experience &&
+    deps.db &&
+    deps.sql &&
+    deps.jobs &&
+    submissions &&
+    deps.registry &&
+    deps.broker
+  ) {
+    const registry = deps.registry;
+    const db = deps.db;
+    const factory = connectorFactoryFor(registry, () =>
+      connectorOptionsFromEnv(deps.sql as Sql, deps.env),
+    );
+    const followups = new CustomerFollowupService({
+      db,
+      sql: deps.sql,
+      jobs: deps.jobs,
+      submissions,
+      registry,
+      experience,
+      effects: new ExperienceEffects(deps.sql, deps.broker, registry),
+      leads: deps.followupLeads,
+      load: (id) => loadCurrentConnector(db, registry, factory, id),
+      onError: (error) => console.error('customer follow-up check failed', String(error)),
+    });
+    mountCustomerFollowups(app, followups);
+    customerFollowupServices.set(app, followups);
+  }
   if (calls) callServices.set(app, calls);
   // Rooms: shared spaces where several people talk to one agent. Switched
   // off, no room request is started, by a route or by a chat platform.
@@ -1126,6 +1162,7 @@ export async function bootstrap(
   let spending: SpendingGuard | undefined;
   let runtimeProbe: (() => Promise<unknown>) | undefined;
   let healthMonitor: HealthMonitor | undefined;
+  let customerFollowups: CustomerFollowupService | undefined;
   const routing = routingFromEnv(env);
   /** This instance among any others on the database, and the singleton work it leads. */
   let instances: InstanceRegistry | undefined;
@@ -1152,6 +1189,7 @@ export async function bootstrap(
     processSweep?.stop();
     processMonitor?.stop();
     await healthMonitor?.stop();
+    await customerFollowups?.stop();
     let failure: unknown;
     for (const stop of [
       () =>
@@ -2283,8 +2321,12 @@ export async function bootstrap(
     checkDatabase,
     attachments,
     triage,
+    followupLeads: () => leading(leases, 'customer-followups'),
     ...(handle ? { checkMemory: () => memoryHealth(handle.sql, memoryEmbedder) } : {}),
   });
+
+  customerFollowups = customerFollowupServices.get(app);
+  if (options.workers !== false) await customerFollowups?.start();
 
   return {
     app,

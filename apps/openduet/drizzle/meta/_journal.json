@@ -939,6 +939,34 @@
       "when": 1789232400113,
       "tag": "0133_task_autonomy",
       "breakpoints": true
+    },
+    {
+      "idx": 134,
+      "version": "7",
+      "when": 1789232400114,
+      "tag": "0134_personal_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 135,
+      "version": "7",
+      "when": 1789232400115,
+      "tag": "0135_model_readiness",
+      "breakpoints": true
+    },
+    {
+      "idx": 136,
+      "version": "7",
+      "when": 1789232400116,
+      "tag": "0136_customer_followups",
+      "breakpoints": true
+    },
+    {
+      "idx": 137,
+      "version": "7",
+      "when": 1789232400117,
+      "tag": "0137_delivery_policy",
+      "breakpoints": true
     }
   ]
 }

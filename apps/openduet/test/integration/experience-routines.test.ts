@@ -231,7 +231,13 @@ withDb('routines, time zone and setup as the person sees them', () => {
     ).agent;
     const routine = automationResponse.parse(
       await (
-        await request('/automations/morning-brief', 'POST', { agent_id: persona.id, at: '08:30' })
+        await request('/automations', 'POST', {
+          title: 'Daily preparation',
+          instruction: 'Prepare my day.',
+          weekdays: [0, 1, 2, 3, 4, 5, 6],
+          agent_id: persona.id,
+          at: '08:30',
+        })
       ).json(),
     ).automation;
     expect(routine.schedule).toBe('Every day at 8:30 AM (UTC)');
@@ -268,7 +274,7 @@ withDb('routines, time zone and setup as the person sees them', () => {
       status: 'done',
       answer: 'Two meetings today, and the passport form is still open.',
     });
-    expect(turns[0]?.text).toContain('Write my morning brief');
+    expect(turns[0]?.text).toContain('Prepare my day.');
     // A reply belongs in a chat of its own, not in the routine's schedule.
     const reply = await request(`/conversations/${thread}/messages`, 'POST', { text: 'More?' });
     expect(reply.status).toBe(409);
@@ -281,7 +287,7 @@ withDb('routines, time zone and setup as the person sees them', () => {
     const home = homeResponse.parse(await (await request('/home')).json());
     expect(home.routine_results[0]).toMatchObject({
       automation_id: routine.id,
-      title: 'Your morning brief',
+      title: 'Daily preparation',
       conversation_id: thread,
       run: { status: 'done', turn_id: latest.turn_id },
     });

@@ -4,9 +4,6 @@ import {
   type ExperienceDraft,
   experienceOperations,
   experienceResult,
-  MORNING_BRIEF_TITLE,
-  morningBriefCreate,
-  morningBriefInstruction,
   runLimitRequest,
   unavailable,
 } from '@openduet/contracts';
@@ -49,6 +46,7 @@ import { type ConnectionLiveness, ExperienceHome } from './home.ts';
 import { listMembers, removeMember } from './members.ts';
 import { ExperienceMemory } from './memory.ts';
 import { ExperiencePermissions } from './permissions.ts';
+import { PersonalSessionService } from './personal-session.ts';
 import { ExperiencePlanning } from './planning.ts';
 import {
   draftForReview,
@@ -121,6 +119,7 @@ const SPACE_OWNER_SURFACES = new Set([
 
 export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceService {
   const service = new ExperienceService(deps.db, deps.jobs, deps.submissions, deps.runner);
+  const personal = new PersonalSessionService(service);
   if (deps.attachments) service.attachments = deps.attachments;
   if (deps.workspaces) service.workspaces = deps.workspaces;
   const longWork = deps.runs;
@@ -370,15 +369,8 @@ export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceServ
       planning.restartAutomation(spaceId, c.req.param('id') ?? ''),
     'DELETE /automations/{id}': (spaceId, c) =>
       planning.deleteAutomation(spaceId, c.req.param('id') ?? '', deps.sql),
-    'POST /automations/morning-brief': (spaceId, _c, input) => {
-      const { topics, ...when } = morningBriefCreate.parse(input);
-      return planning.createAutomation(spaceId, {
-        ...when,
-        title: MORNING_BRIEF_TITLE,
-        instruction: morningBriefInstruction(topics),
-        weekdays: [0, 1, 2, 3, 4, 5, 6],
-      });
-    },
+    'POST /automations/morning-brief': (spaceId, _c, input) =>
+      planning.createMorningBrief(spaceId, input),
     'GET /quick-answers': (spaceId) => questions.list(spaceId),
     'POST /quick-answers/{id}': (spaceId, c, input) =>
       questions.answer(spaceId, c.req.param('id') ?? '', input),
@@ -647,6 +639,10 @@ export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceServ
       if (deleted.routines_paused) await deps.triggers?.syncSchedules();
       return deleted;
     },
+    'GET /personal-session': (spaceId) => personal.get(spaceId),
+    'POST /personal-session/messages': (spaceId, c, input) =>
+      personal.message(spaceId, input, c.req.header('Idempotency-Key')),
+    'PATCH /personal-session/read': (spaceId, _c, input) => personal.read(spaceId, input),
     'GET /conversations': (spaceId, c) => service.conversations(spaceId, c.req.query()),
     'POST /conversations': (spaceId, _c, input) => service.createConversation(spaceId, input),
     'GET /conversations/{id}': async (spaceId, c) => ({
@@ -746,6 +742,15 @@ export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceServ
       if (member && SPACE_OWNER_SURFACES.has(key)) throw ownerOnly();
       // An empty body is read as none, which only a request that may be left out accepts.
       const raw = 'request' in operation ? await c.req.text() : '';
+      if (key === 'POST /personal-session/messages' && raw.trim()) {
+        const message = JSON.parse(raw);
+        if (!message || typeof message !== 'object' || !('target' in message))
+          throw new ServiceError(
+            'message_target_required',
+            'Is this a new task, or which task or result are you replying to?',
+            400,
+          );
+      }
       const input =
         'request' in operation
           ? (operation.request.parse(raw.trim() ? JSON.parse(raw) : undefined) ?? {})

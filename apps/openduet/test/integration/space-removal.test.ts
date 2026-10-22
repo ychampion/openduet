@@ -354,6 +354,9 @@ const REMOVED_BY: Record<string, RemovalPhase> = {
   run_state: 'operational',
   episode: 'operational',
   experience_profile: 'operational',
+  personal_session: 'operational',
+  customer_followup: 'operational',
+  personal_daily_brief: 'operational',
   experience_rule: 'operational',
   approval_review_policy: 'operational',
   action_review: 'operational',
@@ -649,6 +652,45 @@ describe.if(handle !== null)('removing a space', () => {
 
     for (const [table, where] of byKey) expect(await countOf(sql, table, where)).toBe(0);
     expect(await countOf(sql, 'artifact', sql`source_job_id = ${seeded.jobId}`)).toBe(0);
+  });
+
+  test('emptying_clears_personal_assistant_state — child records go, another space and installation readiness stay', async () => {
+    const seeded = await seed('personal');
+    const other = await seed('shared', 'Keep these records');
+    const provider = `removal-${seeded.spaceId}`;
+    await sql`insert into model_readiness (provider, model, configuration, result)
+      values (${provider}, 'fixture-model', 'configuration-fingerprint', '{"status":"ready"}'::jsonb)`;
+    const assistantRows = (value: SeededSpace): Array<[string, ReturnType<Sql>]> => [
+      ['personal_session', sql`id = ${value.personalSessionId}`],
+      ['session_reference', sql`id = ${value.sessionReferenceId}`],
+      ['customer_followup', sql`id = ${value.followupId}`],
+      ['customer_followup_preparation', sql`id = ${value.followupPreparationId}`],
+      // The operational job deletion cascades even though source deletion alone
+      // intentionally leaves a surviving discussion's scope tombstone intact.
+      ['customer_followup_binding', sql`job_id = ${value.jobId}`],
+      ['personal_daily_brief', sql`space_id = ${value.spaceId}`],
+    ];
+    for (const [table, where] of [...assistantRows(seeded), ...assistantRows(other)])
+      expect(await countOf(sql, table, where)).toBe(1);
+
+    const { finished } = await removeCompletely(seeded);
+
+    expect(outcome(finished)).toBe('complete');
+    expect(await countOf(sql, 'space', sql`id = ${seeded.spaceId}`)).toBe(1);
+    for (const [table, where] of assistantRows(seeded))
+      expect(await countOf(sql, table, where)).toBe(0);
+    for (const [table, where] of assistantRows(other))
+      expect(await countOf(sql, table, where)).toBe(1);
+    const readiness =
+      await sql`select provider, model, configuration, result from model_readiness where provider = ${provider}`;
+    expect([...readiness]).toEqual([
+      {
+        provider,
+        model: 'fixture-model',
+        configuration: 'configuration-fingerprint',
+        result: { status: 'ready' },
+      },
+    ]);
   });
 
   test('a_time_zone_note_kept_past_its_chat_goes_with_its_space — and only with its own', async () => {

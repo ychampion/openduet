@@ -43,6 +43,14 @@ export const pushSubscriptionList = z.strictObject({
 export const pushSettings = z.strictObject({
   /** "One decision is waiting." */
   decisions: z.boolean(),
+  /** Results and meaningful updates from work the person requested. */
+  task_results: z.boolean(),
+  /** A reminder or routine explicitly requested for a chosen time. */
+  requested_reminders: z.boolean(),
+  /** Delivery of the canonical personal daily brief; its routine is controlled separately. */
+  daily_brief: z.boolean(),
+  /** Unsolicited suggestions and things noticed without an explicit request. */
+  proactive_suggestions: z.boolean(),
   /** "A chase settled." */
   settled: z.boolean(),
   /** The weekly "what came back" summary. */

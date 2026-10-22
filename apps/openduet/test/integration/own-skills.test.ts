@@ -8,7 +8,8 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { learnedList } from '@openduet/contracts';
+import { learnedList, selectSkills } from '@openduet/contracts';
+import { loadSpaceSkills } from '@openduet/skills';
 import { Hono } from 'hono';
 import { ServiceError } from '../../src/api/errors.ts';
 import { skillFile } from '../../src/connectors/skills.ts';
@@ -78,6 +79,43 @@ const WEEKLY = {
           : { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } }),
       });
   }
+
+  test('reviewed owner steps save once and are selected by the next relevant task without scheduling work', async () => {
+    if (!fixture) return;
+    const spacesRoot = await mkdtemp(path.join(tmpdir(), 'openduet-taught-skill-'));
+    roots.push(spacesRoot);
+    const maya = await person();
+    const call = await routes(spacesRoot, maya.id);
+    const definition = {
+      space_id: maya.spaceId,
+      name: 'client-follow-up',
+      description: 'Prepare a client follow-up.',
+      triggers: ['client follow-up'],
+      body: 'Inputs: meeting notes or an email thread.\nSteps: identify open commitments, check the latest supplied context, draft one clear ask in my preferred style.\nExpected result: an editable draft.\nExceptions: ask for missing context. Preparing the draft does not authorize sending.',
+    };
+    const before = await fixture.handle.sql`select count(*)::int as n from job`;
+    const created = await call('/own-skills', definition);
+    expect(created.status).toBe(201);
+    const first = (await created.json()) as { skill: { version: string; body: string } };
+    expect(first.skill.body).toBe(definition.body);
+    const again = await call('/own-skills', definition);
+    expect(again.status).toBe(201);
+    expect(((await again.json()) as typeof first).skill.version).toBe(first.skill.version);
+    const loaded = loadSpaceSkills(path.join(spacesRoot, maya.spaceId, 'skills'));
+    expect(
+      selectSkills('Prepare the next client follow-up for Priya', '', loaded.skills).map(
+        (match) => match.skill.body,
+      ),
+    ).toEqual([definition.body]);
+    expect((await fixture.handle.sql`select count(*)::int as n from job`)[0]?.n).toBe(before[0]?.n);
+    expect(
+      (await call('/own-skills', { ...definition, body: 'A different procedure.' })).status,
+    ).toBe(400);
+    const other = await person();
+    expect((await (await routes(spacesRoot, other.id))('/own-skills', definition)).status).toBe(
+      403,
+    );
+  }, 60000);
 
   test('what they taught loads for them, and for no one else', async () => {
     if (!fixture) return;

@@ -273,6 +273,19 @@ export const modelDefault = pgTable(
   (table) => [check('model_default_single_row', sql`${table.id} = 'installation'`)],
 );
 
+/** Bounded runtime evidence; a configuration fingerprint prevents stale readiness claims. */
+export const modelReadiness = pgTable(
+  'model_readiness',
+  {
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    configuration: text('configuration').notNull(),
+    result: jsonb('result').notNull(),
+    checkedAt: timestamp('checked_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.provider, table.model] })],
+);
+
 /**
  * The owner's word on whether a model reads images, apart from which model is
  * chosen: saying so for the server's default model leaves it the server's.
@@ -1053,10 +1066,29 @@ export const pushSetting = pgTable('push_setting', {
     .primaryKey()
     .references(() => principal.id, { onDelete: 'cascade' }),
   decisions: boolean('decisions').notNull().default(true),
+  taskResults: boolean('task_results').notNull().default(true),
+  requestedReminders: boolean('requested_reminders').notNull().default(true),
+  dailyBrief: boolean('daily_brief').notNull().default(true),
+  proactiveSuggestions: boolean('proactive_suggestions').notNull().default(false),
   settled: boolean('settled').notNull().default(true),
   weeklySummary: boolean('weekly_summary').notNull().default(true),
   dailyCap: integer('daily_cap').notNull().default(4),
   batchMinutes: integer('batch_minutes').notNull().default(10),
+});
+
+/** Identity only: the associated trigger remains the single source of schedule and pause state. */
+export const personalDailyBrief = pgTable('personal_daily_brief', {
+  spaceId: text('space_id')
+    .primaryKey()
+    .references(() => space.id, { onDelete: 'cascade' }),
+  principalId: text('principal_id')
+    .notNull()
+    .references(() => principal.id, { onDelete: 'cascade' }),
+  purpose: text('purpose').notNull().default('personal.daily_brief'),
+  triggerId: text('trigger_id')
+    .notNull()
+    .unique()
+    .references(() => trigger.id, { onDelete: 'cascade' }),
 });
 
 /**
@@ -1230,6 +1262,51 @@ export const experienceProfile = pgTable('experience_profile', {
   /** How the agent sounds in replies and drafts: `teammate` or `professional`. */
   voice: text('voice').notNull().default('teammate'),
 });
+
+/** A person's feed groups references, while each referenced job keeps its own authority. */
+export const personalSession = pgTable(
+  'personal_session',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    readAt: timestamp('read_at', { withTimezone: true }),
+    readReferenceId: text('read_reference_id'),
+    createdAt: created(),
+  },
+  (t) => [uniqueIndex('personal_session_principal_space_idx').on(t.principalId, t.spaceId)],
+);
+
+export const sessionReference = pgTable(
+  'session_reference',
+  {
+    id: text('id').primaryKey(),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => personalSession.id, { onDelete: 'cascade' }),
+    kind: text('kind').notNull(),
+    jobId: text('job_id')
+      .notNull()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    turnId: text('turn_id').references(() => experienceTurn.id, { onDelete: 'cascade' }),
+    discussionId: text('discussion_id').references(() => job.id, { onDelete: 'set null' }),
+    referenceKey: text('reference_key').notNull(),
+    /** First-handoff retries resolve the same job before submission admission. */
+    submissionKey: text('submission_key'),
+    inputDigest: text('input_digest'),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('session_reference_key_idx').on(t.sessionId, t.referenceKey),
+    uniqueIndex('session_reference_submission_idx').on(t.sessionId, t.submissionKey),
+    index('session_reference_discussion_idx').on(t.discussionId),
+    check('session_reference_kind', sql`${t.kind} in ('conversation', 'run', 'result')`),
+  ],
+);
 
 export const task = pgTable('task', {
   id: text('id').primaryKey(),
@@ -1573,6 +1650,8 @@ export const schema = {
   agent,
   experienceTurn,
   experienceProfile,
+  personalSession,
+  sessionReference,
   task,
   planMilestone,
   experienceRule,
@@ -1759,4 +1838,100 @@ export const personEntitlement = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }),
   },
   (t) => [primaryKey({ columns: [t.principalId, t.key] })],
+);
+
+/** An explicitly confirmed customer thread and deadline; preparation never authorizes sending. */
+export const customerFollowup = pgTable(
+  'customer_followup',
+  {
+    id: text('id').primaryKey(),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    connectionId: text('connection_id')
+      .notNull()
+      .references(() => connection.id, { onDelete: 'cascade' }),
+    connectionGeneration: integer('connection_generation').notNull(),
+    threadKey: jsonb('thread_key').$type<number | string>().notNull(),
+    customerEmail: text('customer_email').notNull(),
+    title: text('title').notNull(),
+    deadlineAt: timestamp('deadline_at', { withTimezone: true }).notNull(),
+    timeZone: text('time_zone').notNull(),
+    skillRefs: jsonb('skill_refs').$type<string[]>().notNull().default([]),
+    preferenceRefs: jsonb('preference_refs').$type<string[]>().notNull().default([]),
+    latestSourceVersion: text('latest_source_version').notNull(),
+    baselineOutgoing: text('baseline_outgoing').notNull(),
+    state: text('state').notNull().default('watching'),
+    paused: boolean('paused').notNull().default(false),
+    nextCheckAt: timestamp('next_check_at', { withTimezone: true }),
+    checkedAt: timestamp('checked_at', { withTimezone: true }),
+    failure: text('failure'),
+    createdAt: created(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('customer_followup_scope_idx').on(
+      t.principalId,
+      t.spaceId,
+      t.connectionId,
+      t.threadKey,
+      t.customerEmail,
+      t.baselineOutgoing,
+    ),
+    index('customer_followup_due')
+      .on(t.nextCheckAt)
+      .where(
+        sql`${t.paused} = false and ${t.state} in ('watching', 'failed', 'preparing', 'prepared')`,
+      ),
+  ],
+);
+
+/** One durable local preparation per confirmed source version, with its canonical chat and draft. */
+export const customerFollowupPreparation = pgTable(
+  'customer_followup_preparation',
+  {
+    id: text('id').primaryKey(),
+    followupId: text('followup_id')
+      .notNull()
+      .references(() => customerFollowup.id, { onDelete: 'cascade' }),
+    sourceVersion: text('source_version').notNull(),
+    preparationType: text('preparation_type').notNull().default('customer_followup'),
+    conversationId: text('conversation_id').references(() => job.id, { onDelete: 'set null' }),
+    turnId: text('turn_id'),
+    draftActionId: text('draft_action_id').references(() => action.id, { onDelete: 'set null' }),
+    state: text('state').notNull().default('preparing'),
+    summary: text('summary').notNull(),
+    notifiedAt: timestamp('notified_at', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [
+    uniqueIndex('customer_followup_preparation_source_idx').on(
+      t.followupId,
+      t.sourceVersion,
+      t.preparationType,
+    ),
+    index('customer_followup_preparation_conversation').on(t.conversationId),
+  ],
+);
+
+/**
+ * A source-bound discussion keeps its mailbox fence even if its original chat,
+ * preparation, watch or connection is deleted. Missing source means denied;
+ * the saved connection ID is a scope tombstone, never account access.
+ */
+export const customerFollowupBinding = pgTable(
+  'customer_followup_binding',
+  {
+    jobId: text('job_id')
+      .primaryKey()
+      .references(() => job.id, { onDelete: 'cascade' }),
+    preparationId: text('preparation_id').references(() => customerFollowupPreparation.id, {
+      onDelete: 'set null',
+    }),
+    connectionId: text('connection_id').notNull(),
+  },
+  (t) => [index('customer_followup_binding_preparation').on(t.preparationId)],
 );

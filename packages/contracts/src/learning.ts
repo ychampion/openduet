@@ -383,6 +383,13 @@ export const ownSkillRecord = z.strictObject({
 export type OwnSkillRecord = z.infer<typeof ownSkillRecord>;
 export const ownSkillListResponse = z.strictObject({ skills: z.array(ownSkillRecord) });
 export const ownSkillResponse = z.strictObject({ skill: ownSkillRecord });
+/** An explicit owner-authored procedure; creating it grants no tools or schedule. */
+export const ownSkillCreateRequest = learningSpaceRequest.extend({
+  name: ownSkillName(),
+  description: z.string().trim().min(1).max(300),
+  triggers: z.array(z.string().trim().min(2).max(80)).min(1).max(12),
+  body: z.string().trim().min(1).max(1400),
+});
 /** Only what changes is sent; the rest stays as it was. */
 export const ownSkillEditRequest = learningSpaceRequest.extend({
   version: z.string().regex(/^[a-f0-9]{64}$/),

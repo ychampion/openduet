@@ -125,6 +125,33 @@ export class OutlookMailTransport implements MailTransport {
     return typeof key === 'string' ? this.message(key) : null;
   }
 
+  async thread(key: number | string): Promise<MailMessage[] | null> {
+    if (typeof key !== 'string' || !GRAPH_MESSAGE_ID.test(key)) return null;
+    const anchor = (await this.json(
+      `/messages/${encodeURIComponent(key)}?$select=conversationId`,
+    )) as { conversationId?: string } | null;
+    if (!anchor?.conversationId) return null;
+    const params = new URLSearchParams({
+      $filter: `conversationId eq ${literal(anchor.conversationId)}`,
+      $select: 'id',
+      $top: '51',
+    });
+    const listed = (await this.json(`/messages?${params}`)) as {
+      value?: { id?: string }[];
+      '@odata.nextLink'?: string;
+    } | null;
+    if (!listed?.value?.length || listed.value.length > 50 || listed['@odata.nextLink'])
+      throw new Error('Thread cannot be checked completely.');
+    const messages: MailMessage[] = [];
+    for (const item of listed.value) {
+      if (!item.id) throw new Error('Thread message identity is missing.');
+      const message = await this.message(item.id);
+      if (!message) throw new Error('A thread message could not be read completely.');
+      messages.push(message);
+    }
+    return messages;
+  }
+
   /**
    * One message's headers, without its body. Mail from inside the same
    * organisation can come without its internet headers; then they are written

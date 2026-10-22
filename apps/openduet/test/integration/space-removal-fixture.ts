@@ -30,6 +30,10 @@ export type SeededSpace = {
   candidateId: string;
   submissionId: string;
   notificationId: string;
+  personalSessionId: string;
+  sessionReferenceId: string;
+  followupId: string;
+  followupPreparationId: string;
   sessionToken: string;
   memberSessionToken: string;
 };
@@ -137,6 +141,30 @@ export async function seedSpace(
     values (${attemptId}, ${jobId}, ${json(['react'])}::text::jsonb)`;
   await sql`insert into experience_turn (id, job_id, agent_id, submission_id, text)
     values (${newId('turn')}, ${jobId}, ${agentId}, ${newId('sub')}, 'Hello')`;
+  // The personal feed keeps its read position apart from any one chat; a
+  // customer watch also keeps its preparation summary after its chat goes.
+  const personalSessionId = newId('psn');
+  const sessionReferenceId = newId('srf');
+  await sql`insert into personal_session (id, principal_id, space_id, read_at, read_reference_id)
+    values (${personalSessionId}, ${principalId}, ${spaceId}, now(), ${sessionReferenceId})`;
+  await sql`insert into session_reference (id, session_id, kind, job_id, reference_key)
+    values (${sessionReferenceId}, ${personalSessionId}, 'conversation', ${jobId}, ${`conversation:${jobId}`})`;
+  const followupId = newId('watch');
+  const followupPreparationId = newId('prep');
+  await sql`insert into customer_followup (id, principal_id, space_id, connection_id,
+      connection_generation, thread_key, customer_email, title, deadline_at, time_zone,
+      latest_source_version, baseline_outgoing)
+    values (${followupId}, ${principalId}, ${spaceId}, ${connectionId}, 0,
+      '{"id":"customer-thread"}'::jsonb, 'customer@example.test', 'Follow up on the quote',
+      now() + interval '1 day', 'UTC', 'source-v1', 'outgoing-1')`;
+  await sql`insert into customer_followup_preparation (id, followup_id, source_version,
+      conversation_id, draft_action_id, summary)
+    values (${followupPreparationId}, ${followupId}, 'source-v1', ${jobId}, ${actionId},
+      'The quote is waiting for the customer.')`;
+  await sql`insert into customer_followup_binding (job_id, preparation_id, connection_id)
+    values (${jobId}, ${followupPreparationId}, ${connectionId})`;
+  await sql`insert into personal_daily_brief (space_id, principal_id, trigger_id)
+    select ${spaceId}, ${principalId}, id from trigger where job_id = ${jobId} limit 1`;
   await sql`insert into plan_milestone (id, plan_id, title, ordinal, agent_id)
     values (${newId('mile')}, ${jobId}, 'Step one', 0, ${agentId})`;
   await sql`insert into browser_session_binding (id, space_id, job_id, control_epoch, control)
@@ -367,6 +395,10 @@ export async function seedSpace(
     candidateId,
     submissionId,
     notificationId,
+    personalSessionId,
+    sessionReferenceId,
+    followupId,
+    followupPreparationId,
     sessionToken,
     memberSessionToken,
   };

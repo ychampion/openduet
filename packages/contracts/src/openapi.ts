@@ -88,6 +88,7 @@ import {
   mcpToolDiscoveryRequest,
   smsTextListResponse,
 } from './connections.ts';
+import { customerFollowupPaths } from './customer-followups-openapi.ts';
 import {
   deviceHelloRequest,
   deviceHelloResponse,
@@ -145,6 +146,7 @@ import {
   learningScopeResponse,
   learningSpaceQuery,
   learningSpaceRequest,
+  ownSkillCreateRequest,
   ownSkillDeleteRequest,
   ownSkillDeleteResponse,
   ownSkillEditRequest,
@@ -189,7 +191,9 @@ import {
   sourceEvidenceResponse,
 } from './memory.ts';
 import {
+  checkModelReadinessRequest,
   keyedModelProvider,
+  modelReadiness,
   modelSettingsResponse,
   saveModelKeyRequest,
   setDefaultModelRequest,
@@ -1885,6 +1889,12 @@ export function buildOpenApiDocument() {
           },
         },
         '/own-skills': {
+          post: {
+            tags: ['learning'],
+            summary: 'Save an explicitly reviewed procedure in the personal skills store',
+            requestBody: json(ownSkillCreateRequest),
+            responses: { '201': jsonResponse('Saved skill', ownSkillResponse) },
+          },
           get: {
             tags: ['learning'],
             summary: "List the person's own skills in their personal space",
@@ -4567,6 +4577,24 @@ export function buildOpenApiDocument() {
           },
         },
 
+        '/model-settings/readiness': {
+          post: {
+            tags: ['model-providers'],
+            summary: 'Check the selected model through Hermes with one disposable read-only note',
+            description:
+              'Uses a small amount of model usage: at most 3 requests and 1536 output tokens, plus prompt tokens. The runtime check has a 45-second limit. No practice model, fallback or external account actions. Checks compatibility, not general intelligence.',
+            requestBody: json(checkModelReadinessRequest),
+            responses: {
+              '200': jsonResponse(
+                'Credentials, inference and tool compatibility evidence',
+                modelReadiness,
+              ),
+              '400': problem('Invalid request'),
+              '403': problem('Only the setup owner or an admin checks the model'),
+            },
+          },
+        },
+
         '/model-settings/keys/{provider}': {
           put: {
             tags: ['model-providers'],
@@ -4888,6 +4916,7 @@ export function buildOpenApiDocument() {
         ...devicePaths(),
         ...appsPaths(),
         ...pagesPaths(),
+        ...customerFollowupPaths(),
         ...processPreviewPaths(),
         ...spaceAuditPaths(),
       },

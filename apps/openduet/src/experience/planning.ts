@@ -4,6 +4,10 @@ import {
   experiencePlan,
   isTerminal,
   jobState,
+  MORNING_BRIEF_PURPOSE,
+  MORNING_BRIEF_TITLE,
+  morningBriefCreate,
+  morningBriefInstruction,
   planCreate,
   scheduleWords,
   triggerSpec,
@@ -21,7 +25,9 @@ import {
   experienceProfile,
   experienceTurn,
   job,
+  personalDailyBrief,
   planMilestone,
+  space,
   trigger,
 } from '../db/schema.ts';
 import { newId } from '../ids.ts';
@@ -356,6 +362,11 @@ export class ExperiencePlanning {
    */
   async automation(row: typeof trigger.$inferSelect, title: string, state: string) {
     const spec = triggerSpec.parse(row.spec);
+    const [canonical] = await this.db
+      .select()
+      .from(personalDailyBrief)
+      .where(eq(personalDailyBrief.triggerId, row.id));
+    const [minute, hour] = spec.kind === 'schedule' ? (spec.cron ?? '').split(/\s+/) : [];
     const runs = await this.db
       .select()
       .from(attempt)
@@ -464,6 +475,11 @@ export class ExperiencePlanning {
     const heldIn = (attemptId: string) => tried.get(attemptId)?.held ?? [];
     return experienceAutomation.parse({
       id: row.id,
+      ...(canonical ? { purpose: MORNING_BRIEF_PURPOSE } : {}),
+      ...(spec.kind === 'schedule' ? { time_zone: spec.timezone } : {}),
+      ...(hour && minute && /^\d+$/.test(hour) && /^\d+$/.test(minute)
+        ? { at: `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}` }
+        : {}),
       title: plainText(title, 'Routine'),
       schedule:
         spec.kind === 'schedule'
@@ -626,6 +642,41 @@ export class ExperiencePlanning {
       spec,
     });
   }
+  /** One personal brief: repeated setup changes its real trigger, never creates a second one. */
+  async createMorningBrief(spaceId: string, raw: unknown) {
+    const input = morningBriefCreate.parse(raw);
+    if (!this.triggers || !this.service.jobs)
+      return unavailable('Scheduled routines are not connected yet.');
+    const [personal] = await this.db
+      .select()
+      .from(space)
+      .where(and(eq(space.id, spaceId), eq(space.kind, 'personal')));
+    if (!personal)
+      throw new ServiceError(
+        'personal_space_required',
+        'Set up your daily brief in your personal space.',
+        400,
+      );
+    const runner = await this.service.agentOrDefault(spaceId, input.agent_id);
+    const [profile] = await this.db
+      .select()
+      .from(experienceProfile)
+      .where(eq(experienceProfile.spaceId, spaceId));
+    const [hour, minute] = input.at.split(':').map(Number);
+    return this.register(spaceId, {
+      title: MORNING_BRIEF_TITLE,
+      objective: morningBriefInstruction(input.topics),
+      agentId: runner.id,
+      spec: triggerSpec.parse({
+        kind: 'schedule',
+        cron: `${minute} ${hour} * * *`,
+        timezone: profile?.timeZone ?? 'UTC',
+      }),
+      purpose: MORNING_BRIEF_PURPOSE,
+      updateInstruction: input.topics !== undefined,
+      updateAgent: input.agent_id !== undefined,
+    });
+  }
   /**
    * Saves a routine: its own thread, resting until its schedule fires. A
    * routine started again from an ended one takes the old one's place, so the
@@ -638,12 +689,47 @@ export class ExperiencePlanning {
       objective: string;
       agentId: string;
       spec: ReturnType<typeof triggerSpec.parse>;
+      purpose?: typeof MORNING_BRIEF_PURPOSE;
+      updateInstruction?: boolean;
+      updateAgent?: boolean;
     },
     replaces?: string,
   ) {
     const jobs = this.service.jobs;
     if (!this.triggers || !jobs) return unavailable('Scheduled routines are not connected yet.');
     const registration = await jobs.transaction(async (tx) => {
+      if (routine.purpose) {
+        // The same lock covers two tabs, repeated setup, and a restart of the ended brief.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`daily-brief:${spaceId}`}, 0))`,
+        );
+        if (!replaces) {
+          const [existing] = await tx
+            .select({ trigger, job })
+            .from(personalDailyBrief)
+            .innerJoin(trigger, eq(trigger.id, personalDailyBrief.triggerId))
+            .innerJoin(job, eq(job.id, trigger.jobId))
+            .where(and(eq(personalDailyBrief.spaceId, spaceId), ownJob()));
+          if (existing) {
+            // Setup may change the time, but may not silently resume a paused/stopped brief.
+            const [updated] = await tx
+              .update(trigger)
+              .set({ spec: routine.spec })
+              .where(eq(trigger.id, existing.trigger.id))
+              .returning();
+            if (!updated) throw experienceMissing();
+            if (routine.updateInstruction !== false || routine.updateAgent !== false)
+              await tx
+                .update(job)
+                .set({
+                  ...(routine.updateInstruction !== false ? { objective: routine.objective } : {}),
+                  ...(routine.updateAgent !== false ? { agentId: routine.agentId } : {}),
+                })
+                .where(eq(job.id, existing.job.id));
+            return updated;
+          }
+        }
+      }
       const row = await jobs.createInTransaction(
         tx,
         {
@@ -678,11 +764,28 @@ export class ExperiencePlanning {
           .returning({ id: trigger.id });
         if (!gone.length) throw experienceMissing();
       }
+      if (routine.purpose) {
+        if (!row.principalId) throw new Error('A personal daily brief requires an owner.');
+        await tx.insert(personalDailyBrief).values({
+          spaceId,
+          principalId: row.principalId,
+          purpose: routine.purpose,
+          triggerId: registration.id,
+        });
+      }
       return registration;
     });
     await this.triggers.syncSchedules();
+    const [current] = await this.db
+      .select({ title: job.title, state: job.state })
+      .from(job)
+      .where(eq(job.id, registration.jobId));
     return {
-      automation: await this.automation(registration, routine.title, 'waiting_for_event_or_time'),
+      automation: await this.automation(
+        registration,
+        current?.title ?? routine.title,
+        current?.state ?? 'waiting_for_event_or_time',
+      ),
     };
   }
   private async requireAutomation(spaceId: string, id: string) {
@@ -770,6 +873,10 @@ export class ExperiencePlanning {
         409,
       );
     const runner = await this.service.agentOrDefault(spaceId, row.job.agentId ?? undefined);
+    const [canonical] = await this.db
+      .select()
+      .from(personalDailyBrief)
+      .where(eq(personalDailyBrief.triggerId, id));
     return this.register(
       spaceId,
       {
@@ -777,6 +884,7 @@ export class ExperiencePlanning {
         objective: row.job.objective,
         agentId: runner.id,
         spec: triggerSpec.parse(row.trigger.spec),
+        ...(canonical ? { purpose: MORNING_BRIEF_PURPOSE } : {}),
       },
       row.trigger.id,
     );

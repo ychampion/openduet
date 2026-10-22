@@ -42,7 +42,8 @@ export type IntentKind =
   | 'situation'
   | 'needs_you'
   | 'done'
-  | 'reminder';
+  | 'reminder'
+  | 'daily_brief';
 
 /** The faster lanes' own pacing. */
 export const SOON_PACING = { dailyCap: 6, batchMinutes: 1 } as const;
@@ -142,7 +143,10 @@ export function composeBatch(waiting: Waiting[]): PushPayload {
       because: first.because,
       url: first.url,
       // Each reminder is its own notification: one must never silently replace another.
-      tag: first.kind === 'reminder' ? `reminder:${first.id}`.slice(0, 64) : first.kind,
+      tag:
+        first.kind === 'reminder' || first.kind === 'daily_brief'
+          ? `${first.kind}:${first.id}`.slice(0, 64)
+          : first.kind,
       ...(first.ack ? { ack: first.ack } : {}),
     };
   const decisions = waiting.filter((w) => w.kind === 'decision');
@@ -152,7 +156,7 @@ export function composeBatch(waiting: Waiting[]): PushPayload {
   const noticed = waiting.filter((w) => w.kind === 'situation');
   const needs = waiting.filter((w) => w.kind === 'needs_you');
   const done = waiting.filter((w) => w.kind === 'done');
-  const asked = waiting.filter((w) => w.kind === 'reminder');
+  const asked = waiting.filter((w) => w.kind === 'reminder' || w.kind === 'daily_brief');
   if (asked.length === waiting.length)
     return {
       title: `${counted(asked.length, 'thing', 'things')} you asked for`,
@@ -236,7 +240,7 @@ export function planPush(input: {
       : input.sentToday;
   if (waiting.length === 0) return { hold: 'nothing' };
   // The person chose this hour: it goes now, ahead of anything paced, never held by quiet or a cap.
-  const due = waiting.filter((w) => w.kind === 'reminder');
+  const due = waiting.filter((w) => w.kind === 'reminder' || w.kind === 'daily_brief');
   if (due.length) {
     const ordered = byAge(due);
     return {

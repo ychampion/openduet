@@ -7,6 +7,8 @@
  * response carries a key, and no request body is logged.
  */
 import {
+  checkModelReadinessRequest,
+  modelReadiness,
   modelSettingsResponse,
   saveModelKeyRequest,
   setDefaultModelRequest,
@@ -70,6 +72,12 @@ export function mountModelSettings(
     await requireOwner(c);
     const input = testModelConnectionRequest.parse(await c.req.json());
     return c.json(testModelConnectionResponse.parse(await settings.test(input)));
+  });
+
+  app.post('/model-settings/readiness', async (c) => {
+    const ownerId = await requireOwner(c);
+    const input = checkModelReadinessRequest.parse(await c.req.json());
+    return c.json(modelReadiness.parse(await settings.checkReadiness(ownerId, input)));
   });
 
   app.put('/model-settings/keys/:provider', async (c) => {

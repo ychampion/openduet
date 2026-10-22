@@ -11,6 +11,7 @@
 import {
   learningSpaceQuery,
   type OwnSkillRecord,
+  ownSkillCreateRequest,
   ownSkillDeleteRequest,
   ownSkillEditRequest,
   ownSkillName,
@@ -19,6 +20,7 @@ import type { Hono } from 'hono';
 import { ServiceError } from '../api/errors.ts';
 import { BrokerFault } from '../broker/errors.ts';
 import {
+  createOwnSkill,
   type OwnSkill,
   readOwnSkills,
   removeOwnSkill,
@@ -77,6 +79,13 @@ export function mountOwnSkills(app: Hono, deps: OwnSkillsDeps) {
     await ownSpace(c.get('owner').id, input.space_id);
     const skills = await readOwnSkills(deps.spacesRoot, input.space_id).catch(asServiceError);
     return c.json({ skills: skills.map(record) });
+  });
+
+  app.post('/own-skills', async (c) => {
+    const { space_id, ...definition } = ownSkillCreateRequest.parse(await c.req.json());
+    await ownSpace(c.get('owner').id, space_id);
+    const saved = await createOwnSkill(deps.spacesRoot, space_id, definition).catch(asServiceError);
+    return c.json({ skill: record(saved) }, 201);
   });
 
   app.post('/own-skills/:name/edit', async (c) => {

@@ -3,12 +3,17 @@ import type {
   Action,
   ConnectorHealth,
   ConnectorManifest,
+  CustomerThreadSnapshot,
   DispatchResult,
   JsonObject,
   VerifyResult,
 } from '@openduet/contracts';
 import { z } from 'zod';
+import { BrokerFault } from '../broker/errors.ts';
+import type { Query } from '../broker/records.ts';
 import { type MailInstance, passwordResetMail, signInMail } from '../experience/account-mail.ts';
+import { FOLLOWUP_BINDINGS } from '../responsibilities/binding.ts';
+import { customerThreadSnapshot } from '../responsibilities/thread.ts';
 import type { SignalSource } from '../signals/types.ts';
 import {
   credentialRefused,
@@ -227,6 +232,11 @@ export function emailMessageId(actionId: string): string {
 
 export class EmailConnector implements Connector {
   readonly manifest: ConnectorManifest;
+  /** Native provider conversations include messages moved out of Inbox; IMAP does not guarantee that scope. */
+  readonly customerThread?: (
+    key: number | string,
+    customerEmail: string,
+  ) => Promise<CustomerThreadSnapshot>;
   private readonly config: { id: string; spaceId: string; from: string };
   private readonly use: <T>(work: (transport: MailTransport) => Promise<T>) => Promise<T>;
 
@@ -240,6 +250,7 @@ export class EmailConnector implements Connector {
     if ('kind' in config && config.kind === 'api') {
       this.manifest = idAddressedEmailManifest;
       this.use = config.session;
+      this.customerThread = (key, customerEmail) => this.readCustomerThread(key, customerEmail);
       return;
     }
     const imap = config as EmailConnection;
@@ -269,6 +280,101 @@ export class EmailConnector implements Connector {
         };
       }),
   };
+
+  private async readCustomerThread(key: number | string, customerEmail: string) {
+    return this.use(async (transport) => {
+      if (!transport.thread) throw new Error('This mailbox cannot check a complete thread.');
+      const messages = await transport.thread(key);
+      if (!messages?.length || messages.some(sensitiveInboxMessage))
+        throw new Error('The complete thread is unavailable or contains protected sign-in mail.');
+      // `from` is trusted connection configuration; message identity uses parsed address arrays.
+      const own = /<([^<>]+)>/.exec(this.config.from)?.[1] ?? this.config.from;
+      return customerThreadSnapshot(messages, own, customerEmail);
+    });
+  }
+
+  async customerMessages(query: string, folder: 'inbox' | 'sent') {
+    return this.use(async (transport) =>
+      (await transport.search(query, 20, folder))
+        .filter((message) => !sensitiveInboxMessage(message) && (message.uid || message.id))
+        .map((message) => ({
+          key: message.id ?? (folder === 'sent' ? `sent:${message.uid}` : (message.uid as number)),
+          subject: message.subject,
+          from: message.from,
+          date: message.date ?? null,
+          preview: message.text.slice(0, 300),
+        })),
+    );
+  }
+
+  /** A prepared watch is context, never permission to send; dispatch rechecks the exact live source. */
+  async validateBinding(action: Action, ctx: ConnectorContext, tx: Query) {
+    if (action.kind !== 'email.send' && action.kind !== 'email.draft') return;
+    const [bound] = await tx.unsafe(
+      `select p.id as preparation_id, binding.connection_id as bound_connection_id, p.source_version, p.state as preparation_state,
+        f.thread_key, f.customer_email, f.connection_id, f.connection_generation, f.paused,
+        f.state, c.generation, c.status, c.scopes, c.shared_use
+      from job j cross join lateral (${FOLLOWUP_BINDINGS}) binding
+        left join customer_followup_preparation p on p.id = binding.preparation_id
+        left join customer_followup f on f.id = p.followup_id
+        left join connection c on c.id = f.connection_id
+      where j.id = $1 order by p.created_at desc limit 1`,
+      [ctx.job_id],
+    );
+    if (!bound) return;
+    if (bound.bound_connection_id !== action.connection_id)
+      throw new BrokerFault(
+        'scope_denied',
+        'This follow-up belongs to the confirmed mailbox only.',
+      );
+    if (
+      !bound.preparation_id ||
+      !bound.connection_id ||
+      bound.connection_id !== bound.bound_connection_id ||
+      bound.paused ||
+      ['replied', 'dismissed', 'completed'].includes(String(bound.state)) ||
+      bound.status !== 'active' ||
+      bound.shared_use !== 'owner' ||
+      !Array.isArray(bound.scopes) ||
+      !bound.scopes.includes('email.read') ||
+      !bound.scopes.includes('email.draft') ||
+      Number(bound.generation) !== Number(bound.connection_generation) ||
+      ['obsolete', 'dismissed'].includes(String(bound.preparation_state))
+    )
+      throw new BrokerFault(
+        'payload_invalid',
+        'This follow-up is paused, changed, or no longer has source access.',
+      );
+    const message = outgoing.parse(action.canonical_payload);
+    if (
+      message.to.length !== 1 ||
+      message.to[0]?.toLowerCase() !== String(bound.customer_email).toLowerCase() ||
+      message.cc?.length ||
+      message.bcc?.length
+    )
+      throw new BrokerFault(
+        'scope_denied',
+        'This responsibility can prepare a draft only for the customer you confirmed, without Cc or Bcc.',
+      );
+    let current: CustomerThreadSnapshot;
+    try {
+      if (!this.customerThread) throw new Error('Complete-thread reading is unavailable.');
+      current = await this.customerThread(
+        bound.thread_key as number | string,
+        String(bound.customer_email),
+      );
+    } catch {
+      throw new BrokerFault(
+        'payload_invalid',
+        'The customer thread could not be checked. Nothing was sent.',
+      );
+    }
+    if (current.replied || current.version !== bound.source_version)
+      throw new BrokerFault(
+        'payload_invalid',
+        'The customer thread changed. Review a fresh draft before sending.',
+      );
+  }
 
   private assertContext(action: Action, ctx: ConnectorContext): void {
     if (

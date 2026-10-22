@@ -99,7 +99,8 @@ export async function sweepOperational(
     await tx`delete from company where space_id = ${spaceId}`;
     // One statement takes attempts, actions, approvals, events, triggers, the
     // ledger, background operations, repair candidates, tool contexts, turns,
-    // milestones, browser bindings and the learning rows below a job.
+    // milestones, browser bindings, customer-followup scope bindings and the
+    // learning rows below a job.
     // A room keeps its handoffs, but no result of this space's work: one not
     // yet shared is cleared, and the room is told it is no longer there.
     await tx`update room_handoff set result_text = null, result_hash = null,
@@ -171,6 +172,14 @@ export async function sweepOperational(
 const SPACE_KEYED_OPERATIONAL = [
   'browser_recipe_candidate',
   'experience_profile',
+  // Feed groups and their references belong to the emptied space, even when
+  // it keeps its space row. Jobs and actions have already gone above.
+  'personal_session',
+  // Watches retain their source summaries after a preparation's chat goes;
+  // deleting each watch takes its preparations before connections go next.
+  'customer_followup',
+  // Normally removed with its trigger, named for an in-place emptying too.
+  'personal_daily_brief',
   // How the person lets auto-review answer for them, and what it decided.
   // The decisions went with their jobs; named again so the phase is whole.
   'approval_review_policy',

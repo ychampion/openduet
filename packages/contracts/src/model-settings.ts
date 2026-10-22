@@ -19,6 +19,44 @@ export const MODEL_PROVIDERS = [
 export const modelProvider = z.enum(MODEL_PROVIDERS);
 export type ModelProvider = z.infer<typeof modelProvider>;
 
+export const modelReadinessStage = z.enum(['passed', 'failed', 'not_checked']);
+export const modelReadiness = z
+  .object({
+    provider: modelProvider,
+    model: z.string(),
+    credentials: modelReadinessStage,
+    inference: modelReadinessStage,
+    tools: modelReadinessStage,
+    checked_at: timestamp,
+    code: z.enum([
+      'ready',
+      'authentication',
+      'billing',
+      'model_unavailable',
+      'endpoint',
+      'tool_compatibility',
+      'timeout',
+      'rate_limited',
+      'runtime_unavailable',
+      'configuration_changed',
+      'inference',
+    ]),
+    message: z.string(),
+    usage: z.object({
+      requests: z.number().int().nonnegative(),
+      output_tokens: z.number().int().nonnegative(),
+    }),
+  })
+  .strict();
+export type ModelReadiness = z.infer<typeof modelReadiness>;
+
+export const checkModelReadinessRequest = z
+  .object({
+    provider: modelProvider,
+    model: z.string().trim().min(1).max(300),
+  })
+  .strict();
+
 /** The providers a key is entered for. */
 export const KEYED_MODEL_PROVIDERS = [
   'anthropic',
@@ -173,6 +211,10 @@ export const modelSettingsResponse = z
     can_store_keys: z
       .boolean()
       .meta({ description: 'False when OPENDUET_MASTER_KEY is unset, so no key can be sealed' }),
+    readiness: modelReadiness.nullable().optional().meta({
+      description:
+        'Last bounded Hermes inference/tool check for the active configuration. Null after relevant configuration changes; not an intelligence benchmark.',
+    }),
     secondary: secondaryModel.meta({
       description:
         'This account’s secondary model, for cheaper work beside the primary, and which work uses it',

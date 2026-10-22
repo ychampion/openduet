@@ -117,6 +117,28 @@ export class GmailApiTransport implements MailTransport {
     return typeof key === 'string' ? this.message(key) : null;
   }
 
+  async thread(key: number | string): Promise<MailMessage[] | null> {
+    if (typeof key !== 'string' || !GMAIL_MESSAGE_ID.test(key)) return null;
+    const anchor = (await this.get(`/messages/${key}?format=metadata`, MAX_HEADER_BYTES)) as {
+      threadId?: string;
+    } | null;
+    if (!anchor?.threadId || !GMAIL_MESSAGE_ID.test(anchor.threadId)) return null;
+    const thread = (await this.get(
+      `/threads/${anchor.threadId}?format=minimal`,
+      MAX_LIST_RESPONSE_BYTES,
+    )) as { messages?: { id?: string }[] } | null;
+    if (!thread?.messages?.length || thread.messages.length > 50)
+      throw new Error('Thread cannot be checked completely.');
+    const messages: MailMessage[] = [];
+    for (const item of thread.messages) {
+      if (!item.id) throw new Error('Thread message identity is missing.');
+      const message = await this.message(item.id);
+      if (!message) throw new Error('A thread message could not be read completely.');
+      messages.push(message);
+    }
+    return messages;
+  }
+
   /** One message's headers, without its body; null when it is gone. */
   private async headers(id: string): Promise<MailMessage | null> {
     if (!GMAIL_MESSAGE_ID.test(id)) return null;

@@ -3,6 +3,7 @@ import type {
   CapabilityManifest,
   ConnectorHealth,
   ConnectorManifest,
+  CustomerThreadSnapshot,
   DispatchResult,
   JobConstraints,
   JsonObject,
@@ -54,6 +55,20 @@ export type ConnectorContext = {
 };
 
 export interface Connector {
+  /** Complete native-mail thread read for an explicitly scoped customer responsibility. */
+  customerThread?(key: number | string, customerEmail: string): Promise<CustomerThreadSnapshot>;
+  customerMessages?(
+    query: string,
+    folder: 'inbox' | 'sent',
+  ): Promise<
+    Array<{
+      key: number | string;
+      subject: string;
+      from: string;
+      date: string | null;
+      preview: string;
+    }>
+  >;
   manifest: ConnectorManifest;
   /**
    * The outside service this connector's tools reach (`google:mail`,

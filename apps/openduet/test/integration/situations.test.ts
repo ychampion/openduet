@@ -132,6 +132,8 @@ async function person(label: string, day: { start: string; end: string }): Promi
 }
 
 async function withPhone(who: Person) {
+  // These scenarios exercise delivery after the person explicitly opts into suggestions.
+  await push.updateSettings(who.id, { proactive_suggestions: true });
   const keys = await generateVapidKeys();
   const endpoint = `https://push.example.test/${who.id}`;
   phones.set(endpoint, {

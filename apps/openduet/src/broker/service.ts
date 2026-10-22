@@ -705,6 +705,8 @@ export class BrokerService implements BrokerOperations {
     const access = await agentAccess(tx, job.id);
     if (
       access.paused ||
+      (access.followupConnection && access.followupConnection !== connectionId) ||
+      (access.chat && access.followupConnection && kind !== 'email.draft') ||
       (access.allowed && !access.allowed.includes(connectionId)) ||
       access.missingAgent ||
       (access.chat && !access.agentId)
@@ -792,6 +794,11 @@ export class BrokerService implements BrokerOperations {
    * refusal comes back as a broker fault the model can read and correct.
    */
   async runTool(claims: CapabilityClaims, name: string, input: unknown): Promise<unknown> {
+    if ((await agentAccess(this.sql, claims.job_id)).followupConnection)
+      throw new BrokerFault(
+        'scope_denied',
+        'This thread watch may prepare its draft; it cannot start or manage other work.',
+      );
     if (!this.options.runs) throw new BrokerFault('unknown_tool');
     try {
       if (name === 'run.try') {
@@ -822,6 +829,11 @@ export class BrokerService implements BrokerOperations {
    * every detail's origin; a refusal comes back as a fault the model can read.
    */
   async intentTool(claims: CapabilityClaims, input: unknown): Promise<unknown> {
+    if ((await agentAccess(this.sql, claims.job_id)).followupConnection)
+      throw new BrokerFault(
+        'scope_denied',
+        'A thread watch cannot turn its source material into new responsibilities.',
+      );
     if (!this.options.intents) throw new BrokerFault('unknown_tool');
     try {
       return await this.options.intents.capture(claims, input);
@@ -919,6 +931,11 @@ export class BrokerService implements BrokerOperations {
    * execution fence all decide it the same way, and it is a tool entry.
    */
   async followUp(claims: CapabilityClaims): Promise<EffectProposalResponse> {
+    if ((await agentAccess(this.sql, claims.job_id)).followupConnection)
+      throw new BrokerFault(
+        'scope_denied',
+        'This responsibility can prepare only its confirmed customer draft.',
+      );
     const port = this.options.chaseFollowUp;
     const next = port
       ? await this.sql.begin(async (tx) => {
@@ -1087,6 +1104,7 @@ export class BrokerService implements BrokerOperations {
     guests: GuestCounts = NO_GUESTS,
   ): Promise<Admissibility> {
     const access = await agentAccess(tx, job.id);
+    const followupSend = Boolean(access.followupConnection && tool.name === 'email.send');
     const settings = this.options.autoReview ? await loadApprovalSettings(tx, job.space_id) : null;
     const money = this.moneyOf(action, tool);
     // A message the person said to send in this turn goes out on its own, held
@@ -1115,6 +1133,7 @@ export class BrokerService implements BrokerOperations {
     const handsOff = tool.name === 'room.handoff' && provider === 'room';
     // The connector itself says the person decides this one, whatever the settings.
     const connectorAsks =
+      followupSend ||
       this.options.connectors.get(action.connection_id)?.asksFirst?.(action) === true;
     // Kept in the person's own space, where they can delete it: the tool's
     // own question about reaching outside does not apply to this one. A room's
@@ -1201,6 +1220,7 @@ export class BrokerService implements BrokerOperations {
       !money &&
       !dont &&
       !roomWork &&
+      !followupSend &&
       warnings.length > 0 &&
       this.options.resolveScopedGrant
         ? await this.options.resolveScopedGrant(tx, input)
@@ -1211,6 +1231,7 @@ export class BrokerService implements BrokerOperations {
         !money &&
         !dont &&
         !roomWork &&
+        !followupSend &&
         warnings.length === 0 &&
         this.options.resolveStandingGrant !== undefined &&
         (await this.options.resolveStandingGrant(tx, input)));

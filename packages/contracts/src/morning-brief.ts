@@ -6,6 +6,9 @@
 
 /** The title every morning brief is saved under, so a client can tell one is set up. */
 export const MORNING_BRIEF_TITLE = 'Your morning brief';
+/** Stable identity, independent of the routine's editable title. */
+export const MORNING_BRIEF_PURPOSE = 'personal.daily_brief';
+export const MORNING_BRIEF_DEFAULT_AT = '08:00';
 
 /** Topics a client may offer for the brief's news line; any short topic is accepted. */
 export const MORNING_BRIEF_TOPICS = [

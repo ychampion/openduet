@@ -260,6 +260,8 @@ export async function imapChanges(
 }
 
 export interface MailTransport {
+  /** Fresh, complete bounded thread including Sent; a partial read must fail closed. */
+  thread?(key: number | string): Promise<MailMessage[] | null>;
   /** Newest first. The inbox unless `folder` says otherwise. */
   search(query: string, limit: number, folder?: MailFolder): Promise<MailMessage[]>;
   /** By UID for IMAP, by id for a mailbox that addresses messages that way. */

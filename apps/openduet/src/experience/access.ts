@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import type { Query } from '../broker/records.ts';
 import type { Transaction } from '../db/transaction.ts';
+import { FOLLOWUP_BINDINGS } from '../responsibilities/binding.ts';
 
 /**
  * The active turn pins its agent; changing the header selects the following
@@ -8,14 +9,17 @@ import type { Transaction } from '../db/transaction.ts';
  * space's own agent's, OpenDuet's, as deleting it moves its chats there.
  */
 export async function agentAccess(tx: Query, jobId: string) {
-  const [row] =
-    await tx`select j.kind, j.paused, j.current_turn_id, coalesce(t.agent_id, j.agent_id) as bound_agent_id, a.id, a.allowed_connection_ids, a.asks_before_acting,
-      a.uses_computer, a.reads_memory, a.writes_memory
+  const [row] = await tx.unsafe(
+    `select j.kind, j.paused, j.current_turn_id, coalesce(t.agent_id, j.agent_id) as bound_agent_id, a.id, a.allowed_connection_ids, a.asks_before_acting,
+      a.uses_computer, a.reads_memory, a.writes_memory,
+      (select binding.connection_id from (${FOLLOWUP_BINDINGS}) binding limit 1) as followup_connection_id
     from job j left join experience_turn t on t.id = j.current_turn_id
     left join agent b on b.id = coalesce(t.agent_id, j.agent_id) and b.space_id = j.space_id
     left join agent a on a.space_id = j.space_id
       and case when b.deleted_at is null then a.id = b.id else a.is_default end
-    where j.id = ${jobId}`;
+    where j.id = $1`,
+    [jobId],
+  );
   return accessOf(row);
 }
 
@@ -24,7 +28,8 @@ export async function agentAccessIn(tx: Transaction, jobId: string): Promise<Age
   const [row] = await tx.execute<
     Record<string, unknown>
   >(sql`select j.kind, j.paused, j.current_turn_id, coalesce(t.agent_id, j.agent_id) as bound_agent_id, a.id, a.allowed_connection_ids, a.asks_before_acting,
-      a.uses_computer, a.reads_memory, a.writes_memory
+      a.uses_computer, a.reads_memory, a.writes_memory,
+      (select binding.connection_id from (${sql.raw(FOLLOWUP_BINDINGS)}) binding limit 1) as followup_connection_id
     from job j left join experience_turn t on t.id = j.current_turn_id
     left join agent b on b.id = coalesce(t.agent_id, j.agent_id) and b.space_id = j.space_id
     left join agent a on a.space_id = j.space_id
@@ -44,6 +49,8 @@ function accessOf(row: Record<string, unknown> | undefined) {
     agentId: row?.id as string | undefined,
     allowed: (row?.allowed_connection_ids ?? undefined) as string[] | undefined,
     asksBeforeActing: row?.asks_before_acting !== false,
+    /** A confirmed thread permits preparing a local draft; its source is supplied by the scoped reader. */
+    followupConnection: row?.followup_connection_id as string | undefined,
     /** Work with no agent of its own (a job, an evaluation) is not narrowed here. */
     usesComputer: row?.uses_computer !== false,
     readsMemory: row?.reads_memory !== false,
@@ -69,7 +76,9 @@ export const computerTool = (kind: string) =>
  * no agent is offered none, and an agent narrowed to some connections only those.
  */
 export const connectionOffered = (access: AgentAccess, connectionId: string): boolean =>
-  !(access.chat && !access.agentId) && !(access.allowed && !access.allowed.includes(connectionId));
+  !(access.chat && !access.agentId) &&
+  !(access.allowed && !access.allowed.includes(connectionId)) &&
+  !(access.followupConnection && access.followupConnection !== connectionId);
 
 /**
  * Whether the agent is offered one of a connection's tools, by its name. In a
@@ -77,7 +86,9 @@ export const connectionOffered = (access: AgentAccess, connectionId: string): bo
  * it in the turn being answered (`told`, from `broker/told.ts`).
  */
 export const toolOffered = (access: AgentAccess, name: string, told = false): boolean =>
-  !(access.chat && directSend(name) && !told) && !(!access.usesComputer && computerTool(name));
+  !(access.chat && directSend(name) && !told) &&
+  !(!access.usesComputer && computerTool(name)) &&
+  !(access.chat && access.followupConnection && name !== 'email.draft');
 
 /**
  * The broker catalog's rule for one tool, for anything that must agree with it:

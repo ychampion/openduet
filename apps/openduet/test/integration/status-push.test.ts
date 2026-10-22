@@ -322,9 +322,12 @@ const MINUTE = 60_000;
 
   test('the person’s switches are respected', async () => {
     const who = await person();
-    await db
-      .insert(pushSetting)
-      .values({ principalId: who.principalId, decisions: false, settled: false });
+    await db.insert(pushSetting).values({
+      principalId: who.principalId,
+      decisions: false,
+      settled: false,
+      taskResults: false,
+    });
     await conversation(who, {
       state: 'waiting_for_input',
       status: 'needs_you',
