@@ -53,8 +53,15 @@ hashes and encoded response bodies still represented the original brand.
 Those fixtures have now been regenerated through their documented stand-ins;
 all 109 authoring tests and all 109 subsequent replay tests passed. The release
 branding check now also inspects encoded payloads. A fresh full CI result is
-required before final verification. The 13 todo entries identify the full-suite
-runner's missing Chromium prerequisite; separate real-browser CI jobs passed.
+required before final verification. The second full run passed 9,698 tests with
+one timeout in a backup-stream fixture. That fixture opened a Bun pipe writer
+without closing it, which can keep its child process alive; it now calls
+[`FileSink.end()`](https://bun.sh/reference/bun/FileSink) after its deliberate
+delay. All 19 streaming-file tests and 20 consecutive runs of the previously
+hanging case passed afterward. Production streaming code was unchanged.
+
+The 13 todo entries identify missing Chromium or opt-in Docker proof
+prerequisites in the full-suite job; separate real-browser CI jobs passed.
 
 Earlier affected-file reruns corrected fixed-length branding assertions, a
 DNS-dependent browser fixture and database-wake time budgets. The browser file

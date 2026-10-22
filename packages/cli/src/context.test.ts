@@ -235,11 +235,13 @@ for (;;) { out.write(new Uint8Array(65536)); await out.flush(); await Bun.sleep(
 
   test('a sink that has read every byte may exit before the source closes, as tar does at its end marker', async () => {
     const size = 300_000;
+    // The fixture owns this pipe writer: close it after the deliberate delay.
+    // An open FileSink can otherwise keep the Bun child alive indefinitely.
     const source = {
       command: [
         bun,
         '-e',
-        `const out = Bun.stdout.writer(); out.write(new Uint8Array(${size})); await out.flush(); await Bun.sleep(400);`,
+        `const out = Bun.stdout.writer(); out.write(new Uint8Array(${size})); await out.flush(); await Bun.sleep(400); await out.end();`,
       ],
     };
     const result = await stream(source, [
