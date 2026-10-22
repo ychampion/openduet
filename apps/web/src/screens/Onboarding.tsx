@@ -319,7 +319,7 @@ export function SignInScreen({ signedIn }: { signedIn: boolean }) {
             </h1>
             <p style={{ fontSize: 15, lineHeight: '22px', color: 'var(--muted)' }}>
               {creating
-                ? 'This is the first account on this installation. Your agents come next.'
+                ? 'This is the first account on this installation. Hand off your first task next.'
                 : link
                   ? 'Finish signing in with the link from your email.'
                   : provider && !passwordSignIn

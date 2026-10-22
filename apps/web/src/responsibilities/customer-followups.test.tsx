@@ -13,6 +13,7 @@ test('a nonexistent spring-forward deadline is refused rather than silently move
 
 test('an autumn repeated wall time resolves to an actual matching instant', () => {
   const instant = zonedInstant('2026-11-01T01:30', 'America/New_York');
+  if (instant === null) throw new Error('A repeated local deadline must resolve to an instant.');
   expect(['2026-11-01T05:30:00.000Z', '2026-11-01T06:30:00.000Z']).toContain(instant);
 });
 

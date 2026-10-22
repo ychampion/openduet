@@ -11,6 +11,7 @@ import {
   beginHandoff,
   discardHandoff,
   type HandoffDraft,
+  handoffHasTarget,
   loadHandoff,
   saveHandoff,
   submitHandoff,
@@ -28,6 +29,7 @@ import {
 import { givenName } from '../experience/profile.ts';
 import { markValueMoment } from '../experience/push.ts';
 import { updateRequestDraft } from '../experience/request-draft.ts';
+import { TaskDependencies, type TaskDependency } from '../experience/task-dependency.tsx';
 import { LearningActions } from '../learning/LearningActions.tsx';
 import { models } from '../models/api.ts';
 import { primaryModelReady } from '../models/readiness.ts';
@@ -50,10 +52,14 @@ function FeedResult({
   reference,
   onOpen,
   onReply,
+  onConnectSource,
+  onProvideContext,
 }: {
   reference: PersonalReference;
   onOpen: (reference: PersonalReference) => void;
   onReply: (reference: PersonalReference, turnId?: string) => void;
+  onConnectSource: (dependency: TaskDependency) => void;
+  onProvideContext: (reference: PersonalReference) => void;
 }) {
   const result = useLoad(
     () => adapter.turnsPage(reference.conversation_id, { limit: 8, events: true }),
@@ -134,6 +140,13 @@ function FeedResult({
                 : reference.status.replaceAll('_', ' ')}
         </span>
       </div>
+      <TaskDependencies
+        conversationId={reference.conversation_id}
+        status={reference.status}
+        updatedAt={reference.updated_at}
+        onConnect={onConnectSource}
+        onProvideContext={() => onProvideContext(reference)}
+      />
       {answer.trim() ? (
         <div className="personal-answer">
           <Markdown
@@ -273,8 +286,13 @@ export function PersonalChatScreen() {
   const [text, setText] = useState(() => savedDraft?.text ?? route.query.get('request') ?? '');
   const [busy, setBusy] = useState(false);
   const [showAll, setShowAll] = useState(false);
-  const [target, setTarget] = useState<{ value: PersonalTarget; title: string } | null>(null);
+  const [target, setTarget] = useState<{ value: PersonalTarget; title: string } | null>(() =>
+    savedDraft?.target && savedDraft.target.kind !== 'new_task'
+      ? { value: savedDraft.target, title: savedDraft.targetTitle ?? 'Selected task' }
+      : null,
+  );
   const [selected, setSelected] = useState<PersonalReference | null>(null);
+  const [contextFor, setContextFor] = useState<string | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
   const files = useAttachments();
   const composeRef = useRef<HTMLDivElement>(null);
@@ -339,13 +357,18 @@ export function PersonalChatScreen() {
     if (draft?.id === id) {
       setSavedDraft(draft);
       setText(draft.text);
+      setTarget(
+        draft.target && draft.target.kind !== 'new_task'
+          ? { value: draft.target, title: draft.targetTitle ?? 'Selected task' }
+          : null,
+      );
     }
   }, [route.query]);
   useEffect(() => {
     if (
       (!noModel && !savedDraft) ||
       savedDraft?.attempted ||
-      target ||
+      (target && !savedDraft) ||
       (!text.trim() && !files.ready.length)
     )
       return;
@@ -354,7 +377,11 @@ export function PersonalChatScreen() {
       const ids = new Set(files.ready.map((file) => file.id));
       const removed = new Set([...localFileIds.current].filter((id) => !ids.has(id)));
       localFileIds.current = ids;
-      const next = updateRequestDraft(current, text, files.ready, removed);
+      const next = {
+        ...updateRequestDraft(current, text, files.ready, removed),
+        target: target?.value ?? { kind: 'new_task' as const },
+        targetTitle: target?.title,
+      };
       if (JSON.stringify(current) !== JSON.stringify(next) || !savedDraft) {
         saveHandoff(next);
         setSavedDraft(next);
@@ -422,6 +449,7 @@ export function PersonalChatScreen() {
     requestAnimationFrame(() => composeRef.current?.querySelector('textarea')?.focus());
   const closeInspector = useCallback(() => {
     setSelected(null);
+    setContextFor(null);
     opener.current?.focus();
   }, []);
   useEffect(() => {
@@ -457,8 +485,51 @@ export function PersonalChatScreen() {
   const open = (reference: PersonalReference) => {
     opener.current = document.activeElement as HTMLElement | null;
     setSelected(reference);
+    setContextFor(null);
     if (session.data?.session.references.some((item) => item.id === reference.id))
       void personal.read(reference.id).then(() => session.reload());
+  };
+  const preserveBeforeRecovery = (): boolean => {
+    if (!text.trim() && !files.ready.length && !savedDraft?.attachments.length) return true;
+    if (files.uploading || files.files.some((file) => file.state !== 'ready')) {
+      toast({
+        kind: 'err',
+        title: 'Wait for your files to finish uploading before opening setup.',
+      });
+      return false;
+    }
+    try {
+      const kept = savedDraft?.attempted
+        ? savedDraft
+        : saveHandoff({
+            ...updateRequestDraft(savedDraft ?? beginHandoff(text, files.ready), text, files.ready),
+            target: target?.value ?? { kind: 'new_task' },
+            targetTitle: target?.title,
+          });
+      setSavedDraft(kept);
+      navigate(`/?starter=${encodeURIComponent(kept.id)}`);
+      return true;
+    } catch (error) {
+      toast({
+        kind: 'err',
+        title: error instanceof Error ? error.message : 'Couldn’t keep your request.',
+      });
+      return false;
+    }
+  };
+  const connectSource = (dependency: TaskDependency) => {
+    if (!preserveBeforeRecovery()) return;
+    window.open(href('/settings/connections'), '_blank', 'noopener,noreferrer');
+    toast({
+      kind: 'info',
+      title: `Reconnect ${dependency.label} in Connections, then return to this task.`,
+    });
+  };
+  const provideContext = (reference: PersonalReference) => {
+    if (!preserveBeforeRecovery()) return;
+    open(reference);
+    setContextFor(reference.conversation_id);
+    requestAnimationFrame(() => inspectorRef.current?.querySelector('textarea')?.focus());
   };
   const reply = (reference: PersonalReference, turnId?: string) => {
     const value = targetOf({
@@ -487,10 +558,15 @@ export function PersonalChatScreen() {
       submission.current = { identity, key: messageKey() };
     let held: HandoffDraft | null = null;
     try {
-      held =
-        value.kind === 'new_task' && savedDraft
-          ? saveHandoff(updateRequestDraft(savedDraft, text, files.ready))
-          : null;
+      if (savedDraft?.attempted && !handoffHasTarget(savedDraft, value))
+        throw new Error('Recover the submitted request before choosing another task.');
+      held = savedDraft
+        ? saveHandoff({
+            ...updateRequestDraft(savedDraft, text, files.ready),
+            target: value,
+            targetTitle: target?.title,
+          })
+        : null;
     } catch (error) {
       toast({
         kind: 'err',
@@ -580,7 +656,7 @@ export function PersonalChatScreen() {
         id={selected.conversation_id}
         embedded
         focusTurnId={selected.turn_id}
-        hideComposer
+        hideComposer={contextFor !== selected.conversation_id}
       />
     </aside>
   ) : null;
@@ -711,6 +787,8 @@ export function PersonalChatScreen() {
                 reference={reference}
                 onOpen={open}
                 onReply={reply}
+                onConnectSource={connectSource}
+                onProvideContext={provideContext}
               />
             ))}
             {!references.length && !unfinished.length ? (

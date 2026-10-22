@@ -3,6 +3,7 @@ import {
   beginHandoff,
   discardHandoff,
   type HandoffTransport,
+  handoffHasTarget,
   loadHandoff,
   removeHandoffAttachment,
   saveHandoff,
@@ -233,4 +234,58 @@ test('a reviewed request zone survives setup refresh and an attempted retry with
   );
   expect(received).toEqual(['America/New_York', 'America/New_York']);
   expect(attempted.id).toBe(draft.id);
+});
+
+test('connection recovery keeps an explicit result target and exact unsent context through refresh', async () => {
+  const kept = storage();
+  const text = '  Please use these notes.\n\nDo not send yet. café £  ';
+  const target = {
+    kind: 'reply_result' as const,
+    conversation_id: 'job_followup',
+    turn_id: 't_draft',
+  };
+  const draft = saveHandoff(
+    {
+      ...beginHandoff(
+        text,
+        [{ id: 'file_notes', name: 'Notes.txt' }],
+        [{ start: 25, end: 41 }],
+        kept,
+      ),
+      target,
+      targetTitle: 'Client follow-up',
+    },
+    kept,
+  );
+  const reloaded = loadHandoff(kept);
+  expect(reloaded).toEqual(draft);
+  if (!reloaded) throw new Error('The preserved recovery context disappeared');
+  expect(handoffHasTarget(reloaded, target)).toBe(true);
+  expect(handoffHasTarget(reloaded, { ...target, conversation_id: 'job_other' })).toBe(false);
+  expect(handoffHasTarget(reloaded, { ...target, turn_id: 't_other' })).toBe(false);
+  expect(handoffHasTarget(reloaded, { kind: 'new_task' })).toBe(false);
+  let received: unknown;
+  await submitHandoff(
+    reloaded,
+    async (request) => {
+      received = {
+        text: request.text,
+        attachments: request.attachments,
+        pasted: request.pasted,
+        target: request.target,
+      };
+      return { data: null, error: 'Response lost', unavailable: null };
+    },
+    kept,
+  );
+  expect(received).toEqual({
+    text,
+    attachments: ['file_notes'],
+    pasted: [{ start: 25, end: 41 }],
+    target,
+  });
+  expect(() => saveHandoff({ ...draft, target: { kind: 'new_task' } }, kept)).toThrow(
+    'already submitted',
+  );
+  expect(loadHandoff(kept)?.target).toEqual(target);
 });

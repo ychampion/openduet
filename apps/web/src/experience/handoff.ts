@@ -4,6 +4,7 @@
  * refresh or second tab resolves to the same task and first turn.
  */
 import { API_BASE_URL, client, type Result } from './adapter.ts';
+import type { PersonalTarget } from './personal-session.ts';
 
 export type HandoffDraft = {
   id: string;
@@ -15,6 +16,9 @@ export type HandoffDraft = {
   timeZone: string;
   attempted: boolean;
   conversationId: string | null;
+  /** An explicitly selected task/result when this composer is kept for setup. */
+  target?: PersonalTarget;
+  targetTitle?: string;
 };
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
@@ -47,6 +51,21 @@ export function loadHandoff(storage = store()): HandoffDraft | null {
       !(draft.conversationId === null || typeof draft.conversationId === 'string')
     )
       return null;
+    if (draft.target !== undefined) {
+      const target = draft.target;
+      if (!target || typeof target !== 'object') return null;
+      if (
+        !(
+          target.kind === 'new_task' ||
+          (target.kind === 'continue_task' && typeof target.conversation_id === 'string') ||
+          (target.kind === 'reply_result' &&
+            typeof target.conversation_id === 'string' &&
+            typeof target.turn_id === 'string')
+        )
+      )
+        return null;
+    }
+    if (draft.targetTitle !== undefined && typeof draft.targetTitle !== 'string') return null;
     return draft as HandoffDraft;
   } catch {
     return null;
@@ -59,7 +78,13 @@ export function saveHandoff(draft: HandoffDraft, storage = store()): HandoffDraf
   const current = loadHandoff(storage);
   if (current?.id === draft.id && current.attempted) {
     const payload = (value: HandoffDraft) =>
-      JSON.stringify([value.text, value.attachments, value.pasted, value.timeZone]);
+      JSON.stringify([
+        value.text,
+        value.attachments,
+        value.pasted,
+        value.timeZone,
+        value.target ?? { kind: 'new_task' },
+      ]);
     if (payload(current) !== payload(draft))
       throw new Error(
         'This request was already submitted. Recover its saved result before editing it.',
@@ -114,6 +139,17 @@ export function beginHandoff(
   );
 }
 
+export function handoffHasTarget(draft: HandoffDraft, target: PersonalTarget): boolean {
+  const kept = draft.target ?? { kind: 'new_task' };
+  if (kept.kind !== target.kind) return false;
+  if (kept.kind === 'new_task') return true;
+  if (target.kind === 'new_task' || kept.conversation_id !== target.conversation_id) return false;
+  return (
+    kept.kind !== 'reply_result' ||
+    (target.kind === 'reply_result' && kept.turn_id === target.turn_id)
+  );
+}
+
 /** Removing the local copy never stops or changes a submitted task. */
 export function discardHandoff(id?: string, storage = store()) {
   if (id && loadHandoff(storage)?.id !== id) return;
@@ -134,7 +170,7 @@ const send: HandoffTransport = async (draft) => {
         'Idempotency-Key': draft.id,
       },
       body: JSON.stringify({
-        target: { kind: 'new_task' },
+        target: draft.target ?? { kind: 'new_task' },
         text: draft.text,
         ...(draft.attachments.length ? { attachments: draft.attachments } : {}),
         ...(draft.pasted.length ? { pasted: draft.pasted } : {}),
