@@ -162,11 +162,20 @@ describe('screenshots an earlier version left in a workspace', () => {
     const store = path.join(work, DEVICE_SCREENS_DIRECTORY);
     await writeFile(store, 'in the way');
     const said: string[] = [];
+    let retryReported = () => {};
+    const firstRetry = new Promise<void>((resolve) => {
+      retryReported = resolve;
+    });
     const done = moveWorkspaceScreensUntilDone(work, {
-      report: (line) => said.push(line),
+      report: (line) => {
+        said.push(line);
+        if (line.includes('trying again')) retryReported();
+      },
       retryMs: 20,
     });
-    await Bun.sleep(60);
+    // Filesystem work can outlast a short sleep on a loaded runner. Keep the
+    // obstruction until an actual failed attempt has reported its retry.
+    await firstRetry;
     expect(said.some((line) => line.includes('trying again'))).toBe(true);
     await rm(store);
     await done;

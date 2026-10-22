@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import type { AttemptBundle, RuntimeAdapter } from '@openduet/contracts';
 import { loadEnv } from '../env.ts';
 import { checkModelRuntime, type ReadinessProbeOptions } from './model-readiness.ts';
@@ -169,6 +169,31 @@ test('provider failures distinguish authentication, billing, missing models and 
       tools: 'not_checked',
       code,
     });
+});
+
+test('a readiness refusal reaches its named operator log with the provider key redacted', async () => {
+  const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    const result = await probe({
+      status: 400,
+      text: JSON.stringify({
+        error: {
+          type: 'invalid_request_error',
+          message: 'unsupported tool schema; credential fixture-key-only',
+        },
+      }),
+    }).run();
+    const logged = stderr.mock.calls.map((call) => String(call[0])).join('');
+    expect(logged).toContain(
+      'model-readiness gateway: provider_rejected: openai/selected-fixture answered 400 (invalid_request_error: unsupported tool schema; credential [redacted])',
+    );
+    expect(logged).not.toContain(provider.apiKey);
+    expect(result).toMatchObject({ inference: 'failed', tools: 'not_checked' });
+    expect(result.message).not.toContain('unsupported tool schema');
+    expect(result.message).not.toContain(provider.apiKey);
+  } finally {
+    stderr.mockRestore();
+  }
 });
 
 test('a practice provider is refused before launching or calling anything', async () => {

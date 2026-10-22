@@ -23,7 +23,7 @@ import {
 } from '../runtime/supervisor.ts';
 import { LocalWorkspaceFs } from '../runtime/workspace-fs.ts';
 import { dockerEndpoint } from '../sandbox/docker-default.ts';
-import { createModelGateway } from './index.ts';
+import { createModelGateway, gatewayLog } from './index.ts';
 import {
   GatewayError,
   type GatewayProvider,
@@ -198,6 +198,7 @@ export async function checkModelRuntime(options: ReadinessProbeOptions): Promise
     model: { provider: options.provider, model: options.model, fallback: null },
   };
   const gateway = createModelGateway({
+    onError: gatewayLog('model-readiness'),
     privacy: defaultPrivacyRouter(),
     providers: options.providers.filter((p) => p.name === options.provider && !p.fake),
     defaultProvider: options.provider,
