@@ -11,6 +11,10 @@ import { BATCH_OPTIONS, CAP_OPTIONS, deviceLine, quietLine } from './Notificatio
 
 const settings: PushSettings = {
   decisions: true,
+  task_results: true,
+  requested_reminders: true,
+  daily_brief: true,
+  proactive_suggestions: false,
   settled: true,
   weekly_summary: true,
   daily_cap: 4,
@@ -20,7 +24,7 @@ const settings: PushSettings = {
 
 test('quiet hours are the day hours read the other way round', () => {
   expect(quietLine(settings)).toBe(
-    'Nothing is sent from 22:00 until 08:00 (Europe/London), outside your day.',
+    'Other updates wait from 22:00 until 08:00 (Europe/London). Your timed reminders and daily brief use the time you chose.',
   );
 });
 

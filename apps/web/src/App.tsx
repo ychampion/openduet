@@ -10,6 +10,7 @@ import { adapter, type Result, SESSION_ENDED_EVENT, servesBrowser } from './expe
 import { agentIdsIn, throttled, unknownAgentIds } from './experience/agent-freshness.ts';
 import { setDisplayZone } from './experience/clock.ts';
 import { featureOn } from './experience/features.ts';
+import { discardHandoff } from './experience/handoff.ts';
 import { forgetEveryConversation } from './experience/history.ts';
 import {
   AppContext,
@@ -32,6 +33,7 @@ import { AgentsScreen } from './screens/Agents.tsx';
 import { AutomationsScreen } from './screens/Automations.tsx';
 import { ChatsScreen } from './screens/Chats.tsx';
 import { CompaniesScreen } from './screens/Companies.tsx';
+import { ExploreScreen } from './screens/Explore.tsx';
 import { FilesScreen } from './screens/Files.tsx';
 import { HomeScreen } from './screens/Home.tsx';
 import { OnboardingScreen, SignInScreen } from './screens/Onboarding.tsx';
@@ -296,6 +298,7 @@ export function App() {
   const clearSignedIn = useCallback(() => {
     // Nothing read under this sign-in is drawn under the next one.
     forgetEveryConversation();
+    discardHandoff();
     setAgents([]);
     setAgentsLoaded(false);
     setConversations([]);
@@ -429,6 +432,8 @@ export function App() {
     screen = <ChatsScreen />;
   } else if (head === 'chat') {
     screen = <ChatScreen key={second ?? 'new'} id={second ?? null} />;
+  } else if (head === 'explore') {
+    screen = <ExploreScreen />;
   } else if (head === 'agents' && opensAgents(member)) {
     screen = <AgentsScreen selected={second ?? null} />;
   } else if (head === 'plans') {
@@ -437,7 +442,7 @@ export function App() {
     screen = <RoomsRoute parts={route.parts} />;
   } else if (head === 'companies' && featureOn(capabilities, 'companies')) {
     screen = <CompaniesScreen />;
-  } else if (head === 'runs') {
+  } else if (head === 'runs' || head === 'work') {
     screen = <WorkScreen key={second ?? 'all'} id={second ?? null} />;
   } else if (head === 'files') {
     screen = <FilesScreen />;
@@ -450,7 +455,9 @@ export function App() {
     if (second === 'learned') window.location.replace('#/settings/memory');
     screen = (
       <SettingsScreen
-        tab={second === 'learned' ? 'memory' : (second ?? 'account')}
+        tab={
+          second === 'learned' ? 'memory' : second === 'about' ? 'account' : (second ?? 'account')
+        }
         detail={route.parts[2] ?? null}
       />
     );

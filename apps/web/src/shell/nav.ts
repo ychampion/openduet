@@ -7,8 +7,9 @@ export const NAV: {
   path: string;
   match: (path: string) => boolean;
 }[] = [
-  { icon: 'home', label: 'Home', path: '/', match: (p) => p === '/' },
-  { icon: 'chat', label: 'Chat', path: '/chat', match: (p) => p.startsWith('/chat') },
+  { icon: 'chat', label: 'Chat', path: '/', match: (p) => p === '/' || p.startsWith('/chat') },
+  { icon: 'search', label: 'Explore', path: '/explore', match: (p) => p.startsWith('/explore') },
+  { icon: 'chat', label: 'Task history', path: '/chat', match: () => false },
   {
     icon: 'piggy',
     label: 'Companies',
@@ -16,7 +17,12 @@ export const NAV: {
     match: (p) => p.startsWith('/companies'),
   },
   { icon: 'plans', label: 'Plans', path: '/plans', match: (p) => p.startsWith('/plans') },
-  { icon: 'progress', label: 'Work', path: '/runs', match: (p) => p.startsWith('/runs') },
+  {
+    icon: 'progress',
+    label: 'Work',
+    path: '/runs',
+    match: (p) => p.startsWith('/runs') || p.startsWith('/work') || p.startsWith('/automations'),
+  },
   { icon: 'users', label: 'Rooms', path: '/rooms', match: (p) => p.startsWith('/rooms') },
   { icon: 'smile', label: 'Agents', path: '/agents', match: (p) => p.startsWith('/agents') },
   {
@@ -34,6 +40,8 @@ export const NAV: {
   { icon: 'files', label: 'Files', path: '/files', match: (p) => p.startsWith('/files') },
   { icon: 'apps', label: 'Apps', path: '/apps', match: (p) => p.startsWith('/apps') },
 ];
+
+export const PRIMARY_PATHS: ReadonlySet<string> = new Set(['/', '/runs', '/explore']);
 
 /**
  * The sections a sign-in reaches. A guest reaches only the rooms they were

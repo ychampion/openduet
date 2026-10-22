@@ -1,0 +1,97 @@
+html[data-sample-day="true"] {
+  --sample-banner-size: 46px;
+}
+html[data-sample-day="true"] .personal-inspector-overlay {
+  top: var(--sample-banner-height, var(--sample-banner-size));
+}
+html[data-sample-day="true"] #root {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+.sample-banner {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 20px;
+  background: #f8e6dc;
+  color: #44271c;
+  border-bottom: 1px solid #d7b5a6;
+  font:
+    13px / 1.5 "DM Sans Variable",
+    sans-serif;
+  z-index: 2001;
+  position: relative;
+  min-height: var(--sample-banner-size);
+  box-sizing: border-box;
+}
+.sample-banner button {
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sample-guide {
+  position: absolute;
+  top: calc(var(--sample-banner-height, var(--sample-banner-size)) + 6px);
+  right: 20px;
+  width: min(560px, calc(100vw - 40px));
+  max-height: calc(100dvh - var(--sample-banner-height, var(--sample-banner-size)) - 24px);
+  overflow-y: auto;
+  background: var(--surface, #faf9f5);
+  border: 1px solid var(--line, #ccc);
+  color: var(--ink, #141413);
+  box-shadow: 0 12px 40px #0002;
+  border-radius: 12px;
+  padding: 20px;
+  z-index: 90;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.sample-guide h2 {
+  font-size: 20px;
+  line-height: 1.3;
+  margin: 0 0 12px;
+}
+.sample-guide ol {
+  padding-left: 20px;
+}
+.sample-guide li {
+  margin-block: 12px;
+}
+.sample-app {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+.sample-app > .shell {
+  height: 100%;
+}
+.sample-error {
+  margin: auto;
+  max-width: 560px;
+  padding: 32px;
+}
+@media (max-width: 600px) {
+  html[data-sample-day="true"] {
+    --sample-banner-size: 64px;
+  }
+  .sample-banner {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  .sample-explanation {
+    display: block;
+  }
+  .sample-guide {
+    right: 12px;
+    width: calc(100vw - 24px);
+    padding: 16px;
+  }
+}

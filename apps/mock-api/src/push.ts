@@ -28,6 +28,10 @@ export function mountPushMock(
   const devices: Device[] = [];
   const settings = {
     decisions: true,
+    task_results: true,
+    requested_reminders: true,
+    daily_brief: true,
+    proactive_suggestions: false,
     settled: true,
     weekly_summary: true,
     daily_cap: 4,

@@ -1,14 +1,16 @@
 /**
  * Phone presence in the browser. The service worker is registered on load so
  * the app can be installed, but a person is only asked about pushes after the
- * first moment OpenDuet was worth hearing from: a decision made, or a chase
- * settled. Never on the first visit.
+ * first useful completed task. Approvals and manual status edits alone do not
+ * establish that value moment.
  */
+
+import { sampleMode } from '../sample/mode.ts';
 import { adapter } from './adapter.ts';
 import { instanceName } from './instance.ts';
 import type { PushDevice } from './types.ts';
 
-const MOMENT_KEY = 'openduet.push.moment';
+const MOMENT_KEY = 'openduet.push.useful-result.v1';
 const DISMISSED_KEY = 'openduet.push.dismissed';
 export const MOMENT_EVENT = 'openduet:value-moment';
 
@@ -31,6 +33,7 @@ const storage = {
 
 export function pushSupported(): boolean {
   return (
+    !sampleMode &&
     typeof window !== 'undefined' &&
     'serviceWorker' in navigator &&
     'PushManager' in window &&
@@ -40,7 +43,7 @@ export function pushSupported(): boolean {
 
 /** Registers the service worker; a tapped push that finds this tab moves it to the decision. */
 export function registerServiceWorker(): void {
-  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+  if (sampleMode || typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
   void navigator.serviceWorker.register('/sw.js').catch(() => {
     // Not installable in this browser; everything else works the same.
   });
@@ -54,7 +57,7 @@ export function registerServiceWorker(): void {
 
 /** The first moment worth a push: remembered, and announced to whatever offers it. */
 export function markValueMoment(): void {
-  if (storage.get(MOMENT_KEY)) return;
+  if (sampleMode || storage.get(MOMENT_KEY)) return;
   storage.set(MOMENT_KEY, new Date().toISOString());
   window.dispatchEvent(new Event(MOMENT_EVENT));
 }
@@ -135,6 +138,12 @@ export type EnableResult =
 
 /** Asks the browser, subscribes, and tells the service about this device. */
 export async function enablePush(): Promise<EnableResult> {
+  if (sampleMode)
+    return {
+      ok: false,
+      reason: 'not_configured',
+      message: 'Sample day does not request notification permission or subscribe this browser.',
+    };
   if (!pushSupported())
     return {
       ok: false,

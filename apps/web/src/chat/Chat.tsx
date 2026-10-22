@@ -10,6 +10,7 @@ import type { AttachmentView } from '@openduet/contracts/attachments';
 import { mentionedAgent } from '@openduet/contracts/mention';
 import {
   Fragment,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -46,6 +47,7 @@ import {
   useNow,
 } from '../experience/hooks.ts';
 import { Outbox } from '../experience/outbox.ts';
+import { personal } from '../experience/personal-session.ts';
 import {
   latestTurn,
   markPermission,
@@ -71,7 +73,7 @@ import type {
 } from '../experience/types.ts';
 import { NEW_CHAT_AGAIN, navigate, useRoute } from '../router.ts';
 import { RunChatCards } from '../runs/RunCards.tsx';
-import { RailToggle, Shell, toast } from '../shell/Shell.tsx';
+import { RailToggle, Shell, type ShellProps, toast } from '../shell/Shell.tsx';
 import { AutonomyAskCard } from './AutonomyAsk.tsx';
 import { useAttachments } from './attachments.ts';
 import { shownBlocks } from './blocks.ts';
@@ -555,29 +557,55 @@ import type { Transcript } from '../experience/reduce.ts';
 const TranscriptContext = createContext<{ transcript: Transcript } | null>(null);
 
 /** A routine writes each run here on its schedule; a question about a result starts a chat. */
-function RoutineThreadNote() {
+function RoutineThreadNote({
+  conversationId,
+  turnId,
+  title,
+}: {
+  conversationId: string;
+  turnId: string | null;
+  title: string;
+}) {
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const key = useRef(messageKey());
+  const files = useAttachments();
+  const send = async () => {
+    if (!turnId || busy || (!text.trim() && !files.ready.length)) return;
+    setBusy(true);
+    const result = await personal.message(
+      { kind: 'reply_result', conversation_id: conversationId, turn_id: turnId },
+      text.trim(),
+      key.current,
+      files.ready.map((file) => file.id),
+    );
+    setBusy(false);
+    if (!result.data) {
+      toast({ kind: 'err', title: result.error ?? 'Couldn’t reply to this result' });
+      return;
+    }
+    navigate(`/chat/${result.data.conversation_id}`);
+  };
   return (
-    <div
-      className="row"
-      role="note"
-      style={{
-        gap: 10,
-        padding: '12px 14px',
-        borderRadius: 14,
-        border: '1px solid var(--line)',
-        background: 'var(--surface)',
-        fontSize: 13,
-        color: 'var(--muted)',
-        flexWrap: 'wrap',
-      }}
-    >
-      <Icon name="automations" size={16} />
-      <span className="grow" style={{ minWidth: 200 }}>
-        This routine adds each run here on its schedule. To ask about a result, start a chat.
-      </span>
-      <Button size="sm" variant="outline" icon="plus" onClick={() => navigate('/chat/new')}>
-        New chat
-      </Button>
+    <div className="col" style={{ gap: 8 }}>
+      <div className="task-context">
+        <Icon name="automations" size={16} />
+        <span>{turnId ? `Replying to: ${title}` : 'Select a routine result to reply to it.'}</span>
+        <Button size="sm" variant="ghost" onClick={() => navigate('/')}>
+          New task
+        </Button>
+      </div>
+      <p className="personal-muted">
+        Your reply uses this exact result. The routine keeps its schedule.
+      </p>
+      <Composer
+        value={text}
+        onChange={setText}
+        onSend={() => void send()}
+        attachments={files}
+        disabled={busy || !turnId}
+        placeholder="Ask about or revise this result"
+      />
     </div>
   );
 }
@@ -593,7 +621,26 @@ function useTranscript() {
  */
 let voiceOnArrival: string | null = null;
 
-export function ChatScreen({ id }: { id: string | null }) {
+function EmbeddedChatFrame({ children, panel }: ShellProps & { children: ReactNode }) {
+  return (
+    <div className="embedded-chat" style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+      {children}
+      {panel}
+    </div>
+  );
+}
+
+export function ChatScreen({
+  id,
+  embedded = false,
+  focusTurnId,
+  hideComposer = false,
+}: {
+  id: string | null;
+  embedded?: boolean;
+  focusTurnId?: string;
+  hideComposer?: boolean;
+}) {
   const { agents, removedAgents, refreshConversations, capabilities } = useApp();
   const route = useRoute();
   const conversationId = id && id !== 'new' ? id : null;
@@ -873,7 +920,7 @@ export function ChatScreen({ id }: { id: string | null }) {
   // A link to one answer (`?turn=`, a routine run's "Open result") opens on that answer,
   // unfolding the earlier turns when it is one of them. It is shown once; after that the
   // chat scrolls as usual.
-  const focusTurn = route.query.get('turn');
+  const focusTurn = focusTurnId ?? route.query.get('turn');
   const focusedTurn = useRef<string | null>(null);
   useEffect(() => {
     if (!focusTurn || focusedTurn.current === focusTurn) return;
@@ -1302,8 +1349,9 @@ export function ChatScreen({ id }: { id: string | null }) {
       />
     ) : null;
 
+  const Frame = embedded ? EmbeddedChatFrame : Shell;
   return (
-    <Shell
+    <Frame
       title={title}
       agentId={agentId}
       phoneBack={() => (window.history.length > 1 ? window.history.back() : navigate('/'))}
@@ -1334,7 +1382,7 @@ export function ChatScreen({ id }: { id: string | null }) {
           </>
         ) : undefined
       }
-      rail={!found && !showComputer}
+      rail={false}
       phoneActions={
         <>
           {voiceButton(44)}
@@ -1438,12 +1486,10 @@ export function ChatScreen({ id }: { id: string | null }) {
                   >
                     {agent && !agent.is_default
                       ? `${agent.name} is listening.`
-                      : 'What do you want to get done?'}
+                      : 'What would you like off your plate?'}
                   </span>
                   <span style={{ fontSize: 14, color: 'var(--muted)', maxWidth: 420 }}>
-                    {agent
-                      ? agent.standing_instruction || agent.tone
-                      : `Say it once. ${assistantName()} checks what it needs, does the steps, and comes back for the moments that need you.`}
+                    Send a task, notes, or a file. I’ll keep the work and its result here.
                   </span>
                 </div>
               ) : null}
@@ -1666,53 +1712,90 @@ ${words}`
                   toast({ kind: 'err', title: 'Couldn’t take over', sub: reason })
                 }
               />
-              {conversation?.automation_id ? (
-                <RoutineThreadNote />
-              ) : (
-                <Composer
-                  value={text}
-                  onChange={changeDraft}
-                  onSend={() => void send(text, files.ready, pasteMarks.current)}
-                  attachments={files}
-                  onPasteText={() => {
-                    pasting.current = true;
-                  }}
-                  agentName={
-                    // A turn handed to another agent with @Name is that agent's while it works.
-                    (working ? agentById(agents, last?.turn.agent_id) : null)?.name ??
-                    agent?.name ??
-                    assistantName()
-                  }
-                  placeholder={
-                    agents.length > 1
-                      ? `Message ${agent?.name ?? assistantName()}, or @name`
-                      : `Message ${agent?.name ?? assistantName()}`
-                  }
-                  state={conversationId ? composerState : 'send'}
-                  working={working}
-                  autoFocus={!touch}
-                  onPause={() => conversationId && void pauseTurn(conversationId)}
-                  onResume={() =>
-                    conversationId && void reportFailure(adapter.resume(conversationId), 'resume')
-                  }
-                  onStop={() =>
-                    conversationId && void reportFailure(adapter.stop(conversationId), 'stop')
-                  }
-                  voice={
-                    voice?.push_to_talk
-                      ? {
-                          maxSeconds: voice.max_recording_seconds,
-                          place: voicePlace,
-                          off: voice.off_reason,
-                        }
-                      : undefined
-                  }
+              {working ? (
+                <div className="task-active-row">
+                  <Icon name="loader" size={14} className="spin" />
+                  <span>{title} · In progress</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() =>
+                      conversationId && void reportFailure(adapter.stop(conversationId), 'stop')
+                    }
+                  >
+                    Stop this task
+                  </Button>
+                </div>
+              ) : null}
+              {hideComposer ? null : conversation?.automation_id && conversationId ? (
+                <RoutineThreadNote
+                  conversationId={conversationId}
+                  turnId={focusTurn ?? last?.id ?? null}
+                  title={title}
                 />
+              ) : (
+                <>
+                  {conversationId ? (
+                    <div className="task-context">
+                      <Icon name="chat" size={14} />
+                      <span>Replying to: {title}</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon="plus"
+                        onClick={() =>
+                          navigate(text ? `/?request=${encodeURIComponent(text)}` : '/')
+                        }
+                      >
+                        New task
+                      </Button>
+                    </div>
+                  ) : null}
+                  <Composer
+                    value={text}
+                    onChange={changeDraft}
+                    onSend={() => void send(text, files.ready, pasteMarks.current)}
+                    attachments={files}
+                    onPasteText={() => {
+                      pasting.current = true;
+                    }}
+                    agentName={
+                      // A turn handed to another agent with @Name is that agent's while it works.
+                      (working ? agentById(agents, last?.turn.agent_id) : null)?.name ??
+                      agent?.name ??
+                      assistantName()
+                    }
+                    placeholder={
+                      agents.length > 1
+                        ? `Message ${agent?.name ?? assistantName()}, or @name`
+                        : `Message ${agent?.name ?? assistantName()}`
+                    }
+                    state={conversationId ? composerState : 'send'}
+                    working={working}
+                    autoFocus={!touch}
+                    onPause={() => conversationId && void pauseTurn(conversationId)}
+                    onResume={() =>
+                      conversationId && void reportFailure(adapter.resume(conversationId), 'resume')
+                    }
+                    onStop={() =>
+                      conversationId && void reportFailure(adapter.stop(conversationId), 'stop')
+                    }
+                    voice={
+                      voice?.push_to_talk
+                        ? {
+                            maxSeconds: voice.max_recording_seconds,
+                            place: voicePlace,
+                            off: voice.off_reason,
+                          }
+                        : undefined
+                    }
+                  />
+                </>
               )}
             </div>
           </div>
         </div>
       </TranscriptContext.Provider>
-    </Shell>
+    </Frame>
   );
 }

@@ -35,3 +35,10 @@ test('setup saves the browser zone unless the person already chose one', () => {
   expect(setupTimeZone(null, null)).toBe('UTC');
   expect(setupTimeZone({ time_zone: 'UTC', time_zone_confirmed: false }, null)).toBe('UTC');
 });
+
+test('resumed setup keeps a valid saved request zone verbatim and ignores invalid stored zones', () => {
+  const profile = { time_zone: 'Europe/London', time_zone_confirmed: true };
+  expect(setupTimeZone(profile, 'America/New_York', 'Asia/Calcutta')).toBe('Asia/Calcutta');
+  expect(setupTimeZone(profile, 'America/New_York', 'not/a/time-zone')).toBe('Europe/London');
+  expect(setupTimeZone(null, 'America/New_York', 'not/a/time-zone')).toBe('America/New_York');
+});

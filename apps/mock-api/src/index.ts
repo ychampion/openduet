@@ -8,6 +8,7 @@
  */
 import { mcpCatalogEntry } from '@openduet/contracts';
 import { createMockApp, MOCK_VERSION } from './app.ts';
+import type { ExperienceMock } from './experience.ts';
 import { Runner } from './runner.ts';
 import { loadScenarios } from './scenarios.ts';
 import { seed } from './seed.ts';
@@ -78,28 +79,34 @@ export function createMock(given: MockOptions = {}) {
   const scenarios = loadScenarios();
   const runner = new Runner(store, { speed: options.speed ?? 1 });
   const { spaceId, connections } = seed(store);
-  const app = createMockApp({
-    store,
-    runner,
-    scenarios,
-    spaceId,
-    experienceSpeed: options.speed ?? 1,
-    seedExperience: options.experience?.seed ?? false,
-    setupNeeded: options.setupNeeded ?? false,
-    voice: options.voice ?? true,
-    computer: options.computer ?? true,
-    desktop: options.desktop ?? 'none',
-    space: options.space ?? 'personal',
-    needsYou: options.needsYou !== 'none',
-    reach: options.reach ?? true,
-    multiplayer: options.multiplayer ?? false,
-    composio: options.composio ?? false,
-    firstRun: options.firstRun ?? false,
-    signIn: options.signIn ?? 'password',
-    featuresOff: options.featuresOff ?? [],
-    ...(options.instanceName ? { instanceName: options.instanceName } : {}),
-    ...(options.assistantName ? { assistantName: options.assistantName } : {}),
-  });
+  let experience: ExperienceMock | undefined;
+  const app = createMockApp(
+    {
+      store,
+      runner,
+      scenarios,
+      spaceId,
+      experienceSpeed: options.speed ?? 1,
+      seedExperience: options.experience?.seed ?? false,
+      setupNeeded: options.setupNeeded ?? false,
+      voice: options.voice ?? true,
+      computer: options.computer ?? true,
+      desktop: options.desktop ?? 'none',
+      space: options.space ?? 'personal',
+      needsYou: options.needsYou !== 'none',
+      reach: options.reach ?? true,
+      multiplayer: options.multiplayer ?? false,
+      composio: options.composio ?? false,
+      firstRun: options.firstRun ?? false,
+      signIn: options.signIn ?? 'password',
+      featuresOff: options.featuresOff ?? [],
+      ...(options.instanceName ? { instanceName: options.instanceName } : {}),
+      ...(options.assistantName ? { assistantName: options.assistantName } : {}),
+    },
+    (value) => {
+      experience = value;
+    },
+  );
   if (options.connections === 'none') store.connections.clear();
   if (options.connections === 'apps') {
     const notion = mcpCatalogEntry('notion');
@@ -107,7 +114,8 @@ export function createMock(given: MockOptions = {}) {
     if (notion) addCatalogConnection(store, spaceId, notion);
     if (linear) addCatalogConnection(store, spaceId, linear, 'failing');
   }
-  return { app, store, runner, scenarios, spaceId, connections };
+  if (!experience) throw new Error('Mock experience was not mounted.');
+  return { app, store, runner, scenarios, spaceId, connections, experience };
 }
 
 if (import.meta.main) {

@@ -20,6 +20,8 @@ type MockBelief = {
   setAside: boolean;
   version: string;
   last_used: string | null;
+  /** Explicit saved items are another projection of this belief, not separate memory. */
+  savedItem?: boolean;
 };
 type Step = { belief_id: string; label: string; from: string | null; to: string | null };
 type MockRewind = C.MemoryRewind & {
@@ -75,7 +77,81 @@ export class MockBeliefs {
   constructor(
     readonly now: () => Date,
     readonly timeZone: () => string,
+    readonly onItemChange?: (
+      id: string,
+      key: string,
+      item: ReturnType<typeof C.memoryItem.parse> | null,
+    ) => void,
   ) {}
+
+  private item(belief: MockBelief) {
+    const current = this.current(belief);
+    return C.memoryItem.parse({
+      id: belief.id,
+      key: belief.label,
+      value: current.value,
+      source:
+        current.source.kind === 'setup'
+          ? 'onboarding'
+          : belief.trust === 'yours'
+            ? 'conversation'
+            : 'inferred',
+      created: belief.versions[0]?.at ?? current.at,
+      last_used: belief.last_used,
+      editable: true,
+      version: belief.version,
+    });
+  }
+
+  private changed(belief: MockBelief, removed = false) {
+    if (belief.savedItem)
+      this.onItemChange?.(
+        belief.id,
+        belief.subject,
+        removed || belief.setAside ? null : this.item(belief),
+      );
+  }
+
+  /** Setup and the Memory screen share one identity, revision and history. */
+  remember(
+    input: ReturnType<typeof C.memoryItemCreate.parse>,
+    label: string,
+    previous?: ReturnType<typeof C.memoryItem.parse>,
+  ) {
+    if (
+      [...this.blocks.values()].some(
+        (block) =>
+          block.subject === input.key ||
+          (block.scope === 'topic' && input.key.startsWith(`${block.subject}.`)),
+      )
+    )
+      throw new MockBeliefError(409, 'You asked me not to learn this detail again.');
+    const existing = [...this.beliefs.values()].find(
+      (belief) => belief.subject === input.key && !belief.setAside,
+    );
+    const at = this.now().toISOString();
+    const belief: MockBelief = existing ?? {
+      id: previous?.id ?? newId('mem'),
+      subject: input.key,
+      label,
+      category: input.key.startsWith('pref.') ? 'preferences' : 'other',
+      trust: 'yours',
+      kind: input.key.startsWith('pref.') ? 'preference' : 'user_statement',
+      versions: [],
+      setAside: false,
+      version: newId('v'),
+      last_used: previous?.last_used ?? null,
+    };
+    belief.savedItem = true;
+    if (!existing || this.current(belief).value !== input.value || belief.trust !== 'yours') {
+      belief.versions.push({ value: input.value, at, source: this.source('setup', at) });
+      belief.trust = 'yours';
+      belief.version = newId('v');
+    }
+    this.beliefs.set(belief.id, belief);
+    this.changed(belief);
+    return this.item(belief);
+  }
 
   private day(at: Date) {
     const parts = new Intl.DateTimeFormat('en-GB', {
@@ -291,10 +367,12 @@ export class MockBeliefs {
     belief.versions.push({ value, at, source: this.source('correction', at) });
     belief.trust = 'yours';
     belief.version = newId('v');
+    this.changed(belief);
   }
   forget(id: string) {
-    this.required(id);
+    const belief = this.required(id);
     this.beliefs.delete(id);
+    this.changed(belief, true);
   }
   /** A block on anything about the belief's subject, or on just that detail. */
   block(id: string, scope: C.BeliefBlockScope = 'topic') {
@@ -311,6 +389,7 @@ export class MockBeliefs {
     };
     this.blocks.set(block.id, block);
     this.beliefs.delete(id);
+    this.changed(belief, true);
     return scope;
   }
 
@@ -454,6 +533,7 @@ export class MockBeliefs {
           });
       }
       belief.version = newId('v');
+      this.changed(belief);
     }
     const rewind: MockRewind = {
       id: newId('rwd'),
@@ -481,6 +561,7 @@ export class MockBeliefs {
         belief.setAside = state.setAside;
         belief.versions = belief.versions.slice(0, state.versions);
         belief.version = newId('v');
+        this.changed(belief);
       }
       rewind.undone_at = this.now().toISOString();
     }

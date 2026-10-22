@@ -79,7 +79,7 @@ import { fileHeaders, mimeForName } from '../../openduet/src/artifact/shown.ts';
 import { mountAppsMock } from './apps.ts';
 import { mountAttachmentsMock } from './attachments.ts';
 import { mountCompaniesMock } from './companies.ts';
-import { mountExperienceMock } from './experience.ts';
+import { type ExperienceMock, mountExperienceMock } from './experience.ts';
 import { mountFeedbackMock } from './feedback.ts';
 import { mountIntentsMock } from './intents.ts';
 import { mountLearnedMock } from './learned.ts';
@@ -195,7 +195,7 @@ export function scenarioPictures(scenarios: Scenario[]): string[] {
   return [...paths];
 }
 
-export function createMockApp(deps: AppDeps) {
+export function createMockApp(deps: AppDeps, onExperience?: (value: ExperienceMock) => void) {
   const { store, runner, scenarios } = deps;
   const app = new Hono();
   const mockSession = randomUUID();
@@ -284,6 +284,7 @@ export function createMockApp(deps: AppDeps) {
     },
   });
   if (deps.seedExperience) experience.seed();
+  onExperience?.(experience);
   // The companies surface is agreed but not yet in openapi.json, so it mounts
   // its own routes rather than going through the contract's operation table.
   mountCompaniesMock(app, deps, experience);

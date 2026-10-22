@@ -30,18 +30,18 @@
   --hover: #ebe9e3;
   --row-hover: #f6f5f1;
 
-  --primary: #2f5fd6;
-  --primary-hover: #274fb8;
+  --primary: #aa4b30;
+  --primary-hover: #913e27;
   --primary-fg: #ffffff;
-  --blue-soft: #e4ebfb;
-  --blue-ink: #22459c;
-  --blue-line: #c2d0f2;
+  --blue-soft: #f7e7df;
+  --blue-ink: #91432d;
+  --blue-line: #dfb6a5;
 
-  --bubble: #e4ebfb;
-  --bubble-ink: #1d3a80;
+  --bubble: #f7e7df;
+  --bubble-ink: #763821;
 
-  --travel: #e4ebfb;
-  --travel-ink: #22459c;
+  --travel: #f7e7df;
+  --travel-ink: #91432d;
   --sage: #e6efe4;
   --sage-ink: #3d6142;
   --sand: #f5ecdc;
@@ -57,7 +57,7 @@
   --chip-bg: #f1efea;
 
   --elevated: 0 12px 32px #1d1b1614, 0 1px 2px #1d1b160a;
-  --ring: #2f5fd640;
+  --ring: #aa4b3040;
   --skeleton-a: #e7e5df;
   --skeleton-b: #f3f1ec;
 
@@ -81,7 +81,7 @@
   --shadow-lift: 0 0 0 1px var(--line), 0 1px 2px #1d1b160a, 0 18px 40px -22px #1d1b1640;
   --shadow-pill: 0 0 0 1px var(--line), 0 1px 2px #1d1b160f;
 
-  /* OpenDuet speaks in the voice face; everything a person operates is DM Sans. */
+  /* Newsreader gives headings a voice; controls and task output use DM Sans. */
   --font-body: "DM Sans Variable", "DM Sans", system-ui, sans-serif;
   --font-voice: "Newsreader Variable", "Newsreader", Georgia, "Times New Roman", serif;
   --font-head: var(--font-body);
@@ -108,15 +108,15 @@
     --hover: #1f2023;
     --row-hover: #24262b;
 
-    --primary: #8db6f7;
-    --primary-hover: #a6c7f9;
-    --primary-fg: #0c1524;
-    --blue-soft: #1b2942;
-    --blue-ink: #b9d1f6;
-    --blue-line: #2c4470;
+    --primary: #e9a086;
+    --primary-hover: #f1b69f;
+    --primary-fg: #29160f;
+    --blue-soft: #38251f;
+    --blue-ink: #edb39e;
+    --blue-line: #704738;
 
-    --bubble: #1b2536;
-    --bubble-ink: #dfe9fa;
+    --bubble: #34251f;
+    --bubble-ink: #f3d7c9;
 
     --travel: #16272b;
     --travel-ink: #93c9cf;
@@ -140,7 +140,7 @@
     --shadow-sheet: 0 0 0 1px var(--line);
     --shadow-lift: 0 0 0 1px var(--line-strong), 0 20px 40px -16px #000000;
     --shadow-pill: 0 0 0 1px var(--line);
-    --ring: #8db6f780;
+    --ring: #e9a08680;
     --skeleton-a: #1c1d20;
     --skeleton-b: #33363c;
   }
@@ -166,15 +166,15 @@
   --hover: #1f2023;
   --row-hover: #24262b;
 
-  --primary: #8db6f7;
-  --primary-hover: #a6c7f9;
-  --primary-fg: #0c1524;
-  --blue-soft: #1b2942;
-  --blue-ink: #b9d1f6;
-  --blue-line: #2c4470;
+  --primary: #e9a086;
+  --primary-hover: #f1b69f;
+  --primary-fg: #29160f;
+  --blue-soft: #38251f;
+  --blue-ink: #edb39e;
+  --blue-line: #704738;
 
-  --bubble: #1b2536;
-  --bubble-ink: #dfe9fa;
+  --bubble: #34251f;
+  --bubble-ink: #f3d7c9;
 
   --travel: #16272b;
   --travel-ink: #93c9cf;
@@ -198,7 +198,7 @@
   --shadow-sheet: 0 0 0 1px var(--line);
   --shadow-lift: 0 0 0 1px var(--line-strong), 0 20px 40px -16px #000000;
   --shadow-pill: 0 0 0 1px var(--line);
-  --ring: #8db6f780;
+  --ring: #e9a08680;
   --skeleton-a: #1c1d20;
   --skeleton-b: #33363c;
 }

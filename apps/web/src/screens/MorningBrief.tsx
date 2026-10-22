@@ -4,14 +4,19 @@
  * request through the normal routine path, so it shows on Automations, where
  * it pauses like any routine.
  */
-import { MORNING_BRIEF_TITLE, MORNING_BRIEF_TOPICS } from '@openduet/contracts/morning-brief';
+import {
+  MORNING_BRIEF_DEFAULT_AT,
+  MORNING_BRIEF_PURPOSE,
+  MORNING_BRIEF_TITLE,
+  MORNING_BRIEF_TOPICS,
+} from '@openduet/contracts/morning-brief';
 import { Icon, type IconName } from '../design/icons.tsx';
 import { Chip, Select } from '../design/primitives.tsx';
 import type { Automation } from '../experience/types.ts';
 import './first-run.css';
 
 /** When the brief comes unless the person picks another time. */
-export const BRIEF_DEFAULT_AT = '08:00';
+export const BRIEF_DEFAULT_AT = MORNING_BRIEF_DEFAULT_AT;
 /** The most news topics a brief takes, as the service allows. */
 export const BRIEF_TOPIC_LIMIT = 5;
 
@@ -31,14 +36,22 @@ export function clockWords(at: string): string {
 
 /** Whether a brief is already set up: one that has not ended, paused or not. */
 export const hasMorningBrief = (automations: readonly Automation[]) =>
-  automations.some((routine) => routine.title === MORNING_BRIEF_TITLE && !routine.ended);
+  automations.some(
+    (routine) =>
+      (routine.purpose === MORNING_BRIEF_PURPOSE || routine.title === MORNING_BRIEF_TITLE) &&
+      !routine.ended,
+  );
 
 /**
  * A brief that ended, to start again rather than make another: with one
  * already there, setting up a new one would leave two on Automations.
  */
 export const endedMorningBrief = (automations: readonly Automation[]): Automation | null =>
-  automations.find((routine) => routine.title === MORNING_BRIEF_TITLE && routine.ended) ?? null;
+  automations.find(
+    (routine) =>
+      (routine.purpose === MORNING_BRIEF_PURPOSE || routine.title === MORNING_BRIEF_TITLE) &&
+      routine.ended,
+  ) ?? null;
 
 /** A topic turned on or off, keeping at most the limit. */
 export function toggleTopic(topics: readonly string[], topic: string): string[] {

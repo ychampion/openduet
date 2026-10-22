@@ -55,7 +55,7 @@ import { href, navigate, newChat, useRoute } from '../router.ts';
 import { useTheme } from '../theme.ts';
 import { CommandPalette } from './CommandPalette.tsx';
 import { showsRail } from './member-guards.ts';
-import { sidebarNav } from './nav.ts';
+import { PRIMARY_PATHS, sidebarNav } from './nav.ts';
 import { weekStrip } from './week-strip.ts';
 import './shell.css';
 import { instanceName } from '../experience/instance.ts';
@@ -187,16 +187,27 @@ function AccountMenu({ address }: { address: string | null }) {
             <MenuSep />
             {/* A guest's sign-in reaches rooms and nothing else, Settings included. */}
             {guest ? null : (
-              <MenuItem
-                icon="sliders"
-                kbd="⌘,"
-                onSelect={() => {
-                  close();
-                  navigate('/settings');
-                }}
-              >
-                Settings
-              </MenuItem>
+              <>
+                <MenuItem
+                  icon="sliders"
+                  kbd="⌘,"
+                  onSelect={() => {
+                    close();
+                    navigate('/settings');
+                  }}
+                >
+                  Settings
+                </MenuItem>
+                <MenuItem
+                  icon="user"
+                  onSelect={() => {
+                    close();
+                    navigate('/settings/about');
+                  }}
+                >
+                  About you
+                </MenuItem>
+              </>
             )}
             <div className="menu-item" style={{ cursor: 'default' }}>
               <Icon name="moon" size={16} />
@@ -310,49 +321,55 @@ function Sidebar({
             <Kbd>⌘K</Kbd>
           </button>
         )}
-        {nav.map((item) => (
-          <a
-            key={item.path}
-            className="nav-item"
-            href={href(item.path)}
-            aria-current={item.match(route.path) ? 'page' : undefined}
-            onClick={onClose}
-          >
-            <Icon name={item.icon} size={18} />
-            <span>{item.label}</span>
-            {item.path === '/' && decisions.count > 0 ? (
-              <span className="nav-count">
-                {decisions.count}
-                <span className="sr-only"> waiting on you</span>
-              </span>
-            ) : null}
-          </a>
-        ))}
-      </nav>
-      <div className="sidebar-recent" style={guest ? { display: 'none' } : undefined}>
-        {agents.length > 0 ? (
-          <>
-            <div className="recent-label">Agents</div>
-            {agents.map((agent) => (
-              <a
-                key={agent.id}
-                className="chat-row"
-                href={href(`/chat/new?agent=${agent.id}`)}
-                title={`New chat with ${agent.name}`}
-                onClick={onClose}
-              >
-                <span className="chat-face">
-                  <AgentAvatar agent={agent} size={16} />
+        {nav
+          .filter((item) => guest || PRIMARY_PATHS.has(item.path))
+          .sort(
+            (a, b) =>
+              ['/', '/runs', '/explore'].indexOf(a.path) -
+              ['/', '/runs', '/explore'].indexOf(b.path),
+          )
+          .map((item) => (
+            <a
+              key={item.path}
+              className="nav-item"
+              href={href(item.path)}
+              aria-current={item.match(route.path) ? 'page' : undefined}
+              onClick={onClose}
+            >
+              <Icon name={item.icon} size={18} />
+              <span>{item.label}</span>
+              {item.path === '/runs' && decisions.count > 0 ? (
+                <span className="nav-count">
+                  {decisions.count}
+                  <span className="sr-only"> waiting on you</span>
                 </span>
-                <span className="clamp1 grow">{agent.name}</span>
-                <span className="clamp1 agent-row-role">{agent.role}</span>
-              </a>
-            ))}
-          </>
-        ) : null}
-        <div className="recent-label" data-after={agents.length > 0 ? 'agents' : undefined}>
-          Chats
-        </div>
+              ) : null}
+            </a>
+          ))}
+      </nav>
+      {guest ? null : (
+        <details className="sidebar-advanced">
+          <summary>More</summary>
+          <nav aria-label="Advanced pages">
+            {nav
+              .filter((item) => !PRIMARY_PATHS.has(item.path))
+              .map((item) => (
+                <a
+                  key={item.path}
+                  className="nav-item"
+                  href={href(item.path === '/chat' ? '/chats' : item.path)}
+                  onClick={onClose}
+                  aria-current={item.match(route.path) ? 'page' : undefined}
+                >
+                  <Icon name={item.icon} size={16} />
+                  <span>{item.label}</span>
+                </a>
+              ))}
+          </nav>
+        </details>
+      )}
+      <div className="sidebar-recent" style={guest ? { display: 'none' } : undefined}>
+        <div className="recent-label">Recent tasks</div>
         {recent.map((chat) => {
           const agent = agentById(agents, chat.agent_id);
           const live = LIVE.has(chat.status);
@@ -759,6 +776,16 @@ export function Shell({
   const agent = agentById(agents, agentId);
 
   useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const resize = () =>
+      document.documentElement.style.setProperty('--app-viewport-height', `${viewport.height}px`);
+    resize();
+    viewport.addEventListener('resize', resize);
+    return () => viewport.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => {
     // Search reads the person's own chats and memory, which a guest does not have.
     if (guest) return;
     const onKey = (event: KeyboardEvent) => {
@@ -920,6 +947,27 @@ export function Shell({
             ) : null}
           </div>
         </div>
+        {phone && !guest ? (
+          <nav className="phone-primary-nav" aria-label="Primary destinations">
+            {sidebarNav(false, false, member === true, false)
+              .filter((item) => PRIMARY_PATHS.has(item.path))
+              .sort(
+                (a, b) =>
+                  ['/', '/runs', '/explore'].indexOf(a.path) -
+                  ['/', '/runs', '/explore'].indexOf(b.path),
+              )
+              .map((item) => (
+                <a
+                  key={item.path}
+                  href={href(item.path)}
+                  aria-current={item.match(route.path) ? 'page' : undefined}
+                >
+                  <Icon name={item.icon} size={20} />
+                  <span>{item.label}</span>
+                </a>
+              ))}
+          </nav>
+        ) : null}
         {guest ? null : <CommandPalette open={palette} onClose={() => setPalette(false)} />}
         {guest ? null : <FeedbackHost />}
         <ToastStack />

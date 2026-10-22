@@ -8,7 +8,7 @@ import {
 } from '@openduet/contracts';
 import { createMock } from './index.ts';
 
-test('the mock keeps setup answers, welcomes the person, and requires sign-in after sign-out', async () => {
+test('the mock keeps setup answers, follows the first actual request, and requires sign-in after sign-out', async () => {
   const { app } = createMock({ speed: 0 });
   const initial = memoryItemList.parse(await (await app.request('/memory/items')).json()).items
     .length;
@@ -56,20 +56,25 @@ test('the mock keeps setup answers, welcomes the person, and requires sign-in af
   const { conversation } = conversationResponse.parse(
     await (await post('/conversations', { title: 'Getting started', agent_id: agent.id })).json(),
   );
-  expect(
-    (await post(`/conversations/${conversation.id}/messages`, { text: 'Where do we start?' }))
-      .status,
-  ).toBe(200);
-  let welcome = '';
+  const request = 'Please make a packing plan.';
+  expect((await post(`/conversations/${conversation.id}/messages`, { text: request })).status).toBe(
+    200,
+  );
+  let answer = '';
   for (let i = 0; i < 100; i++) {
-    welcome =
-      turnList.parse(await (await app.request(`/conversations/${conversation.id}/messages`)).json())
-        .turns[0]?.answer ?? '';
-    if (welcome.includes('You said “A launch at work”')) break;
+    const turn = turnList.parse(
+      await (await app.request(`/conversations/${conversation.id}/messages`)).json(),
+    ).turns[0];
+    expect(turn?.text).toBe(request);
+    answer = turn?.answer ?? '';
+    if (turn?.status === 'done') break;
     await Bun.sleep(5);
   }
-  expect(welcome).toContain('You said “A launch at work”');
-  expect(welcome).not.toContain('{{');
+  expect(answer).toContain('Here is the packing plan for Saturday.');
+  expect(answer).toContain('## What to bring');
+  expect(answer).not.toContain('A launch at work');
+  expect(answer).not.toContain('Where should I start?');
+  expect(answer).not.toContain('{{');
 
   expect((await post('/signout')).status).toBe(200);
   expect((await app.request('/profile')).status).toBe(401);

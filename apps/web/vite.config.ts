@@ -5,6 +5,9 @@ import { defineConfig } from 'vite';
 // else it learns from the API itself.
 export default defineConfig({
   plugins: [react()],
+  // Sample day supplies its two public settings explicitly. No .env file,
+  // including .env.local or .env.development, may add installation data.
+  envDir: process.env.VITE_OPENDUET_SAMPLE === 'on' ? false : undefined,
   server: { port: 5180 },
   // A production bundle carries no source maps: the client's sources are not
   // served beside it. The development server maps as before.

@@ -9,9 +9,9 @@ import { Icon } from '../design/icons.tsx';
 import { LoadError } from '../design/LoadError.tsx';
 import { Button, Dialog, Field, Input, Status } from '../design/primitives.tsx';
 import { adapter, type Result } from '../experience/adapter.ts';
-import { useApp, useLoad, useNow } from '../experience/hooks.ts';
-import type { Run, RunEntry } from '../experience/types.ts';
-import { href, navigate } from '../router.ts';
+import { useApp, useDecisions, useLoad, useNow } from '../experience/hooks.ts';
+import type { Conversation, Run, RunEntry } from '../experience/types.ts';
+import { href, navigate, useRoute } from '../router.ts';
 import { usePoll } from '../runs/poll.ts';
 import { RecordTimeline } from '../runs/Record.tsx';
 import { permissionsFor, RunPermissions } from '../runs/RunPermissions.tsx';
@@ -34,6 +34,10 @@ import {
 } from '../runs/words.ts';
 import { Shell, toast } from '../shell/Shell.tsx';
 import '../runs/runs.css';
+import { WaitingOnYou } from './Home.tsx';
+import { resultPath } from './RoutineResults.tsx';
+import './personal-chat.css';
+import { CustomerFollowups } from '../responsibilities/CustomerFollowups.tsx';
 
 const failed = (result: Result<unknown>, fallback: string) =>
   toast({ kind: 'err', title: result.error ?? result.unavailable ?? fallback });
@@ -146,8 +150,63 @@ function WorkCard({ run, now }: { run: Run; now: number }) {
   );
 }
 
+function ConversationWorkRow({
+  conversation,
+  finished = false,
+  onStop,
+}: {
+  conversation: Conversation;
+  finished?: boolean;
+  onStop: () => void;
+}) {
+  const output = useLoad(
+    () =>
+      finished
+        ? adapter.turnsPage(conversation.id, { limit: 1 })
+        : Promise.resolve({ data: null, error: null, unavailable: null }),
+    [conversation.id, conversation.updated_at, finished],
+  );
+  const turn = output.data?.turns.at(-1);
+  return (
+    <div className="work-task-row">
+      <Icon name={finished ? 'fileText' : 'progress'} size={18} />
+      <div>
+        <a href={href(resultPath(conversation.id, turn?.id ?? null))}>{conversation.title}</a>
+        <p>
+          {finished
+            ? turn?.answer.slice(0, 240) || 'Open to see the saved output and activity.'
+            : (conversation.progress?.current ?? conversation.status.replaceAll('_', ' '))}
+        </p>
+      </div>
+      {finished ? (
+        <a
+          className="btn btn-sm btn-outline"
+          href={href(resultPath(conversation.id, turn?.id ?? null))}
+        >
+          Open result
+        </a>
+      ) : (
+        <Button size="sm" variant="ghost" onClick={onStop}>
+          Stop<span className="sr-only"> {conversation.title}</span>
+        </Button>
+      )}
+    </div>
+  );
+}
+
+const WORK_VIEWS = [
+  ['needs', 'Needs you'],
+  ['progress', 'In progress'],
+  ['finished', 'Finished'],
+  ['recurring', 'Recurring'],
+] as const;
+
 function WorkList() {
+  const { conversations, refreshConversations } = useApp();
+  const decisions = useDecisions();
+  const route = useRoute();
   const data = useLoad(() => adapter.runs(), []);
+  const recurring = useLoad(() => adapter.automations(), []);
   const [starting, setStarting] = useState(false);
   const now = useNow(true, 60_000);
   const runs = workOrder(data.data?.runs ?? []);
@@ -156,27 +215,87 @@ function WorkList() {
     10_000,
     runs.some((run) => !isFinished(run.status)),
   );
-  const open = runs.filter((run) => !isFinished(run.status));
-  const finished = runs.filter((run) => isFinished(run.status));
+  const asked = route.query.get('view');
+  const view = WORK_VIEWS.some(([id]) => id === asked)
+    ? asked
+    : decisions.count
+      ? 'needs'
+      : 'progress';
+  const open = runs.filter(
+    (run) => !isFinished(run.status) && run.status !== 'needs_you' && !run.standing,
+  );
+  const finished = runs.filter((run) => isFinished(run.status) && !run.standing);
+  const runChats = new Set(runs.map((run) => run.conversation_id));
+  const chats = conversations.filter(
+    (conversation) => !runChats.has(conversation.id) && !conversation.automation_id,
+  );
+  const moving = chats.filter((conversation) =>
+    ['queued', 'working', 'streaming', 'stalled', 'paused'].includes(conversation.status),
+  );
+  const completed = chats.filter((conversation) => conversation.status === 'done');
   return (
     <Shell title="Work" rail={false}>
       <div className="page">
         <div className="page-head">
           <div className="col" style={{ gap: 4 }}>
-            <h1>Work in progress</h1>
+            <h1>Work</h1>
             <p style={{ fontSize: 14, color: 'var(--muted)' }}>
-              Bigger jobs your assistants keep at in the background, for hours or days.
+              What you’ve delegated, what it produced, and what needs a decision.
             </p>
           </div>
           <Button icon="plus" onClick={() => setStarting(true)}>
             Start something
           </Button>
         </div>
+        <nav className="work-tabs" aria-label="Work views">
+          {WORK_VIEWS.map(([id, label]) => (
+            <a
+              key={id}
+              href={href(`/work?view=${id}`)}
+              aria-current={view === id ? 'page' : undefined}
+            >
+              {label}
+              {id === 'needs' && decisions.count ? ` (${decisions.count})` : ''}
+            </a>
+          ))}
+        </nav>
         {data.error ? (
           <LoadError what="your work" error={data.error} onRetry={data.reload} />
         ) : null}
         {data.unavailable ? <p className="run-muted">{data.unavailable}</p> : null}
-        {open.length > 0 ? (
+        {view === 'needs' ? (
+          <>
+            <WaitingOnYou
+              decisions={decisions}
+              map={null}
+              now={now}
+              onCleared={refreshConversations}
+            />
+            {runs
+              .filter((run) => run.status === 'needs_you')
+              .map((run) => (
+                <WorkCard key={run.id} run={run} now={now} />
+              ))}
+            {decisions.count === 0 && !runs.some((run) => run.status === 'needs_you') ? (
+              <p className="run-muted">Nothing needs your decision.</p>
+            ) : null}
+          </>
+        ) : null}
+        {view === 'progress'
+          ? moving.map((conversation) => (
+              <ConversationWorkRow
+                key={conversation.id}
+                conversation={conversation}
+                onStop={() =>
+                  void adapter.stop(conversation.id).then((result) => {
+                    if (!result.data) failed(result, 'Couldn’t stop it');
+                    refreshConversations();
+                  })
+                }
+              />
+            ))
+          : null}
+        {view === 'progress' && open.length > 0 ? (
           <section className="col" style={{ gap: 10 }} aria-labelledby="work-open">
             <h2 id="work-open" className="run-section-title">
               Going now
@@ -188,7 +307,17 @@ function WorkList() {
             </div>
           </section>
         ) : null}
-        {finished.length > 0 ? (
+        {view === 'finished'
+          ? completed.map((conversation) => (
+              <ConversationWorkRow
+                key={conversation.id}
+                conversation={conversation}
+                finished
+                onStop={() => {}}
+              />
+            ))
+          : null}
+        {view === 'finished' && finished.length > 0 ? (
           <section className="col" style={{ gap: 10 }} aria-labelledby="work-finished">
             <h2 id="work-finished" className="run-section-title">
               Finished
@@ -200,7 +329,69 @@ function WorkList() {
             </div>
           </section>
         ) : null}
-        {data.data && !data.error && runs.length === 0 ? (
+        {view === 'recurring' ? (
+          <div className="col" style={{ gap: 20 }}>
+            <CustomerFollowups onOpenConversation={(id) => navigate(`/chat/${id}`)} />
+            {recurring.error ? (
+              <LoadError
+                what="your recurring work"
+                error={recurring.error}
+                onRetry={recurring.reload}
+              />
+            ) : null}
+            {recurring.data?.automations.map((routine) => (
+              <article key={routine.id} className="card">
+                <div className="row" style={{ justifyContent: 'space-between', gap: 12 }}>
+                  <div className="col" style={{ gap: 8 }}>
+                    <a href={href(`/chat/${routine.conversation_id}`)}>{routine.title}</a>
+                    <span className="run-muted">
+                      {routine.schedule} ·{' '}
+                      {routine.ended ? 'Stopped' : routine.enabled ? 'On' : 'Paused'}
+                    </span>
+                    {routine.runs[0]?.summary ? <p>{routine.runs[0].summary}</p> : null}
+                    {routine.runs[0]?.turn_id ? (
+                      <a href={href(resultPath(routine.conversation_id, routine.runs[0].turn_id))}>
+                        Latest result
+                      </a>
+                    ) : null}
+                  </div>
+                  {routine.ended ? null : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        void (
+                          routine.enabled
+                            ? adapter.pauseAutomation(routine.id)
+                            : adapter.resumeAutomation(routine.id)
+                        ).then((result) => {
+                          if (!result.data) failed(result, 'Couldn’t update the routine');
+                          recurring.reload();
+                        })
+                      }
+                    >
+                      {routine.enabled ? 'Pause' : 'Resume'}
+                    </Button>
+                  )}
+                </div>
+              </article>
+            ))}
+            {runs
+              .filter((run) => run.standing)
+              .map((run) => (
+                <WorkCard key={run.id} run={run} now={now} />
+              ))}
+            <a href={href('/automations')}>Manage schedules</a>
+          </div>
+        ) : null}
+        {view === 'finished' && completed.length === 0 && finished.length === 0 ? (
+          <p className="run-muted">Finished work and its outputs will wait here.</p>
+        ) : null}
+        {view === 'progress' &&
+        data.data &&
+        !data.error &&
+        open.length === 0 &&
+        moving.length === 0 ? (
           <div className="run-empty">
             <span className="run-empty-icon" aria-hidden="true">
               <Icon name="progress" size={22} />

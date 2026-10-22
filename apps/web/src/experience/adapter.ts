@@ -12,7 +12,6 @@ import { createOpenDuetClient, errorMessage, readSse, subscribeEvents } from '@o
 import { recordingFetch } from '../feedback/diagnostics.ts';
 import { instanceName } from './instance.ts';
 import { plainError } from './plain.ts';
-import { markValueMoment } from './push.ts';
 import { readTextPrefix } from './text-prefix.ts';
 import { browserTimeZone } from './timezone.ts';
 import type { Seen } from './together.ts';
@@ -292,10 +291,6 @@ async function guard<T>(
 const api = client.api;
 
 /** A decision made is the first moment OpenDuet was worth hearing from. */
-function worthHearing<T>(result: Result<T>): Result<T> {
-  if (result.data !== null) markValueMoment();
-  return result;
-}
 const path = (id: string) => ({ params: { path: { id } } });
 
 export const adapter = {
@@ -533,7 +528,7 @@ export const adapter = {
               }
             : { option, version, ...(together.length ? { together } : {}) },
       }),
-    ).then(worthHearing),
+    ),
   /** The person confirms it is them for a money move, and gets a one-time token for its Allow. */
   stepUp: (id: string, password: string) =>
     guard<{ step_up_token: string; expires_at: string }>(() =>
@@ -542,7 +537,7 @@ export const adapter = {
   decideAlways: (id: string, version: string, bounds: RuleBounds) =>
     guard<PermissionOutcome>(() =>
       api.POST('/permissions/{id}', { ...path(id), body: { option: 'always', version, bounds } }),
-    ).then(worthHearing),
+    ),
   permissions: () =>
     guard<{ permissions: Permission[]; handoffs?: RoomHandoff[] }>(() => api.GET('/permissions')),
   undo: (id: string) =>
@@ -597,7 +592,7 @@ export const adapter = {
         ...path(id),
         body: typeof answer === 'string' ? { option_id: answer } : { text: answer.text },
       }),
-    ).then(worthHearing),
+    ),
   /** Stop waiting for an answer to a question the person no longer wants to answer. */
   dismissQuestion: (id: string) =>
     guard<{ status: 'ok' }>(() => api.POST('/quick-answers/{id}/dismiss', path(id))),

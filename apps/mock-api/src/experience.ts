@@ -145,6 +145,89 @@ const required = <T>(map: Map<string, T>, id: string): T => {
 
 /** Scenario records go through the same deterministic presentation functions as real rows. */
 export class ExperienceMock {
+  private personalReadAt: string | null = null;
+  private personalReadReference: string | null = null;
+  private readonly personalSubmissions = new Map<
+    string,
+    { fingerprint: string; accepted: ReturnType<typeof C.personalSessionAcceptance.parse> }
+  >();
+  private readonly resultDiscussions = new Map<string, string>();
+
+  personalSession() {
+    const references: C.PersonalSessionReference[] = [];
+    for (const chat of this.chats.values()) {
+      references.push({
+        id: `chat:${chat.view.id}`,
+        kind: 'conversation',
+        conversation_id: chat.view.id,
+        title: chat.view.title,
+        status: chat.view.status,
+        updated_at: chat.view.updated_at,
+      });
+      for (const turn of chat.turns)
+        if (turn.status === 'done' && turn.answer.trim())
+          references.push({
+            id: `result:${turn.id}`,
+            kind: 'result',
+            conversation_id: chat.view.id,
+            turn_id: turn.id,
+            title: chat.view.title,
+            status: turn.status,
+            updated_at: turn.created_at,
+            output: turn.answer,
+            ...(this.resultDiscussions.has(turn.id)
+              ? { discussion_id: this.resultDiscussions.get(turn.id) }
+              : {}),
+          });
+    }
+    return {
+      session: {
+        id: 'sample-personal-session',
+        space_id: this.deps.spaceId,
+        read_at: this.personalReadAt,
+        read_reference_id: this.personalReadReference,
+        references: references.sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
+      },
+    };
+  }
+
+  private personalMessage(raw: unknown, key?: string) {
+    if (!key) throw new MockExperienceError(400, 'An Idempotency-Key is required.');
+    const input = C.personalSessionMessage.parse(raw);
+    const fingerprint = JSON.stringify(input);
+    const previous = this.personalSubmissions.get(key);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new MockExperienceError(409, 'That submission key already names another request.');
+      return previous.accepted;
+    }
+    let conversationId: string;
+    if (input.target.kind === 'new_task') {
+      conversationId = this.create({ title: input.text.slice(0, 120) || 'Attached task' })
+        .conversation.id;
+    } else if (input.target.kind === 'continue_task') {
+      conversationId = required(this.chats, input.target.conversation_id).view.id;
+    } else {
+      const source = required(this.chats, input.target.conversation_id);
+      const turnId = input.target.turn_id;
+      const turn = source.turns.find((row) => row.id === turnId);
+      if (turn?.status !== 'done')
+        throw new MockExperienceError(409, 'Choose the exact completed result to reply to.');
+      conversationId =
+        this.resultDiscussions.get(turn.id) ??
+        this.create({ title: `Discuss: ${source.view.title}` }).conversation.id;
+      this.resultDiscussions.set(turn.id, conversationId);
+    }
+    const { target: _target, ...message } = input;
+    const result = this.message(required(this.chats, conversationId), message, key);
+    const accepted = C.personalSessionAcceptance.parse({
+      ...result,
+      conversation_id: conversationId,
+      reference_id: `chat:${conversationId}`,
+    });
+    this.personalSubmissions.set(key, { fingerprint, accepted });
+    return accepted;
+  }
   readonly agents = new Map<string, C.ExperienceAgent>();
   /** Deleted agents, kept only to name the turns they answered. */
   readonly removedAgents = new Map<string, C.ExperienceAgent>();
@@ -195,13 +278,20 @@ export class ExperienceMock {
   readonly beliefs = new MockBeliefs(
     () => this.deps.store.now(),
     () => this.profile.time_zone,
+    (id, key, item) => {
+      if (item) {
+        this.memories.set(id, item);
+        this.answers.set(key, item.value);
+      } else {
+        this.memories.delete(id);
+        this.answers.delete(key);
+      }
+    },
   );
   /** Long work in the background, seeded at three stages. */
   readonly runs = new MockRuns(() => this.deps.store.now());
   /** Answers given during setup, by key, so the first message can refer to one. */
   readonly answers = new Map<string, string>();
-  /** Set once the welcome scenario has played; every later message picks by text. */
-  welcomed = false;
   /** After POST /signout every route but sign-in answers 401 until a link is consumed. */
   signedOut = false;
   /** Tasks rooms handed the person, and results waiting for them: shown on Home and with approvals. */
@@ -1390,12 +1480,6 @@ export class ExperienceMock {
     chat.script =
       (scenarioId ? this.deps.scenarios.find((entry) => entry.id === scenarioId) : undefined) ??
       chooseScenario(this.deps.scenarios, `${chat.view.title} ${input.text}`);
-    // The first message after setup gets the welcome, which names one setup answer.
-    const welcome = this.deps.scenarios.find((entry) => entry.id === 'welcome');
-    if (!scenarioId && welcome && this.answers.size > 0 && !this.welcomed) {
-      chat.script = welcome;
-      this.welcomed = true;
-    }
     chat.position = 0;
     chat.paused = false;
     chat.stopped = false;
@@ -1875,6 +1959,20 @@ export class ExperienceMock {
       throw new MockExperienceError(401, 'A session is required.');
     const id = c.req.param('id') ?? '';
     try {
+      if (key === 'POST /memory/items') {
+        const create = C.memoryItemCreate.parse(input);
+        if (C.memoryKeyValue(create.key) !== 'text')
+          throw new MockExperienceError(
+            409,
+            'This key is maintained from source evidence. Correct its saved item instead.',
+            'extractor_owned_key',
+          );
+        const label = this.keyLabel(create.key);
+        const existing = [...this.memories.values()].find((entry) => entry.key === label);
+        const item = this.beliefs.remember(create, label, existing);
+        if (existing && existing.id !== item.id) this.memories.delete(existing.id);
+        return { item };
+      }
       const answered = this.beliefs.handle(key, id, input, c.req.query());
       if (answered !== undefined) return answered;
     } catch (error) {
@@ -1890,6 +1988,18 @@ export class ExperienceMock {
       throw error;
     }
     switch (key) {
+      case 'GET /personal-session':
+        return this.personalSession();
+      case 'POST /personal-session/messages':
+        return this.personalMessage(input, c.req.header('Idempotency-Key'));
+      case 'PATCH /personal-session/read': {
+        const read = C.personalSessionRead.parse(input);
+        if (!this.personalSession().session.references.some((row) => row.id === read.reference_id))
+          throw new MockExperienceError(404, 'Choose a reference from this session.');
+        this.personalReadAt = this.now();
+        this.personalReadReference = read.reference_id;
+        return this.personalSession();
+      }
       case 'GET /agents/templates': {
         const taken = [...this.agents.values()].map((agent) => agent.name);
         return {
@@ -2184,31 +2294,6 @@ export class ExperienceMock {
       }
       case 'GET /memory/items':
         return { items: [...this.memories.values()] };
-      case 'POST /memory/items': {
-        // One key, one current value: a second answer on a key replaces the first.
-        const create = C.memoryItemCreate.parse(input);
-        if (C.memoryKeyValue(create.key) !== 'text')
-          throw new MockExperienceError(
-            409,
-            'This key is maintained from source evidence. Correct its saved item instead.',
-            'extractor_owned_key',
-          );
-        const label = this.keyLabel(create.key);
-        const existing = [...this.memories.values()].find((entry) => entry.key === label);
-        const item = C.memoryItem.parse({
-          id: existing?.id ?? newId('mem'),
-          key: label,
-          value: create.value,
-          source: 'onboarding',
-          created: existing?.created ?? this.now(),
-          last_used: existing?.last_used ?? null,
-          editable: true,
-          version: newId('v'),
-        });
-        this.memories.set(item.id, item);
-        this.answers.set(create.key, create.value);
-        return { item };
-      }
       case 'POST /signout':
         this.signedOut = true;
         return { status: 'ok' };

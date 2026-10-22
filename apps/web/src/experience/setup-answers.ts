@@ -1,5 +1,6 @@
 /**
- * The questions setup asks, and what of an answer is kept. Only what the
+ * Optional profile prompts, and what of an answer is kept. First use submits
+ * an actual task instead of requiring these questions. Only what the
  * person actually said, or a choice that means something about them, is
  * saved as a detail. A skip, an empty answer or a stand-in such as
  * "Somewhere else" saves nothing.
@@ -44,14 +45,6 @@ export const SETUP_QUESTIONS: readonly SetupQuestion[] = [
       answer === 'A launch at work'
         ? 'A launch. I’ll offer to set it up as a plan when you’re ready.'
         : 'That’s the kind of thing I take off your plate first. I’ll start there.',
-  },
-  {
-    key: 'pref.checkins.style',
-    ask: 'How should I check in?',
-    suggestions: ['Morning brief at 8:30', 'Only when it matters', 'Never first'],
-    placeholder: 'Or say how you’d like it',
-    reply: () =>
-      'Perfect, that’s plenty to start. I’ll remember these and learn the rest as we go.',
   },
 ];
 

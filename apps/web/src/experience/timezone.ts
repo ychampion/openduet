@@ -19,13 +19,22 @@ export function browserTimeZone(): string | null {
 export const zoneLabel = (zone: string) => currentZone(zone).replaceAll('_', ' ');
 
 /**
- * The zone setup saves: the one the person already chose, or else this
- * browser's, rather than the default the account started with.
+ * A resumed request keeps its reviewed zone, including valid older aliases.
+ * Otherwise use the person's confirmed profile or this browser's detected zone.
  */
 export function setupTimeZone(
   profile: { time_zone: string; time_zone_confirmed: boolean } | null,
   browser: string | null,
+  savedRequestZone?: string | null,
 ): string {
+  if (savedRequestZone) {
+    try {
+      new Intl.DateTimeFormat('en', { timeZone: savedRequestZone });
+      return savedRequestZone;
+    } catch {
+      // Invalid stored data must not put an unusable zone back into setup.
+    }
+  }
   if (profile?.time_zone_confirmed) return profile.time_zone;
   return browser ?? profile?.time_zone ?? 'UTC';
 }

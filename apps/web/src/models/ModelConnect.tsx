@@ -27,7 +27,85 @@ import {
 } from './api.ts';
 import { UsageThisMonth } from './Usage.tsx';
 import './models.css';
+import { loadHandoff } from '../experience/handoff.ts';
 import { instanceName } from '../experience/instance.ts';
+import { navigate, parseHash } from '../router.ts';
+import type { ModelReadiness } from './api.ts';
+import { primaryModelReady } from './readiness.ts';
+
+const CHECK_USAGE =
+  'Uses a small amount of model usage: up to 3 requests and 1,536 output tokens, plus prompt tokens. The runtime check has a 45-second limit. Reads a disposable note; no real account actions. This checks compatibility, not intelligence.';
+
+/** State names reflect independent observations; listing models never verifies inference or tools. */
+export function ReadinessResult({ result }: { result: ModelReadiness | null | undefined }) {
+  if (!result)
+    return (
+      <span className="models-hint">
+        Inference and tool use have not been checked for this configuration.
+      </span>
+    );
+  return (
+    <div className="col" style={{ gap: 6 }} aria-live="polite">
+      {(
+        [
+          ['credentials', 'Credentials accepted'],
+          ['inference', 'Model responded'],
+          ['tools', 'Tool use verified'],
+        ] as const
+      ).map(([key, label]) => (
+        <span
+          key={key}
+          className="models-result"
+          data-tone={result[key] === 'passed' ? 'ok' : result[key] === 'failed' ? 'err' : undefined}
+        >
+          <Icon
+            name={
+              result[key] === 'passed'
+                ? 'circleCheck'
+                : result[key] === 'failed'
+                  ? 'circleX'
+                  : 'clock'
+            }
+            size={16}
+          />
+          {label}:{' '}
+          {result[key] === 'passed'
+            ? 'Yes'
+            : result[key] === 'failed'
+              ? 'Not verified'
+              : 'Not checked'}
+        </span>
+      ))}
+      <span className="models-hint">{result.message}</span>
+    </div>
+  );
+}
+
+/** Refresh before resuming so a model changed in another tab cannot resume the saved request. */
+async function publishReadiness(
+  result: ModelReadiness,
+  onChanged: (next: ModelSettings) => void,
+  target: ModelTarget,
+) {
+  const fresh = await models.settings();
+  if (!fresh.data) return;
+  onChanged(fresh.data);
+  if (
+    target !== 'primary' ||
+    result.credentials !== 'passed' ||
+    result.inference !== 'passed' ||
+    result.tools !== 'passed' ||
+    !primaryModelReady(fresh.data) ||
+    fresh.data.active.provider !== result.provider ||
+    fresh.data.active.model !== result.model
+  )
+    return;
+  window.dispatchEvent(new CustomEvent('openduet:model-ready'));
+  const request = loadHandoff();
+  const page = parseHash(window.location.hash);
+  if (page.path.startsWith('/settings') && request && page.query.get('handoff') === request.id)
+    navigate(`/?handoff=${encodeURIComponent(request.id)}`);
+}
 
 /** Where each provider hands out keys, in the words its own console uses. */
 const KEY_HINT: Partial<Record<ModelProvider, string>> = {
@@ -36,7 +114,7 @@ const KEY_HINT: Partial<Record<ModelProvider, string>> = {
   google: 'Create one in Google AI Studio under Get API key.',
   fireworks: 'Create one in your Fireworks account under API keys.',
   'openai-compatible':
-    'Any server that speaks the OpenAI API: a hosted gateway, or a model server on your own network. If it checks no key, enter any value.',
+    'Any server that speaks the OpenAI API: a hosted gateway, or a model server on your own network. If it checks no key, enter a placeholder of at least eight characters.',
 };
 
 const BLURB: Record<ModelProvider, string> = {
@@ -74,8 +152,8 @@ async function chooseFor(
         }
       : {
           kind: 'ok',
-          title: `Agents now answer with ${modelDisplayName(model)}`,
-          sub: 'From the next reply. Nothing needed a restart.',
+          title: `${modelDisplayName(model)} selected as your primary model`,
+          sub: 'Checking inference and tool compatibility next.',
         },
   );
   return chosen.data;
@@ -200,7 +278,12 @@ export function ActiveModel({
   onChanged: (next: ModelSettings) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const { active, operator_default: server } = settings;
+  const canCheck =
+    settings.can_edit &&
+    active.connected &&
+    settings.providers.some((p) => p.provider === active.provider);
   return (
     <div className="card-12 models-active">
       <div className="col grow" style={{ gap: 4, minWidth: 0 }}>
@@ -213,6 +296,36 @@ export function ActiveModel({
           {active.source === 'app' ? 'chosen here' : 'the server’s default'}
         </span>
         <VisionSetting settings={settings} onChanged={onChanged} />
+        <ReadinessResult result={settings.readiness} />
+        {canCheck ? (
+          <>
+            <span className="models-hint">{CHECK_USAGE}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              loading={checking}
+              disabled={checking}
+              onClick={() => {
+                setChecking(true);
+                void models
+                  .checkReadiness({
+                    provider: active.provider as ModelProvider,
+                    model: active.model,
+                  })
+                  .then(async (answer) => {
+                    setChecking(false);
+                    if (!answer.data) {
+                      toast({ kind: 'err', title: answer.error ?? 'Couldn’t check this model' });
+                      return;
+                    }
+                    await publishReadiness(answer.data, onChanged, 'primary');
+                  });
+              }}
+            >
+              Connect and check
+            </Button>
+          </>
+        ) : null}
         {active.connected ? null : (
           <span className="models-warning" role="note">
             <Icon name="alert" size={14} />
@@ -225,7 +338,7 @@ export function ActiveModel({
       <div className="col models-active-side">
         {active.connected ? (
           <Badge tone="success" dot>
-            Connected
+            Credential set
           </Badge>
         ) : (
           <Badge tone="danger" dot>
@@ -351,14 +464,14 @@ export function ModelConnect({
   );
 }
 
-function TestResult({ result }: { result: ConnectionTest | null }) {
+export function TestResult({ result }: { result: ConnectionTest | null }) {
   if (!result) return null;
   return result.ok ? (
     <span className="models-result" data-tone="ok">
       <Icon name="circleCheck" size={16} />
       {result.models.length
-        ? `Connected. ${result.models.length} model${result.models.length === 1 ? '' : 's'} available to choose from.`
-        : 'Connected. This provider lists no models, so type the one to use.'}
+        ? `Credentials accepted. The provider listed ${result.models.length} model${result.models.length === 1 ? '' : 's'}. Inference and tool use are not checked.`
+        : 'Credentials accepted. This endpoint lists no models. Enter an exact model ID under Advanced; inference and tool use are not checked.'}
     </span>
   ) : (
     <span className="models-result" data-tone="err">
@@ -393,8 +506,7 @@ function ModelChoice({
   options: string[];
   placeholder: string;
 }) {
-  const [typing, setTyping] = useState(false);
-  const listed = options.length > 0 && !typing;
+  const listed = options.length > 0;
   return (
     <div className="col" style={{ gap: 6 }}>
       {listed ? (
@@ -408,7 +520,14 @@ function ModelChoice({
           />
         </Field>
       ) : (
-        <Field label="Model">
+        <span className="models-hint">
+          List the provider’s models above, or enter an exact model ID under Advanced. No model is
+          recommended from list ordering.
+        </span>
+      )}
+      <details>
+        <summary className="models-link">Advanced: exact model ID</summary>
+        <Field label="Model ID">
           <Input
             value={value}
             onChange={(event) => onChange(event.target.value)}
@@ -419,12 +538,8 @@ function ModelChoice({
             maxLength={300}
           />
         </Field>
-      )}
-      {options.length > 0 ? (
-        <button type="button" className="models-link" onClick={() => setTyping(!typing)}>
-          {typing ? 'Choose from the provider’s list' : 'Type a model name instead'}
-        </button>
-      ) : null}
+      </details>
+      {value ? <span className="models-hint">Selected: {modelDisplayName(value)}</span> : null}
     </div>
   );
 }
@@ -452,6 +567,7 @@ function KeyPanel({
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [result, setResult] = useState<ConnectionTest | null>(null);
+  const [readiness, setReadiness] = useState<ModelReadiness | null>(null);
   const addressChanged =
     compatible && !operatorAddress && address.trim() !== (status.base_url ?? '');
   const hasKey = key.trim().length > 0 || (status.connected && !addressChanged);
@@ -500,8 +616,18 @@ function KeyPanel({
       onChanged(saved.data);
     }
     const chosen = await chooseFor(target, status.provider, model.trim());
+    if (chosen) {
+      onChanged(chosen);
+      const checked = await models.checkReadiness({
+        provider: status.provider,
+        model: model.trim(),
+      });
+      if (checked.data) {
+        setReadiness(checked.data);
+        await publishReadiness(checked.data, onChanged, target);
+      } else toast({ kind: 'err', title: checked.error ?? 'Couldn’t check this model' });
+    }
     setSaving(false);
-    if (chosen) onChanged(chosen);
   };
 
   return (
@@ -513,27 +639,31 @@ function KeyPanel({
         ) : null}
       </div>
       {compatible ? (
-        operatorAddress ? (
-          <ReadOnly label="Address">
-            <span className="models-id">{status.base_url}</span> · set by the operator
-          </ReadOnly>
-        ) : (
-          <Field label="Address" hint="The endpoint’s version prefix. It usually ends in /v1.">
-            <Input
-              value={address}
-              onChange={(event) => {
-                setAddress(event.target.value);
-                setResult(null);
-              }}
-              placeholder="https://models.example.net/v1"
-              width="100%"
-              type="url"
-              inputMode="url"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </Field>
-        )
+        <details>
+          <summary className="models-link">Advanced: endpoint address</summary>
+          {operatorAddress ? (
+            <ReadOnly label="Address">
+              <span className="models-id">{status.base_url}</span> · set by the operator
+            </ReadOnly>
+          ) : (
+            <Field label="Address" hint="The endpoint’s version prefix. It usually ends in /v1.">
+              <Input
+                value={address}
+                onChange={(event) => {
+                  setAddress(event.target.value);
+                  setResult(null);
+                  setReadiness(null);
+                }}
+                placeholder="https://models.example.net/v1"
+                width="100%"
+                type="url"
+                inputMode="url"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </Field>
+          )}
+        </details>
       ) : null}
       {operator ? (
         <ReadOnly label="API key">
@@ -559,6 +689,7 @@ function KeyPanel({
             onChange={(event) => {
               setKey(event.target.value);
               setResult(null);
+              setReadiness(null);
             }}
             type="password"
             placeholder={
@@ -578,7 +709,7 @@ function KeyPanel({
           disabled={testing || !canTest}
           onClick={test}
         >
-          Test connection
+          Check credentials and list models
         </Button>
         {status.key.state === 'set' ? (
           <Button
@@ -609,10 +740,15 @@ function KeyPanel({
       </div>
       <ModelChoice
         value={model}
-        onChange={setModel}
+        onChange={(next) => {
+          setModel(next);
+          setReadiness(null);
+        }}
         options={listed}
         placeholder="The model id, as the provider writes it"
       />
+      <span className="models-hint">{CHECK_USAGE}</span>
+      {readiness ? <ReadinessResult result={readiness} /> : null}
       <div className="row" style={{ gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
         <Button
           loading={saving}
@@ -620,13 +756,7 @@ function KeyPanel({
           onClick={() => void use()}
           iconRight="chevronRight"
         >
-          {target === 'secondary'
-            ? key.trim()
-              ? 'Save and use as secondary'
-              : 'Use as secondary'
-            : key.trim()
-              ? 'Save and use this model'
-              : 'Use this model'}
+          {target === 'secondary' ? 'Connect and check secondary' : 'Connect and check'}
         </Button>
         {inUse ? <span className="models-hint">This provider is in use now.</span> : null}
       </div>
@@ -662,6 +792,7 @@ function SignInPanel({
   const [callback, setCallback] = useState('');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [readiness, setReadiness] = useState<ModelReadiness | null>(null);
   const polling = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
@@ -734,9 +865,19 @@ function SignInPanel({
 
   const use = () => {
     setBusy(true);
-    void chooseFor(target, status.provider, model.trim()).then((chosen) => {
+    void chooseFor(target, status.provider, model.trim()).then(async (chosen) => {
+      if (chosen) {
+        onChanged(chosen);
+        const checked = await models.checkReadiness({
+          provider: status.provider,
+          model: model.trim(),
+        });
+        if (checked.data) {
+          setReadiness(checked.data);
+          await publishReadiness(checked.data, onChanged, target);
+        } else setProblem(checked.error ?? 'Couldn’t check this model');
+      }
       setBusy(false);
-      if (chosen) onChanged(chosen);
     });
   };
 
@@ -851,13 +992,18 @@ function SignInPanel({
         <>
           <ModelChoice
             value={model}
-            onChange={setModel}
+            onChange={(next) => {
+              setModel(next);
+              setReadiness(null);
+            }}
             options={[]}
             placeholder="The model id, as ChatGPT names it"
           />
+          <span className="models-hint">{CHECK_USAGE}</span>
+          {readiness ? <ReadinessResult result={readiness} /> : null}
           <div className="row" style={{ gap: 10 }}>
             <Button disabled={busy || !model.trim()} onClick={use} iconRight="chevronRight">
-              {target === 'secondary' ? 'Use as secondary' : 'Use this model'}
+              {target === 'secondary' ? 'Connect and check secondary' : 'Connect and check'}
             </Button>
           </div>
         </>

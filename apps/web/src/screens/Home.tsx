@@ -1075,7 +1075,9 @@ function DayColumn({ now }: { now: number }) {
 
 /* ---------- the screen ---------- */
 
-export function HomeScreen() {
+// Kept for downstream integrations that embed the former overview. The default
+// destination now uses the personal session without combining task execution.
+export function OverviewScreen() {
   const { agents, profile, refreshConversations, capabilities, member } = useApp();
   const home = useLoad(() => adapter.home(), []);
   const decisions = useDecisions();
@@ -1268,3 +1270,5 @@ export function HomeScreen() {
     </Shell>
   );
 }
+
+export { PersonalChatScreen as HomeScreen } from './PersonalChat.tsx';

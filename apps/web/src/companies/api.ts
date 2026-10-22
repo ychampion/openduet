@@ -12,7 +12,6 @@
  */
 import type { Result } from '../experience/adapter.ts';
 import { call } from '../experience/call.ts';
-import { markValueMoment } from '../experience/push.ts';
 import type {
   CompanyMap,
   LedgerDetail,
@@ -60,8 +59,6 @@ export const companiesApi = {
       method: 'PATCH',
       body: { status },
     });
-    // Money back is the first moment OpenDuet was worth hearing from.
-    if (result.data !== null && status === 'settled') markValueMoment();
     return result;
   },
   handle: (id: string) =>

@@ -8,6 +8,7 @@
  * contract stops this compiling. No call here ever receives a key back.
  */
 import type { paths } from '@openduet/client';
+import type { ModelReadiness } from '@openduet/contracts';
 import { call } from '../experience/call.ts';
 
 type Json<T> = T extends { content: { 'application/json': infer B } } ? B : never;
@@ -16,6 +17,7 @@ export type ModelSettings = Json<paths['/model-settings']['get']['responses'][20
 export type ModelProviderStatus = ModelSettings['providers'][number];
 export type ModelProvider = ModelProviderStatus['provider'];
 export type ConnectionTest = Json<paths['/model-settings/test']['post']['responses'][200]>;
+export type { ModelReadiness };
 export type SignInStatus = Json<
   paths['/model-providers/{provider}/sign-in']['get']['responses'][200]
 >;
@@ -34,6 +36,8 @@ export const models = {
   settings: () => call<ModelSettings>('/model-settings'),
   test: (input: { provider: ModelProvider; api_key?: string; base_url?: string }) =>
     call<ConnectionTest>('/model-settings/test', { method: 'POST', body: input }),
+  checkReadiness: (input: { provider: ModelProvider; model: string }) =>
+    call<ModelReadiness>('/model-settings/readiness', { method: 'POST', body: input }),
   saveKey: (name: ModelProvider, input: { api_key: string; base_url?: string }) =>
     call<ModelSettings>(`/model-settings/keys/${provider(name)}`, { method: 'PUT', body: input }),
   removeKey: (name: ModelProvider) =>

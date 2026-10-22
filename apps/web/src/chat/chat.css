@@ -270,12 +270,12 @@
   border-top: 1px solid var(--line);
   margin: 4px 0;
 }
-/* What the agent says is set in the voice face. */
+/* Messages stay in the reading face; the editorial face is reserved for headings. */
 :where(.turn-text) .answer p {
-  font-family: var(--font-voice);
-  font-size: 17px;
-  line-height: 28px;
-  letter-spacing: -0.012em;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 26px;
+  letter-spacing: normal;
   color: var(--heading);
   text-wrap: pretty;
   min-height: 28px;
@@ -2299,10 +2299,10 @@ a.log-line-link > .log-chevron {
   gap: 6px;
   margin: 0;
   padding-left: 22px;
-  font-family: var(--font-voice);
-  font-size: 17px;
-  line-height: 28px;
-  letter-spacing: -0.012em;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 26px;
+  letter-spacing: normal;
   color: var(--heading);
 }
 ul.answer-list {

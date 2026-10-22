@@ -4,13 +4,15 @@
  * round. The offer to turn pushes on appears once, after the first moment
  * OpenDuet was worth hearing from, never on a first visit.
  */
+
+import { MORNING_BRIEF_DEFAULT_AT, MORNING_BRIEF_PURPOSE } from '@openduet/contracts/morning-brief';
 import { useEffect, useState } from 'react';
 import { Icon } from '../design/icons.tsx';
 import { Button, Input, Select, Toggle } from '../design/primitives.tsx';
 import { adapter } from '../experience/adapter.ts';
 import { featureOn } from '../experience/features.ts';
 import { useApp, useLoad } from '../experience/hooks.ts';
-import { assistantName, instanceName } from '../experience/instance.ts';
+import { instanceName } from '../experience/instance.ts';
 import {
   dismissOffer,
   enablePush,
@@ -24,6 +26,7 @@ import {
   valueMomentReached,
 } from '../experience/push.ts';
 import type { PushDevice, PushSettings } from '../experience/types.ts';
+import { sampleMode } from '../sample/mode.ts';
 import { toast } from '../shell/Shell.tsx';
 import { ReachMe } from './ReachMe.tsx';
 
@@ -40,7 +43,7 @@ export const BATCH_OPTIONS = [0, 5, 10, 30, 60].map((n) => ({
 /** Quiet hours in words, from the settings the service read off the profile. */
 export function quietLine(settings: PushSettings): string {
   const { from, until, time_zone } = settings.quiet_hours;
-  return `Nothing is sent from ${from} until ${until} (${time_zone}), outside your day.`;
+  return `Other updates wait from ${from} until ${until} (${time_zone}). Your timed reminders and daily brief use the time you chose.`;
 }
 
 const dateOf = (iso: string) =>
@@ -72,6 +75,12 @@ export function NotificationsTab() {
   const key = useLoad(() => adapter.pushPublicKey(), []);
   const devices = useLoad(() => adapter.pushDevices(), []);
   const settings = useLoad(() => adapter.pushSettings(), []);
+  const routines = useLoad(() => adapter.automations(), []);
+  const brief = routines.data?.automations.find((item) => item.purpose === MORNING_BRIEF_PURPOSE);
+  const [briefAt, setBriefAt] = useState(MORNING_BRIEF_DEFAULT_AT);
+  useEffect(() => {
+    if (brief?.at) setBriefAt(brief.at);
+  }, [brief?.at]);
   // This browser's subscription, by the hash the service lists it under; undefined until read.
   const [browserHash, setBrowserHash] = useState<string | null | undefined>(undefined);
   const [busy, setBusy] = useState(false);
@@ -82,7 +91,7 @@ export function NotificationsTab() {
     void thisBrowserHash().then(setBrowserHash);
   }, []);
 
-  const configured = Boolean(key.data?.public_key);
+  const configured = !sampleMode && Boolean(key.data?.public_key);
   const list = devices.data?.subscriptions ?? [];
   const here =
     browserHash === undefined || !devices.data ? null : subscribedHere(browserHash, list);
@@ -140,17 +149,40 @@ export function NotificationsTab() {
     settings.reload();
     toast({ kind: 'ok', title: 'Your day is saved', sub: 'Quiet hours follow it.' });
   };
+  const saveBriefTime = async () => {
+    setBusy(true);
+    const result = await adapter.morningBrief({ at: briefAt });
+    setBusy(false);
+    if (!result.data) {
+      toast({
+        kind: 'err',
+        title: result.error ?? result.unavailable ?? 'Couldn’t save that time',
+      });
+      return;
+    }
+    routines.reload();
+    toast({
+      kind: 'ok',
+      title: 'Daily brief time saved',
+      sub: result.data.automation.enabled
+        ? 'Its actual schedule has been updated.'
+        : 'It stays paused until you resume it in Work.',
+    });
+  };
 
   return (
     <div className="col" style={{ gap: 12 }}>
       <p style={{ fontSize: 13, color: 'var(--muted)', maxWidth: 560 }}>
-        {assistantName()} pushes to your phone when a decision is waiting or a chase settles. It
-        stays quiet outside your day, groups what arrives together, and says why it sent each one.
+        Choose which updates may reach your devices. Turning a category off changes delivery, not
+        the work you requested. Results stay in Chat and Work. Timed reminders and the daily brief
+        arrive at the time you chose; other updates respect your quiet hours.
       </p>
 
       {key.data && !configured ? (
         <p style={{ fontSize: 13, color: 'var(--muted)' }}>
-          Pushes aren’t set up on this installation yet.
+          {sampleMode
+            ? 'Sample day does not request notification permission or subscribe this browser. Results stay in the sample Chat and Work.'
+            : 'Pushes aren’t set up on this installation yet. Results will be waiting in Chat and Work.'}
         </p>
       ) : null}
 
@@ -159,11 +191,13 @@ export function NotificationsTab() {
         <Row
           title="This device"
           sub={
-            !pushSupported()
-              ? `This browser can’t receive pushes. On an iPhone, add ${instanceName()} to your Home Screen first.`
-              : here
-                ? 'Pushes arrive here.'
-                : 'Pushes don’t arrive here yet.'
+            sampleMode
+              ? 'Browser notifications are unavailable in Sample day.'
+              : !pushSupported()
+                ? `This browser can’t receive pushes. Results wait in Chat and Work. On an iPhone, add ${instanceName()} to your Home Screen first.`
+                : here
+                  ? 'Pushes arrive here.'
+                  : 'Pushes don’t arrive here yet.'
           }
         >
           {pushSupported() && configured && !here ? (
@@ -193,23 +227,59 @@ export function NotificationsTab() {
           </span>
           <div className="card-12" style={{ overflow: 'hidden' }}>
             <div style={{ height: 1 }} />
-            <Row title="A decision is waiting" sub="Something can’t go on until you say.">
+            <Row
+              title="Decisions requiring input"
+              sub="An approval, question, or task that needs your answer."
+            >
               <Toggle
                 on={current.decisions}
-                label="A decision is waiting"
+                label="Decisions requiring input"
                 onChange={(next) => void save({ decisions: next })}
               />
             </Row>
-            <Row title="A chase settled" sub="Money came back, or a company did what it said.">
+            <Row
+              title="Your requested work"
+              sub="Finished results and meaningful progress from work you handed off, including completed chases."
+            >
               <Toggle
-                on={current.settled}
-                label="A chase settled"
-                onChange={(next) => void save({ settled: next })}
+                on={current.task_results}
+                label="Results and updates from requested work"
+                onChange={(next) => void save({ task_results: next, settled: next })}
+              />
+            </Row>
+            <Row
+              title="Reminders you requested"
+              sub="Your timed reminders and routine results, independently of suggestions."
+            >
+              <Toggle
+                on={current.requested_reminders}
+                label="Reminders you requested"
+                onChange={(next) => void save({ requested_reminders: next })}
+              />
+            </Row>
+            <Row
+              title="Daily brief"
+              sub="Delivery of your personal daily brief. Pause its routine in Work to stop preparation."
+            >
+              <Toggle
+                on={current.daily_brief}
+                label="Daily brief"
+                onChange={(next) => void save({ daily_brief: next })}
+              />
+            </Row>
+            <Row
+              title="Other proactive suggestions"
+              sub="Things noticed without a request. Off means no unsolicited suggestions; requested reminders remain separate."
+            >
+              <Toggle
+                on={current.proactive_suggestions}
+                label="Other proactive suggestions"
+                onChange={(next) => void save({ proactive_suggestions: next })}
               />
             </Row>
             <Row
               title="What came back this week"
-              sub="On Mondays: what settled and which replies arrived."
+              sub="Optional Monday summary, sent only when proactive suggestions are also enabled."
             >
               <Toggle
                 on={current.weekly_summary}
@@ -219,12 +289,45 @@ export function NotificationsTab() {
             </Row>
           </div>
 
+          {brief ? (
+            <div className="card-12" style={{ padding: '0 12px' }}>
+              <Row
+                title="Daily brief schedule"
+                sub={`${brief.enabled ? 'Active' : 'Paused'} · ${brief.time_zone ?? profile?.time_zone ?? 'UTC'}. This edits the routine’s real trigger.`}
+              >
+                <form
+                  className="row"
+                  style={{ gap: 8 }}
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void saveBriefTime();
+                  }}
+                >
+                  <Input
+                    type="time"
+                    aria-label="Daily brief time"
+                    value={briefAt}
+                    onChange={(event) => setBriefAt(event.target.value)}
+                    width={120}
+                    required
+                  />
+                  <Button size="sm" variant="outline" type="submit" disabled={busy}>
+                    Save time
+                  </Button>
+                </form>
+              </Row>
+            </div>
+          ) : null}
+
           <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--heading)', marginTop: 8 }}>
             How often
           </span>
           <div className="card-12" style={{ overflow: 'hidden' }}>
             <div style={{ height: 1 }} />
-            <Row title="Daily limit" sub="What’s held back goes into the next push.">
+            <Row
+              title="Daily limit"
+              sub="Normal updates are capped. Timed reminders and daily briefs do not count against this limit."
+            >
               <Select
                 label="Daily limit"
                 value={String(current.daily_cap)}
@@ -283,7 +386,7 @@ export function NotificationsTab() {
 }
 
 /**
- * The offer on Home, after the first decision or settled chase. It asks once;
+ * The offer after a useful completed task. It asks once;
  * "Not now" is remembered in this browser.
  */
 export function PushOffer() {
@@ -329,8 +432,8 @@ export function PushOffer() {
           Get a nudge when something needs you
         </span>
         <span style={{ fontSize: 13, color: 'var(--muted)' }}>
-          One push when a decision is waiting or a chase settles. Only during your day, a few a day
-          at most.
+          Your task produced a result. Choose which future results, decisions, and reminders may
+          reach this device. Everything also waits in Chat and Work.
         </span>
       </div>
       <div className="row" style={{ gap: 6 }}>

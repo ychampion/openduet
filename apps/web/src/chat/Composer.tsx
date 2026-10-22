@@ -1,8 +1,7 @@
 /**
- * One thin row: the text and a single state button. The button is Send when
- * it is the person's turn, Stop while an agent works or an answer streams,
- * and Resume after a pause. Stopping keeps what the turn already did. The state comes from the conversation
- * itself, never guessed here.
+ * Text and a consistently available Send button. Stop belongs to the active
+ * task row; a paused task can additionally expose Resume beside Send. The
+ * message target is selected by the containing task or personal session.
  *
  * Where the box is given `attachments`, files come in three ways: the
  * paperclip, a drop on the box, or a paste. Each shows as a tile above the
@@ -46,7 +45,13 @@ import { assistantName } from '../experience/instance.ts';
  * Said above the box while no model is connected, since nothing sent could be
  * answered: why, and the one step that fixes it.
  */
-export function ModelMissing({ canEdit }: { canEdit: boolean }) {
+export function ModelMissing({
+  canEdit,
+  setupHref = '/settings/models',
+}: {
+  canEdit: boolean;
+  setupHref?: string;
+}) {
   return (
     <div className="composer-missing" role="status">
       <Icon name="info" size={15} />
@@ -56,7 +61,7 @@ export function ModelMissing({ canEdit }: { canEdit: boolean }) {
           : `${assistantName()} needs a model to answer. The person who runs this server can connect one.`}
       </span>
       {canEdit ? (
-        <a className="composer-missing-link" href={href('/settings/models')}>
+        <a className="composer-missing-link" href={href(setupHref)}>
           Connect a model
           <Icon name="chevronRight" size={13} />
         </a>
@@ -69,9 +74,7 @@ export function Composer({
   value,
   onChange,
   onSend,
-  onPause,
   onResume,
-  onStop,
   state = 'send',
   agentName = assistantName(),
   placeholder = `Message ${agentName}`,
@@ -81,6 +84,10 @@ export function Composer({
   voice,
   attachments,
   onPasteText,
+  modelSetupHref,
+  allowModelSetup = false,
+  readOnly = false,
+  retainedAttachments = 0,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -105,6 +112,11 @@ export function Composer({
   attachments?: AttachmentsControl;
   /** Told the text of each paste, so the message can say which words were pasted. */
   onPasteText?: (text: string) => void;
+  modelSetupHref?: string;
+  /** The first handoff saves the request before opening model setup. */
+  allowModelSetup?: boolean;
+  readOnly?: boolean;
+  retainedAttachments?: number;
 }) {
   const textRef = useRef<HTMLTextAreaElement>(null);
   const pickRef = useRef<HTMLInputElement>(null);
@@ -148,7 +160,10 @@ export function Composer({
   }, [files]);
   const waiting = files.some((file) => file.state !== 'ready');
   const canSend =
-    (value.trim().length > 0 || (attachments?.ready.length ?? 0) > 0) && !waiting && !noModel;
+    (value.trim().length > 0 || (attachments?.ready.length ?? 0) > 0 || retainedAttachments > 0) &&
+    !waiting &&
+    (allowModelSetup || !noModel) &&
+    !disabled;
   const latest = useRef(value);
   latest.current = value;
   const recorder = useRecorder({
@@ -174,54 +189,36 @@ export function Composer({
     onSend();
   };
 
-  // While the agent works, Enter still sends: the words reach it at its next
-  // step. Files wait for the turn to end; they start a turn of their own.
-  const steering = working && (state === 'stop' || state === 'pause') && !files.length;
+  // Sending is the same action for touch, keyboard and mouse. Stop belongs to
+  // the task row, so active work never takes away the ability to hand off work.
   const onKey = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      if ((state === 'send' || steering) && canSend) send();
+      if (canSend) send();
     }
   };
 
-  // Pausing mid-step is not something the assistant can do, so a working turn offers Stop.
-  const stateButton =
-    state === 'pause' || state === 'stop' ? (
-      <button
-        type="button"
-        className="state-btn"
-        aria-label="Stop"
-        title="Stop"
-        onClick={onStop ?? onPause}
-      >
-        <span style={{ width: 12, height: 12, borderRadius: 2, background: 'currentColor' }} />
-      </button>
-    ) : state === 'resume' ? (
-      <button
-        type="button"
-        className="state-btn"
-        data-variant="resume"
-        aria-label="Resume"
-        title="Resume"
-        onClick={onResume}
-      >
-        <Icon name="play" size={14} stroke={2.5} />
-      </button>
-    ) : (
-      <IconButton
-        name="arrowUp"
-        label="Send"
-        variant={canSend ? 'primary' : 'mutedFill'}
-        disabled={!canSend}
-        title={noModel ? 'Connect a model to send' : undefined}
-        onClick={send}
-      />
-    );
+  const stateButton = (
+    <IconButton
+      name="arrowUp"
+      label="Send"
+      variant={canSend ? 'primary' : 'mutedFill'}
+      disabled={!canSend}
+      title={
+        noModel
+          ? allowModelSetup
+            ? 'Keep your request and connect a model'
+            : 'Connect a model to send'
+          : undefined
+      }
+      onClick={send}
+    />
+  );
 
   // Only a drag that carries files is a drop for the box; dragged text is left alone.
   const carriesFiles = (event: DragEvent) => event.dataTransfer?.types.includes('Files') ?? false;
   const onDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!attachments || disabled || !carriesFiles(event)) return;
+    if (!attachments || disabled || readOnly || !carriesFiles(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = 'copy';
     setDropping(true);
@@ -231,7 +228,7 @@ export function Composer({
     setDropping(false);
   };
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
-    if (!attachments || disabled || !carriesFiles(event)) return;
+    if (!attachments || disabled || readOnly || !carriesFiles(event)) return;
     event.preventDefault();
     setDropping(false);
     attachments.add([...event.dataTransfer.files]);
@@ -241,7 +238,7 @@ export function Composer({
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const text = event.clipboardData.getData('text/plain');
     if (text) onPasteText?.(text);
-    if (!attachments) return;
+    if (!attachments || readOnly) return;
     const pasted = [...event.clipboardData.files];
     if (!pasted.length || event.clipboardData.types.includes('text/plain')) return;
     event.preventDefault();
@@ -251,7 +248,15 @@ export function Composer({
 
   return (
     <div className="composer" data-disabled={disabled ? 'true' : undefined}>
-      {noModel && model.data ? <ModelMissing canEdit={model.data.can_edit} /> : null}
+      {noModel && model.data ? (
+        allowModelSetup ? (
+          <div className="composer-missing" role="status">
+            Your request will be kept through model setup.
+          </div>
+        ) : (
+          <ModelMissing canEdit={model.data.can_edit} setupHref={modelSetupHref} />
+        )
+      ) : null}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: a drop target only; the paperclip is the keyboard way in */}
       <div
         ref={cardRef}
@@ -265,7 +270,12 @@ export function Composer({
         {files.length ? (
           <ul className="composer-tiles" aria-label="Files to send">
             {files.map((file) => (
-              <FileTile key={file.key} file={file} onRemove={() => removeFile(file.key)} />
+              <FileTile
+                key={file.key}
+                file={file}
+                onRemove={() => removeFile(file.key)}
+                readOnly={readOnly}
+              />
             ))}
           </ul>
         ) : null}
@@ -282,7 +292,7 @@ export function Composer({
                 name="paperclip"
                 label="Attach files"
                 className="attach-btn"
-                disabled={disabled}
+                disabled={disabled || readOnly}
                 onClick={() => pickRef.current?.click()}
               />
               <input
@@ -306,12 +316,9 @@ export function Composer({
             ref={textRef}
             rows={1}
             value={value}
-            placeholder={
-              working && state !== 'send'
-                ? `${agentName} is working. Add something, or press Stop`
-                : placeholder
-            }
+            placeholder={placeholder}
             disabled={disabled}
+            readOnly={readOnly}
             aria-label={placeholder}
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={onKey}
@@ -349,6 +356,9 @@ export function Composer({
               )}
             </button>
           ) : null}
+          {state === 'resume' && onResume ? (
+            <IconButton name="play" label="Resume this task" onClick={onResume} />
+          ) : null}
           {stateButton}
         </div>
       </div>
@@ -371,7 +381,15 @@ export function Composer({
 }
 
 /** One file in the box: a thumbnail or a name, its state, and a way to take it out. */
-function FileTile({ file, onRemove }: { file: PendingFile; onRemove: () => void }) {
+function FileTile({
+  file,
+  onRemove,
+  readOnly = false,
+}: {
+  file: PendingFile;
+  onRemove: () => void;
+  readOnly?: boolean;
+}) {
   // A file waiting to be tried again looks like one that failed, with its own words.
   const failed = file.state === 'failed' || file.state === 'retrying';
   const picture =
@@ -416,6 +434,7 @@ function FileTile({ file, onRemove }: { file: PendingFile; onRemove: () => void 
         type="button"
         className="attach-x"
         aria-label={`Remove ${file.name}`}
+        disabled={readOnly}
         onClick={onRemove}
       >
         <span>

@@ -41,6 +41,7 @@
     "client:generate": "bun run packages/client/scripts/generate.ts",
     "dev:mock": "bun run --cwd apps/mock-api dev",
     "dev:web": "bun run --cwd apps/web dev",
+    "sample": "bun --no-env-file run scripts/sample.ts",
     "evals": "bun run evals/run.ts",
     "companies:demo": "bun run apps/openduet/src/companies/demo.ts",
     "feedback": "bun run apps/openduet/src/feedback/cli.ts",
