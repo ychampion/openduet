@@ -15,7 +15,7 @@ on model quality, account permissions, tool availability and your instructions.
 | Client follow-up | Mail | Reviewable draft and send receipt |
 | Supplier comparison | Web tools; browser if required | Comparison with gaps and citations |
 | Weekly CSV report | Uploaded files + computer tools | Report and calculations |
-| Meeting preparation | Calendar + relevant documents | Agenda and decisions to make |
+| Meeting preparation | Notes/agenda; calendar optional for fresh details | Agenda and decisions to make |
 | Change watch | Web tools + routine | Dated changes with sources |
 | Project checklist | Plans + tasks | Milestones and next actions |
 | Reusable writing context | Memory | Inspectable preferences |
@@ -46,7 +46,7 @@ why something is urgent. Keep the brief under 300 words. Do not send messages
 or change meetings. Ask if the priority is unclear.
 ```
 
-Use the morning brief option or create the routine in **Automations**. Test it
+Use the dedicated daily brief option to keep one personal schedule; inspect it in **Work → Recurring**. Test it
 once and compare it with the source inbox and calendar.
 
 **Done when:** the brief arrives in the intended time zone, links resolve, and
@@ -67,6 +67,15 @@ the complete draft before sending it.
 **Done when:** the recipient, subject and body are correct, the draft says
 what you intend, and an authorised send has a receipt. An unresolved or
 unknown send outcome needs investigation before retrying.
+
+For the complete teach-and-delegate flow: reply to the result with a correction,
+choose **Remember this preference** or **Save these steps**, then independently
+confirm **Work → Recurring → Watch a customer thread**. Select a native Gmail or
+Microsoft mailbox, inspect the source thread and confirm customer, deadline and
+time zone. If no reply arrives, one preparation waits for review. A confirmed
+send receipt completes this one-shot watch. Pausing or disconnecting blocks new
+checks; a fresh reply makes an old preparation obsolete. IMAP and generic MCP
+mailboxes are not currently offered for this dedicated watch.
 
 ## 4. Research a supplier decision
 

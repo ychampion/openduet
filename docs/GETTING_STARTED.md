@@ -48,66 +48,85 @@ Prefer to inspect the installer first? Download [install.sh](../install.sh)
 or [install.ps1](../install.ps1), read it, then run the saved file. For another
 directory, project name or ports, see the [deployment guide](DEPLOYMENT.md).
 
-## 2. Create your account and connect a model
+## 2. Give it a real task
 
-Open the setup link, create your account, and finish the first-run prompts.
-Confirm your time zone so routines fire at the intended local time.
+Open the setup link and create your account. The next screen asks **What would
+you like off your plate?** Choose a starter or enter your own task, then paste
+notes or attach a supported file. Time zone is detected automatically; use
+**Change** if it is wrong. No personal questionnaire is required.
 
-In **Settings → Models**, configure your provider, API key and model. Save the
-configuration, return to chat and send a small request. The practice model
-used before configuration is a demonstration; it cannot do general work.
-Choose a model that supports the tool use your workflow needs. Providers and
-local endpoints have different capabilities and quality.
-
-![Model settings in the scripted showcase](media/models-1440-light.png)
-
-In **Settings → Approvals**, select **Ask me for everything** while you learn
-the system. Auto-review and other autonomy settings can permit changes
-without a fresh approval.
-
-## 3. Finish a small task
-
-Paste this into a new chat; it needs only a real model:
+Try this request with notes you can check:
 
 ```text
-Turn these notes into a client update:
-- Landing page copy is approved.
-- Mobile screenshots are due Friday.
-- Launch is Monday.
-
-Give me a status, risks and next actions. Ask if a date is ambiguous.
-Do not send anything.
+Priya at Northstar needs a security review before choosing a pilot date.
+We have not confirmed SSO support. Prepare a short follow-up asking which
+security questions her team needs answered. Do not promise SSO or send anything.
 ```
 
-You are done when you have a readable update, unresolved dates are called
-out, and no message has been sent. Correct the result if needed. Then tell
-OpenDuet a preference to remember and inspect it in **Memory**.
+Pasted context is enough for this draft. You can connect an inbox later.
 
-## 4. Connect one account, then try a draft
+## 3. Connect and verify the model
 
-Open **Settings → Connections** and connect a mailbox using a provider your
-installation supports. Depending on the connector, you may need app-specific
-credentials, OAuth configuration or an optional connector service. Catalog
-apps can require operator setup. See [CONNECTORS.md](CONNECTORS.md).
+Press Send. If a model is missing or unchecked, your exact text and uploaded
+attachment references are kept while setup opens. Configure the provider and
+selected model, then review the three separate check stages:
 
-Ask for a short follow-up to a thread you can verify. Name the thread, desired
-outcome and recipient; request a draft first. Check the recipient, subject,
-body and proposed action before sending. A draft is not a delivery receipt.
+![A saved first request waiting for model setup in the scripted Sample day](media/sample-day/first-handoff.png)
 
-![Reviewing an exact send action in the scripted walkthrough](media/review-draft.png)
+| Stage | What it proves |
+| --- | --- |
+| Credentials accepted | The provider accepted the configured credentials. Listing models alone proves no inference capability. |
+| Model responded | The exact selected model produced an inference response through the gateway and Hermes. |
+| Tool use verified | That model called the isolated read-only note tool and returned its actual value. |
 
-## 5. Make recurring work explicit
+The check uses up to three model requests, 1,536 output tokens and 45 seconds
+of runtime. Provider billing can apply. It has no access to your actual accounts.
+IDs and custom endpoints are under Advanced. Changing relevant model configuration
+invalidates earlier readiness. A failed check shows its stage and reason; fix
+credentials, billing, endpoint, model ID or tool compatibility before retrying.
+There is no automatic fallback to another model or the practice fixture.
 
-Open **Automations → New routine**. Enter an instruction, days and time.
-Include what counts as a useful change and what should wait for you. Start
-with a report-only routine. Run a test, inspect its output, then leave it on.
+After a successful check, the saved request continues once. Refreshes or retries
+reuse its submission key. Do not retype it into another task to recover a lost
+response. The check verifies compatibility, not the quality of every future answer.
 
-For example: “Every Friday, review the supplier shortlist, link new sources
-and list questions to verify. Do not contact suppliers.”
+In **Settings → Approvals**, choose **Ask me for everything** while learning the
+system. Other autonomy settings can permit actions under existing policy.
 
-Your server must stay running. Closing the browser does not turn the host
-into an always-on machine. Model budgets, missing credentials and disconnected
-accounts can stop a routine; inspect its runs.
+## 4. Inspect, correct and teach
+
+Your task and its useful output appear in **Chat**. Open the result to see the
+source context and full draft. A draft has not been sent. Correct it with
+**Reply to this result**, for example “Under 120 words, with one clear ask.”
+
+Use **Remember this preference** to review and explicitly save the exact style
+instruction. Use **Save these steps** for a reusable personal procedure. Both
+have review fields; neither starts a routine. Inspect or forget memory in
+**Settings → Memory**, and manage procedures in **Explore → Skills**.
+
+![Prepared customer draft in the labeled Sample day](media/sample-day/result-desktop.png)
+
+## 5. Delegate a future responsibility explicitly
+
+For report-only scheduled work, choose **Run this automatically** after a result
+and review the instruction and schedule. For a daily brief, use the dedicated
+brief settings so there is one actual daily schedule.
+
+For a customer follow-up, connect a native Gmail or Microsoft mailbox in
+**Settings → Connections**. Operator OAuth/app setup can be required; see
+[CONNECTORS.md](CONNECTORS.md). Open **Work → Recurring → Watch a customer thread**,
+select the actual mailbox and thread, inspect its contents, and confirm the
+customer email, deadline and time zone. IMAP and generic MCP sources are not
+currently offered for this watch.
+
+If no reply arrives by the confirmed time, a draft returns for review. A fresh
+reply, paused watch or revoked account access prevents obsolete preparation and
+send. Review the exact message before authorizing its send; a receipt completes
+the one-shot watch. Use Pause watch to stop its actual future checks.
+
+Your host must stay on. Closing a browser does not stop its server, but turning
+off the host does. Budgets, failed checks and disconnected accounts are shown
+rather than treated as successful work. See the [complete behavior guide](PERSONAL_ASSISTANT.md).
 
 ## Add a browser or phone access
 
@@ -136,17 +155,26 @@ origin. There are no native iOS or Android binaries in this release.
 | The first download is slow | Allow the pull to finish; check network access and free Docker disk space. |
 | The app is not reachable | Use the printed URL. Inspect Compose status and logs below. |
 | Setup code is rejected | Check expiry and whether the first account exists. Follow account recovery in the deployment guide. |
-| Replies look like a demonstration | Replace the practice model in Settings → Models with a real provider and valid model ID. |
+| Request stays in setup | Check the selected model’s credentials, inference and tool results. Fix the stated failure, then retry the saved request. |
 | A tool is unavailable | Check the connection, credentials, agent access and any required worker. |
+| A task's source needs reconnecting | Use **Connect**, or **Provide context** to add notes/files to that exact task. The separate unsent request is preserved. Fresh reads and sending still need the source. |
 | A routine fires at the wrong time | Confirm the profile time zone and schedule; inspect its latest run. |
 | Phone cannot connect | Use the server’s HTTPS / tailnet address, not localhost. |
 
-For the default installation:
+For the default installation, in Bash:
 
 ```sh
 docker compose -f ~/openduet/deploy/docker-compose.yml ps
 docker compose -f ~/openduet/deploy/docker-compose.yml logs --tail=100 openduet web
 curl -fsS http://localhost:3101/api/health
+```
+
+In PowerShell:
+
+```powershell
+docker compose -f "$HOME/openduet/deploy/docker-compose.yml" ps
+docker compose -f "$HOME/openduet/deploy/docker-compose.yml" logs --tail=100 openduet web
+Invoke-RestMethod http://localhost:3101/api/health
 ```
 
 The health endpoint should return a successful response. Remove account and

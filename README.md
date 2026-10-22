@@ -1,219 +1,184 @@
 <div align="center">
   <img src="apps/web/public/openduet-mark.svg" alt="OpenDuet" width="104" />
   <h1>OpenDuet</h1>
-  <p><strong>Delegate the work. Keep the control.</strong></p>
-  <p>An open-source, always-on assistant on your own server.<br />Your models. Your workflows. Your memory.</p>
+  <p><strong>Your personal AI. Already on it.</strong></p>
+  <p>It remembers your work, learns the routines you teach it, and comes back with results.<br />Run it on your own server with a model you choose.</p>
   <p>
     <a href="https://github.com/ychampion/openduet/actions/workflows/ci.yml"><img src="https://github.com/ychampion/openduet/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-d97757" alt="Apache 2.0 license" /></a>
-    <a href="https://github.com/ychampion/openduet/releases"><img src="docs/media/release-badge.svg" alt="Release v0.2.1" /></a>
   </p>
-  <p><a href="#get-started">Install</a> · <a href="docs/SHOWCASE.md">Watch the walkthroughs</a> · <a href="docs/USE_CASES.md">Try a workflow</a> · <a href="docs/CLAUDE_DUET_COMPARISON.md">Compare with Claude Duet</a></p>
+  <p><a href="#try-a-sample-day">Try it</a> · <a href="#get-started">Install</a> · <a href="docs/PERSONAL_ASSISTANT.md">How it works</a> · <a href="docs/PRODUCT_VERIFICATION.md">What we tested</a></p>
 </div>
 
-Give OpenDuet a task, close your laptop, and come back to the result and the
-decisions that need you. It brings chat, background jobs, scheduled routines,
-inspectable memory and connected tools into one self-hosted application.
+## Try a Sample day
 
-[![OpenDuet overview: delegate, review and repeat](docs/media/overview.gif)](https://github.com/ychampion/openduet/releases/download/v0.2.1/openduet-overview.mp4)
-
-**[Watch the overview](https://github.com/ychampion/openduet/releases/download/v0.2.1/openduet-overview.mp4)** ·
-**[Follow-up walkthrough](https://github.com/ychampion/openduet/releases/download/v0.2.1/openduet-follow-up.mp4)** ·
-**[Routines walkthrough](https://github.com/ychampion/openduet/releases/download/v0.2.1/openduet-routines.mp4)**
-
-*The showcase uses the real web UI with scripted responses and sample accounts.
-It demonstrates the interaction, including review before sending; no real mail
-is sent. See [media provenance](docs/media/README.md) and the separate
-[production release checks](docs/RELEASE_READINESS.md). Videos have on-screen
-captions and no audio.*
-
-## Why choose OpenDuet?
-
-OpenDuet is for people who want to operate and extend their own assistant.
-
-| What you want | What OpenDuet gives you |
-| --- | --- |
-| Choose the model for the job | Configure your own provider or a compatible local endpoint. Change providers without moving to a different assistant. |
-| Own the installation | Run the service, database and job history on your infrastructure. Apache-2.0 source you can inspect, modify and redistribute. |
-| Make work repeatable | Turn a useful instruction into a scheduled routine. Inspect its runs, pause it or change the workflow. |
-| Review consequential actions | Set **Approvals → Ask me for everything**, then review the destination and action before authorising it. Keep receipts of what happened. |
-| Keep useful context editable | Inspect, correct, export or forget memories; manage reusable skills. |
-| Add your own tools | Connect mail, calendars, files and MCP servers, with optional browser, sandbox and device workers. |
-| Start without a product waitlist | Install the source or public images directly. No Claude subscription is required. Model inference and optional services have their own costs. |
-
-You operate uptime, updates and backups. Connected model and tool providers
-still receive the data needed for their requests; self-hosting alone does not
-make those requests local. Start with one workflow and the minimum connections
-it needs.
-
-## Work you can hand off
-
-| Workflow | Ask OpenDuet | What you review |
-| --- | --- | --- |
-| **Start the day prepared** | “At 8 AM, brief me on meetings, urgent mail and my top three priorities.” | A concise brief, source links and open questions. |
-| **Follow up with clients** | “Read the Northstar proposal thread. Draft a short follow-up. Let me review it before sending.” | The recipient, subject and complete draft. |
-| **Research a decision** | “Compare these three suppliers. Link sources, separate facts from assumptions and list missing information.” | A comparison, recommendation and questions to verify. |
-| **Turn files into an update** | “Use these CSVs to prepare a weekly summary. Show calculations and flag missing data.” | A report and reproducible files, with the configured computer tools. |
-| **Keep recurring work moving** | “Every Friday, review the supplier shortlist and report only meaningful changes.” | A run history with results, changes and failures. |
-| **Build reusable context** | “Remember how I write client updates: short, specific, with the next action first.” | A memory you can inspect, correct or forget. |
-
-These are starting instructions, not guaranteed outcomes across models and
-integrations. The [use-case playbook](docs/USE_CASES.md) includes ten workflows,
-copyable prompts, prerequisites and a definition of done for each.
-
-## See the app
-
-### Read the thread. Review the draft. Decide what leaves.
-
-![Client follow-up draft in the OpenDuet web app](docs/media/follow-up.png)
-
-### Give recurring work a schedule
-
-![Scheduled morning brief and Friday research routine](docs/media/routines.png)
-
-<details>
-<summary>Memory, models, dark mode and phone layouts</summary>
-
-| Inspect what it remembers | Choose your model |
-| --- | --- |
-| ![Editable memory settings](docs/media/memory-1440-light.png) | ![Model configuration](docs/media/models-1440-light.png) |
-
-| Dark appearance | On your phone |
-| --- | --- |
-| ![OpenDuet home in dark appearance](docs/media/home-1440-dark.png) | <img src="docs/media/home-390-light.png" alt="OpenDuet home on a phone" width="260" /> |
-
-</details>
-
-The phone experience is a responsive web app and installable PWA. See the
-[full gallery and walkthrough transcripts](docs/SHOWCASE.md).
-
-## Get started
-
-### 1. Prepare your host
-
-Use a Linux **x86-64** host, or Docker Desktop with Linux containers on Windows
-or an Intel Mac. Published images currently target `linux/amd64`; Apple Silicon
-and other ARM hosts require an appropriate source build and are not covered by
-the published-image install check. Allow **8 GB RAM and 20 GB free disk**.
-
-You need **Docker Engine 28+** and **Docker Compose 2.33.1+**. Start Docker first.
-Windows also needs [Git for Windows](https://git-scm.com/download/win).
-
-### 2. Install
-
-**Linux / macOS — Bash**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
-```
-
-**Windows — PowerShell**
-
-```powershell
-irm https://raw.githubusercontent.com/ychampion/openduet/main/install.ps1 | iex
-```
-
-The installer downloads public images, creates `~/openduet`, starts the stack
-and prints your one-time account setup link. The first download can take
-several minutes. Open that link and create your account. No Bun or Node.js is
-needed for this image-based installation.
-
-### 3. Connect a real model
-
-Open **Settings → Models**, configure your provider, API key and model, and
-save. The initial practice model demonstrates the interface; connect a real
-model to do real work. Then connect the specific accounts your workflow needs
-in **Settings → Connections**.
-
-For approval before every change, choose **Settings → Approvals → Ask me for
-everything**. Other autonomy levels and auto-review can allow actions without
-a new approval.
-
-### 4. Complete your first task
-
-Open [localhost:3101](http://localhost:3101) and try a task with no external
-connections:
-
-> Turn these notes into a client update: landing page copy is approved;
-> mobile screenshots are due Friday; launch is Monday. Give me a status,
-> risks and next actions. Ask if a date is ambiguous. Do not send anything.
-
-Check the result, then try a [connected workflow](docs/USE_CASES.md). Your host
-must stay on for background work. For access from another device, configure
-HTTPS or Tailscale before adding OpenDuet to your phone’s home screen.
-
-**[Detailed first-run guide and troubleshooting →](docs/GETTING_STARTED.md)**
-
-<details>
-<summary>Optional browser worker and source installation</summary>
-
-Once your account exists, enable the agent’s browser without installing Bun:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | OPENDUET_BROWSER=1 bash
-```
-
-To develop or build images yourself, install Git, Bun **1.3.13**, Docker and
-Compose, then:
+Run a local, clearly labeled walkthrough before connecting a model or account:
 
 ```sh
 git clone https://github.com/ychampion/openduet.git
 cd openduet
 bun install --frozen-lockfile
+bun run sample
+```
+
+Open **http://127.0.0.1:5321**. Requires Git, Node.js 22+ and Bun 1.3.13.
+The runner starts fresh, in-memory fixtures on loopback. It removes inherited
+installation settings before loading fixtures, disables dotenv loading for the
+sample web app, and uses no service credentials, database or real connectors.
+Restart it to reset the day.
+Every screen says **Sample day · Scripted examples · No real account actions**.
+There is no hosted public demo.
+
+[![Sample day: review a follow-up, inspect a receipt, and return to saved style and recurring work](docs/media/sample-day/review.gif)](docs/SHOWCASE.md)
+
+A 21-second browser recording of the scripted local sample. No real mail is sent.
+
+**[Walkthrough, screenshots and recording](docs/SHOWCASE.md)** ·
+**[Media provenance](docs/media/sample-day/README.md)**
+
+The sample uses the production React components with deterministic responses.
+Its sample send produces a fixture receipt. It is an interaction demo;
+[real service, database and Hermes checks](docs/PRODUCT_VERIFICATION.md) are separate.
+
+## One task, then a better next time
+
+Start with a concrete request and the information you already have:
+
+> Priya at Northstar needs a security review before choosing a pilot date.
+> SSO is unconfirmed. Prepare a short follow-up asking which security questions
+> her team needs answered. Do not promise SSO or send anything.
+
+OpenDuet keeps the request, prepared draft, source context and review controls
+in **Chat**. Open a result to inspect or revise it. **Draft prepared** means a
+draft exists; a confirmed send has its own receipt.
+
+Then make three separate choices:
+
+1. **Correct the work.** Reply to that result: “Under 120 words, with one clear ask.”
+   Replies to an older run keep that run as their source.
+2. **Teach it.** Choose **Remember this preference** to review and save the exact
+   wording. Or **Save these steps** to review a reusable personal skill.
+   Inspect, edit or forget saved context; changing the model keeps it in your installation.
+3. **Delegate next time.** Choose **Run this automatically** for an explicit
+   schedule. For a customer thread, confirm the mailbox, customer, thread,
+   deadline and time zone in **Work → Recurring → Watch a customer thread**.
+
+The customer watch checks fresh thread state and prepares one follow-up when
+the deadline arrives without a reply. A reply, pause or loss of access blocks
+obsolete work. Sending is a separate reviewed action; a confirmed receipt
+completes this one-shot watch. Native Gmail and Microsoft mailboxes support
+this watch; IMAP and generic MCP mailboxes are not offered for it.
+
+![A source-bound result with the full editable draft](docs/media/sample-day/result-desktop.png)
+
+## Keep the work together
+
+| Place | What you do there |
+| --- | --- |
+| **Chat** | Give the main assistant a task, continue an actual task, or reply to a specific result. Unrelated tasks retain separate execution and approval boundaries. |
+| **Work** | Review **Needs you**, **In progress**, **Finished**, and **Recurring**. Pause the actual routine or customer watch. |
+| **Explore** | Start meeting preparation, research, follow-ups, a daily brief, or writing in your style. Each preset explains its inputs and prerequisites. |
+| **Settings** | Choose a model; manage accounts, memory, skills, approvals and delivery preferences. Advanced tools remain available. |
+
+| Desktop in dark appearance | Phone result view |
+| --- | --- |
+| ![Chat in dark appearance](docs/media/sample-day/chat-dark.png) | <img src="docs/media/sample-day/result-phone.png" alt="Result with Back navigation and sample label on a phone" width="260" /> |
+
+Notes or a supported file are enough to begin. Connect a calendar, mailbox or
+research tool when a task needs fresh information. Output quality depends on
+the selected model and available tools. See [five useful starting workflows](docs/USE_CASES.md).
+
+## Get started
+
+### 1. Prepare your host
+
+Use an always-on Linux **x86-64** host, or Docker Desktop with Linux containers
+on Windows / Intel Mac. Allow **8 GB RAM and 20 GB free disk**. Published images
+target `linux/amd64`; ARM source builds need separate validation.
+Install **Docker Engine 28+**, **Compose 2.33.1+**, and, on Windows, Git for Windows.
+
+### 2. Install
+
+Linux / macOS, in Bash:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
+```
+
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ychampion/openduet/main/install.ps1 | iex
+```
+
+The installer creates `~/openduet`, downloads public images, starts the stack
+and prints a one-time account setup link. Open it and create your account.
+The image installation needs no Bun or Node.js. The first download can take
+several minutes. Read [the detailed guide and troubleshooting](docs/GETTING_STARTED.md).
+
+### 3. Hand off a real task
+
+At **What would you like off your plate?**, enter your actual task, paste notes
+or attach a supported file. Send saves the exact request before model setup.
+Choose your provider and model, then run the compatibility check. It separately
+shows **Credentials accepted**, **Model responded**, and **Tool use verified**.
+Listing models alone does not pass the check. A successful check resumes the
+saved request once; refresh/retry retains its submission key.
+
+The compatibility check uses the selected model through Hermes with an
+isolated read-only note tool. It may use paid inference: up to three model
+requests and 1,536 output tokens, with a 45-second runtime limit. It cannot
+verify task quality. Practice responses are not accepted for real handoffs.
+
+Connect only the accounts needed for your next task. In **Settings → Approvals**,
+choose **Ask me for everything** if you want a fresh review before consequential
+actions. Other autonomy settings can allow actions under existing policy.
+
+### 4. Return to useful work
+
+Keep your host running for jobs and routines. **Work** shows results and
+questions that need you. Delivery preferences separately control decisions,
+your requested work, requested reminders, the daily brief and unsolicited
+suggestions. Suggestions start off. Editing the daily brief changes its real
+schedule; pausing a routine stops its trigger.
+
+For phone access, configure [HTTPS or Tailscale](docs/DEPLOYMENT.md) and install
+the PWA from your browser. There are no native mobile binaries.
+
+<details>
+<summary>Build the real service from source / add a browser worker</summary>
+
+```sh
 bun run openduet init --connect-in-app
 docker compose -f deploy/docker-compose.yml up -d --build --wait --wait-timeout 300
 ```
 
-Open the setup link printed by `init`. Keys belong in the app or your local
+Run these inside the cloned repository after installing dependencies. Open the
+setup link printed by `init`. Configuration belongs in the app or local
 `deploy/.env`, never in Git. See [deployment](docs/DEPLOYMENT.md),
-[browser setup](docs/browser-worker.md), and [capabilities](docs/CAPABILITIES.md).
+[optional browser worker](docs/browser-worker.md), and [architecture](docs/ARCHITECTURE.md).
 
 </details>
 
-## OpenDuet and Claude Duet
+## Why run your own assistant?
 
-Claude Duet’s published preview combines a managed cloud computer, native mobile
-apps and Anthropic’s model. OpenDuet offers a self-hosted service with model
-choice, editable memory and extensible workflows. Choose OpenDuet when owning
-and adapting the installation matters to you.
+Your working context, taught procedures and job history stay in your
+installation while you choose a supported model and extend the tools.
+Apache-2.0 source lets you inspect and adapt the system. You operate uptime,
+updates and backups; connected model/tool services receive the data their
+requests need. Self-hosting does not make remote inference local.
 
-| Area | OpenDuet | Claude Duet’s published preview |
-| --- | --- | --- |
-| Hosting | Your server; you operate it | Anthropic-managed cloud |
-| Model | Your configured provider / compatible local endpoint | Opus 5.5 |
-| Source | Apache-2.0 | Proprietary |
-| Background work and briefs | Durable jobs, routines, watches | Cloud work, periodic checks and briefs |
-| Mobile | Responsive web / installable PWA | Native iOS and Android, plus web |
-| Tools | Native connectors, MCP, optional connector services | Marketplace advertises 6,000+ connectors |
-| Wallet integrations | No built-in equivalent | Link and Shop Pay |
+Claude Duet offers a managed experience. OpenDuet focuses on owning and adapting
+your assistant. See the [source-backed feature comparison](docs/CLAUDE_DUET_COMPARISON.md)
+for native mobile, wallet and connector gaps. We have not benchmarked task quality
+against a Duet account. OpenDuet is independent of Anthropic.
 
-Comparison checked October 22, 2026 against Anthropic’s
-[announcement](https://claude.com/resources/articles/claude-duet) and
-[product page](https://claude.com/product/claude-duet). We have not run a task
-quality benchmark against a Duet account. See the
-[complete comparison and evidence](docs/CLAUDE_DUET_COMPARISON.md).
-OpenDuet is independent and is not affiliated with Anthropic.
-
-## Built to inspect
-
-The service, Postgres job queue, React app, Hermes runtime, connectors and
-optional workers are one application. Test evidence covers durable execution,
-approval policy, receipts, memory boundaries, browser behaviour and installation.
-The [release report](docs/RELEASE_READINESS.md) records what ran and its limits;
-the [capability matrix](docs/CAPABILITIES.md) links features to their tests.
-
-| Learn | Build and operate |
+| Use and understand | Build and operate |
 | --- | --- |
-| [First-run guide](docs/GETTING_STARTED.md) | [Contributing and tests](CONTRIBUTING.md) |
-| [Use-case playbook](docs/USE_CASES.md) | [Architecture](docs/ARCHITECTURE.md) |
-| [Screenshots and videos](docs/SHOWCASE.md) | [Deployment](docs/DEPLOYMENT.md) |
-| [Feature comparison](docs/CLAUDE_DUET_COMPARISON.md) | [Upgrading](docs/UPGRADING.md) |
-| [Setup with a coding assistant](SETUP-WITH-AN-AGENT.md) | [Security policy](SECURITY.md) |
+| [First task guide](docs/GETTING_STARTED.md) | [Contributing and tests](CONTRIBUTING.md) |
+| [Personal assistant behavior](docs/PERSONAL_ASSISTANT.md) | [Architecture](docs/ARCHITECTURE.md) |
+| [Screenshots and walkthrough](docs/SHOWCASE.md) | [Deployment](docs/DEPLOYMENT.md) |
+| [Product verification and limits](docs/PRODUCT_VERIFICATION.md) | [Upgrading](docs/UPGRADING.md) |
 
-For a scripted UI development preview, run `bun run dev:mock` and
-`bun run dev:web` in separate terminals. This is a fixture preview, not a
-replacement for the installed service. Run `bun run icons` after editing the
-logo source.
-
-Apache-2.0. Preserve [LICENSE](LICENSE), [NOTICE](NOTICE) and
-[source provenance](docs/PROVENANCE.md) in redistributions.
+Preserve [LICENSE](LICENSE), [NOTICE](NOTICE) and [source provenance](docs/PROVENANCE.md)
+in redistributions. Run `bun run icons` after editing the logo source.

@@ -1,4 +1,7 @@
-# OpenDuet release verification
+# OpenDuet initial release verification
+
+This is the historical initial release report. For the personal assistant update,
+use [PRODUCT_VERIFICATION.md](PRODUCT_VERIFICATION.md).
 
 Verified October 22–23, 2026. This report distinguishes a working source
 installation, scripted execution evidence and live-provider evidence. The
