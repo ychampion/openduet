@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=1440, height=1080" />
+<title>OpenDuet — delegate the work, keep the control</title>
+<script src="assets/gsap.min.js"></script>
+<style>
+@font-face{font-family:DM Sans;src:url("assets/dm-sans.woff2") format("woff2");font-weight:100 900}
+@font-face{font-family:Newsreader;src:url("assets/newsreader.woff2") format("woff2");font-weight:200 800}
+*{box-sizing:border-box;margin:0}
+html,body{width:1440px;height:1080px;overflow:hidden;background:#f4f3ef;color:#141413}
+body{font-family:DM Sans,sans-serif}
+#root{position:relative;width:1440px;height:1080px}
+.clip.scene{position:absolute;inset:0;background:#f4f3ef}
+header{position:absolute;left:64px;right:64px;top:26px;display:flex;align-items:center;gap:20px}
+.mark{width:72px;height:42px;object-fit:contain}
+h1{font-family:Newsreader,serif;font-size:54px;line-height:1.05;font-weight:500;letter-spacing:-1px}
+.subtitle{position:absolute;top:96px;left:64px;font-size:28px;color:#53565d}
+.screen{position:absolute;left:72px;top:158px;width:1296px;height:864px;object-fit:contain;border-radius:14px;border:1px solid #dedbd4;background:white}
+footer{position:absolute;bottom:16px;left:64px;right:64px;display:flex;justify-content:space-between;font-size:28px;color:#53565d}
+</style>
+</head>
+<body>
+<main id="root" data-composition-id="openduet-overview" data-start="0" data-duration="28.5" data-width="1440" data-height="1080">
+<section id="s1" class="clip scene" data-start="0" data-duration="7.5" data-track-index="0">
+<header><img class="mark" src="assets/openduet-mark.svg" alt="OpenDuet" /><h1>Delegate the work. Keep the control.</h1></header>
+<p class="subtitle">Chat, priorities and background work in your own installation.</p>
+<img class="screen" src="assets/home-1440-light.png" alt="OpenDuet home with tasks and work in progress" />
+</section>
+<section id="s2" class="clip scene" data-start="7" data-duration="7.5" data-track-index="1">
+<header><img class="mark" src="assets/openduet-mark.svg" alt="OpenDuet" /><h1>Read the thread. Review what leaves.</h1></header>
+<p class="subtitle">A client follow-up with a complete draft you can inspect before sending.</p>
+<img class="screen" src="assets/follow-up.png" alt="A reviewable client follow-up draft" />
+</section>
+<section id="s3" class="clip scene" data-start="14" data-duration="7.5" data-track-index="2">
+<header><img class="mark" src="assets/openduet-mark.svg" alt="OpenDuet" /><h1>Make useful work a routine.</h1></header>
+<p class="subtitle">Daily briefs and weekly research, with schedules and run history.</p>
+<img class="screen" src="assets/morning-brief.png" alt="A test run of a scheduled morning brief" />
+</section>
+<section id="s4" class="clip scene" data-start="21" data-duration="7.5" data-track-index="3">
+<header><img class="mark" src="assets/openduet-mark.svg" alt="OpenDuet" /><h1>Your server. Your model. Your workflow.</h1></header>
+<p class="subtitle">Self-host OpenDuet. Connect a real model. Start with one useful task.</p>
+<img class="screen" src="assets/models-1440-light.png" alt="OpenDuet model configuration" />
+</section>
+<footer><span>Scripted UI walkthrough · Sample data</span><span>github.com/ychampion/openduet · Apache-2.0</span></footer>
+</main>
+<script>
+const tl = gsap.timeline({paused:true});
+["#s1","#s2","#s3","#s4"].forEach((selector,index)=>{
+  const start=index*7;
+  tl.from(selector,{opacity:0,duration:0.5,ease:"power2.inOut"},start);
+  tl.from(selector+" header",{y:16,opacity:0,duration:0.7,ease:"power2.out"},start+0.15);
+  tl.from(selector+" .subtitle",{y:10,opacity:0,duration:0.6,ease:"power2.out"},start+0.3);
+});
+tl.to("#s4",{opacity:0,duration:0.5},28);
+window.__timelines=window.__timelines||{};
+window.__timelines["openduet-overview"]=tl;
+</script>
+</body>
+</html>

@@ -12,6 +12,8 @@
       "!**/node_modules",
       "!**/dist",
       "!output",
+      "!docs/media/presentation/.hyperframes",
+      "!docs/media/presentation/assets/gsap.min.js",
       "!**/.wrangler",
       "!.gstack",
       "!**/.omx",
