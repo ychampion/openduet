@@ -274,26 +274,26 @@ withDb('attempt runner against Postgres and pg-boss', () => {
     expect((await claim(runner(), row)).claims.epoch).toBe(1);
   });
 
-  test('a wake is judged by the database clock, not by a process clock up to 50 ms off', async () => {
+  test('a wake is judged by the database clock despite process clock skew', async () => {
     const { handle, jobs } = fixture();
     const realNow = Date.now;
     const shift = (ms: number) => {
       Date.now = () => realNow() + ms;
     };
     try {
-      // Due by the database clock. A process clock 50 ms behind Postgres would
+      // Due by the database clock. A process clock behind Postgres would
       // have called this wake early and dropped it until the recovery scan.
       const row = await create();
       await handle.sql`update job set next_wake_at = now() where id = ${row.id}`;
-      shift(-50);
+      shift(-600_000);
       expect((await claim(runner(), await jobs.get(row.id))).claims.epoch).toBe(1);
-      // Not yet due by the database clock. A process clock 50 ms ahead would
-      // have claimed it before its time.
+      // Leave enough real time for a loaded database to register the wake;
+      // move its deadline explicitly instead of racing a 30 ms window.
       const next = await create();
-      await handle.sql`update job set next_wake_at = now() + interval '30 milliseconds' where id = ${next.id}`;
-      shift(50);
+      await handle.sql`update job set next_wake_at = now() + interval '5 minutes' where id = ${next.id}`;
+      shift(600_000);
       expect(await runner().claim(wake(await jobs.get(next.id)))).toBeNull();
-      await Bun.sleep(60);
+      await handle.sql`update job set next_wake_at = now() where id = ${next.id}`;
       expect((await claim(runner(), await jobs.get(next.id))).claims.epoch).toBe(1);
     } finally {
       Date.now = realNow;

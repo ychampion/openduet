@@ -154,7 +154,7 @@ withDb('responsibility protocol', () => {
     ).toMatchObject({ code: 'operation_conflict' });
   });
 
-  test('an operation wake is judged by the database clock, not by a process clock 50 ms off', async () => {
+  test('an operation wake is judged by the database clock despite process clock skew', async () => {
     const { handle, jobs } = fixture();
     const row = await createJob();
     const service = new OperationService(jobs);
@@ -169,27 +169,28 @@ withDb('responsibility protocol', () => {
     };
     try {
       // Due by the database clock, which is the clock pg-boss delivered it by. A
-      // process clock 50 ms behind would call it early and drop the wake.
+      // process clock behind would call it early and drop the wake.
       const due = await service.register(row.id, {
         operation_key: 'due-now',
         kind: 'timer',
         due_at: await databaseNow(),
       });
-      shift(-50);
+      shift(-600_000);
       await service.handleWake({ id: due.id, version: due.version });
       expect((await service.get(due.id)).state).toBe('settled');
-      // Not yet due by the database clock. A process clock 50 ms ahead would
-      // have fired it before its time.
+      // Registration must not consume the deadline on a loaded database.
+      // Advance the stored deadline explicitly after proving an early wake
+      // stays registered even when the process clock thinks it is due.
       shift(0);
       const early = await service.register(row.id, {
         operation_key: 'due-soon',
         kind: 'timer',
-        due_at: await databaseNow(30),
+        due_at: await databaseNow(300_000),
       });
-      shift(50);
+      shift(600_000);
       await service.handleWake({ id: early.id, version: early.version });
       expect((await service.get(early.id)).state).toBe('registered');
-      await Bun.sleep(60);
+      await handle.sql`update background_operation set due_at = now() where id = ${early.id}`;
       await service.handleWake({ id: early.id, version: early.version });
       expect((await service.get(early.id)).state).toBe('settled');
     } finally {

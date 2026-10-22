@@ -12,6 +12,24 @@ alternative to Claude Duet. It is not affiliated with Anthropic.
 [Desktop and phone screenshots](apps/web/docs/screens/README.md) ·
 [Feature comparison](docs/CLAUDE_DUET_COMPARISON.md)
 
+## Install
+
+With Docker running, install the published images on Linux or macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
+```
+
+The installer creates `~/openduet`, starts the services, and prints a one-time
+account setup link. Create your account and connect your model in **Settings >
+Models**. Without a model key, the practice model only demonstrates the app.
+The installer and setup guide both passed clean-machine checks using the
+public images; see the [release verification](docs/RELEASE_READINESS.md).
+
+Windows requires Docker Desktop and Git for Windows. The PowerShell entry
+point is documented in [install.ps1](install.ps1); the clean-machine execution
+check currently runs on Linux.
+
 ## Install from source
 
 Use a Linux server with Docker Engine 28 or newer, Docker Compose 2.33.1 or newer,
@@ -102,7 +120,8 @@ is a preview. `bun run icons` rebuilds the vector logo into home-screen icons.
 
 The repository includes CI, image builds, clean-machine installation checks and
 deployment conformance. Check their actual results before treating a checkout
-as a tested release. Build locally until release images finish publishing.
+as a tested release. Published images are available from
+[GitHub Packages](https://github.com/ychampion?tab=packages&repo_name=openduet).
 
 ## Architecture and license
 

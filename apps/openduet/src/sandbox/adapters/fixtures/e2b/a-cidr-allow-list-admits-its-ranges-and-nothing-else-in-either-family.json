@@ -14,7 +14,7 @@
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes",
         "path": "/sandboxes",
-        "bodySha256": "292338626589dde648c5e1f47c3f5f20d1b199fef6436d88d04bc39d84190839",
+        "bodySha256": "1a8c4c9b53ffdeee70bef2cc1b357939fd00fa2796b79663a9a523230748fc4b",
         "headers": {
           "content-type": "application/json"
         },
@@ -112,7 +112,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 2,
+        "atMs": 3,
         "body": [
           {
             "event": {
@@ -137,11 +137,11 @@
     },
     {
       "request": {
-        "atMs": 3,
+        "atMs": 4,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
-        "bodySha256": "3459c35367b67e0b02e02f8e5d2734e495e64c7e47b0b3cf987049230d36a1ae",
+        "bodySha256": "e5794ee56e2c0a6bc52ed5ce18cbda0a651e622093d4d057d8fec5c1057e6ad7",
         "headers": {
           "content-type": "application/connect+json",
           "connect-protocol-version": "1",
@@ -176,16 +176,16 @@
             "base64": "AAAAACB7ImV2ZW50Ijp7InN0YXJ0Ijp7InBpZCI6MTAwMn19fQ=="
           },
           {
-            "atMs": 2,
+            "atMs": 4,
             "base64": "AAAAADp7ImV2ZW50Ijp7ImVuZCI6eyJleGl0ZWQiOnRydWUsInN0YXR1cyI6ImV4aXQgc3RhdHVzIDAifX19"
           },
           {
-            "atMs": 2,
+            "atMs": 4,
             "base64": "AgAAAAJ7fQ=="
           }
         ],
         "end": "complete",
-        "atMs": 3,
+        "atMs": 4,
         "body": [
           {
             "event": {
@@ -210,11 +210,11 @@
     },
     {
       "request": {
-        "atMs": 4,
+        "atMs": 9,
         "method": "POST",
         "url": "https://sandbox.e2b.app/filesystem.Filesystem/ListDir",
         "path": "/filesystem.Filesystem/ListDir",
-        "bodySha256": "fb69700926f221892117a545326610c1be4e1eb7a313d7ab749c332d8a04b122",
+        "bodySha256": "d3f1bd8d3aaa8cd90aa52c5e253c903189440f0d1a3410777e7c82d324345b22",
         "headers": {
           "content-type": "application/json",
           "connect-protocol-version": "1",
@@ -234,11 +234,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJlbnRyaWVzIjpbeyJuYW1lIjoiZXhpdCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ubWVsZXRlLWV4ZWMvYWN0XzAxSjBDT05GT1JNQU5DRUNJRFIwMDAwL2V4aXQiLCJzaXplIjoiMSIsIm1vZGUiOjQyMCwib3duZXIiOiJ1c2VyIiwiZ3JvdXAiOiJ1c2VyIn0seyJuYW1lIjoib3V0IiwidHlwZSI6IkZJTEVfVFlQRV9GSUxFIiwicGF0aCI6Ii92YXIvdG1wLy5tZWxldGUtZXhlYy9hY3RfMDFKMENPTkZPUk1BTkNFQ0lEUjAwMDAvb3V0Iiwic2l6ZSI6Ijg0IiwibW9kZSI6NDIwLCJvd25lciI6InVzZXIiLCJncm91cCI6InVzZXIifV19"
+            "base64": "eyJlbnRyaWVzIjpbeyJuYW1lIjoiZXhpdCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ub3BlbmR1ZXQtZXhlYy9hY3RfMDFKMENPTkZPUk1BTkNFQ0lEUjAwMDAvZXhpdCIsInNpemUiOiIxIiwibW9kZSI6NDIwLCJvd25lciI6InVzZXIiLCJncm91cCI6InVzZXIifSx7Im5hbWUiOiJvdXQiLCJ0eXBlIjoiRklMRV9UWVBFX0ZJTEUiLCJwYXRoIjoiL3Zhci90bXAvLm9wZW5kdWV0LWV4ZWMvYWN0XzAxSjBDT05GT1JNQU5DRUNJRFIwMDAwL291dCIsInNpemUiOiI4NCIsIm1vZGUiOjQyMCwib3duZXIiOiJ1c2VyIiwiZ3JvdXAiOiJ1c2VyIn1dfQ=="
           }
         ],
         "end": "complete",
-        "atMs": 5,
+        "atMs": 9,
         "body": {
           "entries": [
             {
@@ -265,7 +265,7 @@
     },
     {
       "request": {
-        "atMs": 5,
+        "atMs": 9,
         "method": "GET",
         "url": "https://sandbox.e2b.app/files",
         "path": "/files?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0CONFORMANCECIDR0000%2Fout&username=user",
@@ -287,7 +287,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 5,
+        "atMs": 9,
         "body": {
           "bytes": 84
         }
@@ -295,7 +295,7 @@
     },
     {
       "request": {
-        "atMs": 6,
+        "atMs": 10,
         "method": "DELETE",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001",
         "path": "/sandboxes/fake-sbx-0001",
@@ -307,7 +307,7 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 6
+        "atMs": 10
       }
     }
   ]

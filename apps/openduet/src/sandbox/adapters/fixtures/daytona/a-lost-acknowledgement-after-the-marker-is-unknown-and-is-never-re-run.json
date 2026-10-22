@@ -10,11 +10,11 @@
   "exchanges": [
     {
       "request": {
-        "atMs": 1,
+        "atMs": 2,
         "method": "POST",
         "url": "https://app.daytona.io/api/sandbox",
         "path": "/api/sandbox",
-        "bodySha256": "3f43070844a5afbf5a86e774a65222a5d48be8e453a9a521b25cb9275e008034",
+        "bodySha256": "ba729dba2b6aec2c9135e290cd229df43bd2d75fbc381d7ca3933bb5dbdfdcf2",
         "headers": {
           "content-type": "application/json"
         },
@@ -45,11 +45,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJjb25mb3JtYW5jZSIsIm1lbGV0ZS5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwibWVsZXRlLmpvYiI6ImpvYl9DT05GT1JNQU5DRSIsIm1lbGV0ZS5hdHRlbXB0IjoiYXR0X0NPTkZPUk1BTkNFIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiY29uZm9ybWFuY2UiLCJvcGVuZHVldC5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuam9iIjoiam9iX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuYXR0ZW1wdCI6ImF0dF9DT05GT1JNQU5DRSIsIm9wZW5kdWV0LnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
           }
         ],
         "end": "complete",
-        "atMs": 1,
+        "atMs": 2,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",
@@ -103,7 +103,7 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJjb25mb3JtYW5jZSIsIm1lbGV0ZS5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwibWVsZXRlLmpvYiI6ImpvYl9DT05GT1JNQU5DRSIsIm1lbGV0ZS5hdHRlbXB0IjoiYXR0X0NPTkZPUk1BTkNFIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiY29uZm9ybWFuY2UiLCJvcGVuZHVldC5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuam9iIjoiam9iX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuYXR0ZW1wdCI6ImF0dF9DT05GT1JNQU5DRSIsIm9wZW5kdWV0LnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
           }
         ],
         "end": "complete",
@@ -161,7 +161,7 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJjb25mb3JtYW5jZSIsIm1lbGV0ZS5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwibWVsZXRlLmpvYiI6ImpvYl9DT05GT1JNQU5DRSIsIm1lbGV0ZS5hdHRlbXB0IjoiYXR0X0NPTkZPUk1BTkNFIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6InN0YXJ0ZWQiLCJkZXNpcmVkU3RhdGUiOiJzdGFydGVkIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiY29uZm9ybWFuY2UiLCJvcGVuZHVldC5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuam9iIjoiam9iX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuYXR0ZW1wdCI6ImF0dF9DT05GT1JNQU5DRSIsIm9wZW5kdWV0LnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6InN0YXJ0ZWQiLCJkZXNpcmVkU3RhdGUiOiJzdGFydGVkIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
           }
         ],
         "end": "complete",
@@ -204,11 +204,11 @@
     },
     {
       "request": {
-        "atMs": 28,
+        "atMs": 29,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "0d01d86648eddffe9481e6450938ccbbb2ee58f37f294400a988286f79fdca9b",
+        "bodySha256": "8cbaa55bd89430f149c080b092eb240d4bd7a1e6d06e42b748d7f0419b10cdb6",
         "headers": {
           "content-type": "application/json"
         },
@@ -229,7 +229,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 29,
+        "atMs": 30,
         "body": {
           "exitCode": 0,
           "result": "PATH=/usr/local/bin:/usr/bin:/bin\nHOME=/home/user\nUSER=user\nLOGNAME=user\nLANG=C.UTF-8\nDAYTONA_SANDBOX_ID=fake-sbx-0001\nDAYTONA_SANDBOX_SNAPSHOT=daytona-small\nDAYTONA_SANDBOX_USER=daytona\nDAYTONA_ORGANIZATION_ID=org_authoring\nDAYTONA_REGION_ID=us\n"
@@ -238,11 +238,11 @@
     },
     {
       "request": {
-        "atMs": 29,
+        "atMs": 30,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session",
         "path": "/toolbox/fake-sbx-0001/process/session",
-        "bodySha256": "5af8ffd8220c129329a39d83b6f0cf00846a863581dac185c801eb3d1511033a",
+        "bodySha256": "1306a65835cc0722c4e9bdd1909437c5264a9ed0975637d1008b119009586286",
         "headers": {
           "content-type": "application/json"
         },
@@ -255,16 +255,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 29
+        "atMs": 31
       }
     },
     {
       "request": {
-        "atMs": 29,
+        "atMs": 31,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0CONFORMANCE00000000/exec",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0CONFORMANCE00000000/exec",
-        "bodySha256": "476c6dbdee8769094c075eb8e1654057e76bdf69eea367fcb52fc5cf2e22ccbc",
+        "bodySha256": "842dbac122e7ee3b0f3418bec378f73b2aea5de77314f9c8857932a846cc0b1f",
         "headers": {
           "content-type": "application/json"
         },
@@ -285,7 +285,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 29,
+        "atMs": 31,
         "body": {
           "cmdId": "cmd-0001"
         }
@@ -293,11 +293,11 @@
     },
     {
       "request": {
-        "atMs": 1044,
+        "atMs": 1036,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "6a24d854bafff5aae0729c2fa4b6e1f83bae0505882aa4806fef64debbf2c8f6",
+        "bodySha256": "5449a33fac3567c19d9f75b1eef01cde8b2c7d131cc96e3d6b08b87733f5f65f",
         "headers": {
           "content-type": "application/json"
         },
@@ -318,7 +318,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 1045,
+        "atMs": 1036,
         "body": {
           "exitCode": 0,
           "result": "f 0 644 out\u0000"
@@ -327,11 +327,11 @@
     },
     {
       "request": {
-        "atMs": 4555,
+        "atMs": 4541,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "6a24d854bafff5aae0729c2fa4b6e1f83bae0505882aa4806fef64debbf2c8f6",
+        "bodySha256": "5449a33fac3567c19d9f75b1eef01cde8b2c7d131cc96e3d6b08b87733f5f65f",
         "headers": {
           "content-type": "application/json"
         },
@@ -352,7 +352,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4555,
+        "atMs": 4542,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 4 644 out\u0000"
@@ -361,7 +361,7 @@
     },
     {
       "request": {
-        "atMs": 4555,
+        "atMs": 4542,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0CONFORMANCE00000000%2Fexit",
@@ -380,7 +380,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4555,
+        "atMs": 4542,
         "body": {
           "bytes": 1
         }
@@ -388,11 +388,11 @@
     },
     {
       "request": {
-        "atMs": 4555,
+        "atMs": 4543,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "6a24d854bafff5aae0729c2fa4b6e1f83bae0505882aa4806fef64debbf2c8f6",
+        "bodySha256": "5449a33fac3567c19d9f75b1eef01cde8b2c7d131cc96e3d6b08b87733f5f65f",
         "headers": {
           "content-type": "application/json"
         },
@@ -413,7 +413,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4556,
+        "atMs": 4543,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 4 644 out\u0000"
@@ -422,7 +422,7 @@
     },
     {
       "request": {
-        "atMs": 4556,
+        "atMs": 4543,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0CONFORMANCE00000000%2Fout",
@@ -441,7 +441,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4556,
+        "atMs": 4544,
         "body": {
           "bytes": 4
         }
@@ -449,11 +449,11 @@
     },
     {
       "request": {
-        "atMs": 4557,
+        "atMs": 4544,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session",
         "path": "/toolbox/fake-sbx-0001/process/session",
-        "bodySha256": "5af8ffd8220c129329a39d83b6f0cf00846a863581dac185c801eb3d1511033a",
+        "bodySha256": "1306a65835cc0722c4e9bdd1909437c5264a9ed0975637d1008b119009586286",
         "headers": {
           "content-type": "application/json"
         },
@@ -473,7 +473,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4557,
+        "atMs": 4544,
         "body": {
           "statusCode": 409,
           "message": "session already exists",
@@ -483,11 +483,11 @@
     },
     {
       "request": {
-        "atMs": 4557,
+        "atMs": 4544,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "6a24d854bafff5aae0729c2fa4b6e1f83bae0505882aa4806fef64debbf2c8f6",
+        "bodySha256": "5449a33fac3567c19d9f75b1eef01cde8b2c7d131cc96e3d6b08b87733f5f65f",
         "headers": {
           "content-type": "application/json"
         },
@@ -508,7 +508,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4557,
+        "atMs": 4545,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 4 644 out\u0000"
@@ -517,7 +517,7 @@
     },
     {
       "request": {
-        "atMs": 4557,
+        "atMs": 4545,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0CONFORMANCE00000000%2Fexit",
@@ -536,7 +536,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4557,
+        "atMs": 4545,
         "body": {
           "bytes": 1
         }
@@ -544,11 +544,11 @@
     },
     {
       "request": {
-        "atMs": 4557,
+        "atMs": 4545,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "6a24d854bafff5aae0729c2fa4b6e1f83bae0505882aa4806fef64debbf2c8f6",
+        "bodySha256": "5449a33fac3567c19d9f75b1eef01cde8b2c7d131cc96e3d6b08b87733f5f65f",
         "headers": {
           "content-type": "application/json"
         },
@@ -569,7 +569,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4558,
+        "atMs": 4545,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 4 644 out\u0000"
@@ -578,7 +578,7 @@
     },
     {
       "request": {
-        "atMs": 4558,
+        "atMs": 4546,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0CONFORMANCE00000000%2Fout",
@@ -597,7 +597,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4558,
+        "atMs": 4546,
         "body": {
           "bytes": 4
         }
@@ -605,7 +605,7 @@
     },
     {
       "request": {
-        "atMs": 4559,
+        "atMs": 4546,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fwork%2Fcounter",
@@ -624,7 +624,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 4559,
+        "atMs": 4546,
         "body": {
           "bytes": 4
         }
@@ -632,7 +632,7 @@
     },
     {
       "request": {
-        "atMs": 4559,
+        "atMs": 4546,
         "method": "DELETE",
         "url": "https://app.daytona.io/api/sandbox/fake-sbx-0001",
         "path": "/api/sandbox/fake-sbx-0001",
@@ -647,11 +647,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJjb25mb3JtYW5jZSIsIm1lbGV0ZS5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwibWVsZXRlLmpvYiI6ImpvYl9DT05GT1JNQU5DRSIsIm1lbGV0ZS5hdHRlbXB0IjoiYXR0X0NPTkZPUk1BTkNFIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImRlc3Ryb3lpbmciLCJkZXNpcmVkU3RhdGUiOiJkZXN0cm95aW5nIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiY29uZm9ybWFuY2UiLCJvcGVuZHVldC5zcGFjZSI6InNwX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuam9iIjoiam9iX0NPTkZPUk1BTkNFIiwib3BlbmR1ZXQuYXR0ZW1wdCI6ImF0dF9DT05GT1JNQU5DRSIsIm9wZW5kdWV0LnNlc3Npb24iOiJzYnhfQ09ORk9STUFOQ0UxIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImRlc3Ryb3lpbmciLCJkZXNpcmVkU3RhdGUiOiJkZXN0cm95aW5nIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
           }
         ],
         "end": "complete",
-        "atMs": 4559,
+        "atMs": 4546,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",

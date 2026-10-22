@@ -14,7 +14,7 @@
         "method": "POST",
         "url": "https://app.daytona.io/api/sandbox",
         "path": "/api/sandbox",
-        "bodySha256": "bd6a7df75951a10286337b19eb302baf06434087410739c6541645c1e720d919",
+        "bodySha256": "9f1abf4f88fac2bb8b0aab7cfdd0cd2920435817d8a90578441de073759e2830",
         "headers": {
           "content-type": "application/json"
         },
@@ -41,11 +41,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJkYXl0b25hLXRlc3QiLCJtZWxldGUuc3BhY2UiOiJzcF9EQVlUT05BIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfREFZVE9OQSJ9LCJwdWJsaWMiOmZhbHNlLCJuZXR3b3JrQmxvY2tBbGwiOnRydWUsInRhcmdldCI6InVzIiwiY3B1IjoxLCJncHUiOjAsIm1lbW9yeSI6MSwiZGlzayI6Mywic3RhdGUiOiJjcmVhdGluZyIsImRlc2lyZWRTdGF0ZSI6InN0YXJ0ZWQiLCJiYWNrdXBTdGF0ZSI6Ik5vbmUiLCJhdXRvU3RvcEludGVydmFsIjoxMCwiYXV0b0FyY2hpdmVJbnRlcnZhbCI6MTAwODAsImF1dG9EZWxldGVJbnRlcnZhbCI6NDMyMDAsImNyZWF0ZWRBdCI6IjIwMjYtMDktMjNUMDA6MDA6MDAuMDAwWiIsInVwZGF0ZWRBdCI6IjIwMjYtMDktMjNUMDA6MDA6MDAuMDAwWiIsInNhbmRib3hDbGFzcyI6ImNvbnRhaW5lciIsImRhZW1vblZlcnNpb24iOiIwLjE5MC4wIiwidG9vbGJveFByb3h5VXJsIjoiaHR0cHM6Ly9wcm94eS5hcHAuZGF5dG9uYS5pby90b29sYm94In0="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiZGF5dG9uYS10ZXN0Iiwib3BlbmR1ZXQuc3BhY2UiOiJzcF9EQVlUT05BIiwib3BlbmR1ZXQuc2Vzc2lvbiI6InNieF9EQVlUT05BIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
           }
         ],
         "end": "complete",
-        "atMs": 0,
+        "atMs": 1,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",
@@ -82,7 +82,7 @@
     },
     {
       "request": {
-        "atMs": 0,
+        "atMs": 2,
         "method": "GET",
         "url": "https://app.daytona.io/api/sandbox/fake-sbx-0001",
         "path": "/api/sandbox/fake-sbx-0001",
@@ -97,11 +97,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJkYXl0b25hLXRlc3QiLCJtZWxldGUuc3BhY2UiOiJzcF9EQVlUT05BIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfREFZVE9OQSJ9LCJwdWJsaWMiOmZhbHNlLCJuZXR3b3JrQmxvY2tBbGwiOnRydWUsInRhcmdldCI6InVzIiwiY3B1IjoxLCJncHUiOjAsIm1lbW9yeSI6MSwiZGlzayI6Mywic3RhdGUiOiJjcmVhdGluZyIsImRlc2lyZWRTdGF0ZSI6InN0YXJ0ZWQiLCJiYWNrdXBTdGF0ZSI6Ik5vbmUiLCJhdXRvU3RvcEludGVydmFsIjoxMCwiYXV0b0FyY2hpdmVJbnRlcnZhbCI6MTAwODAsImF1dG9EZWxldGVJbnRlcnZhbCI6NDMyMDAsImNyZWF0ZWRBdCI6IjIwMjYtMDktMjNUMDA6MDA6MDAuMDAwWiIsInVwZGF0ZWRBdCI6IjIwMjYtMDktMjNUMDA6MDA6MDAuMDAwWiIsInNhbmRib3hDbGFzcyI6ImNvbnRhaW5lciIsImRhZW1vblZlcnNpb24iOiIwLjE5MC4wIiwidG9vbGJveFByb3h5VXJsIjoiaHR0cHM6Ly9wcm94eS5hcHAuZGF5dG9uYS5pby90b29sYm94In0="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiZGF5dG9uYS10ZXN0Iiwib3BlbmR1ZXQuc3BhY2UiOiJzcF9EQVlUT05BIiwib3BlbmR1ZXQuc2Vzc2lvbiI6InNieF9EQVlUT05BIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImNyZWF0aW5nIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
           }
         ],
         "end": "complete",
-        "atMs": 0,
+        "atMs": 2,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",
@@ -138,7 +138,7 @@
     },
     {
       "request": {
-        "atMs": 43,
+        "atMs": 25,
         "method": "GET",
         "url": "https://app.daytona.io/api/sandbox/fake-sbx-0001",
         "path": "/api/sandbox/fake-sbx-0001",
@@ -153,11 +153,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJkYXl0b25hLXRlc3QiLCJtZWxldGUuc3BhY2UiOiJzcF9EQVlUT05BIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfREFZVE9OQSJ9LCJwdWJsaWMiOmZhbHNlLCJuZXR3b3JrQmxvY2tBbGwiOnRydWUsInRhcmdldCI6InVzIiwiY3B1IjoxLCJncHUiOjAsIm1lbW9yeSI6MSwiZGlzayI6Mywic3RhdGUiOiJzdGFydGVkIiwiZGVzaXJlZFN0YXRlIjoic3RhcnRlZCIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiZGF5dG9uYS10ZXN0Iiwib3BlbmR1ZXQuc3BhY2UiOiJzcF9EQVlUT05BIiwib3BlbmR1ZXQuc2Vzc2lvbiI6InNieF9EQVlUT05BIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6InN0YXJ0ZWQiLCJkZXNpcmVkU3RhdGUiOiJzdGFydGVkIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
           }
         ],
         "end": "complete",
-        "atMs": 43,
+        "atMs": 25,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",
@@ -194,11 +194,11 @@
     },
     {
       "request": {
-        "atMs": 44,
+        "atMs": 26,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "0d01d86648eddffe9481e6450938ccbbb2ee58f37f294400a988286f79fdca9b",
+        "bodySha256": "8cbaa55bd89430f149c080b092eb240d4bd7a1e6d06e42b748d7f0419b10cdb6",
         "headers": {
           "content-type": "application/json"
         },
@@ -219,7 +219,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 44,
+        "atMs": 27,
         "body": {
           "exitCode": 0,
           "result": "PATH=/usr/local/bin:/usr/bin:/bin\nHOME=/home/user\nUSER=user\nLOGNAME=user\nDAYTONA_SANDBOX_ID=fake-sbx-0001\nDAYTONA_SANDBOX_SNAPSHOT=daytona-small\nDAYTONA_SANDBOX_USER=daytona\nDAYTONA_ORGANIZATION_ID=org_authoring\nDAYTONA_REGION_ID=us\n"
@@ -228,16 +228,16 @@
     },
     {
       "request": {
-        "atMs": 45,
+        "atMs": 29,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/upload",
         "path": "/toolbox/fake-sbx-0001/files/upload?path=%2Fvar%2Ftmp%2F.openduet-env%2Fact_01J0DAYTONAENV000000000",
-        "bodySha256": "133058c136af01dba6494e7199d30c548e8988a8885f72eab2a7bab01098d8c9",
+        "bodySha256": "98ba177aa8671725d587e81b7b0990f0f37d15202a18d3f93700089633e686aa",
         "headers": {
           "content-type": "multipart/form-data; boundary=openduet-0cbeb98f348ca4b4de237c0f18616167"
         },
         "body": {
-          "bytes": 272
+          "bytes": 276
         }
       },
       "response": {
@@ -245,16 +245,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 45
+        "atMs": 29
       }
     },
     {
       "request": {
-        "atMs": 45,
+        "atMs": 29,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session",
         "path": "/toolbox/fake-sbx-0001/process/session",
-        "bodySha256": "55df06999348264fdd722befeb44d1831d23d850a6947ded835851380058d76a",
+        "bodySha256": "1acc5da638250da30b4b7617fbc8469f6150f076d6be1e470d505d0868066f33",
         "headers": {
           "content-type": "application/json"
         },
@@ -267,16 +267,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 45
+        "atMs": 29
       }
     },
     {
       "request": {
-        "atMs": 45,
+        "atMs": 30,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/exec",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/exec",
-        "bodySha256": "dd5144038c29349169133529e606fe9dfc07b153dc6f4119fdc2d15b219d95a1",
+        "bodySha256": "c6c636bc84ccc031e9359734e3e6c7c266e171736edc876d96779808660e342c",
         "headers": {
           "content-type": "application/json"
         },
@@ -297,7 +297,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 45,
+        "atMs": 30,
         "body": {
           "cmdId": "cmd-0001"
         }
@@ -305,7 +305,7 @@
     },
     {
       "request": {
-        "atMs": 46,
+        "atMs": 31,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001",
@@ -320,11 +320,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImNtZC0wMDAxIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnbWVsZXRlLWxhdW5jaCcgJy93b3JrJyAnLScgJy92YXIvdG1wLy5tZWxldGUtZW52L2FjdF8wMUowREFZVE9OQUVOVjAwMDAwMDAwMCcgJy11JyAnREFZVE9OQV9PUkdBTklaQVRJT05fSUQnICctdScgJ0RBWVRPTkFfUkVHSU9OX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfSUQnICctdScgJ0RBWVRPTkFfU0FOREJPWF9TTkFQU0hPVCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX1VTRVInICd0aW1lb3V0JyAnLXMnICdLSUxMJyAnMjAnICcvYmluL3NoJyAnLWMnICdyPS92YXIvdG1wLy5tZWxldGUtZXhlY1xuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBybSAtZiBcIiRyXCIgMj4vZGV2L251bGw7IG1rZGlyIC1wIC1tIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyBjaG1vZCAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgfVxuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBlY2hvIG1lbGV0ZV9leGVjX3Jvb3RfdW51c2FibGUgPiYyOyBleGl0IDExMjsgfVxuZmluZCBcIiRyXCIgLW1pbmRlcHRoIDEgLW1heGRlcHRoIDEgLXR5cGUgZCAtbXRpbWUgKzYgLWV4ZWMgcm0gLXJmIC0tIHt9ICsgMj4vZGV2L251bGxcbmQ9XCIkci9hY3RfMDFKMERBWVRPTkFFTlYwMDAwMDAwMDBcIlxubWtkaXIgXCIkZFwiIDI+L2Rldi9udWxsIHx8IHsgWyAtZSBcIiRkXCIgXSAmJiB7IGVjaG8gbWVsZXRlX2V4ZWNfcmVlbnRlcmVkID4mMjsgZXhpdCAxMTE7IH07IGVjaG8gbWVsZXRlX2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG57IHsgKCAnXFwnJ3NoJ1xcJycgJ1xcJyctYydcXCcnICdcXCcncHJpbnRmIFwiJXN8JXNcIiBcIiRHSF9QUk9NUFRfRElTQUJMRURcIiBcIiRUWlwiJ1xcJycgKSAyPiYxOyBwcmludGYgJ1xcJyclc1xcbidcXCcnIFwiJD9cIiA+IFwiJGQvc3RhdHVzXCI7IH0gfCBzZXRzaWQgLXcgc2ggLWMgJ1xcJydoZWFkIC1jIFwiJDFcIjsgZXhlYyBjYXQgPiAvZGV2L251bGwnXFwnJyBtZWxldGUta2VlcCA0MTk0MzA1OyB9ID4gXCIkZC9vdXRcIlxuZWM9XG5yZWFkIGVjIDwgXCIkZC9zdGF0dXNcIiAyPi9kZXYvbnVsbFxucm0gLWYgXCIkZC9zdGF0dXNcIlxuWyAtbiBcIiRlY1wiIF0gfHwgZXhpdCAxMTNcbnByaW50ZiAnXFwnJyVzJ1xcJycgXCIkZWNcIiA+IFwiJGQvZXhpdC50bXBcIiAmJiBtdiAtZiBcIiRkL2V4aXQudG1wXCIgXCIkZC9leGl0XCJcblsgXCIkZWNcIiA9IDExMSBdICYmIGV4aXQgMTEzXG5bIFwiJGVjXCIgPSAxMTIgXSAmJiBleGl0IDExM1xuZXhpdCBcIiRlY1wiJyJ9"
+            "base64": "eyJpZCI6ImNtZC0wMDAxIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnb3BlbmR1ZXQtbGF1bmNoJyAnL3dvcmsnICctJyAnL3Zhci90bXAvLm9wZW5kdWV0LWVudi9hY3RfMDFKMERBWVRPTkFFTlYwMDAwMDAwMDAnICctdScgJ0RBWVRPTkFfT1JHQU5JWkFUSU9OX0lEJyAnLXUnICdEQVlUT05BX1JFR0lPTl9JRCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfU05BUFNIT1QnICctdScgJ0RBWVRPTkFfU0FOREJPWF9VU0VSJyAndGltZW91dCcgJy1zJyAnS0lMTCcgJzIwJyAnL2Jpbi9zaCcgJy1jJyAncj0vdmFyL3RtcC8ub3BlbmR1ZXQtZXhlY1xuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBybSAtZiBcIiRyXCIgMj4vZGV2L251bGw7IG1rZGlyIC1wIC1tIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyBjaG1vZCAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgfVxuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBlY2hvIG9wZW5kdWV0X2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG5maW5kIFwiJHJcIiAtbWluZGVwdGggMSAtbWF4ZGVwdGggMSAtdHlwZSBkIC1tdGltZSArNiAtZXhlYyBybSAtcmYgLS0ge30gKyAyPi9kZXYvbnVsbFxuZD1cIiRyL2FjdF8wMUowREFZVE9OQUVOVjAwMDAwMDAwMFwiXG5ta2RpciBcIiRkXCIgMj4vZGV2L251bGwgfHwgeyBbIC1lIFwiJGRcIiBdICYmIHsgZWNobyBvcGVuZHVldF9leGVjX3JlZW50ZXJlZCA+JjI7IGV4aXQgMTExOyB9OyBlY2hvIG9wZW5kdWV0X2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG57IHsgKCAnXFwnJ3NoJ1xcJycgJ1xcJyctYydcXCcnICdcXCcncHJpbnRmIFwiJXN8JXNcIiBcIiRHSF9QUk9NUFRfRElTQUJMRURcIiBcIiRUWlwiJ1xcJycgKSAyPiYxOyBwcmludGYgJ1xcJyclc1xcbidcXCcnIFwiJD9cIiA+IFwiJGQvc3RhdHVzXCI7IH0gfCBzZXRzaWQgLXcgc2ggLWMgJ1xcJydoZWFkIC1jIFwiJDFcIjsgZXhlYyBjYXQgPiAvZGV2L251bGwnXFwnJyBvcGVuZHVldC1rZWVwIDQxOTQzMDU7IH0gPiBcIiRkL291dFwiXG5lYz1cbnJlYWQgZWMgPCBcIiRkL3N0YXR1c1wiIDI+L2Rldi9udWxsXG5ybSAtZiBcIiRkL3N0YXR1c1wiXG5bIC1uIFwiJGVjXCIgXSB8fCBleGl0IDExM1xucHJpbnRmICdcXCcnJXMnXFwnJyBcIiRlY1wiID4gXCIkZC9leGl0LnRtcFwiICYmIG12IC1mIFwiJGQvZXhpdC50bXBcIiBcIiRkL2V4aXRcIlxuWyBcIiRlY1wiID0gMTExIF0gJiYgZXhpdCAxMTNcblsgXCIkZWNcIiA9IDExMiBdICYmIGV4aXQgMTEzXG5leGl0IFwiJGVjXCInIn0="
           }
         ],
         "end": "complete",
-        "atMs": 46,
+        "atMs": 31,
         "body": {
           "id": "cmd-0001",
           "command": "/bin/sh -c 'cd \"$1\" 2>/dev/null || exit 112; shift; f=\"$1\"; shift; e=\"$1\"; shift; [ \"$e\" = - ] || { [ -f \"$e\" ] || exit 112; . \"$e\"; rm -f \"$e\"; }; [ \"$f\" = - ] && exec env \"$@\" < /dev/null; exec env \"$@\" < \"$f\"' 'openduet-launch' '/work' '-' '/var/tmp/.openduet-env/act_01J0DAYTONAENV000000000' '-u' 'DAYTONA_ORGANIZATION_ID' '-u' 'DAYTONA_REGION_ID' '-u' 'DAYTONA_SANDBOX_ID' '-u' 'DAYTONA_SANDBOX_SNAPSHOT' '-u' 'DAYTONA_SANDBOX_USER' 'timeout' '-s' 'KILL' '20' '/bin/sh' '-c' 'r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0DAYTONAENV000000000\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( '\\''sh'\\'' '\\''-c'\\'' '\\''printf \"%s|%s\" \"$GH_PROMPT_DISABLED\" \"$TZ\"'\\'' ) 2>&1; printf '\\''%s\\n'\\'' \"$?\" > \"$d/status\"; } | setsid -w sh -c '\\''head -c \"$1\"; exec cat > /dev/null'\\'' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '\\''%s'\\'' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\"'"
@@ -333,7 +333,7 @@
     },
     {
       "request": {
-        "atMs": 75,
+        "atMs": 53,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001",
@@ -348,11 +348,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImNtZC0wMDAxIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnbWVsZXRlLWxhdW5jaCcgJy93b3JrJyAnLScgJy92YXIvdG1wLy5tZWxldGUtZW52L2FjdF8wMUowREFZVE9OQUVOVjAwMDAwMDAwMCcgJy11JyAnREFZVE9OQV9PUkdBTklaQVRJT05fSUQnICctdScgJ0RBWVRPTkFfUkVHSU9OX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfSUQnICctdScgJ0RBWVRPTkFfU0FOREJPWF9TTkFQU0hPVCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX1VTRVInICd0aW1lb3V0JyAnLXMnICdLSUxMJyAnMjAnICcvYmluL3NoJyAnLWMnICdyPS92YXIvdG1wLy5tZWxldGUtZXhlY1xuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBybSAtZiBcIiRyXCIgMj4vZGV2L251bGw7IG1rZGlyIC1wIC1tIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyBjaG1vZCAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgfVxuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBlY2hvIG1lbGV0ZV9leGVjX3Jvb3RfdW51c2FibGUgPiYyOyBleGl0IDExMjsgfVxuZmluZCBcIiRyXCIgLW1pbmRlcHRoIDEgLW1heGRlcHRoIDEgLXR5cGUgZCAtbXRpbWUgKzYgLWV4ZWMgcm0gLXJmIC0tIHt9ICsgMj4vZGV2L251bGxcbmQ9XCIkci9hY3RfMDFKMERBWVRPTkFFTlYwMDAwMDAwMDBcIlxubWtkaXIgXCIkZFwiIDI+L2Rldi9udWxsIHx8IHsgWyAtZSBcIiRkXCIgXSAmJiB7IGVjaG8gbWVsZXRlX2V4ZWNfcmVlbnRlcmVkID4mMjsgZXhpdCAxMTE7IH07IGVjaG8gbWVsZXRlX2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG57IHsgKCAnXFwnJ3NoJ1xcJycgJ1xcJyctYydcXCcnICdcXCcncHJpbnRmIFwiJXN8JXNcIiBcIiRHSF9QUk9NUFRfRElTQUJMRURcIiBcIiRUWlwiJ1xcJycgKSAyPiYxOyBwcmludGYgJ1xcJyclc1xcbidcXCcnIFwiJD9cIiA+IFwiJGQvc3RhdHVzXCI7IH0gfCBzZXRzaWQgLXcgc2ggLWMgJ1xcJydoZWFkIC1jIFwiJDFcIjsgZXhlYyBjYXQgPiAvZGV2L251bGwnXFwnJyBtZWxldGUta2VlcCA0MTk0MzA1OyB9ID4gXCIkZC9vdXRcIlxuZWM9XG5yZWFkIGVjIDwgXCIkZC9zdGF0dXNcIiAyPi9kZXYvbnVsbFxucm0gLWYgXCIkZC9zdGF0dXNcIlxuWyAtbiBcIiRlY1wiIF0gfHwgZXhpdCAxMTNcbnByaW50ZiAnXFwnJyVzJ1xcJycgXCIkZWNcIiA+IFwiJGQvZXhpdC50bXBcIiAmJiBtdiAtZiBcIiRkL2V4aXQudG1wXCIgXCIkZC9leGl0XCJcblsgXCIkZWNcIiA9IDExMSBdICYmIGV4aXQgMTEzXG5bIFwiJGVjXCIgPSAxMTIgXSAmJiBleGl0IDExM1xuZXhpdCBcIiRlY1wiJyIsImV4aXRDb2RlIjowfQ=="
+            "base64": "eyJpZCI6ImNtZC0wMDAxIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnb3BlbmR1ZXQtbGF1bmNoJyAnL3dvcmsnICctJyAnL3Zhci90bXAvLm9wZW5kdWV0LWVudi9hY3RfMDFKMERBWVRPTkFFTlYwMDAwMDAwMDAnICctdScgJ0RBWVRPTkFfT1JHQU5JWkFUSU9OX0lEJyAnLXUnICdEQVlUT05BX1JFR0lPTl9JRCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfU05BUFNIT1QnICctdScgJ0RBWVRPTkFfU0FOREJPWF9VU0VSJyAndGltZW91dCcgJy1zJyAnS0lMTCcgJzIwJyAnL2Jpbi9zaCcgJy1jJyAncj0vdmFyL3RtcC8ub3BlbmR1ZXQtZXhlY1xuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBybSAtZiBcIiRyXCIgMj4vZGV2L251bGw7IG1rZGlyIC1wIC1tIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyBjaG1vZCAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgfVxuWyAtZCBcIiRyXCIgXSAmJiBbIC13IFwiJHJcIiBdICYmIFsgLXggXCIkclwiIF0gfHwgeyBlY2hvIG9wZW5kdWV0X2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG5maW5kIFwiJHJcIiAtbWluZGVwdGggMSAtbWF4ZGVwdGggMSAtdHlwZSBkIC1tdGltZSArNiAtZXhlYyBybSAtcmYgLS0ge30gKyAyPi9kZXYvbnVsbFxuZD1cIiRyL2FjdF8wMUowREFZVE9OQUVOVjAwMDAwMDAwMFwiXG5ta2RpciBcIiRkXCIgMj4vZGV2L251bGwgfHwgeyBbIC1lIFwiJGRcIiBdICYmIHsgZWNobyBvcGVuZHVldF9leGVjX3JlZW50ZXJlZCA+JjI7IGV4aXQgMTExOyB9OyBlY2hvIG9wZW5kdWV0X2V4ZWNfcm9vdF91bnVzYWJsZSA+JjI7IGV4aXQgMTEyOyB9XG57IHsgKCAnXFwnJ3NoJ1xcJycgJ1xcJyctYydcXCcnICdcXCcncHJpbnRmIFwiJXN8JXNcIiBcIiRHSF9QUk9NUFRfRElTQUJMRURcIiBcIiRUWlwiJ1xcJycgKSAyPiYxOyBwcmludGYgJ1xcJyclc1xcbidcXCcnIFwiJD9cIiA+IFwiJGQvc3RhdHVzXCI7IH0gfCBzZXRzaWQgLXcgc2ggLWMgJ1xcJydoZWFkIC1jIFwiJDFcIjsgZXhlYyBjYXQgPiAvZGV2L251bGwnXFwnJyBvcGVuZHVldC1rZWVwIDQxOTQzMDU7IH0gPiBcIiRkL291dFwiXG5lYz1cbnJlYWQgZWMgPCBcIiRkL3N0YXR1c1wiIDI+L2Rldi9udWxsXG5ybSAtZiBcIiRkL3N0YXR1c1wiXG5bIC1uIFwiJGVjXCIgXSB8fCBleGl0IDExM1xucHJpbnRmICdcXCcnJXMnXFwnJyBcIiRlY1wiID4gXCIkZC9leGl0LnRtcFwiICYmIG12IC1mIFwiJGQvZXhpdC50bXBcIiBcIiRkL2V4aXRcIlxuWyBcIiRlY1wiID0gMTExIF0gJiYgZXhpdCAxMTNcblsgXCIkZWNcIiA9IDExMiBdICYmIGV4aXQgMTEzXG5leGl0IFwiJGVjXCInIiwiZXhpdENvZGUiOjB9"
           }
         ],
         "end": "complete",
-        "atMs": 75,
+        "atMs": 53,
         "body": {
           "id": "cmd-0001",
           "command": "/bin/sh -c 'cd \"$1\" 2>/dev/null || exit 112; shift; f=\"$1\"; shift; e=\"$1\"; shift; [ \"$e\" = - ] || { [ -f \"$e\" ] || exit 112; . \"$e\"; rm -f \"$e\"; }; [ \"$f\" = - ] && exec env \"$@\" < /dev/null; exec env \"$@\" < \"$f\"' 'openduet-launch' '/work' '-' '/var/tmp/.openduet-env/act_01J0DAYTONAENV000000000' '-u' 'DAYTONA_ORGANIZATION_ID' '-u' 'DAYTONA_REGION_ID' '-u' 'DAYTONA_SANDBOX_ID' '-u' 'DAYTONA_SANDBOX_SNAPSHOT' '-u' 'DAYTONA_SANDBOX_USER' 'timeout' '-s' 'KILL' '20' '/bin/sh' '-c' 'r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0DAYTONAENV000000000\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( '\\''sh'\\'' '\\''-c'\\'' '\\''printf \"%s|%s\" \"$GH_PROMPT_DISABLED\" \"$TZ\"'\\'' ) 2>&1; printf '\\''%s\\n'\\'' \"$?\" > \"$d/status\"; } | setsid -w sh -c '\\''head -c \"$1\"; exec cat > /dev/null'\\'' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '\\''%s'\\'' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\"'",
@@ -362,7 +362,7 @@
     },
     {
       "request": {
-        "atMs": 76,
+        "atMs": 53,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001/logs",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000/command/cmd-0001/logs",
@@ -376,12 +376,12 @@
         },
         "chunks": [],
         "end": "complete",
-        "atMs": 76
+        "atMs": 54
       }
     },
     {
       "request": {
-        "atMs": 76,
+        "atMs": 54,
         "method": "DELETE",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000000",
@@ -393,16 +393,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 76
+        "atMs": 54
       }
     },
     {
       "request": {
-        "atMs": 76,
+        "atMs": 55,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "bd61f0ed97c3e70567b0453dc55cf769d5692172b667649f886778ba753a747a",
+        "bodySha256": "23152ef74a94cfee484d2293d6e5f8b317e8b01caf4f7ed0fdcc7f853049b680",
         "headers": {
           "content-type": "application/json"
         },
@@ -423,7 +423,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 76,
+        "atMs": 55,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 14 644 out\u0000"
@@ -432,7 +432,7 @@
     },
     {
       "request": {
-        "atMs": 76,
+        "atMs": 56,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0DAYTONAENV000000000%2Fout",
@@ -451,7 +451,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 76,
+        "atMs": 56,
         "body": {
           "bytes": 14
         }
@@ -459,11 +459,11 @@
     },
     {
       "request": {
-        "atMs": 77,
+        "atMs": 56,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session",
         "path": "/toolbox/fake-sbx-0001/process/session",
-        "bodySha256": "ff05ba7545add8cadcba5588c443317591ff89e1bec844b923749cbfdc254bb7",
+        "bodySha256": "d05f4b8bf5f0fb6ea44a325b9b4f7853edd17265e6dfef7d4e5b39796e679939",
         "headers": {
           "content-type": "application/json"
         },
@@ -476,16 +476,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 77
+        "atMs": 57
       }
     },
     {
       "request": {
-        "atMs": 77,
+        "atMs": 57,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/exec",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/exec",
-        "bodySha256": "be5c250acfd9e5ce5e67daa32a574d339773cb4487fe177372cae83f00a12bc8",
+        "bodySha256": "a8531ca18dc3fd7ac9f774c3f21311e7db5501bda58941079e65bdf1a0c580f3",
         "headers": {
           "content-type": "application/json"
         },
@@ -506,7 +506,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 78,
+        "atMs": 57,
         "body": {
           "cmdId": "cmd-0002"
         }
@@ -514,7 +514,7 @@
     },
     {
       "request": {
-        "atMs": 78,
+        "atMs": 57,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002",
@@ -529,11 +529,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImNtZC0wMDAyIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnbWVsZXRlLWxhdW5jaCcgJy93b3JrJyAnLScgJy0nICctdScgJ0RBWVRPTkFfT1JHQU5JWkFUSU9OX0lEJyAnLXUnICdEQVlUT05BX1JFR0lPTl9JRCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfU05BUFNIT1QnICctdScgJ0RBWVRPTkFfU0FOREJPWF9VU0VSJyAndGltZW91dCcgJy1zJyAnS0lMTCcgJzIwJyAnL2Jpbi9zaCcgJy1jJyAncj0vdmFyL3RtcC8ubWVsZXRlLWV4ZWNcblsgLWQgXCIkclwiIF0gJiYgWyAtdyBcIiRyXCIgXSAmJiBbIC14IFwiJHJcIiBdIHx8IHsgcm0gLWYgXCIkclwiIDI+L2Rldi9udWxsOyBta2RpciAtcCAtbSAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgY2htb2QgMDcwMCBcIiRyXCIgMj4vZGV2L251bGw7IH1cblsgLWQgXCIkclwiIF0gJiYgWyAtdyBcIiRyXCIgXSAmJiBbIC14IFwiJHJcIiBdIHx8IHsgZWNobyBtZWxldGVfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbmZpbmQgXCIkclwiIC1taW5kZXB0aCAxIC1tYXhkZXB0aCAxIC10eXBlIGQgLW10aW1lICs2IC1leGVjIHJtIC1yZiAtLSB7fSArIDI+L2Rldi9udWxsXG5kPVwiJHIvYWN0XzAxSjBEQVlUT05BRU5WMDAwMDAwMDAxXCJcbm1rZGlyIFwiJGRcIiAyPi9kZXYvbnVsbCB8fCB7IFsgLWUgXCIkZFwiIF0gJiYgeyBlY2hvIG1lbGV0ZV9leGVjX3JlZW50ZXJlZCA+JjI7IGV4aXQgMTExOyB9OyBlY2hvIG1lbGV0ZV9leGVjX3Jvb3RfdW51c2FibGUgPiYyOyBleGl0IDExMjsgfVxueyB7ICggJ1xcJydzaCdcXCcnICdcXCcnLWMnXFwnJyAnXFwnJ3ByaW50ZiBcIiVzfCVzXCIgXCIkR0hfUFJPTVBUX0RJU0FCTEVEXCIgXCIkVFpcIidcXCcnICkgMj4mMTsgcHJpbnRmICdcXCcnJXNcXG4nXFwnJyBcIiQ/XCIgPiBcIiRkL3N0YXR1c1wiOyB9IHwgc2V0c2lkIC13IHNoIC1jICdcXCcnaGVhZCAtYyBcIiQxXCI7IGV4ZWMgY2F0ID4gL2Rldi9udWxsJ1xcJycgbWVsZXRlLWtlZXAgNDE5NDMwNTsgfSA+IFwiJGQvb3V0XCJcbmVjPVxucmVhZCBlYyA8IFwiJGQvc3RhdHVzXCIgMj4vZGV2L251bGxcbnJtIC1mIFwiJGQvc3RhdHVzXCJcblsgLW4gXCIkZWNcIiBdIHx8IGV4aXQgMTEzXG5wcmludGYgJ1xcJyclcydcXCcnIFwiJGVjXCIgPiBcIiRkL2V4aXQudG1wXCIgJiYgbXYgLWYgXCIkZC9leGl0LnRtcFwiIFwiJGQvZXhpdFwiXG5bIFwiJGVjXCIgPSAxMTEgXSAmJiBleGl0IDExM1xuWyBcIiRlY1wiID0gMTEyIF0gJiYgZXhpdCAxMTNcbmV4aXQgXCIkZWNcIicifQ=="
+            "base64": "eyJpZCI6ImNtZC0wMDAyIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnb3BlbmR1ZXQtbGF1bmNoJyAnL3dvcmsnICctJyAnLScgJy11JyAnREFZVE9OQV9PUkdBTklaQVRJT05fSUQnICctdScgJ0RBWVRPTkFfUkVHSU9OX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfSUQnICctdScgJ0RBWVRPTkFfU0FOREJPWF9TTkFQU0hPVCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX1VTRVInICd0aW1lb3V0JyAnLXMnICdLSUxMJyAnMjAnICcvYmluL3NoJyAnLWMnICdyPS92YXIvdG1wLy5vcGVuZHVldC1leGVjXG5bIC1kIFwiJHJcIiBdICYmIFsgLXcgXCIkclwiIF0gJiYgWyAteCBcIiRyXCIgXSB8fCB7IHJtIC1mIFwiJHJcIiAyPi9kZXYvbnVsbDsgbWtkaXIgLXAgLW0gMDcwMCBcIiRyXCIgMj4vZGV2L251bGw7IGNobW9kIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyB9XG5bIC1kIFwiJHJcIiBdICYmIFsgLXcgXCIkclwiIF0gJiYgWyAteCBcIiRyXCIgXSB8fCB7IGVjaG8gb3BlbmR1ZXRfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbmZpbmQgXCIkclwiIC1taW5kZXB0aCAxIC1tYXhkZXB0aCAxIC10eXBlIGQgLW10aW1lICs2IC1leGVjIHJtIC1yZiAtLSB7fSArIDI+L2Rldi9udWxsXG5kPVwiJHIvYWN0XzAxSjBEQVlUT05BRU5WMDAwMDAwMDAxXCJcbm1rZGlyIFwiJGRcIiAyPi9kZXYvbnVsbCB8fCB7IFsgLWUgXCIkZFwiIF0gJiYgeyBlY2hvIG9wZW5kdWV0X2V4ZWNfcmVlbnRlcmVkID4mMjsgZXhpdCAxMTE7IH07IGVjaG8gb3BlbmR1ZXRfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbnsgeyAoICdcXCcnc2gnXFwnJyAnXFwnJy1jJ1xcJycgJ1xcJydwcmludGYgXCIlc3wlc1wiIFwiJEdIX1BST01QVF9ESVNBQkxFRFwiIFwiJFRaXCInXFwnJyApIDI+JjE7IHByaW50ZiAnXFwnJyVzXFxuJ1xcJycgXCIkP1wiID4gXCIkZC9zdGF0dXNcIjsgfSB8IHNldHNpZCAtdyBzaCAtYyAnXFwnJ2hlYWQgLWMgXCIkMVwiOyBleGVjIGNhdCA+IC9kZXYvbnVsbCdcXCcnIG9wZW5kdWV0LWtlZXAgNDE5NDMwNTsgfSA+IFwiJGQvb3V0XCJcbmVjPVxucmVhZCBlYyA8IFwiJGQvc3RhdHVzXCIgMj4vZGV2L251bGxcbnJtIC1mIFwiJGQvc3RhdHVzXCJcblsgLW4gXCIkZWNcIiBdIHx8IGV4aXQgMTEzXG5wcmludGYgJ1xcJyclcydcXCcnIFwiJGVjXCIgPiBcIiRkL2V4aXQudG1wXCIgJiYgbXYgLWYgXCIkZC9leGl0LnRtcFwiIFwiJGQvZXhpdFwiXG5bIFwiJGVjXCIgPSAxMTEgXSAmJiBleGl0IDExM1xuWyBcIiRlY1wiID0gMTEyIF0gJiYgZXhpdCAxMTNcbmV4aXQgXCIkZWNcIicifQ=="
           }
         ],
         "end": "complete",
-        "atMs": 78,
+        "atMs": 57,
         "body": {
           "id": "cmd-0002",
           "command": "/bin/sh -c 'cd \"$1\" 2>/dev/null || exit 112; shift; f=\"$1\"; shift; e=\"$1\"; shift; [ \"$e\" = - ] || { [ -f \"$e\" ] || exit 112; . \"$e\"; rm -f \"$e\"; }; [ \"$f\" = - ] && exec env \"$@\" < /dev/null; exec env \"$@\" < \"$f\"' 'openduet-launch' '/work' '-' '-' '-u' 'DAYTONA_ORGANIZATION_ID' '-u' 'DAYTONA_REGION_ID' '-u' 'DAYTONA_SANDBOX_ID' '-u' 'DAYTONA_SANDBOX_SNAPSHOT' '-u' 'DAYTONA_SANDBOX_USER' 'timeout' '-s' 'KILL' '20' '/bin/sh' '-c' 'r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0DAYTONAENV000000001\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( '\\''sh'\\'' '\\''-c'\\'' '\\''printf \"%s|%s\" \"$GH_PROMPT_DISABLED\" \"$TZ\"'\\'' ) 2>&1; printf '\\''%s\\n'\\'' \"$?\" > \"$d/status\"; } | setsid -w sh -c '\\''head -c \"$1\"; exec cat > /dev/null'\\'' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '\\''%s'\\'' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\"'"
@@ -542,7 +542,7 @@
     },
     {
       "request": {
-        "atMs": 107,
+        "atMs": 85,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002",
@@ -557,11 +557,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImNtZC0wMDAyIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnbWVsZXRlLWxhdW5jaCcgJy93b3JrJyAnLScgJy0nICctdScgJ0RBWVRPTkFfT1JHQU5JWkFUSU9OX0lEJyAnLXUnICdEQVlUT05BX1JFR0lPTl9JRCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfU05BUFNIT1QnICctdScgJ0RBWVRPTkFfU0FOREJPWF9VU0VSJyAndGltZW91dCcgJy1zJyAnS0lMTCcgJzIwJyAnL2Jpbi9zaCcgJy1jJyAncj0vdmFyL3RtcC8ubWVsZXRlLWV4ZWNcblsgLWQgXCIkclwiIF0gJiYgWyAtdyBcIiRyXCIgXSAmJiBbIC14IFwiJHJcIiBdIHx8IHsgcm0gLWYgXCIkclwiIDI+L2Rldi9udWxsOyBta2RpciAtcCAtbSAwNzAwIFwiJHJcIiAyPi9kZXYvbnVsbDsgY2htb2QgMDcwMCBcIiRyXCIgMj4vZGV2L251bGw7IH1cblsgLWQgXCIkclwiIF0gJiYgWyAtdyBcIiRyXCIgXSAmJiBbIC14IFwiJHJcIiBdIHx8IHsgZWNobyBtZWxldGVfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbmZpbmQgXCIkclwiIC1taW5kZXB0aCAxIC1tYXhkZXB0aCAxIC10eXBlIGQgLW10aW1lICs2IC1leGVjIHJtIC1yZiAtLSB7fSArIDI+L2Rldi9udWxsXG5kPVwiJHIvYWN0XzAxSjBEQVlUT05BRU5WMDAwMDAwMDAxXCJcbm1rZGlyIFwiJGRcIiAyPi9kZXYvbnVsbCB8fCB7IFsgLWUgXCIkZFwiIF0gJiYgeyBlY2hvIG1lbGV0ZV9leGVjX3JlZW50ZXJlZCA+JjI7IGV4aXQgMTExOyB9OyBlY2hvIG1lbGV0ZV9leGVjX3Jvb3RfdW51c2FibGUgPiYyOyBleGl0IDExMjsgfVxueyB7ICggJ1xcJydzaCdcXCcnICdcXCcnLWMnXFwnJyAnXFwnJ3ByaW50ZiBcIiVzfCVzXCIgXCIkR0hfUFJPTVBUX0RJU0FCTEVEXCIgXCIkVFpcIidcXCcnICkgMj4mMTsgcHJpbnRmICdcXCcnJXNcXG4nXFwnJyBcIiQ/XCIgPiBcIiRkL3N0YXR1c1wiOyB9IHwgc2V0c2lkIC13IHNoIC1jICdcXCcnaGVhZCAtYyBcIiQxXCI7IGV4ZWMgY2F0ID4gL2Rldi9udWxsJ1xcJycgbWVsZXRlLWtlZXAgNDE5NDMwNTsgfSA+IFwiJGQvb3V0XCJcbmVjPVxucmVhZCBlYyA8IFwiJGQvc3RhdHVzXCIgMj4vZGV2L251bGxcbnJtIC1mIFwiJGQvc3RhdHVzXCJcblsgLW4gXCIkZWNcIiBdIHx8IGV4aXQgMTEzXG5wcmludGYgJ1xcJyclcydcXCcnIFwiJGVjXCIgPiBcIiRkL2V4aXQudG1wXCIgJiYgbXYgLWYgXCIkZC9leGl0LnRtcFwiIFwiJGQvZXhpdFwiXG5bIFwiJGVjXCIgPSAxMTEgXSAmJiBleGl0IDExM1xuWyBcIiRlY1wiID0gMTEyIF0gJiYgZXhpdCAxMTNcbmV4aXQgXCIkZWNcIiciLCJleGl0Q29kZSI6MH0="
+            "base64": "eyJpZCI6ImNtZC0wMDAyIiwiY29tbWFuZCI6Ii9iaW4vc2ggLWMgJ2NkIFwiJDFcIiAyPi9kZXYvbnVsbCB8fCBleGl0IDExMjsgc2hpZnQ7IGY9XCIkMVwiOyBzaGlmdDsgZT1cIiQxXCI7IHNoaWZ0OyBbIFwiJGVcIiA9IC0gXSB8fCB7IFsgLWYgXCIkZVwiIF0gfHwgZXhpdCAxMTI7IC4gXCIkZVwiOyBybSAtZiBcIiRlXCI7IH07IFsgXCIkZlwiID0gLSBdICYmIGV4ZWMgZW52IFwiJEBcIiA8IC9kZXYvbnVsbDsgZXhlYyBlbnYgXCIkQFwiIDwgXCIkZlwiJyAnb3BlbmR1ZXQtbGF1bmNoJyAnL3dvcmsnICctJyAnLScgJy11JyAnREFZVE9OQV9PUkdBTklaQVRJT05fSUQnICctdScgJ0RBWVRPTkFfUkVHSU9OX0lEJyAnLXUnICdEQVlUT05BX1NBTkRCT1hfSUQnICctdScgJ0RBWVRPTkFfU0FOREJPWF9TTkFQU0hPVCcgJy11JyAnREFZVE9OQV9TQU5EQk9YX1VTRVInICd0aW1lb3V0JyAnLXMnICdLSUxMJyAnMjAnICcvYmluL3NoJyAnLWMnICdyPS92YXIvdG1wLy5vcGVuZHVldC1leGVjXG5bIC1kIFwiJHJcIiBdICYmIFsgLXcgXCIkclwiIF0gJiYgWyAteCBcIiRyXCIgXSB8fCB7IHJtIC1mIFwiJHJcIiAyPi9kZXYvbnVsbDsgbWtkaXIgLXAgLW0gMDcwMCBcIiRyXCIgMj4vZGV2L251bGw7IGNobW9kIDA3MDAgXCIkclwiIDI+L2Rldi9udWxsOyB9XG5bIC1kIFwiJHJcIiBdICYmIFsgLXcgXCIkclwiIF0gJiYgWyAteCBcIiRyXCIgXSB8fCB7IGVjaG8gb3BlbmR1ZXRfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbmZpbmQgXCIkclwiIC1taW5kZXB0aCAxIC1tYXhkZXB0aCAxIC10eXBlIGQgLW10aW1lICs2IC1leGVjIHJtIC1yZiAtLSB7fSArIDI+L2Rldi9udWxsXG5kPVwiJHIvYWN0XzAxSjBEQVlUT05BRU5WMDAwMDAwMDAxXCJcbm1rZGlyIFwiJGRcIiAyPi9kZXYvbnVsbCB8fCB7IFsgLWUgXCIkZFwiIF0gJiYgeyBlY2hvIG9wZW5kdWV0X2V4ZWNfcmVlbnRlcmVkID4mMjsgZXhpdCAxMTE7IH07IGVjaG8gb3BlbmR1ZXRfZXhlY19yb290X3VudXNhYmxlID4mMjsgZXhpdCAxMTI7IH1cbnsgeyAoICdcXCcnc2gnXFwnJyAnXFwnJy1jJ1xcJycgJ1xcJydwcmludGYgXCIlc3wlc1wiIFwiJEdIX1BST01QVF9ESVNBQkxFRFwiIFwiJFRaXCInXFwnJyApIDI+JjE7IHByaW50ZiAnXFwnJyVzXFxuJ1xcJycgXCIkP1wiID4gXCIkZC9zdGF0dXNcIjsgfSB8IHNldHNpZCAtdyBzaCAtYyAnXFwnJ2hlYWQgLWMgXCIkMVwiOyBleGVjIGNhdCA+IC9kZXYvbnVsbCdcXCcnIG9wZW5kdWV0LWtlZXAgNDE5NDMwNTsgfSA+IFwiJGQvb3V0XCJcbmVjPVxucmVhZCBlYyA8IFwiJGQvc3RhdHVzXCIgMj4vZGV2L251bGxcbnJtIC1mIFwiJGQvc3RhdHVzXCJcblsgLW4gXCIkZWNcIiBdIHx8IGV4aXQgMTEzXG5wcmludGYgJ1xcJyclcydcXCcnIFwiJGVjXCIgPiBcIiRkL2V4aXQudG1wXCIgJiYgbXYgLWYgXCIkZC9leGl0LnRtcFwiIFwiJGQvZXhpdFwiXG5bIFwiJGVjXCIgPSAxMTEgXSAmJiBleGl0IDExM1xuWyBcIiRlY1wiID0gMTEyIF0gJiYgZXhpdCAxMTNcbmV4aXQgXCIkZWNcIiciLCJleGl0Q29kZSI6MH0="
           }
         ],
         "end": "complete",
-        "atMs": 107,
+        "atMs": 85,
         "body": {
           "id": "cmd-0002",
           "command": "/bin/sh -c 'cd \"$1\" 2>/dev/null || exit 112; shift; f=\"$1\"; shift; e=\"$1\"; shift; [ \"$e\" = - ] || { [ -f \"$e\" ] || exit 112; . \"$e\"; rm -f \"$e\"; }; [ \"$f\" = - ] && exec env \"$@\" < /dev/null; exec env \"$@\" < \"$f\"' 'openduet-launch' '/work' '-' '-' '-u' 'DAYTONA_ORGANIZATION_ID' '-u' 'DAYTONA_REGION_ID' '-u' 'DAYTONA_SANDBOX_ID' '-u' 'DAYTONA_SANDBOX_SNAPSHOT' '-u' 'DAYTONA_SANDBOX_USER' 'timeout' '-s' 'KILL' '20' '/bin/sh' '-c' 'r=/var/tmp/.openduet-exec\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { rm -f \"$r\" 2>/dev/null; mkdir -p -m 0700 \"$r\" 2>/dev/null; chmod 0700 \"$r\" 2>/dev/null; }\n[ -d \"$r\" ] && [ -w \"$r\" ] && [ -x \"$r\" ] || { echo openduet_exec_root_unusable >&2; exit 112; }\nfind \"$r\" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf -- {} + 2>/dev/null\nd=\"$r/act_01J0DAYTONAENV000000001\"\nmkdir \"$d\" 2>/dev/null || { [ -e \"$d\" ] && { echo openduet_exec_reentered >&2; exit 111; }; echo openduet_exec_root_unusable >&2; exit 112; }\n{ { ( '\\''sh'\\'' '\\''-c'\\'' '\\''printf \"%s|%s\" \"$GH_PROMPT_DISABLED\" \"$TZ\"'\\'' ) 2>&1; printf '\\''%s\\n'\\'' \"$?\" > \"$d/status\"; } | setsid -w sh -c '\\''head -c \"$1\"; exec cat > /dev/null'\\'' openduet-keep 4194305; } > \"$d/out\"\nec=\nread ec < \"$d/status\" 2>/dev/null\nrm -f \"$d/status\"\n[ -n \"$ec\" ] || exit 113\nprintf '\\''%s'\\'' \"$ec\" > \"$d/exit.tmp\" && mv -f \"$d/exit.tmp\" \"$d/exit\"\n[ \"$ec\" = 111 ] && exit 113\n[ \"$ec\" = 112 ] && exit 113\nexit \"$ec\"'",
@@ -571,7 +571,7 @@
     },
     {
       "request": {
-        "atMs": 108,
+        "atMs": 86,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002/logs",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001/command/cmd-0002/logs",
@@ -585,12 +585,12 @@
         },
         "chunks": [],
         "end": "complete",
-        "atMs": 108
+        "atMs": 86
       }
     },
     {
       "request": {
-        "atMs": 108,
+        "atMs": 86,
         "method": "DELETE",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001",
         "path": "/toolbox/fake-sbx-0001/process/session/openduet-act_01J0DAYTONAENV000000001",
@@ -602,16 +602,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 108
+        "atMs": 87
       }
     },
     {
       "request": {
-        "atMs": 108,
+        "atMs": 87,
         "method": "POST",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/process/execute",
         "path": "/toolbox/fake-sbx-0001/process/execute",
-        "bodySha256": "38fc693bad778675426779915ae90e158649fb1b663063352e2eb4ff3f29b725",
+        "bodySha256": "8ad8ef95aaeb4c7dea1e21eae44a964861a318ca52865b6f80911b426710306d",
         "headers": {
           "content-type": "application/json"
         },
@@ -632,7 +632,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 108,
+        "atMs": 87,
         "body": {
           "exitCode": 0,
           "result": "f 1 644 exit\u0000f 1 644 out\u0000"
@@ -641,7 +641,7 @@
     },
     {
       "request": {
-        "atMs": 108,
+        "atMs": 88,
         "method": "GET",
         "url": "https://proxy.app.daytona.io/toolbox/fake-sbx-0001/files/download",
         "path": "/toolbox/fake-sbx-0001/files/download?path=%2Fvar%2Ftmp%2F.openduet-exec%2Fact_01J0DAYTONAENV000000001%2Fout",
@@ -660,7 +660,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 108,
+        "atMs": 88,
         "body": {
           "bytes": 1
         }
@@ -668,7 +668,7 @@
     },
     {
       "request": {
-        "atMs": 112,
+        "atMs": 88,
         "method": "DELETE",
         "url": "https://app.daytona.io/api/sandbox/fake-sbx-0001",
         "path": "/api/sandbox/fake-sbx-0001",
@@ -683,11 +683,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im1lbGV0ZS5vd25lciI6InYxIiwibWVsZXRlLnByb2plY3QiOiJkYXl0b25hLXRlc3QiLCJtZWxldGUuc3BhY2UiOiJzcF9EQVlUT05BIiwibWVsZXRlLnNlc3Npb24iOiJzYnhfREFZVE9OQSJ9LCJwdWJsaWMiOmZhbHNlLCJuZXR3b3JrQmxvY2tBbGwiOnRydWUsInRhcmdldCI6InVzIiwiY3B1IjoxLCJncHUiOjAsIm1lbW9yeSI6MSwiZGlzayI6Mywic3RhdGUiOiJkZXN0cm95aW5nIiwiZGVzaXJlZFN0YXRlIjoiZGVzdHJveWluZyIsImJhY2t1cFN0YXRlIjoiTm9uZSIsImF1dG9TdG9wSW50ZXJ2YWwiOjEwLCJhdXRvQXJjaGl2ZUludGVydmFsIjoxMDA4MCwiYXV0b0RlbGV0ZUludGVydmFsIjo0MzIwMCwiY3JlYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwidXBkYXRlZEF0IjoiMjAyNi0wOS0yM1QwMDowMDowMC4wMDBaIiwic2FuZGJveENsYXNzIjoiY29udGFpbmVyIiwiZGFlbW9uVmVyc2lvbiI6IjAuMTkwLjAiLCJ0b29sYm94UHJveHlVcmwiOiJodHRwczovL3Byb3h5LmFwcC5kYXl0b25hLmlvL3Rvb2xib3gifQ=="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcmdhbml6YXRpb25JZCI6Im9yZ19hdXRob3JpbmciLCJuYW1lIjoiZmFrZS1zYngtMDAwMSIsInNuYXBzaG90IjoiZGF5dG9uYS1zbWFsbCIsInVzZXIiOiJkYXl0b25hIiwiZW52Ijp7fSwibGFiZWxzIjp7Im9wZW5kdWV0Lm93bmVyIjoidjEiLCJvcGVuZHVldC5wcm9qZWN0IjoiZGF5dG9uYS10ZXN0Iiwib3BlbmR1ZXQuc3BhY2UiOiJzcF9EQVlUT05BIiwib3BlbmR1ZXQuc2Vzc2lvbiI6InNieF9EQVlUT05BIn0sInB1YmxpYyI6ZmFsc2UsIm5ldHdvcmtCbG9ja0FsbCI6dHJ1ZSwidGFyZ2V0IjoidXMiLCJjcHUiOjEsImdwdSI6MCwibWVtb3J5IjoxLCJkaXNrIjozLCJzdGF0ZSI6ImRlc3Ryb3lpbmciLCJkZXNpcmVkU3RhdGUiOiJkZXN0cm95aW5nIiwiYmFja3VwU3RhdGUiOiJOb25lIiwiYXV0b1N0b3BJbnRlcnZhbCI6MTAsImF1dG9BcmNoaXZlSW50ZXJ2YWwiOjEwMDgwLCJhdXRvRGVsZXRlSW50ZXJ2YWwiOjQzMjAwLCJjcmVhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJ1cGRhdGVkQXQiOiIyMDI2LTA5LTIzVDAwOjAwOjAwLjAwMFoiLCJzYW5kYm94Q2xhc3MiOiJjb250YWluZXIiLCJkYWVtb25WZXJzaW9uIjoiMC4xOTAuMCIsInRvb2xib3hQcm94eVVybCI6Imh0dHBzOi8vcHJveHkuYXBwLmRheXRvbmEuaW8vdG9vbGJveCJ9"
           }
         ],
         "end": "complete",
-        "atMs": 113,
+        "atMs": 89,
         "body": {
           "id": "fake-sbx-0001",
           "organizationId": "org_authoring",

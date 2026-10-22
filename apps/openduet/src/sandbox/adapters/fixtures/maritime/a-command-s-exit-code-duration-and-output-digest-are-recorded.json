@@ -9,11 +9,11 @@
   "exchanges": [
     {
       "request": {
-        "atMs": 58,
+        "atMs": 5,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers",
         "path": "/api/v1/computers",
-        "bodySha256": "ba460972b65b80fca3b830585cdd4652e0a31a50f3c573164f7b80e8c9e2d79a",
+        "bodySha256": "4fa826c50cc19ddc0337881cb7579b374dd8c9389574c0a9a0f3459d2bb9de25",
         "headers": {
           "content-type": "application/json"
         },
@@ -32,11 +32,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcyI6ImxpbnV4IiwiYXJjaCI6Ing4Nl82NCIsImV4dGVybmFsVXNlcklkIjoibWVsZXRlLWU1Y2M5YmNjZGZhOGJkMGQyOWVmZWJjZTNmZGEwMTFlY2ZiOWViYTViNDliNzZlMyIsIm5hbWUiOiJtZWxldGUgdjEgY29uZm9ybWFuY2UgLSBzYnhfQ09ORk9STUFOQ0UxIiwic3RhdHVzIjoiYXdha2UiLCJzY3JlZW4iOnsid2lkdGgiOjEyODAsImhlaWdodCI6ODAwLCJtb2RlbFdpZHRoIjoxMjAwfSwibW9kZSI6ImFnZW50IiwibW9kZVJlYXNvbiI6bnVsbCwibGFzdEFjdGlvbkF0IjpudWxsLCJsYXN0V2FrZU1zIjpudWxsLCJsYXN0V2FrZU1ldGhvZCI6bnVsbCwiZXJyb3JNZXNzYWdlIjpudWxsLCJzZXNzaW9uIjpudWxsLCJjcmVhdGVkQXQiOiIyMDI2LTEwLTE4VDAwOjAwOjAwLjAwMFoifQ=="
+            "base64": "eyJpZCI6ImZha2Utc2J4LTAwMDEiLCJvcyI6ImxpbnV4IiwiYXJjaCI6Ing4Nl82NCIsImV4dGVybmFsVXNlcklkIjoib3BlbmR1ZXQtZTVjYzliY2NkZmE4YmQwZDI5ZWZlYmNlM2ZkYTAxMWVjZmI5ZWJhNWI0OWI3NmUzIiwibmFtZSI6Im9wZW5kdWV0IHYxIGNvbmZvcm1hbmNlIC0gc2J4X0NPTkZPUk1BTkNFMSIsInN0YXR1cyI6ImF3YWtlIiwic2NyZWVuIjp7IndpZHRoIjoxMjgwLCJoZWlnaHQiOjgwMCwibW9kZWxXaWR0aCI6MTIwMH0sIm1vZGUiOiJhZ2VudCIsIm1vZGVSZWFzb24iOm51bGwsImxhc3RBY3Rpb25BdCI6bnVsbCwibGFzdFdha2VNcyI6bnVsbCwibGFzdFdha2VNZXRob2QiOm51bGwsImVycm9yTWVzc2FnZSI6bnVsbCwic2Vzc2lvbiI6bnVsbCwiY3JlYXRlZEF0IjoiMjAyNi0xMC0xOFQwMDowMDowMC4wMDBaIn0="
           }
         ],
         "end": "complete",
-        "atMs": 60,
+        "atMs": 8,
         "body": {
           "id": "fake-sbx-0001",
           "os": "linux",
@@ -62,7 +62,7 @@
     },
     {
       "request": {
-        "atMs": 102,
+        "atMs": 13,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/wake",
         "path": "/api/v1/computers/fake-sbx-0001/wake",
@@ -81,7 +81,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 102,
+        "atMs": 14,
         "body": {
           "status": "awake",
           "wakeMs": 0,
@@ -91,7 +91,7 @@
     },
     {
       "request": {
-        "atMs": 103,
+        "atMs": 15,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/actions",
         "path": "/api/v1/computers/fake-sbx-0001/actions",
@@ -116,7 +116,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 103,
+        "atMs": 15,
         "body": {
           "action": "cursor_position",
           "ok": true,
@@ -126,11 +126,11 @@
     },
     {
       "request": {
-        "atMs": 105,
+        "atMs": 16,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "e252a3bb228b15d3199c2361b86954a6363b9f3fc3aad493ee4f662cab05bb06",
+        "bodySha256": "7b120efa38263675acbbee0a3adb57e2a17f9f1fb9642e2cce3702bb5c68a550",
         "headers": {
           "content-type": "application/json"
         },
@@ -151,7 +151,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 132,
+        "atMs": 25,
         "body": {
           "exitCode": 0,
           "stdout": "ready\n",
@@ -161,7 +161,7 @@
     },
     {
       "request": {
-        "atMs": 136,
+        "atMs": 26,
         "method": "PUT",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/files",
         "path": "/api/v1/computers/fake-sbx-0001/files?path=%2Fdata%2F.openduet-run%2Fsandbox-env",
@@ -181,11 +181,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJwYXRoIjoiL2RhdGEvLm1lbGV0ZS1ydW4vc2FuZGJveC1lbnYiLCJzaXplIjoyMn0="
+            "base64": "eyJwYXRoIjoiL2RhdGEvLm9wZW5kdWV0LXJ1bi9zYW5kYm94LWVudiIsInNpemUiOjIyfQ=="
           }
         ],
         "end": "complete",
-        "atMs": 137,
+        "atMs": 27,
         "body": {
           "path": "/data/.openduet-run/sandbox-env",
           "size": 22
@@ -194,16 +194,16 @@
     },
     {
       "request": {
-        "atMs": 143,
+        "atMs": 30,
         "method": "PUT",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/files",
         "path": "/api/v1/computers/fake-sbx-0001/files?path=%2Fdata%2F.openduet-run%2Fact_01J0CONFORMANCE00000000.cmd",
-        "bodySha256": "d195ef1807ffbbb536de4a18e82dd0c1e209fda53ff170776cad0f7262a02762",
+        "bodySha256": "1f2c27d64ca8c769cbe17fcc07f1772fe3b47b41287316132b1f43af28948ef1",
         "headers": {
           "content-type": "application/octet-stream"
         },
         "body": {
-          "bytes": 1139
+          "bytes": 1153
         }
       },
       "response": {
@@ -214,24 +214,24 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJwYXRoIjoiL2RhdGEvLm1lbGV0ZS1ydW4vYWN0XzAxSjBDT05GT1JNQU5DRTAwMDAwMDAwLmNtZCIsInNpemUiOjExMzl9"
+            "base64": "eyJwYXRoIjoiL2RhdGEvLm9wZW5kdWV0LXJ1bi9hY3RfMDFKMENPTkZPUk1BTkNFMDAwMDAwMDAuY21kIiwic2l6ZSI6MTE1M30="
           }
         ],
         "end": "complete",
-        "atMs": 145,
+        "atMs": 31,
         "body": {
           "path": "/data/.openduet-run/act_01J0CONFORMANCE00000000.cmd",
-          "size": 1139
+          "size": 1153
         }
       }
     },
     {
       "request": {
-        "atMs": 146,
+        "atMs": 31,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "23f636474de0f948aa4c30f74a7888833dc1c9c2e4886af08592f5d724dd242c",
+        "bodySha256": "f80d8e64e966cd38571768e76be6239fb9ecadb8b1b84f9ed8267fa6ec2887d8",
         "headers": {
           "content-type": "application/json"
         },
@@ -252,7 +252,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 152,
+        "atMs": 35,
         "body": {
           "exitCode": 0,
           "stdout": "pid=1003\n",
@@ -262,11 +262,11 @@
     },
     {
       "request": {
-        "atMs": 156,
+        "atMs": 37,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "1e741a4e666cee9c87cd82aac86b4dbb3ccd8e5d703c28eb29d796bea55ed09d",
+        "bodySha256": "feffe53b63079003195688a8e05ca5f435129f71dcb1ce3f2d81b2277c889ffc",
         "headers": {
           "content-type": "application/json"
         },
@@ -287,7 +287,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 699,
+        "atMs": 543,
         "body": {
           "exitCode": 0,
           "stdout": "3\n0\n",
@@ -297,11 +297,11 @@
     },
     {
       "request": {
-        "atMs": 721,
+        "atMs": 544,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "0c55b70d28d6a1d04ca0e4c1abd7606f4a57666467bf5265af8191edb9ee85d0",
+        "bodySha256": "2f17976f51f8b8b5f84765cf5e4bb0f3fed57fad472e80ffd40b8b16cb6677a4",
         "headers": {
           "content-type": "application/json"
         },
@@ -322,7 +322,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 722,
+        "atMs": 545,
         "body": {
           "exitCode": 0,
           "stdout": "",
@@ -332,11 +332,11 @@
     },
     {
       "request": {
-        "atMs": 749,
+        "atMs": 547,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "d23a805a8e28465b4add4311df7f7361ec6031a806de2353abf0cb9ece86b8a6",
+        "bodySha256": "155a899076b6e4cf94cee5d6636da55c05b3c4dcb68c1ceb8123fa9cec8707c9",
         "headers": {
           "content-type": "application/json"
         },
@@ -357,7 +357,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 751,
+        "atMs": 548,
         "body": {
           "exitCode": 0,
           "stdout": "",
@@ -367,7 +367,7 @@
     },
     {
       "request": {
-        "atMs": 752,
+        "atMs": 549,
         "method": "GET",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/files",
         "path": "/api/v1/computers/fake-sbx-0001/files?path=%2Fdata%2F.openduet-tmp%2Flist-000001",
@@ -382,11 +382,11 @@
         "chunks": [
           {
             "atMs": 1,
-            "base64": "ZiAxIDY0NCAxOC4wOjE4LjA6MTggZXhpdABmIDE4IDY0NCAxMy4wOjEzLjA6MTMgb3V0AA=="
+            "base64": "ZiAxIDY0NCAxOC4wOjE4LjA6MTggZXhpdABmIDIwIDY0NCAxMy4wOjEzLjA6MTMgb3V0AA=="
           }
         ],
         "end": "complete",
-        "atMs": 752,
+        "atMs": 549,
         "body": {
           "bytes": 52
         }
@@ -394,11 +394,11 @@
     },
     {
       "request": {
-        "atMs": 754,
+        "atMs": 551,
         "method": "POST",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/exec",
         "path": "/api/v1/computers/fake-sbx-0001/exec",
-        "bodySha256": "727b04765d1cfa379733bb516599b123948ae445b858afe983c285f4ad1169bf",
+        "bodySha256": "a87b6eed9d735cfc662b15cb4ce2e6f5554991b7a3953c24d79891dd7cdb4b75",
         "headers": {
           "content-type": "application/json"
         },
@@ -419,7 +419,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 755,
+        "atMs": 551,
         "body": {
           "exitCode": 0,
           "stdout": "",
@@ -429,7 +429,7 @@
     },
     {
       "request": {
-        "atMs": 757,
+        "atMs": 553,
         "method": "GET",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001/files",
         "path": "/api/v1/computers/fake-sbx-0001/files?path=%2Fdata%2F.openduet-exec%2Fact_01J0CONFORMANCE00000000%2Fout",
@@ -443,20 +443,20 @@
         },
         "chunks": [
           {
-            "atMs": 0,
-            "base64": "bWVsZXRlLWNvbmZvcm1hbmNl"
+            "atMs": 1,
+            "base64": "b3BlbmR1ZXQtY29uZm9ybWFuY2U="
           }
         ],
         "end": "complete",
-        "atMs": 757,
+        "atMs": 553,
         "body": {
-          "bytes": 18
+          "bytes": 20
         }
       }
     },
     {
       "request": {
-        "atMs": 758,
+        "atMs": 555,
         "method": "DELETE",
         "url": "https://api.maritime.sh/api/v1/computers/fake-sbx-0001",
         "path": "/api/v1/computers/fake-sbx-0001",
@@ -468,7 +468,7 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 759
+        "atMs": 555
       }
     }
   ]

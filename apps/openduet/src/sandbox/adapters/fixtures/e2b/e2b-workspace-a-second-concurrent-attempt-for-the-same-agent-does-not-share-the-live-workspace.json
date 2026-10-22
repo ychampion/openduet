@@ -10,11 +10,11 @@
   "exchanges": [
     {
       "request": {
-        "atMs": 26,
+        "atMs": 27,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes",
         "path": "/sandboxes",
-        "bodySha256": "8ce90915409ec9235de727fc9d3de2f9682f77cb8c003d48bdaa939fda3bc688",
+        "bodySha256": "89caa39b5570447da8b2383b758e22dcb21a3d5e37edf423d0ca34e28559a6af",
         "headers": {
           "content-type": "application/json"
         },
@@ -62,7 +62,7 @@
     },
     {
       "request": {
-        "atMs": 27,
+        "atMs": 28,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
@@ -106,7 +106,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 28,
+        "atMs": 29,
         "body": [
           {
             "event": {
@@ -131,7 +131,7 @@
     },
     {
       "request": {
-        "atMs": 37,
+        "atMs": 80,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001/pause",
         "path": "/sandboxes/fake-sbx-0001/pause",
@@ -148,12 +148,12 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 37
+        "atMs": 80
       }
     },
     {
       "request": {
-        "atMs": 91,
+        "atMs": 144,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001/connect",
         "path": "/sandboxes/fake-sbx-0001/connect",
@@ -177,7 +177,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 91,
+        "atMs": 144,
         "body": {
           "templateID": "base",
           "sandboxID": "fake-sbx-0001",
@@ -191,7 +191,7 @@
     },
     {
       "request": {
-        "atMs": 93,
+        "atMs": 159,
         "method": "DELETE",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001",
         "path": "/sandboxes/fake-sbx-0001",
@@ -203,7 +203,7 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 93
+        "atMs": 159
       }
     }
   ]

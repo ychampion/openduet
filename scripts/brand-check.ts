@@ -18,9 +18,18 @@ for (const path of new Set(listed.stdout.toString().split('\0').filter(Boolean))
   if (attribution.has(path)) continue;
   const bytes = readFileSync(file);
   if (bytes.includes(0)) continue;
-  if (previousName.test(bytes.toString('utf8'))) findings.push(`${path}: inherited product name`);
+  const text = bytes.toString('utf8');
+  if (previousName.test(text)) findings.push(`${path}: inherited product name`);
+  // HTTP replays carry response bodies as base64; raw source scans miss names
+  // inside those payloads even after the readable fixture body is renamed.
+  for (const match of text.matchAll(/"base64"\s*:\s*"([A-Za-z0-9+/=]+)"/g)) {
+    if (previousName.test(Buffer.from(match[1] ?? '', 'base64').toString('utf8'))) {
+      findings.push(`${path}: inherited product name in encoded payload`);
+      break;
+    }
+  }
 }
 if (findings.length) {
   process.stderr.write(`${findings.join('\n')}\n`);
   process.exitCode = 1;
-} else process.stdout.write('OpenDuet branding: all source paths and text passed\n');
+} else process.stdout.write('OpenDuet branding: paths, text and encoded payloads passed\n');

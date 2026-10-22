@@ -10,11 +10,11 @@
   "exchanges": [
     {
       "request": {
-        "atMs": 32,
+        "atMs": 43,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes",
         "path": "/sandboxes",
-        "bodySha256": "8ce90915409ec9235de727fc9d3de2f9682f77cb8c003d48bdaa939fda3bc688",
+        "bodySha256": "89caa39b5570447da8b2383b758e22dcb21a3d5e37edf423d0ca34e28559a6af",
         "headers": {
           "content-type": "application/json"
         },
@@ -48,7 +48,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 32,
+        "atMs": 43,
         "body": {
           "templateID": "base",
           "sandboxID": "fake-sbx-0001",
@@ -62,7 +62,7 @@
     },
     {
       "request": {
-        "atMs": 33,
+        "atMs": 44,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
@@ -106,7 +106,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 33,
+        "atMs": 44,
         "body": [
           {
             "event": {
@@ -131,11 +131,11 @@
     },
     {
       "request": {
-        "atMs": 39,
+        "atMs": 48,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
-        "bodySha256": "d1125baf213198c2d73549132082e8160913c45d896cb65e7d2be211f9b00c51",
+        "bodySha256": "6d83e25cd3b934f16157b0123b10168cc3357e9e0f32772bffe49208a1c6faae",
         "headers": {
           "content-type": "application/connect+json",
           "connect-protocol-version": "1",
@@ -179,7 +179,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 40,
+        "atMs": 49,
         "body": [
           {
             "event": {
@@ -204,11 +204,11 @@
     },
     {
       "request": {
-        "atMs": 41,
+        "atMs": 50,
         "method": "POST",
         "url": "https://sandbox.e2b.app/filesystem.Filesystem/ListDir",
         "path": "/filesystem.Filesystem/ListDir",
-        "bodySha256": "98d5fe6cb97691dfe3f35b0c9a6a0768875473dd6d055bc36476723f4a557ba6",
+        "bodySha256": "237103a5cada030d5973136a7cd68f78aaf1328eb7d42fdb3f52dfb6c45fe7d3",
         "headers": {
           "content-type": "application/json",
           "connect-protocol-version": "1",
@@ -228,11 +228,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJlbnRyaWVzIjpbeyJuYW1lIjoiZXhpdCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ubWVsZXRlLWV4ZWMvYWN0XzAxSjBXT1JLU1BBQ0VXUklURTAwMDEvZXhpdCIsInNpemUiOiIxIiwibW9kZSI6NDIwLCJvd25lciI6InVzZXIiLCJncm91cCI6InVzZXIifSx7Im5hbWUiOiJvdXQiLCJ0eXBlIjoiRklMRV9UWVBFX0ZJTEUiLCJwYXRoIjoiL3Zhci90bXAvLm1lbGV0ZS1leGVjL2FjdF8wMUowV09SS1NQQUNFV1JJVEUwMDAxL291dCIsIm1vZGUiOjQyMCwib3duZXIiOiJ1c2VyIiwiZ3JvdXAiOiJ1c2VyIn1dfQ=="
+            "base64": "eyJlbnRyaWVzIjpbeyJuYW1lIjoiZXhpdCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ub3BlbmR1ZXQtZXhlYy9hY3RfMDFKMFdPUktTUEFDRVdSSVRFMDAwMS9leGl0Iiwic2l6ZSI6IjEiLCJtb2RlIjo0MjAsIm93bmVyIjoidXNlciIsImdyb3VwIjoidXNlciJ9LHsibmFtZSI6Im91dCIsInR5cGUiOiJGSUxFX1RZUEVfRklMRSIsInBhdGgiOiIvdmFyL3RtcC8ub3BlbmR1ZXQtZXhlYy9hY3RfMDFKMFdPUktTUEFDRVdSSVRFMDAwMS9vdXQiLCJtb2RlIjo0MjAsIm93bmVyIjoidXNlciIsImdyb3VwIjoidXNlciJ9XX0="
           }
         ],
         "end": "complete",
-        "atMs": 41,
+        "atMs": 50,
         "body": {
           "entries": [
             {
@@ -258,7 +258,7 @@
     },
     {
       "request": {
-        "atMs": 42,
+        "atMs": 77,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001/pause",
         "path": "/sandboxes/fake-sbx-0001/pause",
@@ -275,16 +275,16 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 42
+        "atMs": 77
       }
     },
     {
       "request": {
-        "atMs": 47,
+        "atMs": 94,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes",
         "path": "/sandboxes",
-        "bodySha256": "8a273e12933dd88029d6cb127201f509a9899b668339bd9aa605b0c3379b4086",
+        "bodySha256": "d87c4b26b9aa72f96d05a761decb169773920df76fe1fc84affe1fff2297f9b6",
         "headers": {
           "content-type": "application/json"
         },
@@ -318,7 +318,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 47,
+        "atMs": 94,
         "body": {
           "templateID": "base",
           "sandboxID": "fake-sbx-0002",
@@ -332,7 +332,7 @@
     },
     {
       "request": {
-        "atMs": 47,
+        "atMs": 94,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
@@ -376,7 +376,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 47,
+        "atMs": 95,
         "body": [
           {
             "event": {
@@ -401,7 +401,7 @@
     },
     {
       "request": {
-        "atMs": 49,
+        "atMs": 109,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0002/pause",
         "path": "/sandboxes/fake-sbx-0002/pause",
@@ -418,12 +418,12 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 49
+        "atMs": 109
       }
     },
     {
       "request": {
-        "atMs": 54,
+        "atMs": 157,
         "method": "DELETE",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001",
         "path": "/sandboxes/fake-sbx-0001",
@@ -435,12 +435,12 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 54
+        "atMs": 157
       }
     },
     {
       "request": {
-        "atMs": 55,
+        "atMs": 161,
         "method": "GET",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0001",
         "path": "/sandboxes/fake-sbx-0001",
@@ -459,7 +459,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 56,
+        "atMs": 161,
         "body": {
           "code": 404,
           "message": "sandbox fake-sbx-0001 not found"
@@ -468,7 +468,7 @@
     },
     {
       "request": {
-        "atMs": 56,
+        "atMs": 167,
         "method": "GET",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0002",
         "path": "/sandboxes/fake-sbx-0002",
@@ -483,11 +483,11 @@
         "chunks": [
           {
             "atMs": 0,
-            "base64": "eyJ0ZW1wbGF0ZUlEIjoiYmFzZSIsInNhbmRib3hJRCI6ImZha2Utc2J4LTAwMDIiLCJjbGllbnRJRCI6IjAwMDAwMDAwIiwic3RhcnRlZEF0IjoiMjAyNi0wOS0xN1QwMDowMDowMFoiLCJlbmRBdCI6IjIwMjYtMDktMTdUMDA6MDA6MDBaIiwiY3B1Q291bnQiOjIsIm1lbW9yeU1CIjo1MTIsImRpc2tTaXplTUIiOjEwMjQwLCJtZXRhZGF0YSI6eyJtZWxldGUub3duZXIiOiJ2MSIsIm1lbGV0ZS5wcm9qZWN0Ijoid29ya3NwYWNlcyIsIm1lbGV0ZS5zcGFjZSI6InNwX1dPUktTUEFDRVMiLCJtZWxldGUuc2Vzc2lvbiI6InNieF9XUzAwMDIifSwic3RhdGUiOiJwYXVzZWQiLCJlbnZkVmVyc2lvbiI6IjAuNi40IiwiZW52ZEFjY2Vzc1Rva2VuIjoicmVkYWN0ZWQiLCJkb21haW4iOiJlMmIuYXBwIn0="
+            "base64": "eyJ0ZW1wbGF0ZUlEIjoiYmFzZSIsInNhbmRib3hJRCI6ImZha2Utc2J4LTAwMDIiLCJjbGllbnRJRCI6IjAwMDAwMDAwIiwic3RhcnRlZEF0IjoiMjAyNi0wOS0xN1QwMDowMDowMFoiLCJlbmRBdCI6IjIwMjYtMDktMTdUMDA6MDA6MDBaIiwiY3B1Q291bnQiOjIsIm1lbW9yeU1CIjo1MTIsImRpc2tTaXplTUIiOjEwMjQwLCJtZXRhZGF0YSI6eyJvcGVuZHVldC5vd25lciI6InYxIiwib3BlbmR1ZXQucHJvamVjdCI6IndvcmtzcGFjZXMiLCJvcGVuZHVldC5zcGFjZSI6InNwX1dPUktTUEFDRVMiLCJvcGVuZHVldC5zZXNzaW9uIjoic2J4X1dTMDAwMiJ9LCJzdGF0ZSI6InBhdXNlZCIsImVudmRWZXJzaW9uIjoiMC42LjQiLCJlbnZkQWNjZXNzVG9rZW4iOiJyZWRhY3RlZCIsImRvbWFpbiI6ImUyYi5hcHAifQ=="
           }
         ],
         "end": "complete",
-        "atMs": 56,
+        "atMs": 167,
         "body": {
           "templateID": "base",
           "sandboxID": "fake-sbx-0002",
@@ -512,11 +512,11 @@
     },
     {
       "request": {
-        "atMs": 58,
+        "atMs": 177,
         "method": "POST",
         "url": "https://api.e2b.app/sandboxes",
         "path": "/sandboxes",
-        "bodySha256": "375872938e02a42de8471dad10fb8dc2d7c30cbda6115f3d46bddae52423d950",
+        "bodySha256": "9606320a8e769d8c7e2fe4c0874182c2ed4b5539ddbd29806edaf039a5b0a021",
         "headers": {
           "content-type": "application/json"
         },
@@ -550,7 +550,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 59,
+        "atMs": 177,
         "body": {
           "templateID": "base",
           "sandboxID": "fake-sbx-0003",
@@ -564,7 +564,7 @@
     },
     {
       "request": {
-        "atMs": 59,
+        "atMs": 178,
         "method": "POST",
         "url": "https://sandbox.e2b.app/process.Process/Start",
         "path": "/process.Process/Start",
@@ -608,7 +608,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 59,
+        "atMs": 178,
         "body": [
           {
             "event": {
@@ -633,7 +633,7 @@
     },
     {
       "request": {
-        "atMs": 60,
+        "atMs": 189,
         "method": "GET",
         "url": "https://sandbox.e2b.app/files",
         "path": "/files?path=%2Fwork%2Fold.txt&username=user",
@@ -655,7 +655,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 60,
+        "atMs": 190,
         "body": {
           "code": 404,
           "message": "path '/work/old.txt' does not exist"
@@ -664,7 +664,7 @@
     },
     {
       "request": {
-        "atMs": 61,
+        "atMs": 194,
         "method": "DELETE",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0003",
         "path": "/sandboxes/fake-sbx-0003",
@@ -676,12 +676,12 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 61
+        "atMs": 194
       }
     },
     {
       "request": {
-        "atMs": 62,
+        "atMs": 204,
         "method": "DELETE",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0002",
         "path": "/sandboxes/fake-sbx-0002",
@@ -693,12 +693,12 @@
         "headers": {},
         "chunks": [],
         "end": "complete",
-        "atMs": 62
+        "atMs": 205
       }
     },
     {
       "request": {
-        "atMs": 62,
+        "atMs": 209,
         "method": "GET",
         "url": "https://api.e2b.app/sandboxes/fake-sbx-0002",
         "path": "/sandboxes/fake-sbx-0002",
@@ -717,7 +717,7 @@
           }
         ],
         "end": "complete",
-        "atMs": 62,
+        "atMs": 209,
         "body": {
           "code": 404,
           "message": "sandbox fake-sbx-0002 not found"
