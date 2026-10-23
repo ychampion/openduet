@@ -355,6 +355,8 @@ const REMOVED_BY: Record<string, RemovalPhase> = {
   episode: 'operational',
   experience_profile: 'operational',
   personal_session: 'operational',
+  assistant_pulse: 'operational',
+  assistant_suggestion: 'operational',
   customer_followup: 'operational',
   personal_daily_brief: 'operational',
   experience_rule: 'operational',

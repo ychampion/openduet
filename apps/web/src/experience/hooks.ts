@@ -63,14 +63,16 @@ export function useLoad<T>(load: () => Promise<Result<T>>, deps: unknown[]): Loa
   const [loading, setLoading] = useState(true);
   const [version, setVersion] = useState(0);
   const loadRef = useRef(load);
+  const generation = useRef(0);
   loadRef.current = load;
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the caller owns the list; version is the reload counter
   useEffect(() => {
     let live = true;
+    const request = ++generation.current;
     setLoading(true);
     loadRef.current().then((result) => {
-      if (!live) return;
+      if (!live || request !== generation.current) return;
       if (result.error !== null) setError(result.error);
       else if (result.unavailable !== null) {
         setUnavailable(result.unavailable);
@@ -88,7 +90,14 @@ export function useLoad<T>(load: () => Promise<Result<T>>, deps: unknown[]): Loa
   }, [...deps, version]);
 
   const reload = useCallback(() => setVersion((n) => n + 1), []);
-  const set = useCallback((next: T) => setData(next), []);
+  const set = useCallback((next: T) => {
+    // A slow read must not overwrite the durable mutation that just answered.
+    generation.current++;
+    setData(next);
+    setError(null);
+    setUnavailable(null);
+    setLoading(false);
+  }, []);
   return { data, error, unavailable, loading, reload, set };
 }
 

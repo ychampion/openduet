@@ -159,6 +159,9 @@ origin. There are no native iOS or Android binaries in this release.
 | A tool is unavailable | Check the connection, credentials, agent access and any required worker. |
 | A task's source needs reconnecting | Use **Connect**, or **Provide context** to add notes/files to that exact task. The separate unsent request is preserved. Fresh reads and sending still need the source. |
 | A routine fires at the wrong time | Confirm the profile time zone and schedule; inspect its latest run. |
+| No proactive suggestions | Open the Chat status row and confirm suggestions are enabled. Connect a watched source, or check whether a personal task meets the [noticing conditions](ALWAYS_ON.md). No evidence means no invented task. |
+| Background checks are delayed | Keep the host and worker services running. Closing a browser is fine; suspending the host stops its workers. Inspect service status and logs below. |
+| Automatic memory has no new details | Check capture is enabled, the memory model is configured and privacy/spending policy permits extraction. Lasting details are learned asynchronously; review actual saved items in Memory. |
 | Phone cannot connect | Use the server’s HTTPS / tailnet address, not localhost. |
 
 For the default installation, in Bash:

@@ -1,8 +1,54 @@
 import { expect, test } from 'bun:test';
-import { experienceDraft, experienceReceipt, permissionCard } from '@openduet/contracts';
+import {
+  assistantCollaboration,
+  assistantSnapshot,
+  experienceDraft,
+  experienceReceipt,
+  permissionCard,
+} from '@openduet/contracts';
 import { z } from 'zod';
 import { isolatedSampleFetch, sampleRequestAllowed } from '../../web/src/sample/transport.ts';
 import { createSampleDay, SAMPLE_PREFERENCE } from './sample-day.ts';
+
+test('collaborative suggestions have actual sample context, remain unsent, and pause or dismissal stays isolated', async () => {
+  const first = await createSampleDay(),
+    second = await createSampleDay();
+  const read = async (sample: typeof first) =>
+    assistantSnapshot.parse(await (await sample.app.request('/assistant')).json());
+  const card = (await read(first)).suggestions[0];
+  if (!card) throw new Error('Missing suggestion');
+  const before = first.experience.chats.size;
+  const context = assistantCollaboration.parse(
+    await (
+      await first.app.request(`/assistant/suggestions/${card.id}/context`, { method: 'POST' })
+    ).json(),
+  );
+  expect(context.attachment.name).toBe('sample-collaboration-context.txt');
+  expect(context.prompt).toContain('Do not send');
+  expect(first.experience.chats.size).toBe(before);
+  const post = (path: string, body: unknown, method = 'POST') =>
+    first.app.request(path, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  await post('/assistant', { enabled: false }, 'PATCH');
+  expect((await read(first)).status).toBe('paused');
+  expect(
+    (await first.app.request(`/assistant/suggestions/${card.id}/context`, { method: 'POST' }))
+      .status,
+  ).toBe(404);
+  await post('/assistant', { enabled: true }, 'PATCH');
+  await post(`/assistant/suggestions/${card.id}`, { action: 'tomorrow' });
+  expect((await read(first)).suggestions).toHaveLength(0);
+  expect(
+    (await first.app.request(`/assistant/suggestions/${card.id}/context`, { method: 'POST' }))
+      .status,
+  ).toBe(404);
+  await post(`/assistant/suggestions/${card.id}`, { action: 'dismiss' });
+  expect((await read(first)).suggestions).toHaveLength(0);
+  expect((await read(second)).suggestions).toHaveLength(1);
+});
 
 test('Sample day never configures browser push or accepts device subscriptions', async () => {
   const sample = await createSampleDay();

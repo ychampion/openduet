@@ -175,6 +175,8 @@ const SPACE_KEYED_OPERATIONAL = [
   // Feed groups and their references belong to the emptied space, even when
   // it keeps its space row. Jobs and actions have already gone above.
   'personal_session',
+  'assistant_pulse',
+  'assistant_suggestion',
   // Watches retain their source summaries after a preparation's chat goes;
   // deleting each watch takes its preparations before connections go next.
   'customer_followup',

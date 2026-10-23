@@ -1,6 +1,12 @@
 /** Outcome vocabulary for personal interfaces. Never pass an internal record through here. */
 
 import { z } from 'zod';
+import {
+  assistantCollaboration,
+  assistantSettingsUpdate,
+  assistantSnapshot,
+  assistantSuggestionAction,
+} from './assistant.ts';
 import { ATTACHMENT_LIMITS, attachmentView } from './attachments.ts';
 import {
   becauseLink,
@@ -1576,6 +1582,13 @@ export const passwordResetConsume = z.strictObject({
 
 /** Shared operation table makes the mock and OpenAPI cover precisely the same surface. */
 export const experienceOperations = {
+  'GET /assistant': { response: assistantSnapshot },
+  'PATCH /assistant': { request: assistantSettingsUpdate, response: assistantSnapshot },
+  'POST /assistant/suggestions/{id}': {
+    request: assistantSuggestionAction,
+    response: assistantSnapshot,
+  },
+  'POST /assistant/suggestions/{id}/context': { response: assistantCollaboration },
   'GET /personal-session': { response: personalSessionResponse },
   'POST /personal-session/messages': {
     request: personalSessionMessage,

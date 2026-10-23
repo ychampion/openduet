@@ -14,6 +14,25 @@ bun run sample
 Open **http://127.0.0.1:5321**. Requires Node.js 22+ and Bun 1.3.13.
 The fixture API is loopback-only on 3321. Restart the command to reset the day.
 
+## Notice the next step and plan together
+
+![A proactive next step with its reason and source](media/sample-day/proactive-desktop.png)
+
+The fictional security review is still open. Chat suggests preparing the next
+Northstar conversation before you ask. **Plan together** places a suggested
+request and source note in your composer; edit it and decide when to Send.
+Pause, snooze or dismiss suggestions, or open the status row to manage automatic
+memory and review recent saved details. The sample is scripted; the real server
+worker's persistence and source checks are tested separately.
+
+[![An editable request and attached context, before Send](media/sample-day/proactive-plan.png)](media/sample-day/proactive.mp4)
+
+[Watch the collaboration recording](media/sample-day/proactive.mp4): notice a
+suggestion, inspect learning controls, prepare context, add your judgment and
+refresh the unsent request. Actual local Sample day interactions; no task is sent.
+
+[How always-on noticing and automatic learning work](ALWAYS_ON.md).
+
 ## Follow-up walkthrough
 
 ![Prepared work in personal Chat](media/sample-day/chat-desktop.png)

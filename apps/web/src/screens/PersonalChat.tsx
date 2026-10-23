@@ -38,6 +38,7 @@ import { sampleMode } from '../sample/mode.ts';
 import { Shell, toast } from '../shell/Shell.tsx';
 import { PushOffer } from './Notifications.tsx';
 import './personal-chat.css';
+import { AssistantPulse } from './AssistantPulse.tsx';
 
 const ACTIVE = new Set(['queued', 'running', 'working', 'streaming', 'stalled']);
 
@@ -673,6 +674,55 @@ export function PersonalChatScreen() {
         </header>
         <div className="personal-scroll">
           <div className="personal-reading">
+            <AssistantPulse
+              onCollaborate={(prompt, attachment, item) => {
+                if (
+                  text.trim() ||
+                  files.files.length ||
+                  target ||
+                  savedDraft?.attempted ||
+                  savedDraft?.attachments.length
+                ) {
+                  toast({
+                    kind: 'info',
+                    title:
+                      'Finish or clear your current request first. Your words and files are still here.',
+                  });
+                  return false;
+                }
+                try {
+                  const nextTarget: PersonalTarget = item.conversation_id
+                    ? { kind: 'continue_task', conversation_id: item.conversation_id }
+                    : { kind: 'new_task' };
+                  const draft = saveHandoff({
+                    ...beginHandoff(prompt, [attachment]),
+                    target: nextTarget,
+                    targetTitle: item.context,
+                  });
+                  setSavedDraft(draft);
+                  setText(prompt);
+                  files.restore([attachment]);
+                  setTarget(
+                    nextTarget.kind === 'new_task'
+                      ? null
+                      : { value: nextTarget, title: item.context },
+                  );
+                  navigate(`/?starter=${encodeURIComponent(draft.id)}`);
+                  focusComposer();
+                  toast({
+                    kind: 'info',
+                    title: 'Context is ready. Add your thoughts, then Send when you’re ready.',
+                  });
+                  return true;
+                } catch (error) {
+                  toast({
+                    kind: 'err',
+                    title: error instanceof Error ? error.message : 'Couldn’t keep this request.',
+                  });
+                  return false;
+                }
+              }}
+            />
             {!references.length ? (
               <header className="personal-invitation">
                 <h1>

@@ -7,7 +7,7 @@
     <a href="https://github.com/ychampion/openduet/actions/workflows/ci.yml"><img src="https://github.com/ychampion/openduet/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-d97757" alt="Apache 2.0 license" /></a>
   </p>
-  <p><a href="#try-a-sample-day">Try it</a> · <a href="#get-started">Install</a> · <a href="docs/PERSONAL_ASSISTANT.md">How it works</a> · <a href="docs/PRODUCT_VERIFICATION.md">What we tested</a></p>
+  <p><a href="#try-a-sample-day">Try it</a> · <a href="#get-started">Install</a> · <a href="docs/PERSONAL_ASSISTANT.md">How it works</a> · <a href="docs/ALWAYS_ON.md">Always-on and verification</a></p>
 </div>
 
 ## Try a Sample day
@@ -40,6 +40,29 @@ The sample uses the production React components with deterministic responses.
 Its sample send produces a fixture receipt. It is an interaction demo;
 [real service, database and Hermes checks](docs/PRODUCT_VERIFICATION.md) are separate.
 
+## Already looking for the next useful step
+
+OpenDuet's server checks watched calendar events, unresolved source signals and
+stalled personal tasks every minute, even with the browser closed. Chat offers
+up to three suggestions with a reason and source. **Plan together** gathers the
+current context into an editable request with an attached source note. Add your
+judgment and press Send when ready. **Tomorrow**, **Not useful** and **Pause
+suggestions** keep this useful rather than repetitive.
+
+![A suggested next step with its reason and collaboration controls, using labeled sample data](docs/media/sample-day/proactive-desktop.png)
+
+Lasting facts and preferences from your own words can be learned automatically
+by the configured memory model. Chat shows the learning setting and recent
+saved details; review, edit or forget them in Memory. Start a message with
+“off the record” to skip learning from it. Model quality and configured budgets
+still matter. Explicit preference and procedure controls remain available.
+
+Keep the host running. Source polling has its own cadence; this is not continuous
+model inference. Suggestions prepare saved context without a model call or
+external action. Your delegated jobs, routines and supported watches do the
+background work. Push notifications have separate opt-ins.
+See [operation, limits and tests](docs/ALWAYS_ON.md).
+
 ## One task, then a better next time
 
 Start with a concrete request and the information you already have:
@@ -52,11 +75,12 @@ OpenDuet keeps the request, prepared draft, source context and review controls
 in **Chat**. Open a result to inspect or revise it. **Draft prepared** means a
 draft exists; a confirmed send has its own receipt.
 
-Then make three separate choices:
+Then refine the work and choose what to delegate:
 
 1. **Correct the work.** Reply to that result: “Under 120 words, with one clear ask.”
    Replies to an older run keep that run as their source.
-2. **Teach it.** Choose **Remember this preference** to review and save the exact
+2. **Teach it.** Automatic memory captures lasting details when enabled. Choose
+   **Remember this preference** to review and save the exact
    wording. Or **Save these steps** to review a reusable personal skill.
    Inspect, edit or forget saved context; changing the model keeps it in your installation.
 3. **Delegate next time.** Choose **Run this automatically** for an explicit
@@ -86,7 +110,7 @@ this watch; IMAP and generic MCP mailboxes are not offered for it.
 
 Notes or a supported file are enough to begin. Connect a calendar, mailbox or
 research tool when a task needs fresh information. Output quality depends on
-the selected model and available tools. See [five useful starting workflows](docs/USE_CASES.md).
+the selected model and available tools. See [example workflows](docs/USE_CASES.md).
 
 ## Get started
 
@@ -139,7 +163,8 @@ actions. Other autonomy settings can allow actions under existing policy.
 Keep your host running for jobs and routines. **Work** shows results and
 questions that need you. Delivery preferences separately control decisions,
 your requested work, requested reminders, the daily brief and unsolicited
-suggestions. Suggestions start off. Editing the daily brief changes its real
+suggestions. Push for unsolicited suggestions starts off; in-app noticing starts
+on and has its own pause control. Editing the daily brief changes its real
 schedule; pausing a routine stops its trigger.
 
 For phone access, configure [HTTPS or Tailscale](docs/DEPLOYMENT.md) and install

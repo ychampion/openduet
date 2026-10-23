@@ -12,6 +12,7 @@ import type { Context, Hono } from 'hono';
 import type { Sql } from 'postgres';
 import { ServiceError } from '../api/errors.ts';
 import { readEventCursor } from '../api/events.ts';
+import { AssistantService } from '../assistant/service.ts';
 import type { AttachmentService } from '../attachments/store.ts';
 import { BrokerFault } from '../broker/errors.ts';
 import { loadAction } from '../broker/records.ts';
@@ -120,6 +121,7 @@ const SPACE_OWNER_SURFACES = new Set([
 export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceService {
   const service = new ExperienceService(deps.db, deps.jobs, deps.submissions, deps.runner);
   const personal = new PersonalSessionService(service);
+  const assistant = deps.sql ? new AssistantService(deps.sql) : undefined;
   if (deps.attachments) service.attachments = deps.attachments;
   if (deps.workspaces) service.workspaces = deps.workspaces;
   const longWork = deps.runs;
@@ -639,6 +641,28 @@ export function mountExperience(app: Hono, deps: ExperienceDeps): ExperienceServ
       if (deleted.routines_paused) await deps.triggers?.syncSchedules();
       return deleted;
     },
+    'GET /assistant': (spaceId, c) =>
+      assistant?.get(spaceId, c.get('owner').id) ??
+      unavailable('Background noticing is not connected.'),
+    'PATCH /assistant': (spaceId, c, input) =>
+      assistant?.configure(spaceId, c.get('owner').id, input.enabled === true) ??
+      unavailable('Background noticing is not connected.'),
+    'POST /assistant/suggestions/{id}': (spaceId, c, input) =>
+      assistant?.mark(
+        spaceId,
+        c.get('owner').id,
+        c.req.param('id') ?? '',
+        input.action === 'tomorrow' ? 'tomorrow' : 'dismiss',
+      ) ?? unavailable('Background noticing is not connected.'),
+    'POST /assistant/suggestions/{id}/context': (spaceId, c) =>
+      assistant && deps.attachments
+        ? assistant.collaborate(
+            spaceId,
+            c.get('owner').id,
+            c.req.param('id') ?? '',
+            deps.attachments,
+          )
+        : unavailable('Context files are not connected.'),
     'GET /personal-session': (spaceId) => personal.get(spaceId),
     'POST /personal-session/messages': (spaceId, c, input) =>
       personal.message(spaceId, input, c.req.header('Idempotency-Key')),

@@ -9,6 +9,7 @@ export * from './agent-library.ts';
 export * from './api.ts';
 export * from './apps.ts';
 export * from './artifacts.ts';
+export * from './assistant.ts';
 export * from './attachments.ts';
 export * from './audit.ts';
 export * from './beliefs.ts';

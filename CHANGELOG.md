@@ -1,5 +1,16 @@
 # Changelog
 
+## Always-on collaboration
+
+- Server-side noticing runs every minute without an open browser, with persisted heartbeat and personal-space suggestions.
+- Upcoming meetings, unresolved source signals and stalled tasks offer reasons, source context and an editable Plan together request.
+- Durable dismissal, 24-hour snooze and pause survive repeated scans and restart; removed or obsolete sources disappear.
+- Chat exposes existing automatic memory capture, recent saved details and review/edit/forget controls.
+- Collaborative instructions carry forward context, apply corrections and suggest evidence-backed next steps.
+- Migration 0138 adds scoped pulse and source-reference records, included in space removal.
+
+See [operation and verification](docs/ALWAYS_ON.md).
+
 ## Personal assistant update
 
 - Start with a real saved task; resume exact text/files once after selected-model setup.

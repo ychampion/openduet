@@ -144,6 +144,9 @@ export async function seedSpace(
   // The personal feed keeps its read position apart from any one chat; a
   // customer watch also keeps its preparation summary after its chat goes.
   const personalSessionId = newId('psn');
+  await sql`insert into assistant_pulse (space_id, principal_id) values (${spaceId}, ${principalId})`;
+  await sql`insert into assistant_suggestion (id, space_id, principal_id, source_key)
+    values (${newId('rth')}, ${spaceId}, ${principalId}, 'task:removal-fixture')`;
   const sessionReferenceId = newId('srf');
   await sql`insert into personal_session (id, principal_id, space_id, read_at, read_reference_id)
     values (${personalSessionId}, ${principalId}, ${spaceId}, now(), ${sessionReferenceId})`;

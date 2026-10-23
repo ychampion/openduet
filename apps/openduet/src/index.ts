@@ -58,6 +58,7 @@ import {
 import { configuredVoiceCompanion, type VoiceCompanion } from './api/voice-companion.ts';
 import { mountApps } from './apps/routes.ts';
 import { mountAppViews } from './apps/serve.ts';
+import { AssistantService } from './assistant/service.ts';
 import { attachmentSettingsFromEnv } from './attachments/limits.ts';
 import { mountAttachments } from './attachments/routes.ts';
 import { AttachmentService } from './attachments/store.ts';
@@ -1141,6 +1142,7 @@ export async function bootstrap(
   let companyReplies: CompanyReplyPoller | undefined;
   let signalPoller: SignalPoller | undefined;
   let triage: TriageService | undefined;
+  let assistantPulse: AssistantService | undefined;
   let triageClassifier: TriageClassifier | null = null;
   let historySummariser: HistorySummariser | undefined;
   let pushDispatcher: PushDispatcher | undefined;
@@ -1199,6 +1201,7 @@ export async function bootstrap(
           companyReplies?.stop(),
           signalPoller?.stop(),
           triage?.stop(),
+          assistantPulse?.stop(),
           situations?.stop(QUEUES.clockSweep),
           reach?.stop(QUEUES.reachSweep),
           pushDispatcher?.stop(),
@@ -2196,6 +2199,12 @@ export async function bootstrap(
 `),
           });
           await triage.start();
+          assistantPulse = new AssistantService(handle.sql, {
+            leads: () => leading(leases, 'assistant-pulse'),
+            onError: () =>
+              process.stderr.write('assistant: background noticing failed; retrying\n'),
+          });
+          assistantPulse.start();
         }
         // Pushes to people's devices, when this installation has its VAPID keys.
         if (handle) {

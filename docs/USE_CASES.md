@@ -21,6 +21,12 @@ on model quality, account permissions, tool availability and your instructions.
 | Reusable writing context | Memory | Inspectable preferences |
 | Internal tool workflow | Your MCP server | Domain-specific result and action trail |
 
+Chat can also suggest a next step before you ask: an upcoming watched meeting,
+an unresolved source signal, or a stalled task. **Plan together** gathers current
+context into an editable, unsent request. Automatic memory carries lasting details
+forward when configured; review, edit or forget them in Memory. See
+[always-on collaboration and its limits](ALWAYS_ON.md).
+
 ## 1. Turn scattered notes into a client update
 
 **Setup:** a real model. No external connection required.

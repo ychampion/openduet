@@ -56,7 +56,32 @@ Review the exact action and choose an approval option before sending when
 policy requires it. A confirmed connector receipt records the result. The
 customer watch always separates preparation from the exact send review.
 
-## Teach only what you choose
+## Always-on noticing and collaboration
+
+The server checks current saved state every minute while its workers are running;
+closing the browser does not stop it. Chat shows the persisted heartbeat, including
+starting, delayed and paused states. Suggestions cover upcoming watched meetings,
+unresolved source signals and stalled personal tasks. Source polling follows its
+own interval. No evidence means no invented next task.
+
+**Plan together** attaches current source context to an editable, unsent request.
+It preserves an existing request rather than replacing it. **Tomorrow** snoozes
+for 24 hours; **Not useful** dismisses that source suggestion durably. Pausing
+suggestions leaves already requested jobs, routines and watches running. Push
+settings are independent. [Details and limits](ALWAYS_ON.md).
+
+## Automatic memory, with explicit teaching controls
+
+With automatic capture enabled and the memory model configured, the existing
+memory worker extracts lasting facts and preferences from your own words. It
+retains provenance, applies corrections and supports forgetting. One-off tasks,
+quoted content and the assistant's guesses are not standing preferences. Start
+a message with “off the record” to exclude it. Chat exposes the capture setting
+and recent saved details; Settings → Memory provides review, edit and forget.
+
+Automatic capture is model-dependent, asynchronous and subject to the configured
+privacy and spending policy. The label “Automatic memory on” describes the setting;
+it does not promise a successful extraction from every message.
 
 After a useful result, choose one of three actions:
 
@@ -110,8 +135,9 @@ threaded reply headers or another automatic follow-up after that send.
 
 Settings → Notifications separates decisions, your requested work, requested
 reminders, the daily brief and unsolicited suggestions. Requested work includes
-meaningful progress and results. Unsolicited suggestions default off; existing
-opt-outs remain off through migration.
+meaningful progress and results. Push for unsolicited suggestions defaults off;
+existing opt-outs remain off through migration. In-app noticing defaults on and
+can be paused independently from Chat.
 
 The personal daily brief has one canonical persisted purpose and one actual
 schedule. Changing its time edits the trigger. Pausing stops it; delivery opt-out
@@ -130,8 +156,8 @@ the visible keyboard and safe area. DM Sans is used for controls and task text;
 Newsreader provides editorial headings. The accent follows the terracotta mark.
 
 The implementation retains React/Vite, TypeScript/Bun, Postgres, the job queue
-and Hermes. Additive migrations 0134–0137 add personal sessions, model readiness,
-customer watches and delivery policy. Existing chats, artifacts, approvals,
+and Hermes. Additive migrations 0134–0138 add personal sessions, model readiness,
+customer watches, delivery policy and assistant pulse state. Existing chats, artifacts, approvals,
 connections and memory remain the execution sources. The personal session does
 not introduce a second transcript or memory database.
 

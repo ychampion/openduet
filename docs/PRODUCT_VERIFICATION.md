@@ -1,5 +1,9 @@
 # Personal assistant update: verification
 
+The subsequent [always-on collaboration update](ALWAYS_ON.md) has its own
+operation guide, checks and media. The revision below covers the earlier
+personal Chat/Work/Explore delivery.
+
 Checked October 23, 2026 against source revision
 [`5b7da2d5`](https://github.com/ychampion/openduet/commit/5b7da2d5ec4c43d88ae4019749e122d40dfa7fe5). This report
 covers the personal Chat/Work/Explore update; [earlier release evidence](RELEASE_READINESS.md)

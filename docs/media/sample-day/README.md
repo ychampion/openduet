@@ -26,3 +26,14 @@ with a fresh Sample day process before recording the send a second time.
 The sample has a prepared result, an explicit saved preference, a deterministic
 later task and a confirmed sample watch. It is not a live source/model test.
 See [the product verification report](../../PRODUCT_VERIFICATION.md).
+
+The `proactive-*.png` images are captured by
+`python scripts/docs/check-assistant.py`. They use actual production components
+and the local sample context endpoint. Suggestion and memory-setting persistence
+is simulated independently per disposable browser context; database persistence
+is covered by server integration tests. No request is submitted by this proof.
+
+`python scripts/docs/record-assistant.py` records the actual sample context
+endpoint, editable request and refresh restoration, with zero submissions.
+`proactive.mp4` is an H.264 conversion of its WebM output using FFmpeg, with no
+audio or fabricated UI. The visible sample label remains throughout.

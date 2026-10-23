@@ -27,6 +27,27 @@ export async function createSampleDay() {
     speed: 0,
   });
   const { experience, scenarios } = mock;
+  const collaborationForm = new FormData();
+  collaborationForm.append(
+    'file',
+    new File([SAMPLE_NOTES], 'sample-collaboration-context.txt', { type: 'text/plain' }),
+  );
+  const collaborationUpload = await mock.app.request('/attachments', {
+    method: 'POST',
+    body: collaborationForm,
+  });
+  if (!collaborationUpload.ok)
+    throw new Error('Sample collaboration context could not be prepared.');
+  experience.assistantSuggestions.set('sample-next-step', {
+    id: 'sample-next-step',
+    kind: 'meeting',
+    title: 'Prepare the next Northstar conversation',
+    reason: 'Sample day · the security review is still an open commitment.',
+    context: 'SSO is unconfirmed. Let’s line up the questions before choosing a pilot date.',
+    source_label: 'Sample day · supplied call notes',
+    conversation_id: null,
+    at: null,
+  });
   const draftBody =
     'Hi Priya,\n\nThanks for walking me through the pilot. Before we agree a date, I’ll help get your team’s security questions answered. SSO support is still unconfirmed.\n\nWhich security questions should we prioritise for the review?\n\nThanks,\nAvery';
   scenarios.unshift(

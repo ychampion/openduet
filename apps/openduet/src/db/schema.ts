@@ -1935,3 +1935,35 @@ export const customerFollowupBinding = pgTable(
   },
   (t) => [index('customer_followup_binding_preparation').on(t.preparationId)],
 );
+
+/** A persisted heartbeat and switch for noticing useful work while the browser is closed. */
+export const assistantPulse = pgTable('assistant_pulse', {
+  spaceId: text('space_id')
+    .primaryKey()
+    .references(() => space.id, { onDelete: 'cascade' }),
+  principalId: text('principal_id')
+    .notNull()
+    .references(() => principal.id, { onDelete: 'cascade' }),
+  enabled: boolean('enabled').notNull().default(true),
+  checkedAt: timestamp('checked_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** References only: source text is re-read under current access, never copied into a second feed. */
+export const assistantSuggestion = pgTable(
+  'assistant_suggestion',
+  {
+    id: text('id').primaryKey(),
+    spaceId: text('space_id')
+      .notNull()
+      .references(() => space.id, { onDelete: 'cascade' }),
+    principalId: text('principal_id')
+      .notNull()
+      .references(() => principal.id, { onDelete: 'cascade' }),
+    sourceKey: text('source_key').notNull(),
+    dismissed: boolean('dismissed').notNull().default(false),
+    snoozedUntil: timestamp('snoozed_until', { withTimezone: true }),
+    createdAt: created(),
+  },
+  (t) => [uniqueIndex('assistant_suggestion_source_idx').on(t.spaceId, t.principalId, t.sourceKey)],
+);

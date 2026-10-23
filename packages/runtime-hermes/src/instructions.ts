@@ -109,6 +109,10 @@ export function renderInstructions(bundle: AttemptBundle, placement: RunPlacemen
   }
 
   parts.push(renderVoice(bundle.voice ?? DEFAULT_REPLY_VOICE));
+  // Keep collaboration in the shared runtime prefix so custom identities receive it too.
+  parts.push(
+    'Use saved context and corrections. Prepare while decisions wait. Suggest next steps with evidence; ask one focused question.',
+  );
   parts.push(...renderStanding(bundle.earlier));
   parts.push(WORKSPACE_NOTE(bundle, placement.workspace ?? bundle.workspace.mount));
   return parts.join('\n\n');

@@ -967,6 +967,13 @@
       "when": 1789232400117,
       "tag": "0137_delivery_policy",
       "breakpoints": true
+    },
+    {
+      "idx": 138,
+      "version": "7",
+      "when": 1789232400118,
+      "tag": "0138_assistant_pulse",
+      "breakpoints": true
     }
   ]
 }
