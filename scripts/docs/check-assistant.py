@@ -50,6 +50,9 @@ try:
                 request = route.request
                 path = urlparse(request.url).path
                 view = state["view"]
+                if path == "/assistant" and request.method == "GET" and state.get("unreachable"):
+                    route.fulfill(status=503, json={"error": {"code": "unavailable", "message": "Fixture server offline"}})
+                    return
                 if path == "/assistant" and request.method == "GET" and state.pop("defer_next", False):
                     state["pending"] = (route, copy.deepcopy(view))
                     return
@@ -192,6 +195,29 @@ try:
         expect(pulse.locator("summary")).to_contain_text("Suggestions paused")
         expect(pulse.get_by_role("button", name="Plan together", exact=True)).to_have_count(0)
         check(page, "a delayed read cannot undo a successful pause")
+        context.close()
+        state = {"view": copy.deepcopy(fixture), "capture": True}
+        context = browser.new_context(viewport={"width": 1440, "height": 1000})
+        context.route(API + "/**", intercept)
+        page = context.new_page()
+        page.on("pageerror", lambda error: report["page_errors"].append(str(error)))
+        page.goto(WEB + "/#/", wait_until="networkidle")
+        pulse = page.get_by_role("region", name="Your collaborative assistant")
+        expect(pulse.locator("summary")).to_contain_text("Keeping an eye on things")
+        composer = page.locator("textarea").first
+        composer.fill("Keep this draft through a server outage.")
+        state["unreachable"] = True
+        page.evaluate("window.dispatchEvent(new Event('focus'))")
+        expect(pulse.locator("summary")).to_contain_text("Background status unavailable")
+        expect(pulse.get_by_role("button", name="Plan together", exact=True)).to_have_count(0)
+        expect(pulse.locator("[data-active='true']")).to_have_count(0)
+        check(page, "a failed refresh hides stale advice and the healthy indicator")
+        state["unreachable"] = False
+        pulse.get_by_role("button", name="Retry", exact=True).click()
+        expect(pulse.locator("summary")).to_contain_text("Keeping an eye on things")
+        expect(pulse.get_by_role("button", name="Plan together", exact=True)).to_be_visible()
+        expect(composer).to_have_value("Keep this draft through a server outage.")
+        check(page, "retry restores current advice without losing an unsent request")
         context.close()
         assert not report["submissions"]
         assert not report["page_errors"]

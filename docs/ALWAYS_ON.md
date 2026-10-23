@@ -19,8 +19,10 @@ not increase provider polling or run continuous model inference. Without useful
 evidence, no suggestion is fabricated. Shared spaces do not receive this personal
 feed. A replica without the worker lease does not scan.
 
-The heartbeat is persisted. Chat distinguishes starting, watching, delayed and
-paused states. A check more than three minutes old is shown as delayed. The pulse
+The heartbeat is persisted. Chat distinguishes starting, watching, delayed,
+paused and unavailable states. A check more than three minutes old is shown as
+delayed. A failed refresh hides stale advice and the healthy indicator; Retry
+restores current suggestions without changing an unsent request. The pulse
 does not spend model tokens, submit a job or perform an external action.
 
 ## Plan together
@@ -92,10 +94,11 @@ Verification uses disposable data and scripted models:
 
 The focused October 24 checks passed: **8 assistant integration tests**, **106
 runtime instruction/skills tests**, **254 runtime-plugin tests** (7 skipped),
-**3 generated-client sync tests**, **649 frontend tests**, and **43 browser
+**3 generated-client sync tests**, **649 frontend tests**, and **45 browser
 checks** with zero task submissions or page errors. Browser coverage includes a
 delayed status read arriving after a
-successful pause, blocked browser storage, and exact stalled-task continuation.
+successful pause, blocked browser storage, exact stalled-task continuation, and
+server failure and recovery after an earlier healthy check.
 First-handoff and source-recovery browser proofs also passed, with 11 and 5 checks
 respectively. Typecheck, lint, deployment configuration checks and the production
 web build also passed.

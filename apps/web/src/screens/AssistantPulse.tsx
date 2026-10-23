@@ -86,17 +86,23 @@ export function AssistantPulse({
       });
     }
   };
-  const status = {
-    checking: 'Starting background checks',
-    watching: 'Keeping an eye on things',
-    paused: 'Suggestions paused',
-    delayed: 'Background checks delayed',
-  }[view.status];
+  const cannotRefresh = Boolean(snapshot.error || snapshot.unavailable);
+  const status = cannotRefresh
+    ? 'Background status unavailable'
+    : {
+        checking: 'Starting background checks',
+        watching: 'Keeping an eye on things',
+        paused: 'Suggestions paused',
+        delayed: 'Background checks delayed',
+      }[view.status];
   return (
     <section className="assistant-pulse" aria-label="Your collaborative assistant">
       <details className="assistant-presence">
         <summary>
-          <span className="assistant-presence-dot" data-active={view.status === 'watching'} />
+          <span
+            className="assistant-presence-dot"
+            data-active={!cannotRefresh && view.status === 'watching'}
+          />
           {status}
           <span className="assistant-learning-label">
             {memory.data?.capture
@@ -165,7 +171,15 @@ export function AssistantPulse({
           <a href={href('/settings/notifications')}>Choose what can notify you</a>
         </div>
       </details>
-      {view.enabled && view.suggestions.length ? (
+      {cannotRefresh ? (
+        <p className="assistant-pulse-error" role="status">
+          Couldn’t refresh background checks. Retry to see current suggestions.{' '}
+          <button type="button" onClick={snapshot.reload}>
+            Retry
+          </button>
+        </p>
+      ) : null}
+      {!cannotRefresh && view.enabled && view.suggestions.length ? (
         <div className="assistant-suggestions">
           <h2>A useful next step</h2>
           <p>I’ve gathered the context. We can work through one of these together.</p>
