@@ -1,6 +1,7 @@
 # Personal assistant update: verification
 
-Checked October 23, 2026 against the local product implementation. This report
+Checked October 23, 2026 against source revision
+[`5b7da2d5`](https://github.com/ychampion/openduet/commit/5b7da2d5ec4c43d88ae4019749e122d40dfa7fe5). This report
 covers the personal Chat/Work/Explore update; [earlier release evidence](RELEASE_READINESS.md)
 and [v0.2.1 showcase verification](SHOWCASE_VERIFICATION.md) have separate revisions.
 
@@ -110,11 +111,31 @@ RFC threaded-reply headers and another automatic follow-up are not promised.
 
 ## Aggregate checks
 
+Published-source workflows:
+
+| Workflow | Result | Evidence |
+| --- | --- | --- |
+| Full CI | Passed; all nine jobs | [Full suite, runtime plugin, types, lint, images, browsers and Docker](https://github.com/ychampion/openduet/actions/runs/39874679647) |
+| Images | Passed; all five images published | [Image builds and tagging](https://github.com/ychampion/openduet/actions/runs/39874679556) |
+| Install | Passed | [Clean one-line installation, repeat update and side-by-side instances](https://github.com/ychampion/openduet/actions/runs/39874921921) |
+| Setup guide | Passed | [Clean-machine guide execution](https://github.com/ychampion/openduet/actions/runs/39874921896) |
+| Conformance | Passed; four jobs | [Upgrade, deployment and external database/bucket restore](https://github.com/ychampion/openduet/actions/runs/39874679663) |
+
 The product source is checked with `bun run typecheck`, `bun run lint`,
 `bun run --cwd apps/web build`, the three Compose check commands, and the full
 `bun run test` suite on Linux with Node 22, Bun 1.3.13 and disposable PostgreSQL.
 The latest typecheck, lint, production web build and all three Compose checks
-passed. The runtime plugin suite passed **254 tests**, with **7 skips**.
+passed. Fresh published-source CI passed **9,796 tests / 224,125 assertions**
+across 943 files in **1,526.75 seconds**, with **224 skips, 13 todos and zero
+failures** (10,033 cases total). The runtime plugin suite passed **254 tests**,
+with **7 skips**, in 55.78 seconds.
+
+The full-suite runner does not enable every opt-in proof: skips/todos include
+absent Chromium, separately enabled Docker proofs and unavailable live accounts.
+The dedicated browser, renderer sandbox, sign-out, stdio MCP, Docker and
+deployment jobs above passed their own checks. This does not turn the remaining
+live-provider/account skips into passing evidence.
+
 The final affected Linux run passed **297 tests / 2,098 assertions** across
 35 files, with **2 optional runtime-proof skips** and no failures.
 Those two Hermes cases passed separately in both process and Docker proofs.
@@ -136,8 +157,9 @@ unhandled assertion; its Linux file rerun passed **19 tests / 46 assertions**,
 and the early-exiting sink case passed 30 further Linux repetitions.
 An Undo Send test also failed once; its unchanged 19-test file passed on Windows
 and the failing case passed three Linux repetitions. Those causes were not
-reproduced and are not described as repaired. Final-source GitHub validation is
-pending; the earlier failed snapshot is not counted as a passing full run.
+reproduced and are not described as repaired. Both unchanged cases also passed
+in the fresh, complete published-source CI run. The earlier failed snapshot is
+retained as separate evidence and is not counted as a passing full run.
 
 The Vite build retains a bundle-size warning. Biome has 28 existing warnings and
 2 infos with no lint errors after fixes. Scope-specific tests supplement, rather
