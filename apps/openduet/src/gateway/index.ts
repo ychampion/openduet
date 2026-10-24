@@ -427,10 +427,10 @@ export function createModelGateway(options: GatewayOptions): Server {
       // A multiplied completion count would evade the single-output reservation.
       if (body.n !== undefined && body.n !== 1)
         throw new GatewayError(400, 'multiple_outputs_denied');
-      // A limit the runtime names is honoured or refused, never rewritten. One
-      // it leaves out is filled in, bounded by what the attempt may still spend,
-      // so the substitute cannot itself be the reason a call is refused.
-      const requested =
+      // Explicit limits remain exact unless the runtime opts into treating one
+      // as a ceiling. Native Anthropic clients must name a limit on every call;
+      // that ceiling must shrink as earlier calls consume the attempt budget.
+      const ceiling =
         body.max_output_tokens ??
         body.max_completion_tokens ??
         body.max_tokens ??
@@ -439,9 +439,14 @@ export function createModelGateway(options: GatewayOptions): Server {
           principal.maxTokens,
           principal.remainingTokens ?? principal.maxTokens,
         );
-      if (!positiveInteger(requested) || requested > principal.maxTokens) {
+      if (!positiveInteger(ceiling) || ceiling > principal.maxTokens) {
         throw new GatewayError(429, 'token_cap_exceeded');
       }
+      const requested =
+        header(request, 'x-openduet-clamp-output') === '1'
+          ? Math.min(ceiling, principal.remainingTokens ?? principal.maxTokens)
+          : ceiling;
+      if (!positiveInteger(requested)) throw new GatewayError(429, 'token_cap_exceeded');
       // An output cap that leaves no room even for the framing can never fit,
       // however short the conversation. It is refused as itself, because the
       // engine reads input_context_exceeded as a cue to compact, and compacting

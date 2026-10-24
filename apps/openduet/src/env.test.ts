@@ -7,6 +7,8 @@ import {
   brokerCatalogState,
   DEFAULT_COMPACTION_MAX_TOKENS,
   DEFAULT_ENGINE_MAX_TURNS,
+  engineSettingsFromEnvironment,
+  renderEngineConfig,
 } from '@openduet/runtime-hermes';
 import { parse } from 'yaml';
 import {
@@ -112,6 +114,82 @@ describe('the model defaults', () => {
     ).toBe(2048);
     for (const value of ['0', '-1', '1.5', 'many'])
       expect(readEnv({ OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: value }).ok).toBe(false);
+    expect(readEnv({ OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '' }).ok).toBe(false);
+  });
+
+  test('legacy default output formats accepted at boot reach the renderer unchanged', () => {
+    for (const value of ['1e3', ' 512 ', '0x200', '+512', '1.0', String(Number.MAX_SAFE_INTEGER)]) {
+      for (const dedicated of [undefined, '']) {
+        const source = {
+          OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: dedicated,
+          OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: value,
+        };
+        expect(loadEnv(source).OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS).toBe(Number(value));
+        const settings = engineSettingsFromEnvironment(source);
+        expect(
+          renderEngineConfig({
+            provider: 'fake',
+            model: 'scripted',
+            brokerUrl: 'http://openduet:8788',
+            ...settings,
+          }),
+        ).toMatchObject({ model: { max_tokens: Number(value) } });
+      }
+    }
+    for (const value of [
+      '',
+      ' ',
+      '0',
+      '-1',
+      '1.5',
+      'many',
+      'NaN',
+      'Infinity',
+      '9007199254740992',
+      '0x20000000000000',
+    ]) {
+      const source = {
+        OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '',
+        OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: value,
+      };
+      expect(readEnv(source).ok).toBe(false);
+      expect(() => engineSettingsFromEnvironment(source)).toThrow(
+        'OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS',
+      );
+    }
+  });
+
+  test('the optional engine reply ceiling accepts Compose blanks and only positive safe integers', () => {
+    expect(loadEnv({}).OPENDUET_ENGINE_MAX_OUTPUT_TOKENS).toBeUndefined();
+    expect(
+      loadEnv({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '' }).OPENDUET_ENGINE_MAX_OUTPUT_TOKENS,
+    ).toBeUndefined();
+    for (const value of ['1', '512', '000512', String(Number.MAX_SAFE_INTEGER)])
+      expect(
+        loadEnv({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: value }).OPENDUET_ENGINE_MAX_OUTPUT_TOKENS,
+      ).toBe(Number(value));
+    for (const value of [
+      '0',
+      '-1',
+      '1.5',
+      '1e3',
+      'NaN',
+      'Infinity',
+      ' 512',
+      '512 ',
+      '+512',
+      '9007199254740992',
+      '１２',
+    ]) {
+      const result = readEnv({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: value });
+      expect(result.ok).toBe(false);
+      if (!result.ok)
+        expect(
+          result.issues.some((issue) => issue.startsWith('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS:')),
+        ).toBe(true);
+    }
+    const example = readFileSync(join(import.meta.dir, '../../../deploy/.env.example'), 'utf8');
+    expect(example).toContain('\nOPENDUET_ENGINE_MAX_OUTPUT_TOKENS=\n');
   });
 
   test('automatic memory has no daily read limit unless the operator sets one', () => {
@@ -235,6 +313,7 @@ describe('the engine limits', () => {
     // as nobody looked at the environment.
     for (const name of [
       'OPENDUET_ENGINE_MAX_TURNS',
+      'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS',
       'OPENDUET_COMPACTION_MAX_TOKENS',
       'OPENDUET_MODEL_CONTEXT_WINDOW',
     ]) {
@@ -248,12 +327,14 @@ describe('the engine limits', () => {
     const composed = composeServiceEnvironment();
     for (const name of [
       'OPENDUET_ENGINE_MAX_TURNS',
+      'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS',
       'OPENDUET_COMPACTION_MAX_TOKENS',
       'OPENDUET_MODEL_CONTEXT_WINDOW',
     ])
       expect(composed[name]).toBe('');
     const env = loadEnv(composed);
     expect(env.OPENDUET_ENGINE_MAX_TURNS).toBe(DEFAULT_ENGINE_MAX_TURNS);
+    expect(env.OPENDUET_ENGINE_MAX_OUTPUT_TOKENS).toBeUndefined();
     expect(env.OPENDUET_COMPACTION_MAX_TOKENS).toBe(DEFAULT_COMPACTION_MAX_TOKENS);
     expect(env.OPENDUET_MODEL_CONTEXT_WINDOW).toBeUndefined();
     expect(env.OPENDUET_PUBLIC_URL).toBeUndefined();

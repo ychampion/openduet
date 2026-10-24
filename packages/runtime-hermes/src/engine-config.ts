@@ -116,6 +116,8 @@ export type EngineConfigOptions = {
   compactionMaxTokens?: number;
   /** The engine's per-run iteration ceiling. */
   maxTurns?: number;
+  /** Per-request output ceiling; the caller derives it from the attempt's budget. */
+  maxOutputTokens?: number;
   /**
    * Whether the model is shown screenshots as pictures. Absent, the model
    * catalog decides. A model that reads images has part of the gateway's body
@@ -148,6 +150,9 @@ export const VISION_ENV = 'OPENDUET_ENGINE_SUPPORTS_VISION';
 
 /** The header the model gateway meters by. */
 export const CAPABILITY_HEADER = 'x-openduet-capability';
+
+/** Lets the gateway lower a producer ceiling to the attempt's remaining output budget. */
+export const OUTPUT_CLAMP_HEADER = 'x-openduet-clamp-output';
 
 /** What the image is built with when nothing names a model. */
 export const DEFAULT_ENGINE_PROVIDER = 'fireworks';
@@ -301,6 +306,7 @@ export function engineVision(
 
 /** The engine configuration these options describe, secrets included only if given. */
 export function renderEngineConfig(options: EngineConfigOptions): EngineConfig {
+  const maxOutputTokens = outputTokenLimit(options.maxOutputTokens);
   const features = { ...DEFAULT_FEATURES, ...options.features };
   const contextWindow =
     options.contextWindow ?? engineContextWindow(options.model, options.contextWindowLimit);
@@ -311,9 +317,13 @@ export function renderEngineConfig(options: EngineConfigOptions): EngineConfig {
     gatewayMaxRequestBytes: options.gatewayMaxRequestBytes,
     vision,
   });
-  const headers = options.capability
-    ? { extra_headers: { [CAPABILITY_HEADER]: options.capability } }
-    : {};
+  // A per-response ceiling can outlive the attempt's remaining budget after a
+  // tool round, so these clients explicitly allow the gateway to lower it.
+  const extraHeaders = {
+    ...(options.capability ? { [CAPABILITY_HEADER]: options.capability } : {}),
+    ...(maxOutputTokens === undefined ? {} : { [OUTPUT_CLAMP_HEADER]: '1' }),
+  };
+  const headers = Object.keys(extraHeaders).length ? { extra_headers: extraHeaders } : {};
   const provider: Record<string, unknown> = {
     base_url: `${options.brokerUrl.replace(/\/+$/, '')}/providers/${options.provider}/v1`,
     key_env: 'OPENDUET_MODEL_KEY',
@@ -383,6 +393,8 @@ export function renderEngineConfig(options: EngineConfigOptions): EngineConfig {
       provider: GATEWAY_PROVIDER,
       default: options.model,
       context_length: contextWindow,
+      // Bound the producer's request before the gateway reserves the attempt's tokens.
+      ...(maxOutputTokens === undefined ? {} : { max_tokens: maxOutputTokens }),
       // Read first by the engine's vision lookup (agent/image_routing.py,
       // _supports_vision_override), ahead of a catalog it cannot reach from
       // here. True: a screenshot tool's picture goes to the model; false: its
@@ -411,6 +423,7 @@ export const IMAGE_ENGINE_OPTIONS: EngineConfigOptions = {
  * image cannot know.
  */
 export function engineConfigEnvironment(options: EngineConfigOptions): Record<string, string> {
+  const maxOutputTokens = outputTokenLimit(options.maxOutputTokens);
   const contextWindow =
     options.contextWindow ?? engineContextWindow(options.model, options.contextWindowLimit);
   const terminal = options.features?.terminalBackend;
@@ -422,6 +435,9 @@ export function engineConfigEnvironment(options: EngineConfigOptions): Record<st
     // The boot script adds the helpers' toolset from it, and refuses any other value.
     ...(options.features?.toolsets?.includes(DELEGATION_TOOLSET) ? { [DELEGATION_ENV]: '1' } : {}),
     OPENDUET_ENGINE_MAX_TURNS: String(options.maxTurns ?? DEFAULT_ENGINE_MAX_TURNS),
+    ...(maxOutputTokens === undefined
+      ? {}
+      : { OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: String(maxOutputTokens) }),
     OPENDUET_ENGINE_CONTEXT_LENGTH: String(contextWindow),
     OPENDUET_ENGINE_COMPACTION_THRESHOLD: String(
       compactionThresholdTokens({
@@ -445,11 +461,47 @@ const positive = (value: string | undefined, name: string): number | undefined =
   return parsed;
 };
 
+/** Refuse an invalid producer ceiling rather than fall back to a provider's larger default. */
+const outputTokenLimit = (
+  value: number | undefined,
+  name = 'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS',
+): number | undefined => {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0))
+    throw new RangeError(`${name} must be a positive whole number of tokens`);
+  return value;
+};
+
 /** The settings an operator may state, read once and validated once. */
 export function engineSettingsFromEnvironment(
   environment: Record<string, string | undefined> = process.env,
-): { maxTurns: number; compactionMaxTokens: number; contextWindowLimit: number | undefined } {
+): {
+  maxTurns: number;
+  compactionMaxTokens: number;
+  contextWindowLimit: number | undefined;
+  maxOutputTokens?: number;
+} {
+  // Compose forwards optional settings as empty strings; a blank override must
+  // still honor the existing gateway default rather than break every launch.
+  const dedicatedOutputTokens = environment.OPENDUET_ENGINE_MAX_OUTPUT_TOKENS;
+  const outputVariable =
+    dedicatedOutputTokens === undefined || dedicatedOutputTokens === ''
+      ? 'OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS'
+      : 'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS';
+  const rawOutputTokens = environment[outputVariable];
+  // DEFAULT predates this setting and accepts Number's numeric spellings at
+  // service boot; preserve those while keeping the dedicated override strict.
+  if (
+    outputVariable === 'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS' &&
+    rawOutputTokens !== undefined &&
+    !/^[0-9]+$/.test(rawOutputTokens)
+  )
+    throw new RangeError(`${outputVariable} must be a positive whole number of tokens`);
+  const maxOutputTokens = outputTokenLimit(
+    rawOutputTokens === undefined ? undefined : Number(rawOutputTokens),
+    outputVariable,
+  );
   return {
+    ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
     maxTurns:
       positive(environment.OPENDUET_ENGINE_MAX_TURNS, 'OPENDUET_ENGINE_MAX_TURNS') ??
       DEFAULT_ENGINE_MAX_TURNS,

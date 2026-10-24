@@ -2,8 +2,11 @@
 import contextvars
 import json
 import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime_support"))
 
@@ -203,6 +206,9 @@ def test_gateway_headers_give_the_capability_to_the_broker_only(monkeypatch):
     # The engine's Anthropic client ignores the provider's extra headers, so
     # the gateway capability seam adds this header where the client is built.
     from openduet_runtime_hooks import gateway_headers
+    provider = types.ModuleType('hermes_cli.runtime_provider')
+    provider._get_model_config = lambda: {}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.runtime_provider', provider)
     monkeypatch.setenv("OPENDUET_BROKER_URL", "http://openduet:8788/broker/")
     monkeypatch.setenv("OPENDUET_ATTEMPT_TOKEN", "attempt-capability")
     wanted = {"x-openduet-capability": "attempt-capability"}
@@ -214,3 +220,49 @@ def test_gateway_headers_give_the_capability_to_the_broker_only(monkeypatch):
     assert gateway_headers(None) == {}
     monkeypatch.delenv("OPENDUET_ATTEMPT_TOKEN")
     assert gateway_headers("http://openduet:8788/broker/providers/anthropic/v1") == {}
+
+
+@pytest.mark.parametrize('limit', [1, 512, 4096, 9007199254740991])
+def test_native_gateway_headers_read_the_current_ceiling_when_a_spare_is_handed_over(monkeypatch, limit):
+    from openduet_runtime_hooks import gateway_headers, gateway_output_tokens
+
+    model = {'max_tokens': limit, 'extra_headers': {'x-openduet-clamp-output': '1'}}
+    provider = types.ModuleType('hermes_cli.runtime_provider')
+    provider._get_model_config = lambda: model
+    monkeypatch.setitem(sys.modules, 'hermes_cli.runtime_provider', provider)
+    monkeypatch.setenv('OPENDUET_BROKER_URL', 'http://broker:8788')
+    monkeypatch.delenv('OPENDUET_ATTEMPT_TOKEN', raising=False)
+    target = 'http://broker:8788/providers/anthropic/v1'
+    assert gateway_headers(target) == {}
+    assert gateway_output_tokens(target, None) is None
+    monkeypatch.setenv('OPENDUET_ATTEMPT_TOKEN', 'handed-capability')
+    assert gateway_headers(target) == {
+        'x-openduet-capability': 'handed-capability', 'x-openduet-clamp-output': '1',
+    }
+    assert gateway_output_tokens(target, None) == limit
+    assert gateway_output_tokens(target, 256) == 256
+    # An explicit oversized request retains the gateway's strict refusal contract.
+    assert gateway_output_tokens(target, 9007199254740991) == 9007199254740991
+    assert gateway_output_tokens('https://api.anthropic.com', None) is None
+    assert gateway_output_tokens('http://broker:8788.invalid/providers/anthropic/v1', None) is None
+    assert gateway_headers('https://api.anthropic.com') == {}
+    assert gateway_headers('http://broker:8788.invalid/providers/anthropic/v1') == {}
+    # The next construction reads the current config, rather than caching a spare's copy.
+    model['extra_headers'] = {}
+    assert gateway_headers(target) == {'x-openduet-capability': 'handed-capability'}
+    assert gateway_output_tokens(target, None) is None
+
+
+@pytest.mark.parametrize('limit', [None, True, False, 0, -1, 1.5, '512', '', float('nan'), float('inf'), 9007199254740992])
+def test_native_gateway_headers_do_not_negotiate_an_invalid_ceiling(monkeypatch, limit):
+    from openduet_runtime_hooks import gateway_headers, gateway_output_tokens
+
+    provider = types.ModuleType('hermes_cli.runtime_provider')
+    provider._get_model_config = lambda: {'max_tokens': limit, 'extra_headers': {'x-openduet-clamp-output': '1'}}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.runtime_provider', provider)
+    monkeypatch.setenv('OPENDUET_BROKER_URL', 'http://broker:8788')
+    monkeypatch.setenv('OPENDUET_ATTEMPT_TOKEN', 'handed-capability')
+    assert gateway_headers('http://broker:8788/providers/anthropic/v1') == {
+        'x-openduet-capability': 'handed-capability',
+    }
+    assert gateway_output_tokens('http://broker:8788/providers/anthropic/v1', None) is None

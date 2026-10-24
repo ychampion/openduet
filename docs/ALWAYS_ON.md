@@ -3,6 +3,12 @@
 OpenDuet keeps working on its host when you close the browser. Keep the host and
 worker services running; a sleeping laptop cannot poll accounts or run routines.
 
+The [live-model execution record](LIVE_MODEL_VERIFICATION.md) follows a learned
+style correction into a new task and a native scheduled run. That run completed
+with the browser closed and the production web server stopped, using both
+Anthropic Opus 5.5 and Fireworks through Hermes in separate installations.
+Their exact requests, answers and timing are included.
+
 ## What it notices
 
 The assistant pulse runs on the server every minute. It reads current saved

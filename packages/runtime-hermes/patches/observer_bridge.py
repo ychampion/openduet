@@ -2,7 +2,7 @@
 
 Three observer seams, one prompt seam, one reasoning seam, one picture
 seam, one live-tools seam, one delegation seam, one parallel-reads seam and one
-gateway-capability seam. The prompt seam: `agent.host_prompt: false` leaves out the engine's own
+gateway-capability seam, one gateway-output seam and one auxiliary-output seam. The prompt seam: `agent.host_prompt: false` leaves out the engine's own
 product pointer, its profile line and its host runtime block, which describe
 the engine's install rather than the attempt. It is inert unless that key is
 set. The reasoning seam puts the model's reasoning on a run's event stream as
@@ -20,8 +20,12 @@ The gateway-capability seam gives the engine's own Anthropic client the
 attempt's capability header, which its OpenAI-wire clients already take from
 the provider entry, so a Claude model reaches OpenDuet's gateway at all. It adds
 the header only to a client pointed at OpenDuet's broker.
+The gateway-output seam passes the configured per-response ceiling into every
+gateway-created agent, before a provider default can exceed the attempt budget.
+The auxiliary-output seam gives native Anthropic compaction calls the configured
+ceiling when they omit a limit, before the adapter inserts the model's default.
 
-All ten original source hashes are checked before any write. A subsequent
+All twelve original source hashes are checked before any write. A subsequent
 run accepts only the same patch, or a named earlier version of it, never an
 arbitrary nearby upstream version.
 The support module is copied into the runtime's import root so plugin loading
@@ -35,6 +39,52 @@ import sys
 from pathlib import Path
 
 PATCHES = {
+    # All gateway provider resolvers share this constructor mapping. At the pin
+    # it drops model.max_tokens, so the native Anthropic client requests its
+    # much larger provider default before the gateway can reserve any budget.
+    "gateway/run.py": (
+        "39e574061458da89692a6d80c200af0711388547cffec2f28c3a1dce4f3abad6",
+        [
+            ('''def _runtime_agent_kwargs(runtime: dict) -> dict:
+    """AIAgent constructor kwargs shared by every runtime-provider resolution.
+    ``request_overrides`` passes through as resolved so the provider's request body reaches each turn."""
+    return {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+        "request_overrides": runtime.get("request_overrides")}
+''',
+             '''def _runtime_agent_kwargs(runtime: dict) -> dict:
+    """AIAgent constructor kwargs shared by every runtime-provider resolution.
+    ``request_overrides`` passes through as resolved so the provider's request body reaches each turn."""
+    from hermes_cli.runtime_provider import _get_model_config  # OpenDuet gateway-output seam
+    model_config = _get_model_config()
+    output = {}
+    if "max_tokens" in model_config:
+        max_tokens = model_config["max_tokens"]
+        # A malformed ceiling must not silently restore a provider's larger default.
+        if type(max_tokens) is not int or not 0 < max_tokens <= 9007199254740991:
+            raise ValueError("model.max_tokens must be a positive whole number of tokens")
+        output["max_tokens"] = max_tokens
+    return {
+        **output,
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+        "request_overrides": runtime.get("request_overrides")}
+'''),
+        ],
+    ),
     "hermes_cli/plugins.py": (
         "9dc62779a8bc8b3c84ac7856b9d808adeb58d07bd681f43673aee94c9c879b38",
         [("    \"on_session_finalize\", \"on_session_reset\",\n",
@@ -258,11 +308,25 @@ def _durable_content(content: Any) -> Any:
              "            or parallel_read(name)):  # OpenDuet parallel-reads seam\n"),
         ],
     ),
+    # Native auxiliary calls omit max_tokens for compaction. Supply only the
+    # owned gateway's opt-in ceiling before Anthropic inserts its native default.
+    "agent/auxiliary_client.py": (
+        "1fae4b096f75878de687c8f1f6554b2458321a437a2febae45e317e58e3bb0b1",
+        [
+            ('        else:\n'
+             '            max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")\n'
+             '        temperature = kwargs.get("temperature")\n',
+             '        else:\n'
+             '            max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")\n'
+             '        from openduet_runtime_hooks import gateway_output_tokens  # OpenDuet auxiliary-output seam\n'
+             '        max_tokens = gateway_output_tokens(self._base_url, max_tokens)\n'
+             '        temperature = kwargs.get("temperature")\n'),
+        ],
+    ),
     # The gateway-capability seam. At the pin the native Anthropic client is
     # built from the key and the beta headers alone: the provider entry's
-    # extra_headers, where the boot script puts the attempt's capability, reach
-    # only the OpenAI-wire clients. Every Anthropic client the engine builds
-    # (main, fallback, rebuild, auxiliary) is made by this one function.
+    # extra_headers reach only the OpenAI-wire clients. Main, fallback, rebuild
+    # and auxiliary Anthropic clients are all made by this one function.
     "agent/anthropic_adapter.py": (
         "40128a54b62d7c06498b751b2f6626144924887ec11a634b9e03109d290c01b0",
         [
@@ -338,7 +402,7 @@ def main() -> None:
     prepared.append((root / "openduet_runtime_hooks.py", support.read_text(encoding="utf-8")))
     for target, content in prepared:
         target.write_text(content, encoding="utf-8", newline="\n")
-    print("OpenDuet observer bridge applied: 10 checked source files and 1 support module")
+    print(f"OpenDuet observer bridge applied: {len(PATCHES)} checked source files and 1 support module")
 
 
 if __name__ == "__main__":

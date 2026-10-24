@@ -698,9 +698,14 @@ const variables = z.object({
   TAVILY_API_KEY: unsetWhenBlank(z.string().min(1).max(512).optional()),
   /**
    * The output limit the gateway gives a model request that names none. The
-   * engine names none by default, so this is the usual ceiling on one reply.
+   * engine also uses this ceiling unless its dedicated output setting is given.
    */
-  OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(4096),
+  OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(4096),
   OPENDUET_SPEECH_MODEL: unsetWhenBlank(z.string().optional()),
   /**
    * ElevenLabs, for everything voice (docs/VOICE.md). The key alone turns on
@@ -1133,6 +1138,15 @@ const variables = z.object({
    */
   OPENDUET_ENGINE_MAX_TURNS: unsetWhenBlank(
     z.coerce.number().int().positive().default(DEFAULT_ENGINE_MAX_TURNS),
+  ),
+  /** A dedicated reply ceiling; blank falls back to the default output ceiling. */
+  OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: unsetWhenBlank(
+    z
+      .string()
+      .regex(/^[0-9]+$/, 'must be a positive whole number of tokens')
+      .transform(Number)
+      .pipe(z.number().int().positive().max(Number.MAX_SAFE_INTEGER))
+      .optional(),
   ),
   OPENDUET_COMPACTION_MAX_TOKENS: unsetWhenBlank(
     z.coerce.number().int().positive().default(DEFAULT_COMPACTION_MAX_TOKENS),

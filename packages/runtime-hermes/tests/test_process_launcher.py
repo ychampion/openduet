@@ -269,6 +269,43 @@ def test_the_container_spare_is_configured_with_its_capability_before_it_serves(
         assert name not in os.environ
 
 
+def test_a_spare_handoff_preserves_the_output_ceiling_headers_from_the_real_boot_program(tmp_path, monkeypatch):
+    import builtins
+
+    source = (Path(__file__).parents[1] / 'entrypoint.sh').read_text().split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+    template = tmp_path / 'template.json'
+    template.write_text(json.dumps({'model': {}, 'providers': {'openduet-gateway': {}}}))
+    native_open = builtins.open
+
+    def scoped_open(path, *args, **kwargs):
+        return native_open(template if str(path) == '/opt/openduet-runtime/config.yaml' else path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', scoped_open)
+    monkeypatch.setitem(sys.modules, 'yaml', types.SimpleNamespace(
+        safe_load=json.load, safe_dump=lambda value, stream, **kwargs: json.dump(value, stream),
+    ))
+    started_with = {
+        'HERMES_HOME': str(tmp_path),
+        'OPENDUET_RUNTIME_SPARE': '1',
+        'OPENDUET_BOOT_CONFIG': source,
+        'OPENDUET_BROKER_URL': 'http://broker:19188',
+        'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS': '512',
+    }
+    # Loading before an attempt exists and handing it over run the same renderer.
+    render_attempt_configuration(started_with, {})
+    spare = json.loads((tmp_path / 'config.yaml').read_text())
+    assert spare['model']['max_tokens'] == 512
+    for section in (spare['model'], spare['providers']['openduet-gateway']):
+        assert section['extra_headers'] == {'x-openduet-clamp-output': '1'}
+    render_attempt_configuration(started_with, {'OPENDUET_ATTEMPT_TOKEN': 'attempt-capability'})
+    handed = json.loads((tmp_path / 'config.yaml').read_text())
+    assert handed['model']['max_tokens'] == 512
+    for section in (handed['model'], handed['providers']['openduet-gateway']):
+        assert section['extra_headers'] == {
+            'x-openduet-clamp-output': '1', 'x-openduet-capability': 'attempt-capability',
+        }
+
+
 def test_a_container_spares_directory_is_not_watched_but_its_attempt_values_are(monkeypatch):
     """A container engine loads in /work and serves in /work: its workspace takes
     that directory over, so the engine reading it while loading reads what the

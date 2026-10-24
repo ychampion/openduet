@@ -1,0 +1,178 @@
+{
+  "checked_at": "2026-10-24T00:24:02.159864+00:00",
+  "source_base": "e6b113af67a83b070ec41978233f9d9fd3c34cc6",
+  "instructions_sha256": "ee28a049256704a89d874bf651582ae477b61ffbda5ca7c0e83f2ddf92415e09",
+  "skill_sha256": {
+    "write-a-draft": "f4e75aec09168cef26f6d9e6ffdec4d2c76047b8d0b11871e72e894272b72d24",
+    "draft-follow-up": "223b2bf100812e065d82ee121ac756dcd47ac78db1282c2334ea01a13c324d04"
+  },
+  "model": {
+    "provider": "fireworks",
+    "requested": "accounts/fireworks/models/deepseek-v4p1-flash",
+    "actual": "accounts/fireworks/models/deepseek-v4p1-flash"
+  },
+  "runtime": {
+    "adapter": "hermes",
+    "supervisor": "process",
+    "engine_commit": "2237be355906fbe6065ce1815711eee52b2d646e"
+  },
+  "data": "Supplied fictional customer notes in an isolated installation; real provider inference, no mailbox or sending.",
+  "readiness": {
+    "provider": "fireworks",
+    "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+    "credentials": "passed",
+    "inference": "passed",
+    "tools": "passed",
+    "checked_at": "2026-10-24T00:01:09.518Z",
+    "code": "ready",
+    "message": "The selected model responded through Hermes, read the disposable note with the allowed tool, and returned its value. This checks compatibility, not general intelligence.",
+    "usage": {
+      "requests": 2,
+      "output_tokens": 100
+    }
+  },
+  "first_task": {
+    "id": "turn_01M5NKDAT9FTJ5JMP33D9G4W7N",
+    "conversation_id": "job_01M5NKD9SNTE19XW00WKKNGR3K",
+    "agent_id": "agent_01M5NJXG8QACPP2KN6G9PQNMHJ",
+    "text": "For customer follow-ups, I prefer three short bullet points and the sign-off 'Regards, Sam'. Draft a follow-up to Priya from Northstar: she needs our security questionnaire before choosing a pilot date; SSO is unconfirmed. Ask which security questions she needs answered. Use only these notes. Do not promise SSO or send anything.",
+    "answer": "Here's the draft:\n\nSubject: Security questionnaire before your pilot date\n\nHi Priya,\n\nFollowing up on the security questionnaire.\n\n- You need it before choosing a pilot date.\n- SSO is still unconfirmed.\n- Which security questions do you need answered?\n\nRegards,\nSam\n\nNothing is sent, and SSO isn't promised anywhere. Say the word if you want it saved as a file or tweaked.",
+    "status": "done",
+    "delivery": null,
+    "created_at": "2026-10-24T00:01:46.080Z",
+    "attachments": []
+  },
+  "correction": {
+    "id": "turn_01M5NKFEDM95Z029ZXT6A9K5DG",
+    "conversation_id": "job_01M5NKD9SNTE19XW00WKKNGR3K",
+    "agent_id": "agent_01M5NJXG8QACPP2KN6G9PQNMHJ",
+    "text": "Correction for all future customer follow-ups: replace my old bullet-point style with one short paragraph, under 60 words, and sign off 'Thanks, Sam' instead of 'Regards, Sam'. Apply this correction to the Priya draft now. Never send anything.",
+    "answer": "Here's the revised draft, now one paragraph under 60 words:\n\nSubject: Security questionnaire before your pilot date\n\nHi Priya,\n\nFollowing up on the security questionnaire you need before choosing a pilot date. SSO is still unconfirmed. Could you let me know which security questions you need answered?\n\nThanks,\nSam\n\nChanged from the earlier version: the three bullets became a single paragraph, and the sign-off is now \"Thanks, Sam.\" Nothing is sent, and SSO isn't promised.",
+    "status": "done",
+    "delivery": null,
+    "created_at": "2026-10-24T00:02:56.422Z",
+    "attachments": []
+  },
+  "saved_memory": [
+    {
+      "id": "k_2XXJ4M2ZXRAYQ1R8NAA3XZGBM3",
+      "key": "Writing customer followup",
+      "value": "Wants customer follow-ups written as one short paragraph under 60 words, signed off 'Thanks, Sam'",
+      "source": "conversation",
+      "created": "2026-10-24T00:02:59.214Z",
+      "last_used": null,
+      "editable": true,
+      "version": "b0f70207745e101973f1bc00f3476eb79cd851b8a6dde042f6da62b81a3bb27a"
+    }
+  ],
+  "independent_task": {
+    "id": "turn_01M5NKGJW841WE5E3HEZD147QH",
+    "conversation_id": "job_01M5NKGJNMD8HZ2KHEDJGMJZ0Q",
+    "agent_id": "agent_01M5NJXG8QACPP2KN6G9PQNMHJ",
+    "text": "Draft a customer follow-up to Daniel at Cedar. Notes: he requested a revised onboarding checklist before agreeing a kickoff date. We have not confirmed the data residency region. Ask which onboarding details he needs next. Use only the supplied notes and prepare the draft here; do not send anything.",
+    "answer": "Here's the draft:\n\nHi Daniel, I'm pulling together the revised onboarding checklist you asked for, so we can settle on a kickoff date. One thing still open on our side: the data residency region isn't confirmed yet. Which onboarding details do you need next?\n\nThanks,\nSam\n\nNothing sent. The checklist wording stays open since the notes don't say whether it's finished or still in progress, and I left the data residency region unstated as unconfirmed.",
+    "status": "done",
+    "delivery": null,
+    "created_at": "2026-10-24T00:03:33.554Z",
+    "attachments": []
+  },
+  "memory_revisions": [
+    {
+      "claim_id": "k_2XXJ4M2ZXRAYQ1R8NAA3XZGBM3",
+      "revision": 1,
+      "status": "superseded",
+      "recorded_at": "2026-10-24T00:01:52.055073+00:00",
+      "superseded_at": "2026-10-24T00:02:59.261499+00:00"
+    },
+    {
+      "claim_id": "k_2XXJ4M2ZXRAYQ1R8NAA3XZGBM3",
+      "revision": 2,
+      "status": "active",
+      "recorded_at": "2026-10-24T00:02:59.214119+00:00",
+      "superseded_at": null
+    }
+  ],
+  "background": {
+    "trigger_id": "trg_01M5NMGT89BWFA6KGNAKSX3MDN",
+    "conversation_id": "job_01M5NMGT6Y3K0KGZTR4FXNM8XY",
+    "browser_closed_at": "2026-10-24T00:21:11.173060+00:00",
+    "web_stopped_at": "2026-10-24T00:21:11.915913+00:00",
+    "observed_completed_while_web_off_at": "2026-10-24T00:24:01.037723+00:00",
+    "schedule_time": "05:53",
+    "time_zone": "Asia/Calcutta",
+    "native_schedule": true,
+    "manual_wake": false,
+    "run": {
+      "id": "att_01M5NMN1ASMV6MGSX736J5XVPJ",
+      "status": "done",
+      "started_at": "2026-10-24T00:23:28.299Z",
+      "finished_at": "2026-10-24T00:23:44.508Z",
+      "conversation_id": "job_01M5NMGT6Y3K0KGZTR4FXNM8XY",
+      "turn_id": "turn_01M5NMN17S545FF9C0S7E0FM9A",
+      "summary": "Here's the draft, in your one-paragraph, under-60-words style with the \"Thanks, Sam\" sign-off: Hi Daniel, Thanks for the note on the revised onboarding checklist. Before we agree a kickoff date, one item is still open on our side: the data residency region isn't confirmed. Which\u2026",
+      "reason": null
+    },
+    "result": {
+      "id": "turn_01M5NMN17S545FF9C0S7E0FM9A",
+      "conversation_id": "job_01M5NMGT6Y3K0KGZTR4FXNM8XY",
+      "agent_id": "agent_01M5NJXG8QACPP2KN6G9PQNMHJ",
+      "text": "Prepare a customer follow-up to Daniel at Cedar from the source scope below. Return a ready-to-review email draft and one specific open decision I need to make. Use my saved writing preferences. Do not send anything or claim any unconfirmed fact.\n\nSource and scope: Supplied context only: Daniel requested a revised onboarding checklist before agreeing a kickoff date. Data residency region remains unconfirmed. Ask which onboarding details he needs next. No fresh mailbox or calendar is connected; use only these supplied notes.\nReference result: conversation job_01M5NKGJNMD8HZ2KHEDJGMJZ0Q, turn turn_01M5NKGJW841WE5E3HEZD147QH. This is context, not permission to send or perform outward actions. Follow current approval settings.",
+      "answer": "Here's the draft, in your one-paragraph, under-60-words style with the \"Thanks, Sam\" sign-off:\n\nHi Daniel,\n\nThanks for the note on the revised onboarding checklist. Before we agree a kickoff date, one item is still open on our side: the data residency region isn't confirmed. Which onboarding details do you need next?\n\nThanks,\nSam\n\nOne decision I need from you: which data residency region to commit to for Cedar (EU, US, or India, say), since the email says it's still open and I've kept it that way rather than guess.\n\nNothing has been sent, and I can't send from here. Tell me the region and I'll fold it in, or say so and I'll leave it out.",
+      "status": "done",
+      "delivery": null,
+      "created_at": "2026-10-24T00:23:28.171Z",
+      "attachments": []
+    },
+    "paused_after_run": true
+  },
+  "usage": [
+    {
+      "provider": "fireworks",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "model_actual": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "purpose": "agent",
+      "status": "succeeded",
+      "calls": 13,
+      "cost_usd": 0.035411000000000005
+    },
+    {
+      "provider": "fireworks",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "model_actual": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "purpose": "memory",
+      "status": "succeeded",
+      "calls": 3,
+      "cost_usd": 0.001546
+    },
+    {
+      "provider": "fireworks",
+      "model": "nomic-ai/nomic-embed-text-v1.5",
+      "model_actual": "nomic-ai/nomic-embed-text-v1.5",
+      "purpose": "memory_embedding",
+      "status": "succeeded",
+      "calls": 21,
+      "cost_usd": 2.2000000000000006e-5
+    },
+    {
+      "provider": "fireworks",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "model_actual": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "purpose": "model-readiness",
+      "status": "succeeded",
+      "calls": 2,
+      "cost_usd": 0.0013210000000000001
+    }
+  ],
+  "limits": [
+    "One provider/model and supplied-context workflow; not a reliability benchmark.",
+    "Live mailbox access, sending, native push and long-duration uptime were not exercised.",
+    "Initial cold-start readiness failed once before a successful retry."
+  ],
+  "backend_restart": {
+    "process_started_at": "2026-10-24T00:20:52.030000+00:00",
+    "method": "OS process start time from proc; current corrected memory read through API after restart",
+    "verified_at": "2026-10-24T00:26:56.235392+00:00",
+    "current_claim_id": "k_2XXJ4M2ZXRAYQ1R8NAA3XZGBM3",
+    "current_revision": 2
+  }
+}

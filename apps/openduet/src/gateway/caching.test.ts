@@ -295,6 +295,24 @@ describe('cached input is charged at its cached price, from the one price table'
     ).toBe(200);
   });
 
+  test('Opus 5.5 overrides the legacy family estimate for budget accounting', () => {
+    const usage = {
+      inputTokens: 1_200_000,
+      cachedInputTokens: 1_000_000,
+      cacheWriteInputTokens: 100_000,
+      outputTokens: 10_000,
+    };
+    expect(prices.cost('anthropic', 'claude-opus-5-5', usage)).toBeCloseTo(
+      0.4 + 0.2 + 0.5 + 0.2,
+      6,
+    );
+    expect(prices.chargedInputTokens('anthropic', 'claude-opus-5-5', usage)).toBe(275_000);
+    const operator = new PriceTable({
+      'anthropic/*': { input: 1, output: 1, cached_input: 1, cache_write_input: 1 },
+    });
+    expect(operator.cost('anthropic', 'claude-opus-5-5', usage)).toBeCloseTo(1.21, 6);
+  });
+
   test('an unknown provider is charged as though nothing was cached', () => {
     for (const provider of ['openai-compatible', 'constructor', '__proto__'])
       expect(

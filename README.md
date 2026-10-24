@@ -7,121 +7,25 @@
     <a href="https://github.com/ychampion/openduet/actions/workflows/ci.yml"><img src="https://github.com/ychampion/openduet/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-d97757" alt="Apache 2.0 license" /></a>
   </p>
-  <p><a href="#try-a-sample-day">Try it</a> · <a href="#get-started">Install</a> · <a href="docs/PERSONAL_ASSISTANT.md">How it works</a> · <a href="docs/ALWAYS_ON.md">Always-on and verification</a></p>
+  <p><a href="#get-started">Install OpenDuet</a> · <a href="#put-it-to-work">Workflows</a> · <a href="docs/PERSONAL_ASSISTANT.md">How it works</a> · <a href="docs/media/live-assistant/opus-learning-and-background.mp4">Watch it work</a></p>
 </div>
 
-## Try a Sample day
-
-Run a local, clearly labeled walkthrough before connecting a model or account:
-
-```sh
-git clone https://github.com/ychampion/openduet.git
-cd openduet
-bun install --frozen-lockfile
-bun run sample
-```
-
-Open **http://127.0.0.1:5321**. Requires Git, Node.js 22+ and Bun 1.3.13.
-The runner starts fresh, in-memory fixtures on loopback. It removes inherited
-installation settings before loading fixtures, disables dotenv loading for the
-sample web app, and uses no service credentials, database or real connectors.
-Restart it to reset the day.
-Every screen says **Sample day · Scripted examples · No real account actions**.
-There is no hosted public demo.
-
-[![Sample day: review a follow-up, inspect a receipt, and return to saved style and recurring work](docs/media/sample-day/review.gif)](docs/SHOWCASE.md)
-
-A 21-second browser recording of the scripted local sample. No real mail is sent.
-
-**[Walkthrough, screenshots and recording](docs/SHOWCASE.md)** ·
-**[Media provenance](docs/media/sample-day/README.md)**
-
-The sample uses the production React components with deterministic responses.
-Its sample send produces a fixture receipt. It is an interaction demo;
-[real service, database and Hermes checks](docs/PRODUCT_VERIFICATION.md) are separate.
-
-## Already looking for the next useful step
-
-OpenDuet's server checks watched calendar events, unresolved source signals and
-stalled personal tasks every minute, even with the browser closed. Chat offers
-up to three suggestions with a reason and source. **Plan together** gathers the
-current context into an editable request with an attached source note. Add your
-judgment and press Send when ready. **Tomorrow**, **Not useful** and **Pause
-suggestions** keep this useful rather than repetitive.
-
-![A suggested next step with its reason and collaboration controls, using labeled sample data](docs/media/sample-day/proactive-desktop.png)
-
-Lasting facts and preferences from your own words can be learned automatically
-by the configured memory model. Chat shows the learning setting and recent
-saved details; review, edit or forget them in Memory. Start a message with
-“off the record” to skip learning from it. Model quality and configured budgets
-still matter. Explicit preference and procedure controls remain available.
-
-Keep the host running. Source polling has its own cadence; this is not continuous
-model inference. Suggestions prepare saved context without a model call or
-external action. Your delegated jobs, routines and supported watches do the
-background work. Push notifications have separate opt-ins.
-See [operation, limits and tests](docs/ALWAYS_ON.md).
-
-## One task, then a better next time
-
-Start with a concrete request and the information you already have:
-
-> Priya at Northstar needs a security review before choosing a pilot date.
-> SSO is unconfirmed. Prepare a short follow-up asking which security questions
-> her team needs answered. Do not promise SSO or send anything.
-
-OpenDuet keeps the request, prepared draft, source context and review controls
-in **Chat**. Open a result to inspect or revise it. **Draft prepared** means a
-draft exists; a confirmed send has its own receipt.
-
-Then refine the work and choose what to delegate:
-
-1. **Correct the work.** Reply to that result: “Under 120 words, with one clear ask.”
-   Replies to an older run keep that run as their source.
-2. **Teach it.** Automatic memory captures lasting details when enabled. Choose
-   **Remember this preference** to review and save the exact
-   wording. Or **Save these steps** to review a reusable personal skill.
-   Inspect, edit or forget saved context; changing the model keeps it in your installation.
-3. **Delegate next time.** Choose **Run this automatically** for an explicit
-   schedule. For a customer thread, confirm the mailbox, customer, thread,
-   deadline and time zone in **Work → Recurring → Watch a customer thread**.
-
-The customer watch checks fresh thread state and prepares one follow-up when
-the deadline arrives without a reply. A reply, pause or loss of access blocks
-obsolete work. Sending is a separate reviewed action; a confirmed receipt
-completes this one-shot watch. Native Gmail and Microsoft mailboxes support
-this watch; IMAP and generic MCP mailboxes are not offered for it.
-
-![A source-bound result with the full editable draft](docs/media/sample-day/result-desktop.png)
-
-## Keep the work together
-
-| Place | What you do there |
-| --- | --- |
-| **Chat** | Give the main assistant a task, continue an actual task, or reply to a specific result. Unrelated tasks retain separate execution and approval boundaries. |
-| **Work** | Review **Needs you**, **In progress**, **Finished**, and **Recurring**. Pause the actual routine or customer watch. |
-| **Explore** | Start meeting preparation, research, follow-ups, a daily brief, or writing in your style. Each preset explains its inputs and prerequisites. |
-| **Settings** | Choose a model; manage accounts, memory, skills, approvals and delivery preferences. Advanced tools remain available. |
-
-| Desktop in dark appearance | Phone result view |
-| --- | --- |
-| ![Chat in dark appearance](docs/media/sample-day/chat-dark.png) | <img src="docs/media/sample-day/result-phone.png" alt="Result with Back navigation and sample label on a phone" width="260" /> |
-
-Notes or a supported file are enough to begin. Connect a calendar, mailbox or
-research tool when a task needs fresh information. Output quality depends on
-the selected model and available tools. See [example workflows](docs/USE_CASES.md).
+OpenDuet brings tasks, memory, connected accounts and recurring work into one
+personal assistant. Give it context, review what it prepares, correct it, and
+delegate the work you want it to keep doing. Your server keeps jobs and routines
+running when you close the browser.
 
 ## Get started
 
 ### 1. Prepare your host
 
 Use an always-on Linux **x86-64** host, or Docker Desktop with Linux containers
-on Windows / Intel Mac. Allow **8 GB RAM and 20 GB free disk**. Published images
-target `linux/amd64`; ARM source builds need separate validation.
-Install **Docker Engine 28+**, **Compose 2.33.1+**, and, on Windows, Git for Windows.
+on Windows / Intel Mac. Allow **8 GB RAM and 20 GB free disk**. Install
+**Docker Engine 28+**, **Compose 2.33.1+**, and, on Windows, **Git for Windows**.
+Published images target `linux/amd64`; see [deployment](docs/DEPLOYMENT.md) for
+source-build options and platform details.
 
-### 2. Install
+### 2. Install OpenDuet
 
 Linux / macOS, in Bash:
 
@@ -135,75 +39,167 @@ Windows, in PowerShell:
 irm https://raw.githubusercontent.com/ychampion/openduet/main/install.ps1 | iex
 ```
 
-The installer creates `~/openduet`, downloads public images, starts the stack
-and prints a one-time account setup link. Open it and create your account.
-The image installation needs no Bun or Node.js. The first download can take
-several minutes. Read [the detailed guide and troubleshooting](docs/GETTING_STARTED.md).
+The installer creates `~/openduet`, downloads the public images, starts the
+services and prints a one-time account setup link. Open that link and create
+your account. The app normally runs at **http://localhost:3101**. This installation
+needs no Bun or Node.js; allow several minutes for the first image download.
 
-### 3. Hand off a real task
+For Docker setup, alternate ports or troubleshooting, follow the
+[step-by-step installation guide](docs/GETTING_STARTED.md).
 
-At **What would you like off your plate?**, enter your actual task, paste notes
-or attach a supported file. Send saves the exact request before model setup.
-Choose your provider and model, then run the compatibility check. It separately
-shows **Credentials accepted**, **Model responded**, and **Tool use verified**.
-Listing models alone does not pass the check. A successful check resumes the
-saved request once; refresh/retry retains its submission key.
+### 3. Give it a task and connect your model
 
-The compatibility check uses the selected model through Hermes with an
-isolated read-only note tool. It may use paid inference: up to three model
-requests and 1,536 output tokens, with a 45-second runtime limit. It cannot
-verify task quality. Practice responses are not accepted for real handoffs.
+At **What would you like off your plate?**, enter a task, paste your notes or
+attach a supported file, then press Send. Your request is saved while you choose
+your provider and model.
 
-Connect only the accounts needed for your next task. In **Settings → Approvals**,
-choose **Ask me for everything** if you want a fresh review before consequential
-actions. Other autonomy settings can allow actions under existing policy.
+Run the compatibility check and look for all three stages: **Credentials
+accepted**, **Model responded**, and **Tool use verified**. The check uses your
+selected model through Hermes, including a read-only tool call; provider billing
+can apply. When it passes, your saved request continues automatically.
 
-### 4. Return to useful work
+Connect the accounts needed for the task in **Settings → Connections**. In
+**Settings → Approvals**, choose **Ask me for everything** to review consequential
+actions yourself, or select the autonomy policy that suits your work.
 
-Keep your host running for jobs and routines. **Work** shows results and
-questions that need you. Delivery preferences separately control decisions,
-your requested work, requested reminders, the daily brief and unsolicited
-suggestions. Push for unsolicited suggestions starts off; in-app noticing starts
-on and has its own pause control. Editing the daily brief changes its real
-schedule; pausing a routine stops its trigger.
+### 4. Teach it and delegate the next run
 
-For phone access, configure [HTTPS or Tailscale](docs/DEPLOYMENT.md) and install
-the PWA from your browser. There are no native mobile binaries.
+Review the result in **Chat** and reply with a correction. Automatic memory can
+carry lasting preferences forward; use **Remember this preference** or **Save
+these steps** when you want to review the exact instruction being saved.
+
+Choose **Run this automatically** to review a recurring instruction and schedule.
+Keep the host running and return to **Work** for results, progress and questions
+that need you. Manage notification preferences separately in Settings, and pause
+a routine from **Work → Recurring** whenever you want it to stop.
+
+For phone access, configure [HTTPS or Tailscale](docs/DEPLOYMENT.md), then install
+the PWA from your browser. OpenDuet runs in desktop and mobile browsers.
 
 <details>
-<summary>Build the real service from source / add a browser worker</summary>
+<summary>Build from source or add a browser worker</summary>
+
+For source development, install Git, Node.js 22+ and Bun 1.3.13, alongside the
+Docker prerequisites above:
 
 ```sh
+git clone https://github.com/ychampion/openduet.git
+cd openduet
+bun install --frozen-lockfile
 bun run openduet init --connect-in-app
 docker compose -f deploy/docker-compose.yml up -d --build --wait --wait-timeout 300
 ```
 
-Run these inside the cloned repository after installing dependencies. Open the
-setup link printed by `init`. Configuration belongs in the app or local
+Open the setup link printed by `init`. Configuration belongs in the app or local
 `deploy/.env`, never in Git. See [deployment](docs/DEPLOYMENT.md),
-[optional browser worker](docs/browser-worker.md), and [architecture](docs/ARCHITECTURE.md).
+[the optional browser worker](docs/browser-worker.md), and
+[architecture](docs/ARCHITECTURE.md).
 
 </details>
+
+## Put it to work
+
+Start with notes you already have, then add connected accounts and tools as the
+work needs them.
+
+| You want to… | Give OpenDuet… | Come back to… |
+| --- | --- | --- |
+| Send a clear client update | Your notes, milestones and open questions | A concise draft ready for your review |
+| Be ready for a meeting | The agenda and documents; calendar access for fresh details | A brief, unresolved decisions and questions to ask |
+| Stay on top of a customer thread | A connected mailbox, chosen thread and follow-up deadline | A prepared follow-up when the deadline passes without a reply |
+| Start the day with priorities | Connected mail and calendar, plus a daily brief schedule | Meetings, unanswered mail and useful next actions |
+| Compare suppliers or tools | Source URLs and web tools; a browser worker where needed | A comparison with citations and gaps to resolve |
+| Repeat a useful workflow | A reviewed instruction, saved steps and a schedule | Results in Work while your browser is closed |
+
+Find detailed prompts, required connections and expected outputs in
+[ten practical workflows](docs/USE_CASES.md).
+
+### Start with one useful task
+
+For example, paste your own client notes with a request like this:
+
+> Priya at Northstar needs a security review before choosing a pilot date.
+> SSO is unconfirmed. Prepare a short follow-up asking which security questions
+> her team needs answered. Do not promise SSO or send anything.
+
+OpenDuet keeps the request, prepared draft, source context and review controls
+in **Chat**. Open a result to inspect or revise it. A prepared draft stays ready
+for review; a confirmed send has its own receipt.
+
+The following captures show OpenDuet using Anthropic Opus 5.5 with supplied
+customer notes. It learned a correction automatically, used it in a separate
+task, and completed a scheduled preparation with both the browser and frontend
+server stopped. The same workflow also passed with a Fireworks model.
+
+![A customer follow-up prepared by a live model after learning a style correction](docs/media/live-assistant/opus-result-desktop.png)
+
+**[Watch the result and learned preference](docs/media/live-assistant/opus-learning-and-background.mp4)** ·
+**[Execution details](docs/LIVE_MODEL_VERIFICATION.md)**
+
+Reply to the result with “Under 120 words, with one clear ask.” Then choose what
+should carry forward:
+
+- **Memory:** lasting facts and preferences can be learned from your own words.
+  Review, edit or forget them in **Settings → Memory**. Start a message with
+  **off the record** to skip learning from it.
+- **Skills:** use **Save these steps** to review a reusable personal procedure.
+  Your saved context and procedures stay with your installation when you change models.
+- **Recurring work:** use **Run this automatically** to confirm the next run,
+  or **Work → Recurring → Watch a customer thread** for a specific follow-up.
+
+![The automatically learned correction in OpenDuet's memory controls](docs/media/live-assistant/opus-memory-desktop.png)
+
+Customer watches support native Gmail and Microsoft mailboxes. Choose the
+mailbox and thread, confirm the customer, deadline and time zone, and review
+the follow-up when it returns. New replies, paused watches and revoked access
+prevent obsolete work. Sending remains governed by your approval policy.
+
+### Notice the next useful step
+
+OpenDuet checks watched calendar events, unresolved source signals and stalled
+personal tasks every minute, even with the browser closed. Chat offers up to
+three suggestions with a reason and source.
+
+**Plan together** gathers the current context into an editable request with an
+attached source note. Add your judgment and press Send when ready. **Tomorrow**,
+**Not useful** and **Pause suggestions** let you shape what deserves attention.
+
+Suggestions gather saved context; delegated jobs, routines and supported watches
+perform the background work. Push delivery has its own preferences. See
+[always-on collaboration](docs/ALWAYS_ON.md) for behavior and controls.
+
+## Keep the work together
+
+| Place | What you do there |
+| --- | --- |
+| **Chat** | Hand off a task, continue existing work or reply to a specific result. |
+| **Work** | Review **Needs you**, **In progress**, **Finished**, and **Recurring**; pause routines and customer watches. |
+| **Explore** | Begin meeting preparation, research, follow-ups, a daily brief or writing in your style, with the inputs each workflow needs. |
+| **Settings** | Choose your model and manage connections, memory, skills, approvals and delivery preferences. |
+
+| Desktop in dark appearance | Phone result view |
+| --- | --- |
+| ![A live-model result in dark appearance](docs/media/live-assistant/opus-result-dark.png) | <img src="docs/media/live-assistant/opus-result-phone.png" alt="A live-model follow-up on a phone" width="260" /> |
 
 ## Why run your own assistant?
 
 Your working context, taught procedures and job history stay in your
-installation while you choose a supported model and extend the tools.
-Apache-2.0 source lets you inspect and adapt the system. You operate uptime,
-updates and backups; connected model/tool services receive the data their
-requests need. Self-hosting does not make remote inference local.
+installation while you choose a supported model and extend its tools.
+Apache-2.0 source lets you inspect and adapt the system. You control uptime,
+updates and backups; connected model and tool services receive the data their
+requests need.
 
-Claude Duet offers a managed experience. OpenDuet focuses on owning and adapting
-your assistant. See the [source-backed feature comparison](docs/CLAUDE_DUET_COMPARISON.md)
-for native mobile, wallet and connector gaps. We have not benchmarked task quality
-against a Duet account. OpenDuet is independent of Anthropic.
+OpenDuet focuses on owning and adapting your assistant. For a capability-by-capability
+look at the managed alternative, see the
+[Claude Duet comparison](docs/CLAUDE_DUET_COMPARISON.md). OpenDuet is independent
+of Anthropic.
 
 | Use and understand | Build and operate |
 | --- | --- |
-| [First task guide](docs/GETTING_STARTED.md) | [Contributing and tests](CONTRIBUTING.md) |
+| [First task guide](docs/GETTING_STARTED.md) | [Contributing](CONTRIBUTING.md) |
 | [Personal assistant behavior](docs/PERSONAL_ASSISTANT.md) | [Architecture](docs/ARCHITECTURE.md) |
-| [Screenshots and walkthrough](docs/SHOWCASE.md) | [Deployment](docs/DEPLOYMENT.md) |
-| [Product verification and limits](docs/PRODUCT_VERIFICATION.md) | [Upgrading](docs/UPGRADING.md) |
+| [Example workflows](docs/USE_CASES.md) | [Deployment](docs/DEPLOYMENT.md) |
+| [Product verification](docs/PRODUCT_VERIFICATION.md) | [Upgrading](docs/UPGRADING.md) |
 
 Preserve [LICENSE](LICENSE), [NOTICE](NOTICE) and [source provenance](docs/PROVENANCE.md)
 in redistributions. Run `bun run icons` after editing the logo source.

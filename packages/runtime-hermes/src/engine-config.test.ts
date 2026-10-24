@@ -113,6 +113,152 @@ test('this change turns nothing else on', () => {
   expect(config.terminal).toBeUndefined();
 });
 
+test('the producer output ceiling reaches rendered config and boot environment without changing context caps', () => {
+  for (const maxOutputTokens of [1, 512, 4096, 8192]) {
+    const options = { ...base, maxOutputTokens };
+    const config = renderEngineConfig(options) as Record<string, Record<string, unknown>>;
+    const unchanged = renderEngineConfig(base) as Record<string, Record<string, unknown>>;
+    const headers = { 'x-openduet-clamp-output': '1' };
+    expect(config.model).toEqual({
+      ...unchanged.model,
+      max_tokens: maxOutputTokens,
+      extra_headers: headers,
+    });
+    expect(gatewayEntry(config).extra_headers).toEqual(headers);
+    expect(config.compression).toEqual(unchanged.compression);
+    expect(engineConfigEnvironment(options)).toEqual({
+      ...engineConfigEnvironment(base),
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: String(maxOutputTokens),
+    });
+    expect(
+      engineSettingsFromEnvironment({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: String(maxOutputTokens) }),
+    ).toMatchObject({ maxOutputTokens });
+  }
+  expect(engineConfigEnvironment(base)).not.toHaveProperty('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS');
+  expect(engineSettingsFromEnvironment({})).not.toHaveProperty('maxOutputTokens');
+});
+
+test('output ceiling negotiation survives adding the attempt capability to a spare', () => {
+  const spare = renderEngineConfig({ ...base, maxOutputTokens: 512 }) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  const handed = renderEngineConfig({
+    ...base,
+    maxOutputTokens: 512,
+    capability: 'attempt-token',
+  }) as Record<string, Record<string, unknown>>;
+  const headers = { 'x-openduet-clamp-output': '1', 'x-openduet-capability': 'attempt-token' };
+  expect(spare.model?.extra_headers).toEqual({ 'x-openduet-clamp-output': '1' });
+  expect(gatewayEntry(spare).extra_headers).toEqual({ 'x-openduet-clamp-output': '1' });
+  expect(handed.model?.extra_headers).toEqual(headers);
+  expect(gatewayEntry(handed).extra_headers).toEqual(headers);
+});
+
+test('invalid output ceilings are refused before engine configuration or environment is produced', () => {
+  for (const maxOutputTokens of [
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    expect(() => renderEngineConfig({ ...base, maxOutputTokens })).toThrow(RangeError);
+    expect(() => engineConfigEnvironment({ ...base, maxOutputTokens })).toThrow(RangeError);
+  }
+  for (const value of [
+    '0',
+    '-1',
+    '1.5',
+    '1e3',
+    'NaN',
+    'Infinity',
+    ' 512',
+    '512 ',
+    '+512',
+    '9007199254740992',
+    '１２',
+  ]) {
+    expect(() =>
+      engineSettingsFromEnvironment({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: value }),
+    ).toThrow(RangeError);
+  }
+});
+
+test('the dedicated output ceiling overrides the existing operator default without adding a new default', () => {
+  expect(
+    engineSettingsFromEnvironment({ OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '256' }),
+  ).toMatchObject({
+    maxOutputTokens: 256,
+  });
+  expect(
+    engineSettingsFromEnvironment({
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '512',
+      OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '256',
+    }),
+  ).toMatchObject({ maxOutputTokens: 512 });
+  expect(
+    engineSettingsFromEnvironment({
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '512',
+      OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: 'invalid',
+    }),
+  ).toMatchObject({ maxOutputTokens: 512 });
+  expect(engineSettingsFromEnvironment({})).not.toHaveProperty('maxOutputTokens');
+  expect(
+    engineSettingsFromEnvironment({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '' }),
+  ).not.toHaveProperty('maxOutputTokens');
+  expect(
+    engineSettingsFromEnvironment({
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '',
+      OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '256',
+    }),
+  ).toMatchObject({ maxOutputTokens: 256 });
+  // The existing nonoptional default rejects an empty value outside Compose,
+  // whose :-4096 interpolation supplies its fallback before the service boots.
+  expect(() => engineSettingsFromEnvironment({ OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '' })).toThrow(
+    'OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS',
+  );
+  expect(() =>
+    engineSettingsFromEnvironment({
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: '',
+      OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '',
+    }),
+  ).toThrow('OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS');
+  for (const value of ['0', '-1', '1.5', 'many', 'NaN', 'Infinity', '9007199254740992']) {
+    expect(() =>
+      engineSettingsFromEnvironment({ OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: value }),
+    ).toThrow('OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS');
+    expect(() =>
+      engineSettingsFromEnvironment({
+        OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: value,
+        OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: '256',
+      }),
+    ).toThrow('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS');
+  }
+});
+
+test('legacy default output formats reach the renderer while a nonblank engine override stays strict', () => {
+  for (const value of ['1e3', ' 512 ', '0x200', '+512', '1.0']) {
+    for (const dedicated of [undefined, '']) {
+      const settings = engineSettingsFromEnvironment({
+        OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: dedicated,
+        OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS: value,
+      });
+      expect(settings.maxOutputTokens).toBe(Number(value));
+      expect(renderEngineConfig({ ...base, ...settings })).toMatchObject({
+        model: { max_tokens: Number(value) },
+      });
+      expect(
+        engineConfigEnvironment({ ...base, ...settings }).OPENDUET_ENGINE_MAX_OUTPUT_TOKENS,
+      ).toBe(String(Number(value)));
+    }
+    expect(() =>
+      engineSettingsFromEnvironment({ OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: value }),
+    ).toThrow('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS');
+  }
+});
+
 test('a feature switch renders the section it belongs to and nothing else', () => {
   const config = renderEngineConfig({
     ...base,

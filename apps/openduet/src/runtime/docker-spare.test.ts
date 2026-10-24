@@ -263,7 +263,7 @@ describe('Docker spare engines', () => {
     const coldMs = await timeToFirstRun(cold, bundle(0));
     const warm = await setup({ spares: 1, bootMs: 600 });
     await warm.runtime.initialize();
-    warm.runtime.warm(bundle().model);
+    warm.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     // The spare loads while nothing waits for it.
     await until(() => warm.engines.calls.some((call) => call.path.endsWith('/start')));
     await Bun.sleep(700);
@@ -278,7 +278,7 @@ describe('Docker spare engines', () => {
   test("a spare is started with nothing of an attempt and handed exactly the attempt's values", async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await until(() => f.engines.spares().length === 1);
     const [spare] = f.engines.spares();
     if (!spare) throw new Error('No spare');
@@ -289,6 +289,7 @@ describe('Docker spare engines', () => {
       `OPENDUET_RUNTIME_SPARE_KEYS=${CONTAINER_ATTEMPT_KEYS.join(',')}`,
     );
     expect(spare.config.Env).toContain('OPENDUET_MODEL_PROVIDER=fake');
+    expect(spare.config.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=1000');
     expect(Object.keys(spare.config.Labels).sort()).toEqual([
       'com.openduet.attempt-supervisor',
       'com.openduet.project',
@@ -333,7 +334,7 @@ describe('Docker spare engines', () => {
     await mkdir(join(job, 'notes'), { recursive: true });
     await writeFile(join(job, 'notes', 'draft.md'), 'kept');
     await writeFile(join(job, 'report.txt'), 'also kept');
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await until(() => f.engines.spares().length === 1);
     const subpath =
       f.engines.spares()[0]?.config.HostConfig.Mounts[0]?.VolumeOptions?.Subpath ?? '';
@@ -351,7 +352,7 @@ describe('Docker spare engines', () => {
   test('a new job takes the spare directory whole', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     await f.runtime.start(bundle(3), f.sink, new AbortController().signal);
     expect((await readdir(f.root)).sort()).toContain(identity('job', 3));
@@ -360,7 +361,7 @@ describe('Docker spare engines', () => {
   test('no container serves two attempts, and a spare is ready again for the next', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     await f.runtime.start(bundle(0), f.sink, new AbortController().signal);
     await Bun.sleep(400);
@@ -380,7 +381,7 @@ describe('Docker spare engines', () => {
   test('an attempt for another model starts its own engine, and the spare follows it', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     const [first] = f.engines.spares();
     await f.runtime.start(bundle(0, 'other-model'), f.sink, new AbortController().signal);
@@ -394,11 +395,34 @@ describe('Docker spare engines', () => {
     expect(next?.config.Env).toContain('OPENDUET_MODEL_NAME=other-model');
   });
 
+  test('a spare with a larger output ceiling is not reused for a smaller attempt budget', async () => {
+    const f = await setup();
+    await f.runtime.initialize();
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
+    await until(() => f.engines.spares().length === 1);
+    await Bun.sleep(400);
+    const [first] = f.engines.spares();
+    expect(first?.config.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=1000');
+    const bounded = bundle();
+    bounded.budget = { ...bounded.budget, max_output_tokens: 512 };
+    await f.runtime.start(bounded, f.sink, new AbortController().signal);
+    expect(first?.handoff).toBeUndefined();
+    await until(() => first?.removed === true);
+    const own = f.engines.containers.find(
+      (entry) => !entry.config.Env.includes('OPENDUET_RUNTIME_SPARE=1'),
+    );
+    expect(own?.config.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=512');
+    expect(own?.config.Env).toContain('OPENDUET_ATTEMPT_TOKEN=capability-of-attempt-0');
+    expect(f.engines.spares().find((entry) => !entry.removed)?.config.Env).toContain(
+      'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=512',
+    );
+  });
+
   test('a spare that read its attempt while loading turns spares off', async () => {
     const f = await setup();
     f.engines.spareExit = 3;
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await until(() => f.engines.spares()[0]?.removed === true);
     await f.runtime.start(bundle(0), f.sink, new AbortController().signal);
     await f.runtime.start(bundle(1), f.sink, new AbortController().signal);
@@ -409,7 +433,7 @@ describe('Docker spare engines', () => {
   test('shutdown removes a spare and its directory, loaded or not', async () => {
     const f = await setup({ bootMs: 10_000 });
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await until(() => f.engines.spares().length === 1);
     await f.runtime.close();
     expect(f.engines.spares()[0]?.removed).toBe(true);
@@ -514,12 +538,12 @@ describe('an engine got ready while the attempt is put together', () => {
   test('the handoff and the engine coming up overlap the bundle being put together', async () => {
     const after = await setup({ spares: 1, bootMs: 300, serveMs: 400 });
     await after.runtime.initialize();
-    after.runtime.warm(bundle().model);
+    after.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(450);
     const sequentialMs = await firstRunAfter(after, bundle(0), 400, false);
     const ahead = await setup({ spares: 1, bootMs: 300, serveMs: 400 });
     await ahead.runtime.initialize();
-    ahead.runtime.warm(bundle().model);
+    ahead.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(450);
     const overlappedMs = await firstRunAfter(ahead, bundle(1), 400, true);
     process.stdout.write(
@@ -550,7 +574,7 @@ describe('an engine got ready while the attempt is put together', () => {
   test('an attempt that never starts gives its engine up, and its job takes the next spare', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     const [first] = f.engines.spares();
     const giveUp = f.runtime.prepare(bundle(0), new AbortController().signal);
@@ -579,7 +603,7 @@ describe('an engine got ready while the attempt is put together', () => {
   test('a bundle that now asks for another engine gets one of its own', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     const signal = new AbortController().signal;
     const giveUp = f.runtime.prepare(bundle(0), signal);
@@ -598,7 +622,7 @@ describe('an engine got ready while the attempt is put together', () => {
   test('shutdown removes an engine got ready for an attempt that has not started', async () => {
     const f = await setup();
     await f.runtime.initialize();
-    f.runtime.warm(bundle().model);
+    f.runtime.warm(bundle().model, bundle().tools, bundle().budget);
     await Bun.sleep(400);
     const [first] = f.engines.spares();
     f.runtime.prepare(bundle(0), new AbortController().signal);

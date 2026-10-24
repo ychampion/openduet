@@ -2026,12 +2026,20 @@ and Wikipedia then answers with encyclopedia articles only. For a hosted or
 shared installation, set `TAVILY_API_KEY` or `BRAVE_SEARCH_API_KEY`.
 
 `OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS` (default `4096`) is the output limit the
-gateway gives a model request that names none. The runtime names none unless its
-own configuration sets one, so this is the usual ceiling on one reply; a few
-hundred tokens truncates ordinary answers. The limit is reserved against the
-job's output budget until the call settles at its real usage, and it is lowered
-to what the job has left rather than refused. A limit the runtime does name is
-never rewritten: it is honoured, or refused when it exceeds the job's budget.
+gateway gives a model request that names none and the usual Hermes reply ceiling.
+`OPENDUET_ENGINE_MAX_OUTPUT_TOKENS` can override that ceiling for Hermes alone.
+Both process and Docker engines receive an explicit ceiling bounded by the
+attempt's total output allowance. This also supports Anthropic clients, which
+must name a limit on every call. The model compatibility check uses `512` per
+response so its small total allowance can cover inference and a tool round.
+
+Hermes permits the gateway to lower this ceiling to the output allowance left
+after earlier calls. The reservation and settlement still enforce the job's
+total token and spending caps, including concurrent calls. Other clients' named
+limits remain exact unless they explicitly opt into lowering with
+`x-openduet-clamp-output: 1`; oversized or exhausted requests are refused.
+A few hundred tokens can truncate ordinary answers, so keep the small
+compatibility-check limit separate from your normal reply setting.
 
 ### Connecting a model in the app
 

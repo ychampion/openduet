@@ -2,8 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { engineSettingsFromEnvironment, renderEngineConfig } from '@openduet/runtime-hermes';
 import { parse, stringify } from 'yaml';
+import { loadEnv } from '../../apps/openduet/src/env.ts';
 import { ATTEMPT_LOG_CONFIG } from '../../apps/openduet/src/runtime/docker.ts';
+import { runtimeOutputLimit } from '../../apps/openduet/src/runtime/output-limit.ts';
 import {
   type ComposeFile,
   type ComposeLogging,
@@ -76,6 +79,36 @@ function interpolate(text: string, env: Record<string, string>): string {
   }
   return out;
 }
+
+test('Compose forwards the engine reply ceiling, preserving blank fallback and the total budget', () => {
+  const environment = compose.services?.openduet?.environment ?? {};
+  const name = 'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS';
+  const fallback = 'OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS';
+  const scenarios: Array<[Record<string, string>, number | undefined, number]> = [
+    [{}, undefined, 4096],
+    [{ [name]: '', [fallback]: '256' }, undefined, 256],
+    [{ [name]: '512', [fallback]: '256' }, 512, 512],
+    [{ [name]: '', [fallback]: '' }, undefined, 4096],
+  ];
+  for (const [settings, dedicated, expected] of scenarios) {
+    const forwarded = Object.fromEntries(
+      [name, fallback].map((key) => [key, interpolate(String(environment[key]), settings)]),
+    );
+    const validated = loadEnv(forwarded);
+    expect(validated.OPENDUET_ENGINE_MAX_OUTPUT_TOKENS).toBe(dedicated);
+    const output = engineSettingsFromEnvironment(forwarded).maxOutputTokens;
+    expect(output).toBe(expected);
+    const config = renderEngineConfig({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      brokerUrl: 'http://openduet:8788',
+      maxOutputTokens: runtimeOutputLimit({ max_output_tokens: 128 }, output),
+    });
+    expect(config).toMatchObject({
+      model: { max_tokens: 128, extra_headers: { 'x-openduet-clamp-output': '1' } },
+    });
+  }
+});
 
 describe('the image names', () => {
   const resolved = (env: Record<string, string>) =>
@@ -286,9 +319,11 @@ describe('the check catches the mistakes that would matter', () => {
   test('a setting the service reads but is not handed', () => {
     const name = 'the service receives every setting it reads';
     expect(failures(compose)).not.toContain(name);
-    const dropped: ComposeFile = structuredClone(compose);
-    delete dropped.services?.openduet?.environment?.OPENDUET_LOCAL_MODEL_URL;
-    expect(failures(dropped)).toContain(name);
+    for (const setting of ['OPENDUET_LOCAL_MODEL_URL', 'OPENDUET_ENGINE_MAX_OUTPUT_TOKENS']) {
+      const dropped: ComposeFile = structuredClone(compose);
+      delete dropped.services?.openduet?.environment?.[setting];
+      expect(failures(dropped)).toContain(name);
+    }
     // Each exception is a setting the service really reads.
     for (const setting of Object.keys(SETTINGS_NOT_FROM_DEPLOY_ENV))
       expect(SERVICE_SETTINGS).toContain(setting);

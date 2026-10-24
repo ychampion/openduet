@@ -2,6 +2,7 @@
 import builtins
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -36,6 +37,7 @@ def boot(tmp_path, monkeypatch, template_config, environment):
         "OPENDUET_ENGINE_CONTEXT_LENGTH",
         "OPENDUET_ENGINE_COMPACTION_THRESHOLD",
         "OPENDUET_ENGINE_MAX_TURNS",
+        "OPENDUET_ENGINE_MAX_OUTPUT_TOKENS",
         "OPENDUET_MODEL_API_MODE",
         "OPENDUET_ENGINE_SUPPORTS_VISION",
         "TERMINAL_ENV",
@@ -120,6 +122,56 @@ def test_boot_config_keeps_the_image_defaults_when_nothing_is_passed(tmp_path, m
     assert config["model"]["context_length"] == 1000000
     assert config["compression"]["threshold_tokens"] == 200000
     assert config["agent"]["max_turns"] == 150
+    assert config["model"]["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize("limit", [1, 512, 4096, 8192])
+def test_boot_config_applies_the_rendered_output_ceiling(tmp_path, monkeypatch, limit):
+    config = boot(tmp_path, monkeypatch, TEMPLATE, {
+        **BASE_ENVIRONMENT,
+        "OPENDUET_ENGINE_MAX_OUTPUT_TOKENS": str(limit),
+    })
+    assert config["model"]["max_tokens"] == limit
+    headers = {"x-openduet-capability": "fixture-capability", "x-openduet-clamp-output": "1"}
+    assert config["model"]["extra_headers"] == headers
+    assert config["providers"]["openduet-gateway"]["extra_headers"] == headers
+    assert config["model"]["context_length"] == TEMPLATE["model"]["context_length"]
+    assert config["compression"] == TEMPLATE["compression"]
+
+
+def test_boot_does_not_add_an_output_ceiling_when_absent_from_image_and_environment(tmp_path, monkeypatch):
+    template = {**TEMPLATE, "model": {"context_length": 1000000}}
+    config = boot(tmp_path, monkeypatch, template, BASE_ENVIRONMENT)
+    assert "max_tokens" not in config["model"]
+
+
+def test_output_ceiling_boot_matches_the_shared_renderer(tmp_path, monkeypatch):
+    """The container boot and process renderer must request the same bounded output."""
+    rendered = subprocess.run([
+        "bun", "--eval", """
+        import {engineConfigEnvironment, renderEngineConfig} from './src/engine-config.ts';
+        const base = {provider: 'fireworks', model: 'accounts/fireworks/models/deepseek-v4p1-flash', brokerUrl: 'http://broker:19188'};
+        const bounded = {...base, maxOutputTokens: 512};
+        console.log(JSON.stringify({
+          template: renderEngineConfig(base),
+          environment: engineConfigEnvironment(bounded),
+          expected: renderEngineConfig({...bounded, capability: 'fixture-capability'}),
+        }));
+        """,
+    ], cwd=Path(__file__).parents[1], capture_output=True, text=True, check=True)
+    values = json.loads(rendered.stdout)
+    config = boot(tmp_path, monkeypatch, values["template"], {
+        **BASE_ENVIRONMENT, **values["environment"],
+    })
+    assert config == values["expected"]
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "1.5", "1e3", "NaN", "Infinity", " 512", "512 ", "+512", "9007199254740992", "１２"])
+def test_boot_refuses_an_invalid_output_ceiling(tmp_path, monkeypatch, value):
+    with pytest.raises(SystemExit, match="OPENDUET_ENGINE_MAX_OUTPUT_TOKENS"):
+        boot(tmp_path, monkeypatch, TEMPLATE, {
+            **BASE_ENVIRONMENT, "OPENDUET_ENGINE_MAX_OUTPUT_TOKENS": value,
+        })
 
 
 @pytest.mark.parametrize("variable", [

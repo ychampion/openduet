@@ -203,6 +203,8 @@ withDb('recall answers this message', () => {
     for (const embedding of [undefined, failing]) {
       const options = {
         includeProfile: true,
+        // This checks retrieval correctness; allow shared integration DB contention.
+        deadlineMs: 3000,
         ...(embedding ? { embedding, onError: () => {} } : {}),
       };
       const dinner = await recall(

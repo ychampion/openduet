@@ -22,6 +22,7 @@ import { modelApiMode } from '../gateway/providers.ts';
 import { newId } from '../ids.ts';
 import { ATTEMPT_LOG_CONFIG } from './docker.ts';
 import { EngineRegistry, type ProcessTable } from './engines.ts';
+import { runtimeOutputLimit } from './output-limit.ts';
 import { resolvePython } from './python.ts';
 import { jobWorkspace } from './workspace-fs.ts';
 
@@ -56,6 +57,8 @@ export type SupervisorOptions = {
   python: string;
   runtimePackage: string;
   startupTimeoutMs?: number;
+  /** Per-response ceiling; a compatibility check needs room for several small calls. */
+  maxOutputTokens?: number;
   dockerImage: string;
   dockerNetwork: string;
   dockerWorkVolume: string;
@@ -291,7 +294,7 @@ export class ProcessRuntimeSupervisor implements RuntimeSupervisor {
     budget?: AttemptBundle['budget'],
   ): void {
     if (!this.prewarm || this.spare || this.shutdown.signal.aborted) return;
-    const config = this.engineConfig(model, attemptEngineFeatures(tools, budget));
+    const config = this.engineConfig(model, attemptEngineFeatures(tools, budget), budget);
     const abandoned = new AbortController();
     const engine = this.startSpare(config, abandoned.signal).catch((error: unknown) => {
       process.stderr.write(
@@ -322,8 +325,10 @@ export class ProcessRuntimeSupervisor implements RuntimeSupervisor {
   private engineConfig(
     model: AttemptBundle['model'],
     features: ReturnType<typeof attemptEngineFeatures>,
+    budget?: AttemptBundle['budget'],
     capability?: string,
   ): EngineConfig {
+    const settings = engineSettingsFromEnvironment();
     return renderEngineConfig({
       provider: encodeURIComponent(model.provider),
       model: model.model,
@@ -331,7 +336,11 @@ export class ProcessRuntimeSupervisor implements RuntimeSupervisor {
       modelApiMode: modelApiMode(model.provider, model.model),
       capability,
       vision: model.vision,
-      ...engineSettingsFromEnvironment(),
+      ...settings,
+      maxOutputTokens: runtimeOutputLimit(
+        budget,
+        this.options.maxOutputTokens ?? settings.maxOutputTokens,
+      ),
       // A space with a sandbox runs the engine's terminal there, and only there.
       features,
     });
@@ -602,13 +611,16 @@ export class ProcessRuntimeSupervisor implements RuntimeSupervisor {
     await moveJobScreens(this.options.workRoot, bundle.attempt.job_id);
     const token = randomBytes(32).toString('base64url');
     const features = attemptEngineFeatures(bundle.tools, bundle.budget);
-    const config = this.engineConfig(bundle.model, features, bundle.attempt.token);
+    const config = this.engineConfig(bundle.model, features, bundle.budget, bundle.attempt.token);
     const attempt: Record<string, string> = {
       ...attemptEnvironment(bundle, this.options.brokerUrl, token),
       TERMINAL_CWD: workspace,
     };
     let engine = this.prewarm
-      ? await this.takeSpare(JSON.stringify(this.engineConfig(bundle.model, features)), signal)
+      ? await this.takeSpare(
+          JSON.stringify(this.engineConfig(bundle.model, features, bundle.budget)),
+          signal,
+        )
       : undefined;
     try {
       if (engine) {
@@ -804,6 +816,12 @@ export class DockerRuntimeSupervisor implements RuntimeSupervisor {
     const token = randomBytes(32).toString('base64url');
     const environment = {
       ...attemptEnvironment(bundle, this.options.brokerUrl, token),
+      OPENDUET_ENGINE_MAX_OUTPUT_TOKENS: String(
+        runtimeOutputLimit(
+          bundle.budget,
+          this.options.maxOutputTokens ?? engineSettingsFromEnvironment().maxOutputTokens,
+        ),
+      ),
       API_SERVER_HOST: '0.0.0.0',
       API_SERVER_PORT: '8790',
       HERMES_HOME: '/var/lib/hermes',

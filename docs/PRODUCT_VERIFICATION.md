@@ -1,5 +1,10 @@
 # Personal assistant update: verification
 
+The [October 24 live-model runs](LIVE_MODEL_VERIFICATION.md) add real provider
+evidence for automatic correction learning, a separate task using that correction,
+and native scheduled work completing with the browser and web server stopped.
+The earlier regression evidence below remains scoped to its recorded revision.
+
 The subsequent [always-on collaboration update](ALWAYS_ON.md) has its own
 operation guide, checks and media. The revision below covers the earlier
 personal Chat/Work/Explore delivery.

@@ -356,16 +356,52 @@ def attach_helper_parked(result: Any) -> Any:
     return json.dumps(data, ensure_ascii=False)
 
 
+def _gateway_address(base_url: Any) -> bool:
+    broker = os.environ.get("OPENDUET_BROKER_URL", "").rstrip("/")
+    if not broker or not isinstance(base_url, str):
+        return False
+    address = base_url.rstrip("/")
+    return address == broker or address.startswith(broker + "/")
+
+
+def _gateway_output_ceiling() -> int | None:
+    try:
+        from hermes_cli.runtime_provider import _get_model_config
+    except ImportError:
+        return None
+    model = _get_model_config()
+    ceiling = model.get("max_tokens")
+    configured_headers = model.get("extra_headers")
+    if (type(ceiling) is int and 0 < ceiling <= 9007199254740991
+            and isinstance(configured_headers, dict)
+            and configured_headers.get("x-openduet-clamp-output") == "1"):
+        return ceiling
+    return None
+
+
 def gateway_headers(base_url: Any) -> dict[str, str]:
-    """The attempt's capability header for a model client pointed at OpenDuet's
+    """The attempt's gateway headers for a model client pointed at OpenDuet's
     broker, and nothing for any other address, so the capability never goes to
     a third party. Read when the client is built: a spare engine has no
     capability until its attempt is handed over."""
     token = os.environ.get("OPENDUET_ATTEMPT_TOKEN", "")
-    broker = os.environ.get("OPENDUET_BROKER_URL", "").rstrip("/")
-    if not token or not broker or not isinstance(base_url, str):
+    if not token or not _gateway_address(base_url):
         return {}
-    address = base_url.rstrip("/")
-    if address == broker or address.startswith(broker + "/"):
-        return {"x-openduet-capability": token}
-    return {}
+    headers = {"x-openduet-capability": token}
+    # Native Anthropic clients do not read the configured extra headers.
+    # Read at construction so a spare uses the handed-over configuration.
+    if _gateway_output_ceiling() is not None:
+        headers["x-openduet-clamp-output"] = "1"
+    return headers
+
+
+def gateway_output_tokens(base_url: Any, requested: int | None) -> int | None:
+    """Fill an omitted native auxiliary limit only for the owned gateway.
+
+    Anthropic requires a limit on the wire. Without this, its auxiliary adapter
+    inserts the model's much larger default before the gateway sees the request.
+    Explicit limits and clients without a configured opt-in retain their behavior.
+    """
+    if requested is not None or not os.environ.get("OPENDUET_ATTEMPT_TOKEN") or not _gateway_address(base_url):
+        return requested
+    return _gateway_output_ceiling()

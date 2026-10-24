@@ -141,6 +141,7 @@ async function setup(
   brokerPort?: number,
   instance?: InstanceView,
   shared?: string,
+  maxOutputTokens?: number,
 ) {
   const root = shared ?? (await mkdtemp(join(tmpdir(), 'openduet-supervisor-test-')));
   const daemon = new Daemon();
@@ -162,6 +163,7 @@ async function setup(
     pendingWait,
     brokerPort,
     instance,
+    maxOutputTokens,
     fetch: async (url) => {
       httpCalls.push(url);
       if (mode.unavailable) throw new Error('Not listening yet');
@@ -251,6 +253,7 @@ describe('Docker attempt supervision', () => {
     ]);
     expect(child?.Env).toContain('OPENDUET_ATTEMPT_TOKEN=only-this-attempt');
     expect(child?.Env).toContain('OPENDUET_MODEL_PROVIDER=fake');
+    expect(child?.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=1000');
     expect(child?.Env).not.toContain('OPENDUET_APPROVAL_KEY=');
     expect(JSON.stringify(child)).not.toContain('docker.sock');
     expect(f.daemon.calls.find((call) => call.path === '/networks/create')?.body).toMatchObject({
@@ -270,6 +273,16 @@ describe('Docker attempt supervision', () => {
       'networks',
       'volumes',
     ]);
+  });
+
+  test('a compatibility ceiling fits several calls and cannot exceed the attempt budget', async () => {
+    const f = await setup(undefined, undefined, undefined, undefined, 512);
+    await f.runtime.start(bundle(), f.sink, new AbortController().signal);
+    expect(f.daemon.created[0]?.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=512');
+    const smaller = bundle(1);
+    smaller.budget.max_output_tokens = 128;
+    await f.runtime.start(smaller, f.sink, new AbortController().signal);
+    expect(f.daemon.created[1]?.Env).toContain('OPENDUET_ENGINE_MAX_OUTPUT_TOKENS=128');
   });
 
   test('an attempt container reaches the broker on the port the service binds', async () => {

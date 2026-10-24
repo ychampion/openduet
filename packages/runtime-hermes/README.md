@@ -33,6 +33,21 @@ since unset means unlimited; the tool-loop hard stop on by name, because the
 engine counts this platform as attended and would otherwise only warn; and model
 traffic pointed at OpenDuet's gateway.
 
+The supervisors also supply a per-response output ceiling: normally `4096`,
+bounded by the attempt's total output allowance. An operator's
+`OPENDUET_ENGINE_MAX_OUTPUT_TOKENS` takes precedence over
+`OPENDUET_DEFAULT_MAX_OUTPUT_TOKENS`. The hash-checked gateway constructor seam
+passes the ceiling into the actual agent, including the native Anthropic client.
+Both protocol clients permit the gateway to lower it as earlier calls spend the
+attempt's allowance. Image boot, process launch and spare handoff preserve the
+same setting; the gateway still reserves and settles every call against the
+job's total budget. Compatibility checks use a separate `512`-token ceiling.
+Native Anthropic compaction calls omit their output limit upstream; an audited
+auxiliary-adapter seam fills that omission from the same configured ceiling,
+before the model's larger native default is inserted. The seam applies only to
+authenticated OpenDuet gateway clients with the explicit clamp opt-in; existing
+explicit auxiliary limits and configurations without a ceiling remain unchanged.
+
 The two built-ins act only inside the engine. `todo` keeps a task list in the
 agent's memory for work with several steps, in every attempt. `delegation` runs
 helpers inside the same turn, and only for an attempt whose budget is a
@@ -78,14 +93,16 @@ own bundled skills are never copied into an attempt's home.
 The boot script adds only what belongs to one attempt: the capability, the model
 it was granted, and the window and trigger that follow from that model. The
 image also applies
-`patches/observer_bridge.py`: ten source hashes must match the audited pin or
+`patches/observer_bridge.py`: twelve source hashes must match the audited pin or
 the identical reviewed patch. It gives the engine's Anthropic client the
 attempt's capability header for calls to the broker (that client ignores the
-provider's extra headers), adds a real compaction dispatch, binds plugin
-observations to the current HTTP run queue, puts the model's reasoning on the
-run's event stream as `reasoning.delta`, keeps the agent's own screenshot in
-the session store and puts a paired computer's back from the broker when the
-next run of the same session reads its history (the engine stores a picture as
+provider's extra headers), carries the configured output ceiling into gateway
+agents and omitted native Anthropic auxiliary limits, adds a real compaction
+dispatch, binds plugin observations to the current HTTP run queue, puts the
+model's reasoning on the run's event stream as `reasoning.delta`, keeps the
+agent's own screenshot in the session store and puts a paired computer's back
+from the broker when the next run of the same session reads its history (the
+engine stores a picture as
 the word "[screenshot]", and code the agent runs can read that store), and, when
 `agent.host_prompt` is false, leaves the engine's product pointer, profile line
 and host runtime block out of the system prompt. It also keeps a delegation

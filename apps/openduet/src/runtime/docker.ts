@@ -29,6 +29,7 @@ import {
   DockerSocketApi,
   LocalCellHost,
 } from './cell-host-local.ts';
+import { runtimeOutputLimit } from './output-limit.ts';
 
 export {
   ATTEMPT_LOG_CONFIG,
@@ -73,6 +74,8 @@ export type DockerRuntimeOptions = {
   /** The port the service's broker binds. Cells reach it as `openduet` on their own network. */
   brokerPort?: number;
   startTimeoutMs?: number;
+  /** Per-response ceiling, still bounded by the attempt's total output allowance. */
+  maxOutputTokens?: number;
   /**
    * How many engine containers are kept loaded ahead of the next attempts.
    * Each holds an idle engine's memory and saves an attempt the engine's start.
@@ -224,6 +227,7 @@ export class DockerHermesRuntimeAdapter implements RuntimeAdapter {
     budget?: AttemptBundle['budget'],
   ): EngineSetup {
     const broker = this.brokerUrl();
+    const settings = engineSettingsFromEnvironment();
     const environment = [
       `OPENDUET_MODEL_PROVIDER=${model.provider}`,
       `OPENDUET_MODEL_NAME=${model.model}`,
@@ -237,7 +241,11 @@ export class DockerHermesRuntimeAdapter implements RuntimeAdapter {
           model: model.model,
           brokerUrl: broker,
           vision: model.vision,
-          ...engineSettingsFromEnvironment(),
+          ...settings,
+          maxOutputTokens: runtimeOutputLimit(
+            budget,
+            this.options.maxOutputTokens ?? settings.maxOutputTokens,
+          ),
           // TERMINAL_ENV, when the space has a sandbox; the boot script
           // writes the terminal section from it and refuses any other.
           features: attemptEngineFeatures(tools, budget),

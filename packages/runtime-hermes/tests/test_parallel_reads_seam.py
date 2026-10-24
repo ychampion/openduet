@@ -85,7 +85,13 @@ def test_the_seam_applies_to_the_pinned_source_and_again_to_its_own_result():
 
 def test_web_lookups_in_one_batch_run_together_and_the_rest_keep_their_order(monkeypatch):
     module = bridge()
-    source = engine_source()
+    expected_hash, changes = module.PATCHES[NAME]
+    # The installed engine may already have this seam; compare with its audited
+    # original in memory so the differential probe never changes that checkout.
+    reviewed = module.patched(engine_source(), expected_hash, changes)
+    source = module.restored(reviewed, changes)
+    assert source is not None
+    assert module.digest(source) == expected_hash
     lookups = [call("web.fetch", url=f"https://example.test/{n}") for n in range(3)]
 
     # At the pin they are read one after another.

@@ -349,6 +349,55 @@ describe('model gateway effect boundary', () => {
     expect(pastTheCap.status).toBe(413);
   });
 
+  test.each([
+    ['anthropic', 'fixture-messages', 'messages', 'max_tokens'],
+    ['openai', 'fixture-chat', 'chat/completions', 'max_completion_tokens'],
+    ['openai', 'gpt-6-astra', 'responses', 'max_output_tokens'],
+  ])(
+    'an opted-in %s %s ceiling shrinks after a settled tool-loop call',
+    async (provider, model, protocol, field) => {
+      const sent: Record<string, unknown>[] = [];
+      let budget: TestBudget;
+      const f = await start({
+        authenticate: async () => ({
+          ...principal,
+          maxTokens: 1000,
+          remainingTokens: 1000 - budget.spent,
+        }),
+        fetch: async (request) => {
+          expect(request.headers.has('x-openduet-clamp-output')).toBe(false);
+          sent.push((await request.json()) as Record<string, unknown>);
+          return Response.json({
+            model,
+            choices: [],
+            content: [],
+            output: [],
+            usage: { prompt_tokens: 5, completion_tokens: 50, input_tokens: 5, output_tokens: 50 },
+          });
+        },
+      });
+      budget = f.budget;
+      const path = `/providers/${provider}/v1/${protocol}`;
+      const body = { model, max_tokens: 1000, messages: [] };
+      const headers = { 'x-openduet-clamp-output': '1' };
+      const first = await f.post(path, body, headers);
+      expect(first.status).toBe(200);
+      await first.json();
+      expect(budget.spent).toBe(50);
+      // Without the explicit opt-in, a client's named limit is still exact.
+      expect((await f.post(path, body)).status).toBe(429);
+      const next = await f.post(path, body, headers);
+      expect(next.status).toBe(200);
+      await next.json();
+      expect(sent.map((call) => call[field])).toEqual([1000, 950]);
+      expect(budget.reservations.map((call) => call.maxOutputTokens)).toEqual([1000, 950]);
+      expect((await f.post(path, { ...body, max_tokens: 1001 }, headers)).status).toBe(429);
+      budget.spent = 1000;
+      expect((await f.post(path, body, headers)).status).toBe(429);
+      expect(sent).toHaveLength(2);
+    },
+  );
+
   test('a request without an output limit gets the configured default, within what the attempt may spend', async () => {
     const sent: Record<string, unknown>[] = [];
     const upstream = async (request: Request) => {

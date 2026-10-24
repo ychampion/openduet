@@ -264,7 +264,13 @@ withDb('semantic recall', () => {
     });
     // The lexical index is still built.
     await buildViews(db.sql, scope, failing);
-    const result = await recall(db.sql, scope, { query: 'teal' }, { embedding: failing });
+    // This checks lexical fallback, with headroom for shared integration DB contention.
+    const result = await recall(
+      db.sql,
+      scope,
+      { query: 'teal' },
+      { embedding: failing, deadlineMs: 3000 },
+    );
     expect(result.status).not.toBe('unavailable');
     expect(result.recipe).toBe('simple-lexical-v1');
     expect(result.items[0]?.content).toBe('teal');

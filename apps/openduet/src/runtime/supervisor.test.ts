@@ -135,14 +135,21 @@ server.serve_forever()
         provider: 'openduet-gateway',
         default: 'scripted',
         context_length: 128_000,
+        max_tokens: bundle.budget.max_output_tokens,
         supports_vision: false,
-        extra_headers: { 'x-openduet-capability': bundle.attempt.token },
+        extra_headers: {
+          'x-openduet-capability': bundle.attempt.token,
+          'x-openduet-clamp-output': '1',
+        },
       });
       expect(Object.keys(config.providers)).toEqual(['openduet-gateway']);
       expect(config.providers['openduet-gateway']).toMatchObject({
         base_url: 'http://openduet:8788/providers/fake/v1',
         key_env: 'OPENDUET_MODEL_KEY',
-        extra_headers: { 'x-openduet-capability': bundle.attempt.token },
+        extra_headers: {
+          'x-openduet-capability': bundle.attempt.token,
+          'x-openduet-clamp-output': '1',
+        },
       });
       // Nothing about this path renders a different engine from the container's.
       expect(config.memory).toEqual({
@@ -541,7 +548,7 @@ server.serve_forever()
     test('takes the attempt it was prepared for, as if it had started with it', async () => {
       const { root, supervisor, seen, records } = await fixture('ready');
       try {
-        supervisor.warm(bundle.model);
+        supervisor.warm(bundle.model, bundle.tools, bundle.budget);
         const instance = await supervisor.launch(
           { ...bundle, time_zone: 'Pacific/Chatham' },
           new AbortController().signal,
@@ -558,7 +565,12 @@ server.serve_forever()
         // The configuration it started from carries this attempt's capability.
         expect(parse(engine.config).model.extra_headers).toEqual({
           'x-openduet-capability': bundle.attempt.token,
+          'x-openduet-clamp-output': '1',
         });
+        expect(parse(engine.config).providers['openduet-gateway'].extra_headers).toEqual(
+          parse(engine.config).model.extra_headers,
+        );
+        expect(parse(engine.config).model.max_tokens).toBe(bundle.budget.max_output_tokens);
         await instance.stop();
         // The next attempt's engine is started as this one stops.
         const next = await supervisor.launch(
@@ -578,9 +590,32 @@ server.serve_forever()
     test('prepared for another model, it is set aside and the attempt starts its own', async () => {
       const { root, supervisor, seen } = await fixture('ready');
       try {
-        supervisor.warm({ provider: 'fake', model: 'another', fallback: null });
+        supervisor.warm(
+          { provider: 'fake', model: 'another', fallback: null },
+          bundle.tools,
+          bundle.budget,
+        );
         const instance = await supervisor.launch(bundle, new AbortController().signal);
         expect((await seen(instance.baseUrl)).was_spare).toBe(false);
+        await instance.stop();
+      } finally {
+        await supervisor.close().catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test('a spare prepared for a larger output budget is not reused by a smaller attempt', async () => {
+      const { root, supervisor, seen, starts } = await fixture('ready');
+      try {
+        supervisor.warm(bundle.model, bundle.tools, bundle.budget);
+        for (let tries = 0; tries < 100 && !(await starts()).includes('spare'); tries++)
+          await Bun.sleep(20);
+        expect(await starts()).toContain('spare');
+        const bounded = { ...bundle, budget: { ...bundle.budget, max_output_tokens: 512 } };
+        const instance = await supervisor.launch(bounded, new AbortController().signal);
+        const engine = await seen(instance.baseUrl);
+        expect(engine.was_spare).toBe(false);
+        expect(parse(engine.config).model.max_tokens).toBe(512);
         await instance.stop();
       } finally {
         await supervisor.close().catch(() => {});
@@ -591,7 +626,7 @@ server.serve_forever()
     test('one that read its attempt while loading is never used, and no more are started', async () => {
       const { root, supervisor, seen, records, starts } = await fixture('unusable');
       try {
-        supervisor.warm(bundle.model);
+        supervisor.warm(bundle.model, bundle.tools, bundle.budget);
         const instance = await supervisor.launch(bundle, new AbortController().signal);
         expect((await seen(instance.baseUrl)).was_spare).toBe(false);
         // Stopping asks for a spare; none is started once one could not be used.
@@ -607,7 +642,7 @@ server.serve_forever()
     test('one that never finishes loading holds its attempt no longer than an engine start', async () => {
       const { root, supervisor, seen, records, starts } = await fixture('stuck', 3_000);
       try {
-        supervisor.warm(bundle.model);
+        supervisor.warm(bundle.model, bundle.tools, bundle.budget);
         const started = Date.now();
         const instance = await supervisor.launch(bundle, new AbortController().signal);
         expect((await seen(instance.baseUrl)).was_spare).toBe(false);
@@ -629,7 +664,7 @@ server.serve_forever()
     test('an attempt cancelled while its spare still loads ends at once', async () => {
       const { root, supervisor } = await fixture('stuck', 20_000);
       try {
-        supervisor.warm(bundle.model);
+        supervisor.warm(bundle.model, bundle.tools, bundle.budget);
         const controller = new AbortController();
         setTimeout(() => controller.abort(new Error('cancelled')), 500);
         const started = Date.now();

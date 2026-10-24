@@ -324,6 +324,7 @@ export async function checkModelRuntime(options: ReadinessProbeOptions): Promise
         probeKey: options.env.OPENDUET_RUNTIME_KEY ?? token,
         brokerPort: address.port,
         startTimeoutMs: 25_000,
+        maxOutputTokens: 512,
         parkedActions: async () => [],
         host: {
           id: host.id,
@@ -349,6 +350,7 @@ export async function checkModelRuntime(options: ReadinessProbeOptions): Promise
         dockerNetwork: options.env.OPENDUET_RUNTIME_NETWORK,
         dockerWorkVolume: options.env.OPENDUET_RUNTIME_WORK_VOLUME,
         startupTimeoutMs: 25_000,
+        maxOutputTokens: 512,
       });
       const instance = await supervisor.launch(bundle, controller.signal);
       ownWorkspace = true;

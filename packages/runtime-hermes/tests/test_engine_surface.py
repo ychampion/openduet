@@ -126,6 +126,13 @@ CHAT_COMPLETION_REPLY = {
 CAPABILITY_HEADER = "x-openduet-capability"
 
 
+def test_gateway_configured_output_ceiling_reaches_the_native_anthropic_wire(tmp_path, monkeypatch):
+    """Keep the constructor-to-wire regression in the opt-in pinned engine probes too."""
+    from test_gateway_output_seam import assert_gateway_output_on_wire
+
+    assert_gateway_output_on_wire(tmp_path, monkeypatch)
+
+
 # --- Probe 1: the auxiliary compression client and the capability header ------
 # Finding 1. The main agent applies per-provider extra_headers; the auxiliary
 # client that makes the compaction summary call builds its client through
@@ -1196,8 +1203,8 @@ def test_a_helper_is_openduet_with_the_parents_tools_less_the_parent_only_ones(h
         config["platform_toolsets"]["api_server"].append("terminal_tools")
     config["providers"]["openduet-gateway"].update({"base_url": base, "extra_headers": {CAPABILITY_HEADER: "attempt-token"}})
     write_config(hermes_home, config)
-    (hermes_home / "SOUL.md").write_text((Path(__file__).parents[1] / "config" / "SOUL.md").read_text(encoding="utf-8"),
-                                         encoding="utf-8")
+    identity = (Path(__file__).parents[1] / "config" / "SOUL.md").read_text(encoding="utf-8").strip()
+    (hermes_home / "SOUL.md").write_text(identity, encoding="utf-8")
     ok = (201, {"action_id": "act_probe", "status": "succeeded", "message": "ran"})
     with _sandbox_backend(ok), _broker_tools("files.read", *PARENT_ONLY_TOOLS):
         parent = _parent_agent(base, sorted(_get_platform_tools(config, "api_server")))
@@ -1207,7 +1214,8 @@ def test_a_helper_is_openduet_with_the_parents_tools_less_the_parent_only_ones(h
         assert set(child.valid_tool_names) == expected
         assert {d["function"]["name"] for d in child.tools} == expected
         prompt = child._build_system_prompt()
-        assert prompt.lstrip().startswith("# OpenDuet\n\nYou are OpenDuet")
+        assert identity.startswith("You are OpenDuet")
+        assert prompt.lstrip().startswith(identity)
         assert "Hermes Agent" not in prompt
         assert child._client_kwargs["default_headers"][CAPABILITY_HEADER] == "attempt-token"
 

@@ -86,6 +86,9 @@ export const DEFAULT_MODEL_PRICES: Record<string, ModelPrice> = {
   'fireworks/*llama*': { input: 0.2, output: 0.6 },
   'anthropic/*': { input: 3, output: 15, cached_input: 0.3 },
   'anthropic/*opus*': { input: 15, output: 75, cached_input: 1.5 },
+  // Standard Opus 5.5 rates, including its lower cache-read price (October 2026).
+  // https://platform.claude.com/docs/en/models/opus-5-5/overview
+  'anthropic/claude-opus-5-5': { input: 4, output: 20, cached_input: 0.2, cache_write_input: 5 },
   'anthropic/*sonnet*': { input: 3, output: 15, cached_input: 0.3 },
   'anthropic/*haiku*': { input: 1, output: 5, cached_input: 0.1 },
   'openai/*': { input: 2.5, output: 10, cached_input: 0.25 },

@@ -109,9 +109,9 @@ export function renderInstructions(bundle: AttemptBundle, placement: RunPlacemen
   }
 
   parts.push(renderVoice(bundle.voice ?? DEFAULT_REPLY_VOICE));
-  // Keep collaboration in the shared runtime prefix so custom identities receive it too.
+  // Shared grounding also applies to scheduled work, where nobody is present to correct an assumption.
   parts.push(
-    'Use saved context and corrections. Prepare while decisions wait. Suggest next steps with evidence; ask one focused question.',
+    'Use saved corrections. Prepare next steps. Drafts assert only supplied or verified facts: omit missing details, never invent attachments, progress, blockers or commitments. Label inferences. Never invent decisions; ask only for essential missing details.',
   );
   parts.push(...renderStanding(bundle.earlier));
   parts.push(WORKSPACE_NOTE(bundle, placement.workspace ?? bundle.workspace.mount));
@@ -207,10 +207,9 @@ export function renderSkills(bundle: AttemptBundle): string[] {
  * manifests use the service's words; the person should hear plain ones.
  */
 export const PLAIN_WORDS: readonly string[] = [
-  'When you talk to the person, use plain words for how you work. The computer your',
-  'commands, files and desktop steps run on is "my computer". Anything waiting on them',
-  'is waiting for "your approval" or "your OK". Something you could not finish is',
-  'something you "tried". Never say sandbox, broker, capability, attempt, connector,',
+  'Use plain words: commands, files and desktop run on "my computer"; waiting on the',
+  'person means "your approval" or "your OK"; unfinished means "tried".',
+  'Never say sandbox, broker, capability, attempt, connector,',
   'payload or receipt to them, and never give an id, a hash or a tool name.',
 ];
 

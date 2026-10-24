@@ -1,0 +1,11 @@
+{
+  "checks": [
+    "desktop: scheduled output restored",
+    "corrected memory restored",
+    "native run in Work",
+    "dark: scheduled output restored",
+    "phone: scheduled output restored",
+    "recorded persisted output"
+  ],
+  "page_errors": []
+}

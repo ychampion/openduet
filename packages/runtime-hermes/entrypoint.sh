@@ -100,6 +100,15 @@ model_section = {**(model_config if isinstance(model_config, dict) else {}), "pr
 context_length = whole("OPENDUET_ENGINE_CONTEXT_LENGTH")
 if context_length:
     model_section["context_length"] = context_length
+# Keep the producer's output request inside its supplied budget before gateway reservation.
+max_output_tokens = os.environ.get("OPENDUET_ENGINE_MAX_OUTPUT_TOKENS")
+if max_output_tokens is not None:
+    if not max_output_tokens.isascii() or not max_output_tokens.isdigit() or not 0 < int(max_output_tokens) <= 9007199254740991:
+        raise SystemExit("OPENDUET_ENGINE_MAX_OUTPUT_TOKENS must be a positive whole number of tokens")
+    model_section["max_tokens"] = int(max_output_tokens)
+    # A tool round may leave less than this ceiling; permit the gateway to lower it.
+    model_section.setdefault("extra_headers", {})["x-openduet-clamp-output"] = "1"
+    provider.setdefault("extra_headers", {})["x-openduet-clamp-output"] = "1"
 threshold = whole("OPENDUET_ENGINE_COMPACTION_THRESHOLD")
 if threshold:
     config.setdefault("compression", {})["threshold_tokens"] = threshold
