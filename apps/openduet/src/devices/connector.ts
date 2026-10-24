@@ -821,7 +821,16 @@ export function createDeviceConnector(options: DeviceConnectorOptions): Connecto
       ctx.signal?.throwIfAborted();
       const tool = toolOf(action);
       if (!tool) return refused('That is not something a connected computer does.');
-      const device = await load();
+      let device: DeviceRow | undefined;
+      for (;;) {
+        ctx.signal?.throwIfAborted();
+        const revision = hub.authorityRevision(options.deviceId);
+        device = await load();
+        ctx.signal?.throwIfAborted();
+        // A Settings change can withdraw before this old snapshot reaches the
+        // hub. Re-read it, then validate and enqueue without another await.
+        if (revision === hub.authorityRevision(options.deviceId)) break;
+      }
       if (!device || device.revoked_at || device.connection_status === 'revoked')
         return refused('This computer was disconnected, so nothing was sent.');
       const capability = DEVICE_TOOL_CAPABILITY[tool];
@@ -899,9 +908,19 @@ export function createDeviceConnector(options: DeviceConnectorOptions): Connecto
               reason: 'What this did on the computer cannot be checked afterwards.',
             }
           : { decision: 'unsupported', reason: 'reading has no effect to verify' };
-      const device = await load();
+      let device: DeviceRow | undefined;
+      // Reconciliation reads cannot outlive a change to the computer's access.
+      for (;;) {
+        ctx.signal?.throwIfAborted();
+        const revision = hub.authorityRevision(options.deviceId);
+        device = await load();
+        ctx.signal?.throwIfAborted();
+        if (revision === hub.authorityRevision(options.deviceId)) break;
+      }
       if (!device || device.revoked_at || device.connection_status === 'revoked')
         return { decision: 'undecided', reason: 'the computer was disconnected' };
+      if (!device.capabilities.files || !device.local_capabilities.files)
+        return { decision: 'undecided', reason: 'file access was turned off for the computer' };
       const payload = action.canonical_payload;
       const outcome = await hub.call(
         device.id,

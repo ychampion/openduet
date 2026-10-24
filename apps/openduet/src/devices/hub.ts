@@ -57,10 +57,20 @@ export class DeviceHub {
   private readonly waiters = new Map<string, () => void>();
   private readonly seen = new Map<string, number>();
   private readonly listeners = new Set<OnlineListener>();
+  private readonly authority = new Map<string, number>();
   /** Computers disconnected for good; a poll still open when that happened does not bring them back. */
   private readonly gone = new Set<string>();
 
   constructor(private readonly now: () => number = Date.now) {}
+
+  /** Fence permission snapshots read before an asynchronous database query completed. */
+  authorityRevision(deviceId: string): number {
+    return this.authority.get(deviceId) ?? 0;
+  }
+
+  private authorityChanged(deviceId: string): void {
+    this.authority.set(deviceId, this.authorityRevision(deviceId) + 1);
+  }
 
   /** Called whenever a channel that was not online is heard from. */
   onOnline(listener: OnlineListener): () => void {
@@ -209,6 +219,7 @@ export class DeviceHub {
    * the companion's to refuse, which it does by its own settings.
    */
   withdraw(deviceId: string, allowed: (request: DeviceRequest) => boolean): number {
+    this.authorityChanged(deviceId);
     let withdrawn = 0;
     for (const pending of [...this.byId.values()])
       if (pending.deviceId === deviceId && !pending.delivered && !allowed(pending.request)) {
@@ -224,6 +235,7 @@ export class DeviceHub {
    * again under this id; a connector being closed and reopened passes false.
    */
   disconnect(deviceId: string, forever = true): void {
+    this.authorityChanged(deviceId);
     if (forever) this.gone.add(deviceId);
     for (const pending of [...this.byId.values()])
       if (pending.deviceId === deviceId)
