@@ -17,17 +17,28 @@ running when you close the browser.
 
 ## Get started
 
+Install OpenDuet once on a computer or server that stays on. Use its web app
+from Windows, macOS, Linux or a phone; only the host needs Docker. For access
+from other devices, set up [HTTPS](docs/DEPLOYMENT.md#configuration-and-browser-access)
+or [Tailscale](docs/DEPLOYMENT.md#tailscale).
+
+For a local installation, open the printed `http://localhost:3101` address in
+Chrome or Edge. Safari needs an HTTPS address for sign-in; use
+[HTTPS](docs/DEPLOYMENT.md#configuration-and-browser-access) or
+[Tailscale](docs/DEPLOYMENT.md#tailscale) when accessing your host from Safari.
+
 ### 1. Prepare your host
 
 Use an always-on Linux **x86-64** host, or Docker Desktop with Linux containers
 on Windows / Intel Mac. Allow **8 GB RAM and 20 GB free disk**. Install
 **Docker Engine 28+**, **Compose 2.33.1+**, and, on Windows, **Git for Windows**.
 Published images target `linux/amd64`; see [deployment](docs/DEPLOYMENT.md) for
-source-build options and platform details.
+source-build options and platform details. Apple Silicon Macs can use the web
+app hosted on any supported host.
 
 ### 2. Install OpenDuet
 
-Linux / macOS, in Bash:
+Linux / Intel Mac, in Bash:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash

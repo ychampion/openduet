@@ -487,7 +487,9 @@ check_project_free() {
     name="${line%%|*}" dir="${line#*|}"
     [ -n "$dir" ] ||
       fail "The container $name runs as the Compose project $project and does not say which folder started it, so it may be another installation's, and this one would take it over. Remove it if it is left over. $choose"
-    [ "$dir" = "$here" ] || [ "$dir" = "$physical" ] || others+=("$dir")
+    # Native Compose uses C:\... while Git Bash uses /c/... for the same folder.
+    # File identity also handles aliases without accepting another installation.
+    [ "$dir" = "$here" ] || [ "$dir" = "$physical" ] || [ "$dir" -ef "$DEPLOY" ] || others+=("$dir")
   done <<<"$listed"
   if [ "${#others[@]}" -gt 0 ]; then
     if [ -f "$DEPLOY/.env" ]; then

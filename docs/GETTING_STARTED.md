@@ -3,14 +3,18 @@
 Go from a fresh installation to one completed task, then a connected workflow.
 For all operator options, use [DEPLOYMENT.md](DEPLOYMENT.md).
 
+Install the server once, then use the web app from Windows, macOS, Linux or a
+phone. Only the host running the server needs Docker. Your other devices
+connect to that host's web address.
+
 ## Before you start
 
 You need a host that can stay on, Docker Engine **28+**, Compose **2.33.1+**,
 **8 GB RAM**, **20 GB free disk**, and outbound access to GitHub and your model
 provider. Published images are **linux/amd64**. Use Linux x86-64 or Docker
-Desktop with Linux containers on Windows / Intel Mac. ARM source builds are
-not covered by the public-image install checks. Windows also needs Git for
-Windows. The clean-machine installer check runs on Linux.
+Desktop with Linux containers on Windows / Intel Mac. On an Apple Silicon Mac,
+use the web app hosted on a supported host; local ARM installations require
+building images from source. Windows also needs Git for Windows.
 
 Check Docker in your terminal:
 
@@ -27,7 +31,7 @@ if Docker is missing.
 
 ## 1. Install the public images
 
-Linux / macOS, in Bash:
+Linux / Intel Mac, in Bash:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
@@ -43,6 +47,11 @@ The installer creates `~/openduet` and local configuration, pulls the images
 and starts the services. It prints the web address and a one-time setup link.
 Keep the setup code until you have created your account; it expires after
 72 hours. On the host, the app is normally at **http://localhost:3101**.
+
+Open that local HTTP address in Chrome or Edge. Safari requires HTTPS for
+OpenDuet's secure sign-in cookies, including on localhost. To use Safari,
+configure [HTTPS](DEPLOYMENT.md#configuration-and-browser-access) or
+[Tailscale](DEPLOYMENT.md#tailscale) and open the HTTPS address.
 
 Prefer to inspect the installer first? Download [install.sh](../install.sh)
 or [install.ps1](../install.ps1), read it, then run the saved file. For another
@@ -216,6 +225,18 @@ Keep the master key separately as described in
 [upgrading and rollback](UPGRADING.md) before re-running the installer with the
 target release in its URL, `OPENDUET_REF` and `OPENDUET_IMAGE_TAG`.
 
+## Use OpenDuet from another computer or phone
+
+On the host running OpenDuet, open **http://localhost:3101**. On a Mac or
+another device, open the host's configured HTTPS address and sign in to your
+account. `localhost` always means the device where the browser is running.
+
+Configure [Tailscale](DEPLOYMENT.md#tailscale) for private access, or use your
+own HTTPS reverse proxy as described in the deployment guide. With Tailscale,
+follow [From a phone or a laptop](DEPLOYMENT.md#from-a-phone-or-a-laptop) to
+connect each device. Keep the host and its Docker services running so tasks
+and routines can continue after you close the browser.
+
 ## When something does not work
 
 | Symptom | Check |
@@ -225,6 +246,7 @@ target release in its URL, `OPENDUET_REF` and `OPENDUET_IMAGE_TAG`.
 | No matching image manifest | Public images target linux/amd64. Check the host architecture. |
 | The first download is slow | Allow the pull to finish; check network access and free Docker disk space. |
 | The app is not reachable | Use the printed URL. Inspect Compose status and logs below. |
+| Sign-in succeeds but Safari returns to the sign-in screen | Use the host's HTTPS / Tailscale address. For HTTP localhost, use Chrome or Edge. |
 | Setup code is rejected | Check expiry and whether the first account exists. Follow account recovery in the deployment guide. |
 | Request stays in setup | Check the selected model’s credentials, inference and tool results. Fix the stated failure, then retry the saved request. |
 | A tool is unavailable | Check the connection, credentials, agent access and any required worker. |
