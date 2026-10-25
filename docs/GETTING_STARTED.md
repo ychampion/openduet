@@ -187,13 +187,13 @@ and delivery settings.
 Once your account exists, enable the browser worker from Bash:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | OPENDUET_BROWSER=1 bash
+curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/v0.3.1/install.sh | OPENDUET_REF=v0.3.1 OPENDUET_IMAGE_TAG=v0.3.1 OPENDUET_BROWSER=1 bash
 ```
 
 For a tagged installation, keep the same tag in the download URL,
 `OPENDUET_REF` and `OPENDUET_IMAGE_TAG` when adding the worker or updating.
-Use the [matching release commands](releases/v0.3.0.md#optional-browser-worker)
-for v0.3.0. The command above tracks `main` deployment files.
+The command above uses v0.3.1. See the [matching release notes](releases/v0.3.1.md)
+for installation and update details.
 
 See [browser-worker.md](browser-worker.md) for Windows and source-install
 alternatives. Browser access and a sandbox computer are separate capabilities.
