@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import type { AttemptBundle } from '@openduet/contracts';
+import { APPROVAL_OUTDATED_NOTE, type AttemptBundle } from '@openduet/contracts';
 import { loadEnv } from '../../src/env.ts';
 import { createScriptedProvider } from '../../src/gateway/fake.ts';
 import { newId } from '../../src/ids.ts';
@@ -75,8 +75,24 @@ afterAll(async () => {
 
     const bundles: AttemptBundle[] = [];
     const timings: AttemptTiming[] = [];
+    let reportBothTimings = () => {};
+    const bothTimings = new Promise<void>((resolve) => {
+      reportBothTimings = resolve;
+    });
     const requests = new Map<string, string[]>();
-    const scripted = createScriptedProvider();
+    // Discovery is part of the real bootstrap path: this connector is indexed
+    // before its schema is loaded into the running engine.
+    const scripted = createScriptedProvider([
+      { tool: { name: 'load_tool', arguments: { name: 'test.send' }, id: 'load_scripted_send' } },
+      {
+        tool: {
+          name: 'test.send',
+          arguments: { message: 'scripted hello' },
+          id: 'call_scripted_send',
+        },
+      },
+      { text: 'This is a walkthrough answer from the scripted model.' },
+    ]);
     const service = await bootstrap({
       env: loadEnv({
         NODE_ENV: 'test',
@@ -96,7 +112,10 @@ afterAll(async () => {
         OPENDUET_DEFAULT_MODEL: 'scripted',
       }),
       onBundle: (bundle) => bundles.push(bundle),
-      onTiming: (timing) => timings.push(timing),
+      onTiming: (timing) => {
+        timings.push(timing);
+        if (timings.length === 2) reportBothTimings();
+      },
       fakeProvider: async (body, attemptId, protocol) => {
         requests.set(attemptId, [...(requests.get(attemptId) ?? []), JSON.stringify(body)]);
         return scripted(body, attemptId, protocol);
@@ -158,8 +177,17 @@ afterAll(async () => {
             await handle.sql`select id, outcome, outcome_detail from attempt where job_id = ${body.job.id} and ended_at is not null order by epoch`;
           if (rows.length >= count) {
             const current = rows[count - 1];
-            if (current?.outcome !== 'waiting_for_approval')
-              throw new Error(`Hermes attempt ended unexpectedly: ${JSON.stringify(current)}`);
+            if (current?.outcome !== 'waiting_for_approval') {
+              const toolResults = (requests.get(String(current?.id)) ?? []).flatMap((request) => {
+                const body = JSON.parse(request) as {
+                  messages?: { role: string; content: unknown }[];
+                };
+                return body.messages?.filter((message) => message.role === 'tool') ?? [];
+              });
+              throw new Error(
+                `Hermes attempt ended unexpectedly: ${JSON.stringify({ attempt: current, toolResults })}`,
+              );
+            }
             return;
           }
           await Bun.sleep(100);
@@ -175,19 +203,40 @@ afterAll(async () => {
       expect(first.skills.map((skill) => skill.name)).toEqual(['alpha', 'beta', 'gamma']);
       expect(first.knowledge).toHaveLength(2);
       expect(first.knowledge.map((item) => item.handle)).toContain(`${seat.id}@1`);
-      expect(first.tools.map((tool) => tool.name)).toEqual([
-        'search_tools',
-        'load_tool',
+      expect(first.tools.map((tool) => tool.name).sort()).toEqual([
         'ask_person',
+        'files.delete',
+        'files.list',
+        'load_tool',
         'memory.search',
         'react',
-        'test.send',
+        'search_tools',
+        'skills.read',
+        'web.fetch',
+        'web.search',
       ]);
+      expect(first.tools.map((tool) => tool.name)).not.toContain('test.send');
       expect(first.inputs.since_last).toBeUndefined();
       expect(first.since_last.attempt_id).toBeNull();
-      expect(first.since_last.evidence.map((item) => item.handle)).toEqual([
+      expect(first.since_last.evidence.map((item) => item.handle)).toContain(
         `source:${seeded.sourceId}@1`,
-      ]);
+      );
+      // Automatic capture can add the request itself before recall. Every
+      // delivered source still belongs to this person's own space.
+      const sources = await handle.sql`select id, source_version from memory_sources
+        where space_id = ${scope.spaceId} and owner_id = ${scope.ownerId} and state = 'active'`;
+      const allowedSources = new Set(
+        sources.map((source) => `source:${source.id}@${source.source_version}`),
+      );
+      for (const evidence of first.since_last.evidence) {
+        expect(evidence.kind).toBe('source');
+        expect(allowedSources.has(evidence.handle)).toBe(true);
+      }
+      const [priorApproval] = await handle.sql`select a.id as action_id, p.id as approval_id,
+        a.status, p.decision from action a join approval p on p.action_id = a.id
+        where a.attempt_id = ${first.attempt.id}`;
+      if (!priorApproval) throw new Error('The first send did not request approval');
+      expect(priorApproval).toMatchObject({ status: 'needs_approval', decision: null });
       expect(
         (
           await call('/memory/outputs', {
@@ -216,7 +265,33 @@ afterAll(async () => {
       if (!second) throw new Error('No replacement bundle');
       expect(second.attempt.token).not.toBe(first.attempt.token);
       expect(second.since_last.attempt_id).toBe(first.attempt.id);
-      expect(second.since_last.pending_approvals.length).toBeGreaterThan(0);
+      // Permission asked on the old facts cannot survive a correction. The
+      // replacement must ask again before anything reaches the destination.
+      const [withdrawn] = await handle.sql`select a.status, p.decision, p.decided_by
+        from action a join approval p on p.action_id = a.id
+        where p.id = ${priorApproval.approval_id}`;
+      expect(withdrawn).toMatchObject({
+        status: 'denied',
+        decision: 'denied',
+        decided_by: APPROVAL_OUTDATED_NOTE,
+      });
+      expect(second.since_last.pending_approvals).toHaveLength(0);
+      expect(second.since_last.pending_approvals.map((item) => item.approval_id)).not.toContain(
+        priorApproval.approval_id,
+      );
+      const [freshApproval] = await handle.sql`select a.id as action_id, p.id as approval_id,
+        a.status, p.decision, p.job_revision from action a join approval p on p.action_id = a.id
+        where a.attempt_id = ${second.attempt.id}`;
+      expect(freshApproval).toMatchObject({
+        status: 'needs_approval',
+        decision: null,
+        job_revision: second.attempt.revision,
+      });
+      expect(freshApproval?.action_id).not.toBe(priorApproval.action_id);
+      expect(freshApproval?.approval_id).not.toBe(priorApproval.approval_id);
+      const deliveries = await handle.sql`select d.action_id from test_destination_ledger d
+        join action a on a.id = d.action_id where a.job_id = ${jobId}`;
+      expect(deliveries).toHaveLength(0);
       expect(second.inputs.repair_briefs).toHaveLength(1);
       expect(second.inputs.repair_briefs[0]).toMatchObject({
         changed_handle: `${seat.id}@1`,
@@ -224,6 +299,14 @@ afterAll(async () => {
       });
       expect(second.knowledge.map((item) => item.handle)).toContain(`${seat.id}@2`);
       for (const bundle of [first, second]) {
+        const schemas = (requests.get(bundle.attempt.id) ?? []).map((request) => {
+          const body = JSON.parse(request) as {
+            tools?: { name?: string; function?: { name?: string } }[];
+          };
+          return (body.tools ?? []).map((tool) => tool.function?.name ?? tool.name);
+        });
+        expect(schemas[0]).not.toContain('test.send');
+        expect(schemas.slice(1).some((tools) => tools.includes('test.send'))).toBe(true);
         const delivered = requests.get(bundle.attempt.id)?.join('\n') ?? '';
         for (const skill of bundle.skills) expect(delivered).toContain(skill.body);
         for (const knowledge of bundle.knowledge) {
@@ -248,6 +331,9 @@ afterAll(async () => {
       expect(replacementRequest).toContain('Repair required');
       expect(replacementRequest).toContain(`${seat.id}@1`);
       expect(replacementRequest).toContain(`${seat.id}@2`);
+      // Outcomes commit before engine cleanup finishes; the callback reports
+      // the completed cleanup whose timing this assertion measures.
+      await bothTimings;
       expect(timings).toHaveLength(2);
       for (const timing of timings) {
         expect(timing.coldStartMs).toBeGreaterThan(0);

@@ -43,6 +43,8 @@ jobs:
             [ "$attempt" = 3 ] || sleep $((attempt * 10))
           done
           exit 1
+      - name: Dependency security audit
+        run: bun audit
       - name: Typecheck
         run: bun run typecheck
       - name: Lint
@@ -56,7 +58,8 @@ jobs:
   test:
     name: Test suite and runtime plugin
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Includes the complete suite and pinned-engine proofs; per-test limits stay fixed.
+    timeout-minutes: 90
     services:
       # The embedded Postgres binary does not start on current Linux, so the
       # fixtures create their disposable databases on this server instead. The
@@ -145,6 +148,40 @@ jobs:
         run: bun run test
       - name: Runtime plugin suite
         run: bun run test:plugin
+      # The ordinary suite has no engine installation. Exercise these opt-ins
+      # explicitly so a stale runtime fixture cannot remain hidden behind a skip.
+      - name: Install the pinned Hermes engine for integration proofs
+        run: |
+          git clone --depth 1 --branch v2026.9.7 https://github.com/NousResearch/hermes-agent.git .hermes-src
+          test "$(git -C .hermes-src rev-parse HEAD)" = 2237be355906fbe6065ce1815711eee52b2d646e
+          UV_PROJECT_ENVIRONMENT="$PWD/.hermes-venv" uv sync --project .hermes-src --frozen --no-install-project --extra messaging --extra anthropic --python 3.12
+          uv pip install --python .hermes-venv/bin/python --no-deps -e .hermes-src
+          uv pip install --python .hermes-venv/bin/python pytest==9.1.1 pillow==12.3.0
+          .hermes-venv/bin/python packages/runtime-hermes/patches/observer_bridge.py .hermes-src
+      - name: Runtime plugin suite with actual engine imports
+        run: |
+          PYTHONPATH="$PWD/packages/runtime-hermes/runtime_support:$PWD/packages/runtime-hermes:$PWD/.hermes-src" \
+            .hermes-venv/bin/python -m pytest packages/runtime-hermes/tests -q -rs
+      - name: Actual engine capability, readiness, identity and repair proofs
+        env:
+          OPENDUET_CAPABILITY_PROOF: '1'
+          OPENDUET_CAPABILITY_STAGE: ''
+          OPENDUET_READINESS_RUNTIME_PROOF: '1'
+          OPENDUET_HERMES_E2E: '1'
+        run: |
+          bun test --max-concurrency=1 --timeout=900000 \
+            apps/openduet/test/integration/capability-proof.test.ts \
+            apps/openduet/test/integration/model-readiness-real.test.ts \
+            apps/openduet/test/integration/hooks-real.test.ts \
+            apps/openduet/test/integration/compaction-real.test.ts \
+            apps/openduet/test/integration/identity-prompt.test.ts \
+            apps/openduet/test/integration/wired-assistant.test.ts
+      - name: Standalone runtime and memory conformance
+        run: |
+          bun run packages/runtime-hermes/scripts/e2e.ts
+          bun run packages/runtime-hermes/scripts/e2e-exec.ts
+          bun run packages/runtime-hermes/scripts/discovery-e2e.ts
+          bun run conformance:memory
 
   capability-evals:
     name: Capability evaluations with the scripted provider

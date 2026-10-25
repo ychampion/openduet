@@ -1,6 +1,6 @@
 {
   "name": "@openduet/mock-api",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -13,8 +13,8 @@
   },
   "dependencies": {
     "@openduet/contracts": "workspace:*",
-    "hono": "4.13.7",
+    "hono": "4.13.13",
     "ulid": "3.0.2",
-    "zod": "4.6.2"
+    "zod": "4.6.7"
   }
 }

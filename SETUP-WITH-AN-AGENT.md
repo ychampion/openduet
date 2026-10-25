@@ -10,6 +10,12 @@ checks what is already there first, so after an interruption, start again from
 the top. The repository's checks run steps 2 to 5 on a clean machine, from the
 commands on this page.
 
+For the concise user walkthrough, use [Getting started](docs/GETTING_STARTED.md).
+This guide follows `main`. For a tagged deployment, use the matching release's
+installation commands and keep `OPENDUET_REF` and `OPENDUET_IMAGE_TAG` pinned
+together, including when adding the browser worker. Back up an existing
+installation before an update; see [the installer backup path](docs/GETTING_STARTED.md#before-updating-an-existing-installation).
+
 ## Rules for the whole setup
 
 - **Never ask for a password or a key in the chat.** Keys go into OpenDuet's
@@ -42,8 +48,8 @@ server?**
 
 - **This computer** suits trying it out. OpenDuet runs while the computer is on,
   at `http://localhost:3101`.
-- **A server** (a small Linux machine with 2 CPUs, 4 GB of memory and 30 GB of
-  disk) keeps it running all the time. Creating one costs money, so the person
+- **A server** (a Linux x86-64 machine with 2 CPUs, 8 GB of memory and at least
+  20 GB of free disk) keeps it running all the time. Creating one costs money, so the person
   creates it or tells you to. Then connect over SSH and run every step below
   on the server.
 
@@ -77,9 +83,9 @@ OpenDuet needs:
   on Linux and macOS, or `powershell -c "irm bun.sh/install.ps1 | iex"` on
   Windows, then open a new Git Bash window.
 - **Git.** On a minimal Debian or Ubuntu server, `apt-get install -y git curl unzip ca-certificates` as root.
-- **At least 10 GB free** where Docker keeps its images. On Linux,
+- **At least 20 GB free** where Docker keeps its images. On Linux,
   `df -h "$(docker info --format '{{.DockerRootDir}}')"` shows it. Docker
-  Desktop shows its disk under **Settings > Resources**. Below 10 GB, stop and
+  Desktop shows its disk under **Settings > Resources**. Below 20 GB, stop and
   tell the person how much is free.
 - **Ports 3100 and 3101 free** on the machine:
 
@@ -153,7 +159,7 @@ unset FIREWORKS_API_KEY
 ```
 
 For another provider, they export its key and add `--provider` and `--model`,
-as [Connect your model](README.md#connect-your-model) lists, for example
+as [Providers](docs/DEPLOYMENT.md#providers) lists, for example
 `ANTHROPIC_API_KEY` with `--provider anthropic --model <model id>`.
 
 **Other ports or a second installation.** Before the first start, and only
@@ -255,22 +261,30 @@ again. If it says there is no account yet, wait for step 6. From here on, every
 
 ## 7. The person connects a model
 
-Tell the person to open **Settings › Models** in OpenDuet (it also opens by
-itself while no model works), choose their provider, paste their API key,
-choose **Test connection**, pick a model and save. It applies straight away, with no
-restart. With a ChatGPT plan instead of a key, they choose **Sign in with
-ChatGPT** there.
+Tell the person to open **Settings › Models** in OpenDuet (it also opens when
+their first task needs a working model), choose their provider and paste their
+API key. **Check credentials and list models** checks the key and lists available
+models. Pick a model, or enter its exact ID under Advanced, then choose
+**Connect and check**. Look for **Credentials accepted**, **Model responded** and
+**Tool use verified**. The latter two use the selected model through Hermes,
+including an isolated read-only tool call. Provider billing can apply. A change
+applies without a restart. With a ChatGPT plan instead of a key, they choose
+**Sign in with ChatGPT** there.
 
 Remind them to paste the key only into OpenDuet, never into this chat.
 
-**Worked when** the person starts a new chat, says hello, and gets a reply.
+**Worked when** all three compatibility stages pass and the person's saved first
+request continues. If they connected from Settings, have them send a small task
+with notes they can check and review the result.
 `status.ts` cannot see a key saved in the app, so its Model line stays `warn`
 when the key lives there; that is expected. If they chose to keep the key in
 `deploy/.env` in step 4, Model reads `ok`.
 
-If the test in Settings fails, its message says why: a refused key means the
-person pastes it again; a model name the provider does not serve means
-choosing one from the list.
+If a check fails, its stage and message explain why. Resolve the indicated key,
+billing, endpoint, model ID or tool compatibility issue before retrying. Listing
+models alone does not verify inference or tool use. See the
+[first-task guide](docs/GETTING_STARTED.md#3-connect-and-verify-the-model) for the
+bounded check and saved-request behavior.
 
 The basic setup is done here. Tell the person, and offer the optional parts
 below. Do each only when the person wants it.

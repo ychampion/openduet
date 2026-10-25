@@ -200,6 +200,14 @@ of Anthropic.
 | [Personal assistant behavior](docs/PERSONAL_ASSISTANT.md) | [Architecture](docs/ARCHITECTURE.md) |
 | [Example workflows](docs/USE_CASES.md) | [Deployment](docs/DEPLOYMENT.md) |
 | [Product verification](docs/PRODUCT_VERIFICATION.md) | [Upgrading](docs/UPGRADING.md) |
+| [Live model results](docs/LIVE_MODEL_VERIFICATION.md) | [Release readiness](docs/RELEASE_READINESS.md) |
+
+Need help? [Report a problem](https://github.com/ychampion/openduet/issues/new/choose)
+with your installation method, version and reproduction steps. For security
+reports, use the [private reporting channel](SECURITY.md).
+
+Sharing OpenDuet? The [launch kit](docs/LAUNCH.md) includes a demo walkthrough,
+screenshots, recordings and prepared announcement copy.
 
 Preserve [LICENSE](LICENSE), [NOTICE](NOTICE) and [source provenance](docs/PROVENANCE.md)
 in redistributions. Run `bun run icons` after editing the logo source.

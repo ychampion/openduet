@@ -14,10 +14,21 @@ comparison are new. The original license and notices are retained in LICENSE
 and NOTICE. Third-party names and licenses retain their own identities.
 
 Technical evidence in older design notes describes the source project's
-historical tests. The current OpenDuet verification report is
-[RELEASE_READINESS.md](RELEASE_READINESS.md). It alone records what was run for
-this release. This is a fresh installation, not a migration for existing
-Melete deployments: its settings, containers and storage have separate names.
+historical tests. OpenDuet evidence is recorded by update and execution scope:
+
+- [Release readiness](RELEASE_READINESS.md) records release and installation
+  checks at its stated revision.
+- [Product verification](PRODUCT_VERIFICATION.md) records the personal assistant
+  regression and browser checks, with their revisions and fixture boundaries.
+- [Live-model verification](LIVE_MODEL_VERIFICATION.md) records the October 24
+  Anthropic Opus 5.5 and Fireworks runs: automatic correction learning, use in
+  a separate task, restart persistence and native scheduled work with the
+  browser and frontend server stopped.
+
+The live report links the sanitized execution records and media. Earlier
+scripted captures retain their labels and do not become live-model evidence.
+This is a fresh installation, not a migration for existing Melete deployments:
+its settings, containers and storage have separate names.
 
 OpenDuet is not affiliated with or endorsed by Anthropic. Claude and Claude
 Duet are Anthropic product names, used only to identify the comparison target.

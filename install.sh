@@ -3,6 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
 #
+# Tagged releases pin both deployment files and images, including when adding
+# a browser worker later. Use the matching release's install commands; set
+# OPENDUET_REF and OPENDUET_IMAGE_TAG to the same tag on the bash side of the pipe.
+#
 # It downloads the Compose file and its configuration into ~/openduet (or
 # OPENDUET_DIR), writes deploy/.env once with fresh secrets, pulls the images and
 # starts them. The first run prints a one-time setup code, which creates the

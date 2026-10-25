@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type AttemptBundle, EMPTY_SINCE_LAST, type RuntimeEvent } from '@openduet/contracts';
 import { signCapability } from '../../../apps/openduet/src/broker/capability.ts';
-import { toolTokens } from '../../../apps/openduet/src/broker/catalog.ts';
+import { META_TOOLS, toolTokens } from '../../../apps/openduet/src/broker/catalog.ts';
 import { createInternalServer } from '../../../apps/openduet/src/broker/internal-server.ts';
 import { recordId } from '../../../apps/openduet/src/broker/records.ts';
 import { emailManifest } from '../../../apps/openduet/src/connectors/email.ts';
@@ -26,7 +26,15 @@ import { defaultPrivacyRouter } from '../../../apps/openduet/src/privacy/index.t
 import { seedJob } from '../../../apps/openduet/test/helpers/broker.ts';
 import { createPostgresFixture } from '../../../apps/openduet/test/helpers/postgres.ts';
 import { brokerCatalogState, brokerParkedActions, HermesRuntimeAdapter } from '../src/adapter.ts';
-import { API_KEY, hermesHome, ROOT, type Runtime, startRuntime, waitForApi } from './e2e.ts';
+import {
+  API_KEY,
+  HERMES_SRC,
+  hermesHome,
+  PYTHON,
+  type Runtime,
+  startRuntime,
+  waitForApi,
+} from './e2e.ts';
 
 const BROKER_PORT = 3142;
 const HERMES_PORT = 3140;
@@ -42,9 +50,13 @@ const sourceHashes = {
     '270f7e221b5486a6ac499732d0f5471f3f48dc0c0a0633186bc762bcb1345a39',
 };
 // The process supervisor applies this reviewed observer variant of the same pin.
-const observerHashes: Record<string, string> = {
-  'gateway/platforms/api_server_runs.py':
+const observerHashes: Record<string, readonly string[]> = {
+  'gateway/platforms/api_server_runs.py': [
     '23e8cefeb83c27f8e22f0ab1fe0596dc01188f3cd0b2ae3d688507177057b2c0',
+    // The current observer includes live-tool hydration. Reversing its ten
+    // reviewed replacements restores the exact sourceHashes baseline above.
+    '258aaeb0ef20d7c3c25cc67635fcfad44dfe629b1675b31b03a1b996e7e44369',
+  ],
 };
 type WireMessage = { role?: string; content?: unknown; [key: string]: unknown };
 type WireTool = { function?: { name?: string } };
@@ -56,17 +68,14 @@ const nonSystem = (body: Record<string, unknown>) =>
   messages(body).filter((message) => message.role !== 'system');
 
 async function main() {
-  assert(
-    existsSync(join(ROOT, '.hermes-venv', 'Scripts', 'python.exe')),
-    'Install the isolated Hermes venv first.',
-  );
+  assert(existsSync(PYTHON), 'Install the isolated Hermes venv first.');
   const observedSourceHashes: Record<string, string> = {};
   for (const [file, expected] of Object.entries(sourceHashes)) {
     const actual = createHash('sha256')
-      .update(readFileSync(join(ROOT, '.hermes-src', file)))
+      .update(readFileSync(join(HERMES_SRC, file)))
       .digest('hex');
     assert(
-      actual === expected || actual === observerHashes[file],
+      actual === expected || observerHashes[file]?.includes(actual),
       `Pinned source differs: ${file}`,
     );
     observedSourceHashes[file] = actual;
@@ -225,7 +234,24 @@ async function main() {
     process.env.OPENDUET_BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
     const core = await internal.broker.catalog(claims);
     const coreTokens = toolTokens(core);
-    assert(coreTokens >= 650 && coreTokens <= 750, `Core not near-filled: ${coreTokens}`);
+    // The question and the bounded discovery index have room beside the
+    // connector budget. Its schemas still fill the original 750-token cap.
+    assert(core.some((tool) => tool.name === 'ask_person'));
+    const loader = META_TOOLS.find((tool) => tool.name === 'load_tool');
+    assert(loader);
+    const withoutIndex = core.map((tool) =>
+      tool.name === loader.name ? { ...tool, description: loader.description } : tool,
+    );
+    const indexTokens = coreTokens - toolTokens(withoutIndex);
+    assert(indexTokens > 0 && indexTokens <= 1000);
+    assert(core.find((tool) => tool.name === loader.name)?.description.includes(TARGET));
+    const budgetedCoreTokens = toolTokens(
+      withoutIndex.filter((tool) => tool.name !== 'ask_person'),
+    );
+    assert(
+      budgetedCoreTokens >= 650 && budgetedCoreTokens <= 750,
+      `Budgeted core not near-filled: ${budgetedCoreTokens}; total: ${coreTokens}`,
+    );
     assert(!core.some((tool) => tool.name === TARGET));
     const bundle: AttemptBundle = {
       attempt: {
@@ -303,7 +329,11 @@ async function main() {
     const beforeLoad = captures[1]?.body;
     const afterLoad = captures.find((capture) => names(capture.body).includes(TARGET))?.body;
     assert(first && beforeLoad && afterLoad);
-    assert.deepEqual([...names(first)].sort(), core.map((tool) => tool.name).sort());
+    // The renderer also enables the engine's own local checklist tool.
+    assert.deepEqual(
+      [...names(first)].sort(),
+      [...core.map((tool) => tool.name), 'todo_list'].sort(),
+    );
     assert(captures.every((capture) => capture.attemptId === claims.attempt_id));
     assert.deepEqual(
       starts.map((start) => start.headers.get('Idempotency-Key')),
@@ -380,6 +410,8 @@ async function main() {
       hermesPort: HERMES_PORT,
       coreNames: core.map((tool) => tool.name),
       coreTokens,
+      budgetedCoreTokens,
+      indexTokens,
       systemChars,
       toolSchemaChars,
       scaffoldingTokens,

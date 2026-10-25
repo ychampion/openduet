@@ -11,7 +11,7 @@ personal Chat/Work/Explore delivery.
 
 Checked October 23, 2026 against source revision
 [`5b7da2d5`](https://github.com/ychampion/openduet/commit/5b7da2d5ec4c43d88ae4019749e122d40dfa7fe5). This report
-covers the personal Chat/Work/Explore update; [earlier release evidence](RELEASE_READINESS.md)
+covers the personal Chat/Work/Explore update; [earlier release evidence](releases/v0.2.1-verification.md)
 and [v0.2.1 showcase verification](SHOWCASE_VERIFICATION.md) have separate revisions.
 
 The app retains React/Vite, TypeScript/Bun, Postgres and Hermes. Migrations
@@ -46,7 +46,7 @@ the quality of a live model's answer.
 | **B: readiness** | Model listing succeeds while inference fails; tools remain unverified. Wrong/stale configuration cannot publish readiness. A model skipping the actual tool call fails. | `gateway/model-readiness.test.ts`, `integration/model-readiness.test.ts`, web `models/readiness.test.tsx`; actual pinned Hermes process and default Compose cell-host proofs each passed 2 tests, 9 assertions. |
 | **C: parallel work** | Task B has a separate job; A keeps its running state/version and pending approval. B creates no steer event for A; stopping B leaves A intact. | `integration/personal-session.test.ts`; DB-backed action/approval fixture. |
 | **D: targeted continuation** | Explicit Continue reaches only its selected task; ambiguous input is refused with a focused target question. Correcting a current exact draft withdraws only that affected approval. | `personal-session.test.ts`; web `personal-session.test.ts`, `composer-actions.test.tsx`. |
-| **E: learning** | Save preference → next relevant recall contains it; edit → recall contains revised value and excludes old; forget → current recall excludes it. No job/trigger is created. Reviewed procedure persists through existing skills store and is available to matching selection. | `integration/personal-learning.test.ts`, `own-skills.test.ts`, `learning/learning.test.tsx`; scripted Sample day demonstrates later style. Live model preference adherence remains unmeasured. |
+| **E: learning** | Save preference → next relevant recall contains it; edit → recall contains revised value and excludes old; forget → current recall excludes it. No job/trigger is created. Reviewed procedure persists through existing skills store and is available to matching selection. | `integration/personal-learning.test.ts`, `own-skills.test.ts`, `learning/learning.test.tsx`; scripted Sample day illustrates later style. The subsequent [October 24 live runs](LIVE_MODEL_VERIFICATION.md) separately demonstrated automatic correction replacement and adherence in an independent task and native scheduled preparation, with Anthropic Opus 5.5 and Fireworks. Those runs are scoped execution proofs, not a general quality benchmark. |
 | **F: responsibility** | Ten unchanged checks produce one preparation/draft/notification; restart produces no duplicate. Fresh reply, pause, disconnect and revoked read scope block obsolete work. Scope/recipient mismatches fail. Changed deadline during a read uses the locked current deadline. Confirmed send occurs once with a receipt and ends the watch. | `integration/customer-followups.test.ts`; `connectors/customer-thread-readers.test.ts` covers archived replies, pagination, missing/oversized threads and IMAP withholding. |
 | **G: delivery** | Concurrent brief setup resolves one actual trigger; editing time updates it. Paused remains paused. Suggestions off preserves requested reminders; simultaneous category changes preserve other opt-outs. Dispatch labels/categories match. Legacy opt-outs and history survive migration. | `integration/delivery-policy.test.ts`, `delivery-migration.test.ts`, `status-push.test.ts`; web `screens/notifications.test.ts`; mock push tests. |
 | **H: old result** | Reply to yesterday's routine result retains its exact turn, leaves the next schedule enabled and preserves newer pending approvals. Nested historical watch discussions retain mailbox/customer restrictions and source revalidation. | `integration/personal-session.test.ts`, `customer-followups.test.ts`. |
@@ -90,9 +90,11 @@ the same request key and file IDs. The check performs no source sign-in.
 - [Saved preference](media/sample-day/preference-desktop.png)
 - [Recording](media/sample-day/review.mp4) and [media reproduction](media/sample-day/README.md)
 
-The screenshot/recording data is fictional and visibly labeled. Sample day does
-not run paid inference, poll a live inbox or send mail. Current files replace
-the old navigation in the main showcase; v0.2.1 recordings are historical.
+The Sample day screenshot/recording data is fictional and visibly labeled. It
+does not run paid inference, poll a live inbox or send mail. These captures
+document the October 23 UI checks; v0.2.1 recordings are historical. The main
+[getting-started guide](GETTING_STARTED.md) now uses the separate
+[live Opus captures](media/live-assistant/README.md).
 
 ## Runtime proof and remaining live checks
 
@@ -106,12 +108,20 @@ Both actually read the isolated note and reject a model response without tool
 use. The provider responses were scripted for the exact selected fixture model.
 The check does not silently substitute a practice or fallback model.
 
-No live-provider credentials were available in the scoped workspace or test
-environment. Live authentication, billing, inference and native tool behavior
-therefore remain unverified. A paid/provider-backed task-quality
-run, real Gmail account/Graph tenant and real external mail send remain unrun.
-Compatibility checks do not establish autonomous judgment or preference-adherence
-quality. No Claude Duet account or comparative quality benchmark was exercised.
+At the October 23 revision, no live-provider credentials were available in the
+scoped environment; that report therefore did not verify live authentication,
+inference or native tool behavior. The subsequent
+[October 24 live-model report](LIVE_MODEL_VERIFICATION.md) supersedes that limit
+for its two named provider/model combinations. It records real compatibility
+checks, automatic correction learning, preference use in a separate task,
+restart persistence and native scheduled preparation while the browser and
+frontend server were stopped. It used the process supervisor; its live workflow
+does not establish default Docker supervisor behavior.
+
+Real Gmail account/Graph tenant access and external mail sending remain outside
+those live runs. Compatibility checks and individual successful drafts do not
+establish general autonomous judgment or preference-adherence reliability.
+No Claude Duet account or comparative quality benchmark was exercised.
 
 Native Gmail/Graph complete-thread watches are implemented and fixture-tested.
 IMAP and generic MCP watches remain unavailable until complete-thread state can
@@ -133,8 +143,8 @@ Published-source workflows:
 The product source is checked with `bun run typecheck`, `bun run lint`,
 `bun run --cwd apps/web build`, the three Compose check commands, and the full
 `bun run test` suite on Linux with Node 22, Bun 1.3.13 and disposable PostgreSQL.
-The latest typecheck, lint, production web build and all three Compose checks
-passed. Fresh published-source CI passed **9,796 tests / 224,125 assertions**
+For the October 23 revision, typecheck, lint, the production web build and all
+three Compose checks passed. Fresh published-source CI passed **9,796 tests / 224,125 assertions**
 across 943 files in **1,526.75 seconds**, with **224 skips, 13 todos and zero
 failures** (10,033 cases total). The runtime plugin suite passed **254 tests**,
 with **7 skips**, in 55.78 seconds.
@@ -142,8 +152,8 @@ with **7 skips**, in 55.78 seconds.
 The full-suite runner does not enable every opt-in proof: skips/todos include
 absent Chromium, separately enabled Docker proofs and unavailable live accounts.
 The dedicated browser, renderer sandbox, sign-out, stdio MCP, Docker and
-deployment jobs above passed their own checks. This does not turn the remaining
-live-provider/account skips into passing evidence.
+deployment jobs above passed their own checks. Skipped cases in that run
+remain skipped; the subsequent live report records its own execution evidence.
 
 The final affected Linux run passed **297 tests / 2,098 assertions** across
 35 files, with **2 optional runtime-proof skips** and no failures.

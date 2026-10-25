@@ -1,6 +1,6 @@
 {
   "name": "@openduet/runtime-hermes",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@openduet/contracts": "workspace:*",
-    "zod": "4.6.2",
+    "zod": "4.6.7",
     "@openduet/skills": "workspace:*"
   }
 }

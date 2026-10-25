@@ -97,6 +97,12 @@ with `OPENDUET_BROWSER=1`:
 curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | OPENDUET_BROWSER=1 bash
 ```
 
+If you installed a tagged release, preserve that release in all three places:
+the installer URL, `OPENDUET_REF` and `OPENDUET_IMAGE_TAG`. The command above
+downloads `main` deployment files; it is for installations tracking `main`.
+See the [v0.3.0 browser commands](releases/v0.3.0.md#optional-browser-worker)
+for a pinned example.
+
 It takes the same steps with the shell, Docker and the published images: the
 service container creates the connection and the space's directory, the service
 image works out the deploy file and the connections entry, and the same

@@ -71,7 +71,9 @@ const text = (content: unknown): string =>
         OPENDUET_DEFAULT_MODEL: 'scripted',
       }),
       fakeProvider: async (body, attemptId, protocol) => {
-        requests.push(body as Body);
+        // Memory and acknowledgment calls have their own prompts; inspect the
+        // execution attempt whose Hermes identity this proof is meant to verify.
+        if (attemptId.startsWith('att_')) requests.push(body as Body);
         return scripted(body, attemptId, protocol);
       },
     });

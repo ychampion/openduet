@@ -6,10 +6,12 @@ what should happen and why. Report a security problem privately, as described in
 
 ## Set up and verify
 
-Use Bun 1.3 or newer. From the repository root:
+Use the pinned Bun **1.3.13** from `.bun-version` and Node.js **22**. From the
+repository root:
 
 ```bash
 bun install --frozen-lockfile
+bun audit
 bun run doctor
 bun run typecheck
 bun run lint
@@ -24,8 +26,22 @@ bun run conformance:memory
 bun run test:plugin
 ```
 
+The full Bun suite uses Bun's native discovery and runs one native shard per
+file, sequentially in fresh processes with `--isolate`, a concurrency limit of
+two and a 30-second per-test timeout. This bounds accumulated worker state
+during long runs. Every file runs even when an earlier file fails; any failure
+makes the full command fail.
+Arguments such as `bun run test apps/openduet/src/companies/replies.test.ts`
+run one native invocation with those filters.
+
 Run `bun run doctor` first: it names each missing test prerequisite. Tests use
 scripted providers, so no model key is needed.
+
+The root manifest pins security fixes for transitive dependencies in `overrides`.
+Keep these pins until the requesting packages resolve patched versions on their
+own. The `esbuild` pin also replaces the older copy used by the migration tool's
+legacy loader; check `drizzle-kit check` from `apps/openduet` when updating it.
+Run `bun audit` after dependency changes. CI checks every advisory severity.
 
 Database tests use disposable Postgres 17: embedded when `DATABASE_URL` is
 unset, otherwise disposable databases created on the server you supply, which
@@ -92,6 +108,42 @@ bun test apps/openduet/test/integration/wired-assistant.test.ts --max-concurrenc
 [Service conformance](conformance/README.md) and
 [memory conformance](conformance/memory/README.md) describe each scenario and
 how to run the deployment scenarios against a Compose stack.
+
+### Verify against the pinned engine
+
+CI also installs the exact engine commit used by the runtime image and runs the
+opt-in proofs against it. Use a disposable checkout with `DATABASE_URL` pointed
+at your test Postgres. Start without existing `.hermes-src` or `.hermes-venv`
+directories, then prepare the same locked dependencies:
+
+```bash
+git clone --depth 1 --branch v2026.9.7 https://github.com/NousResearch/hermes-agent.git .hermes-src
+test "$(git -C .hermes-src rev-parse HEAD)" = 2237be355906fbe6065ce1815711eee52b2d646e
+UV_PROJECT_ENVIRONMENT="$PWD/.hermes-venv" uv sync --project .hermes-src --frozen --no-install-project --extra messaging --extra anthropic --python 3.12
+uv pip install --python .hermes-venv/bin/python --no-deps -e .hermes-src
+uv pip install --python .hermes-venv/bin/python pytest==9.1.1 pillow==12.3.0
+.hermes-venv/bin/python packages/runtime-hermes/patches/observer_bridge.py .hermes-src
+PYTHONPATH="$PWD/packages/runtime-hermes/runtime_support:$PWD/packages/runtime-hermes:$PWD/.hermes-src" .hermes-venv/bin/python -m pytest packages/runtime-hermes/tests -q -rs
+OPENDUET_CAPABILITY_PROOF=1 OPENDUET_CAPABILITY_STAGE= OPENDUET_READINESS_RUNTIME_PROOF=1 OPENDUET_HERMES_E2E=1 \
+  bun test --max-concurrency=1 --timeout=900000 \
+    apps/openduet/test/integration/capability-proof.test.ts \
+    apps/openduet/test/integration/model-readiness-real.test.ts \
+    apps/openduet/test/integration/hooks-real.test.ts \
+    apps/openduet/test/integration/compaction-real.test.ts \
+    apps/openduet/test/integration/identity-prompt.test.ts \
+    apps/openduet/test/integration/wired-assistant.test.ts
+bun run packages/runtime-hermes/scripts/e2e.ts
+bun run packages/runtime-hermes/scripts/e2e-exec.ts
+bun run packages/runtime-hermes/scripts/discovery-e2e.ts
+bun run conformance:memory
+```
+
+These proofs use scripted providers through actual Hermes and the production
+gateway, without paid-model keys. Keep them sequential: several fixtures own
+fixed local ports. The commands above use Unix virtual-environment paths; on
+Windows use `.hermes-venv/Scripts/python.exe` and the platform's `PYTHONPATH`
+separator. The process supervisor has your operating-system access; Docker
+isolation is proved separately by the container suites.
 
 ## Where things live
 

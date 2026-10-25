@@ -5,7 +5,9 @@ These are editable recipes, not claims that every model completes every task.
 For initial use, choose **Settings → Approvals → Ask me for everything**.
 Inspect the proposed destination and action before allowing a change.
 
-The [walkthroughs](SHOWCASE.md) use scripted sample data. Live outcomes depend
+The [client draft, correction learning and recurring preparation](LIVE_MODEL_VERIFICATION.md)
+have actual Opus and Fireworks execution records and captures. Additional
+[walkthroughs](SHOWCASE.md) use scripted sample data. Live outcomes depend
 on model quality, account permissions, tool availability and your instructions.
 
 | Start with | Needs | Deliverable |

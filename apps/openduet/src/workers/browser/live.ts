@@ -35,7 +35,7 @@ export type LiveHost = {
 type HeldFrame = Extract<LiveDown, { type: 'frame' }> & { ack: number };
 
 export type BrowserLiveOptions = { now?: () => number; limits?: LiveLimitOverrides };
-type Screen = { page: Page; cdp: CDPSession; release: () => void };
+type Screen = { page: Page; cdp: CDPSession; closed: boolean; release: () => void };
 
 /** Budgets and limits that last for one takeover epoch, across the channels opened under it. */
 type Takeover = {
@@ -261,26 +261,62 @@ export class BrowserLive {
       await this.end(channel, 'slow_down');
       throw new BrowserFault('slow_down');
     }
+    // Queued input belongs to the view shown at admission, even if a popup changes it later.
+    const target = channel.screen;
+    const admittedPopup = channel.popup;
     // Batches keep their order; each event is fenced by the epoch immediately before dispatch.
     const dispatched = channel.inputs.then(async () => {
       let accepted = 0;
-      for (const event of events) {
-        await channel.switching;
-        const screen = channel.screen;
-        if (channel.ended || !screen) throw new BrowserFault('live_closed');
-        if (liveAction(event)) channel.scope.acted();
-        try {
-          await this.host.sessions.dispatchHumanInput(channel.sessionId, channel.epoch, () =>
-            this.dispatch(channel, screen.cdp, event),
-          );
-        } catch (error) {
-          if (error instanceof BrowserFault) await this.end(channel, endCode(error));
-          throw error;
+      try {
+        for (const event of events) {
+          let switching: Promise<void>;
+          do {
+            switching = channel.switching;
+            await switching;
+            this.host.sessions.checkHumanControl(channel.sessionId, channel.epoch);
+            if (channel.ended) throw new BrowserFault('live_closed');
+          } while (switching !== channel.switching);
+          if (
+            !target ||
+            channel.screen !== target ||
+            target.page.isClosed() ||
+            (target.page === admittedPopup && target.closed)
+          )
+            return { accepted };
+          if (liveAction(event)) channel.scope.acted();
+          try {
+            await this.host.sessions.dispatchHumanInput(channel.sessionId, channel.epoch, () =>
+              this.dispatch(channel, target.cdp, event),
+            );
+            this.host.sessions.checkHumanControl(channel.sessionId, channel.epoch);
+            if (channel.ended) throw new BrowserFault('live_closed');
+          } catch (error) {
+            this.host.sessions.checkHumanControl(channel.sessionId, channel.epoch);
+            if (channel.ended) throw new BrowserFault('live_closed');
+            if (!closedCdpTarget(error)) throw error;
+            do {
+              switching = channel.switching;
+              await switching;
+              this.host.sessions.checkHumanControl(channel.sessionId, channel.epoch);
+              if (channel.ended) throw new BrowserFault('live_closed');
+            } while (switching !== channel.switching);
+            const current = channel.screen;
+            const closedPopup =
+              target.page === admittedPopup && (target.closed || target.page.isClosed());
+            if (!closedPopup && (!current || current === target || current.page.isClosed()))
+              throw error;
+            // Closing a popup can destroy its CDP target before acknowledging input. Its effect
+            // is uncertain, so exclude it and the remaining batch rather than replaying either.
+            return { accepted };
+          }
+          accepted++;
+          this.counts.inputs++;
         }
-        accepted++;
-        this.counts.inputs++;
+        return { accepted };
+      } catch (error) {
+        if (error instanceof BrowserFault) await this.end(channel, endCode(error));
+        throw error;
       }
-      return { accepted };
     });
     channel.inputs = dispatched.catch(() => {});
     return dispatched;
@@ -356,14 +392,21 @@ export class BrowserLive {
       const loaded = () => this.where(channel, page);
       page.on('framenavigated', navigated);
       page.on('domcontentloaded', loaded);
+      const closed = () => {
+        screen.closed = true;
+      };
       const screen: Screen = {
         page,
         cdp,
+        closed: false,
         release: () => {
           page.off('framenavigated', navigated);
           page.off('domcontentloaded', loaded);
+          cdp.off('close', closed);
         },
       };
+      // CDP can report target closure before the page-close notification reaches the live view.
+      cdp.once('close', closed);
       channel.screen = screen;
       const ack = (sessionId: number) => {
         void cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
@@ -635,6 +678,15 @@ export class BrowserLive {
         .map((page) => page.close().catch(() => {})),
     );
   }
+}
+
+function closedCdpTarget(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /Target page, context or browser has been closed|Session closed|Target closed/.test(
+      error.message,
+    )
+  );
 }
 
 function endCode(error: BrowserFault): LiveEndCode {

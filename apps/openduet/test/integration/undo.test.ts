@@ -8,7 +8,7 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import type { Action, ConnectorManifest, DispatchResult, JsonObject } from '@openduet/contracts';
 import { loadAction, recordId } from '../../src/broker/records.ts';
-import { BrokerService } from '../../src/broker/service.ts';
+import { type BrokerOptions, BrokerService } from '../../src/broker/service.ts';
 import { createTableTrustResolver, type TrustTableEntry } from '../../src/broker/trust.ts';
 import { calendarManifest } from '../../src/connectors/calendar.ts';
 import { emailManifest } from '../../src/connectors/email.ts';
@@ -121,6 +121,8 @@ async function setup(
     existing?: Occurrence[];
     sendHoldMs?: number;
     declaresHold?: string;
+    /** A controlled gate inside the transaction that commits a successful receipt. */
+    recordStandingScope?: BrokerOptions['recordStandingScope'];
     /** Events on another calendar the person has connected in the same space. */
     otherCalendar?: Occurrence[];
   } = {},
@@ -145,20 +147,49 @@ async function setup(
     // The event the person pointed at themselves.
     ['act_theirs', { origin_trust: 'owner' }],
   ]);
-  const brokerFor = () =>
-    new BrokerService({
+  const dispatches = new Set<Promise<Action>>();
+  const brokerFor = () => {
+    const broker = new BrokerService({
       sql,
       connectors: registry,
       resolveTrust: createTableTrustResolver(trust),
       // No reviewer: what goes ahead unasked is decided by fixed rules alone.
       autoReview: { reviewer: null },
       sendHoldMs: options.sendHoldMs ?? 0,
+      recordStandingScope: options.recordStandingScope,
     });
+    const dispatch = broker.dispatch.bind(broker);
+    broker.dispatch = (...args) => {
+      const pending = dispatch(...args);
+      dispatches.add(pending);
+      void pending.then(
+        () => dispatches.delete(pending),
+        () => dispatches.delete(pending),
+      );
+      return pending;
+    };
+    return broker;
+  };
+  const drainDispatches = async () => {
+    // A held-send timer can win over a recovery scan; its receipt must commit before assertions.
+    while (dispatches.size) await Promise.all([...dispatches]);
+  };
   const broker = brokerFor();
   const effects = new ExperienceEffects(sql, broker, registry);
   const propose = (kind: string, payload: JsonObject) =>
     broker.propose(seed.claims, { connection_id: seed.connectionId, kind, payload });
-  return { ...seed, ...fake, sql, registry, broker, brokerFor, effects, propose, trust };
+  return {
+    ...seed,
+    ...fake,
+    sql,
+    registry,
+    broker,
+    brokerFor,
+    drainDispatches,
+    effects,
+    propose,
+    trust,
+  };
 }
 
 describe('undo send', () => {
@@ -206,12 +237,83 @@ describe('undo send', () => {
     await restarted.resumeParked();
     await s.broker.resumeParked();
     expect(s.executed.map((action) => action.id)).toEqual([second.id]);
+    await s.drainDispatches();
     expect((await loadAction(s.sql, second.id)).status).toBe('succeeded');
     // Once sent, it cannot be cancelled.
     expect(await s.effects.undo(s.claims.space_id, second.id)).toMatchObject({
       status: 'not_available',
     });
   });
+
+  databaseTest(
+    'a held-send timer commits one receipt after recovery scans have returned',
+    async () => {
+      let enteredCommit = () => {};
+      let releaseCommit = () => {};
+      const committing = new Promise<void>((resolve) => {
+        enteredCommit = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      const s = await setup(emailManifest, {
+        sendHoldMs: 2_000,
+        recordStandingScope: async () => {
+          enteredCommit();
+          await released;
+        },
+      });
+      try {
+        const proposed = await s.propose('email.send', {
+          to: 'alex@example.test',
+          subject: 'Dinner',
+          body: 'Eight?',
+        });
+        expect(proposed.status).toBe('needs_approval');
+        await s.broker.decide(proposed.action_id, {
+          decision: 'approved',
+          payload_hash: proposed.payload_hash,
+        });
+        const admitted = await s.broker.admit(s.claims, proposed.action_id, proposed.payload_hash);
+        expect(admitted.status).toBe('admitted');
+        expect(s.executed).toHaveLength(0);
+        // Only the original broker's real hold timer starts this dispatch.
+        await committing;
+        const restarted = s.brokerFor();
+        expect(await restarted.resumeParked()).toBe(0);
+        expect(await restarted.resumeParked()).toBe(0);
+        expect(await s.broker.resumeParked()).toBe(0);
+        expect(s.executed.map((action) => action.id)).toEqual([proposed.action_id]);
+        const pending = await loadAction(s.sql, proposed.action_id);
+        expect(pending.status).toBe('dispatched');
+        expect(pending.receipt).toBeNull();
+        const [before] = await s.sql`select count(*)::int as count from event
+        where type = 'notice' and payload->>'phase' = 'receipt'
+          and payload->>'action_id' = ${proposed.action_id}`;
+        expect(before?.count).toBe(0);
+        releaseCommit();
+        await s.drainDispatches();
+        const completed = await loadAction(s.sql, proposed.action_id);
+        expect(completed.status).toBe('succeeded');
+        expect(completed.receipt).toMatchObject({
+          action_id: proposed.action_id,
+          connection_id: s.connectionId,
+          external_ref: proposed.action_id,
+        });
+        await restarted.resumeParked();
+        await s.broker.resumeParked();
+        await s.drainDispatches();
+        expect(s.executed.map((action) => action.id)).toEqual([proposed.action_id]);
+        const [after] = await s.sql`select count(*)::int as count from event
+        where type = 'notice' and payload->>'phase' = 'receipt'
+          and payload->>'action_id' = ${proposed.action_id}`;
+        expect(after?.count).toBe(1);
+      } finally {
+        releaseCommit();
+        await s.drainDispatches();
+      }
+    },
+  );
 
   databaseTest('an instance whose clock runs ahead does not end a hold early', async () => {
     const s = await setup(emailManifest, { sendHoldMs: 60_000 });
