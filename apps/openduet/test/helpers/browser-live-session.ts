@@ -1,10 +1,16 @@
+import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { chromium, type Page } from 'playwright';
 import { BrowserController } from '../../src/workers/browser/controller.ts';
 import type { BrowserLive } from '../../src/workers/browser/live.ts';
 import type { LiveDown, LiveInput } from '../../src/workers/browser/live-protocol.ts';
-import { BrowserFault, type BrowserSession } from '../../src/workers/browser/sessions.ts';
+import {
+  BrowserFault,
+  type BrowserSession,
+  browserLaunchOptions,
+} from '../../src/workers/browser/sessions.ts';
 import { SIGN_IN, SIGN_IN_POINTS } from './browser-fixture.ts';
 
 // The worker runs in Node, so a scripted person drives the live session against real Chromium
@@ -320,8 +326,299 @@ async function still() {
   }
 }
 
+type Interruption =
+  | 'popup_closed'
+  | 'detached'
+  | 'acknowledged_prefix'
+  | 'live_error'
+  | 'revoked'
+  | 'channel_closed'
+  | 'acknowledged_revoked'
+  | 'acknowledged_channel_closed'
+  | 'close_before_notification'
+  | 'close_before_switch';
+
+/** Hold a real CDP call at a controlled boundary; every destination remains real Chromium. */
+async function interruptedInput(kind: Interruption) {
+  type Gate = {
+    page: Page;
+    type: string;
+    afterAck: boolean;
+    entered: () => void;
+    wait: Promise<void>;
+  };
+  let gate: Gate | undefined;
+  let invalid: Page | undefined;
+  let release = () => {};
+  let notifyClosed = () => {};
+  const pending: Promise<unknown>[] = [];
+  const calls: { page: Page; method: string }[] = [];
+  const closedTargets = new Set<Page>();
+  const controller = new BrowserController({
+    spaceId: `sp_interrupted_${kind}`,
+    spaceRoot: await mkdtemp(join(tmpdir(), 'openduet-live-input-')),
+    idleMs: 1500,
+    humanIdleMs: 2500,
+    network: { fixtureOrigins: [app, idp, other] },
+    launch: async (profile) => {
+      const context = await chromium.launchPersistentContext(
+        join(profile, 'chromium'),
+        browserLaunchOptions(),
+      );
+      const attach = context.newCDPSession.bind(context);
+      context.newCDPSession = async (page) => {
+        assert('isClosed' in page, 'The fixture instruments page targets');
+        const cdp = await attach(page);
+        cdp.once('close', () => closedTargets.add(page));
+        const send = cdp.send.bind(cdp);
+        cdp.send = async (method, params) => {
+          if (method === 'Input.dispatchMouseEvent' && invalid === page) {
+            invalid = undefined;
+            await send('Input.dispatchMouseEvent', {
+              type: 'invalid-fixture-event' as never,
+              x: 0,
+              y: 0,
+            });
+            throw new Error('Chromium accepted the deliberately invalid fixture event');
+          }
+          const held = gate;
+          if (
+            held?.page === page &&
+            method === 'Input.dispatchMouseEvent' &&
+            params &&
+            'type' in params &&
+            params.type === held.type
+          ) {
+            gate = undefined;
+            if (held.afterAck) {
+              const response = await send(method, params);
+              calls.push({ page, method });
+              held.entered();
+              await held.wait;
+              return response;
+            }
+            held.entered();
+            await held.wait;
+          }
+          if (method.startsWith('Input.')) calls.push({ page, method });
+          return send(method, params);
+        };
+        return cdp;
+      };
+      return context;
+    },
+  });
+  const capture = (operation: Promise<{ accepted: number }>) => {
+    const settled = operation.then(
+      (value) => ({ ...value }),
+      (error: unknown) => ({ error: reason(error) }),
+    );
+    pending.push(settled);
+    return settled;
+  };
+  try {
+    const { sessions, live } = controller;
+    let session = await sessions.lease('job_input_boundary', policy);
+    const command = (operation: unknown) =>
+      controller.command({
+        session_id: session.id,
+        job_id: 'job_input_boundary',
+        control_epoch: session.control_epoch,
+        operation,
+      });
+    await command({ kind: 'observe' });
+    await command({ kind: 'open', url: `${app}/help?n=main` });
+    session = await sessions.takeover(session.id);
+    const opened = await live.open(session.id, session.control_epoch);
+    const you = person(live, opened.live_id);
+    const context = sessions.context;
+    const main = sessions.page;
+    assert(context && main);
+    const switchReady = async (suffix: string) => {
+      assert(
+        await you.until(() => you.view.where.endsWith(suffix)),
+        'The intended view must appear',
+      );
+      // Repainting is serialized with the real target switch and introduces no input of its own.
+      await live.pull(opened.live_id, you.view.seq, 0, true);
+    };
+    const popup = async () => {
+      const openedPage = context.waitForEvent('page');
+      await main.evaluate(`window.open(${JSON.stringify(`${app}/help?n=interrupted`)})`);
+      const page = await openedPage;
+      await page.waitForLoadState('domcontentloaded');
+      await switchReady('/help?n=interrupted');
+      return page;
+    };
+    const move: LiveInput = { k: 'move', x: 900, y: 740, button: 0, mods: 0, clicks: 1 };
+    if (kind === 'live_error') {
+      invalid = main;
+      const rejected = await capture(you.send([move]));
+      const continued = await you.send([move]);
+      return { rejected, main_closed: main.isClosed(), continued };
+    }
+    const closesPopup =
+      kind === 'popup_closed' ||
+      kind === 'revoked' ||
+      kind === 'channel_closed' ||
+      kind === 'close_before_notification' ||
+      kind === 'close_before_switch';
+    const original = closesPopup ? await popup() : main;
+    let entered = () => {};
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const afterAck = kind.startsWith('acknowledged_');
+    gate = {
+      page: original,
+      type: afterAck ? 'mouseMoved' : 'mouseReleased',
+      afterAck,
+      entered,
+      wait,
+    };
+    const batch = capture(
+      you.send(
+        kind === 'acknowledged_revoked' || kind === 'acknowledged_channel_closed'
+          ? [move]
+          : [
+              move,
+              { ...move, k: 'down' },
+              { ...move, k: 'up' },
+              { k: 'text', text: 'remainder-must-not-replay' },
+            ],
+      ),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        reached,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('The controlled CDP gate was not reached')),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    // This second batch was submitted while the old view was still visible, before the switch.
+    const queued = capture(you.send([{ k: 'text', text: 'queued-must-not-replay' }]));
+    let replacement: Page;
+    let beforeNotification: { page_closed: boolean; cdp_closed: boolean } | undefined;
+    const holdNotification = kind === 'close_before_notification' || kind === 'close_before_switch';
+    if (closesPopup) {
+      if (kind === 'close_before_notification') {
+        // Hold only Playwright's client notification. The real browser and CDP target close,
+        // so this exercises an error arriving before the live popup-close handler can switch.
+        const client = original as Page & { _onClose: () => void };
+        assert.equal(
+          typeof client._onClose,
+          'function',
+          'The pinned close-notification seam exists',
+        );
+        const close = client._onClose.bind(client);
+        client._onClose = () => {
+          notifyClosed = close;
+        };
+      }
+      if (kind === 'close_before_switch') {
+        const emitter = original as Page & {
+          emit: (event: string | symbol, ...args: unknown[]) => boolean;
+        };
+        const emit = emitter.emit.bind(emitter);
+        emitter.emit = (event, ...args) => {
+          if (event === 'close') {
+            notifyClosed = () => {
+              emit(event, ...args);
+            };
+            return true;
+          }
+          return emit(event, ...args);
+        };
+      }
+      await original.close();
+      if (!holdNotification) await switchReady('/help?n=main');
+      replacement = main;
+    } else {
+      replacement = await popup();
+    }
+    const replacementCalls = calls.filter((call) => call.page === replacement).length;
+    const revoked = kind === 'revoked' || kind === 'acknowledged_revoked';
+    const closed = kind === 'channel_closed' || kind === 'acknowledged_channel_closed';
+    if (revoked) await sessions.handback(session.id);
+    if (closed) await live.close(opened.live_id);
+    release();
+    const outcomes = { batch: await batch, queued: await queued };
+    if (holdNotification) {
+      beforeNotification = {
+        page_closed: original.isClosed(),
+        cdp_closed: closedTargets.has(original),
+      };
+      notifyClosed();
+      notifyClosed = () => {};
+      await switchReady('/help?n=main');
+    }
+    const replayed = calls.filter((call) => call.page === replacement).length - replacementCalls;
+    if (revoked || closed) {
+      return {
+        ...outcomes,
+        replayed,
+        control: sessions.session?.control,
+        old_channel: await refusal(() => you.send([move])),
+        ended: (await live.pull(opened.live_id, you.view.seq, 0)).events,
+      };
+    }
+    const continued = await you.send([move]);
+    return {
+      ...outcomes,
+      replayed,
+      original_closed: original.isClosed(),
+      continued,
+      ...(beforeNotification ? { before_notification: beforeNotification } : {}),
+    };
+  } finally {
+    release();
+    notifyClosed();
+    await Promise.all(pending);
+    await controller.sessions.close();
+  }
+}
+
+async function interruptions() {
+  const outcomes: Record<string, unknown> = {};
+  result.interruptions = outcomes;
+  for (const kind of [
+    'popup_closed',
+    'detached',
+    'acknowledged_prefix',
+    'live_error',
+    'revoked',
+    'channel_closed',
+    'acknowledged_revoked',
+    'acknowledged_channel_closed',
+    'close_before_notification',
+    'close_before_switch',
+  ] as const) {
+    try {
+      outcomes[kind] = await interruptedInput(kind);
+    } catch (error) {
+      outcomes[kind] = { error: reason(error) };
+    }
+  }
+}
+
 try {
-  await (mode === 'limits' ? limits() : mode === 'still' ? still() : flow());
+  await (mode === 'interruptions'
+    ? interruptions()
+    : mode === 'limits'
+      ? limits()
+      : mode === 'still'
+        ? still()
+        : flow());
 } catch (error) {
   result.error = reason(error);
 } finally {

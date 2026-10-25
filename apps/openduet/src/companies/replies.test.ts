@@ -14,6 +14,7 @@ import type { SecretAccess } from '../connectors/secrets.ts';
 import {
   connectorReplyMailbox,
   deliveryFailureCode,
+  fromAddresses,
   isReplyFrom,
   registrableDomain,
   replyPayload,
@@ -118,12 +119,18 @@ test('a reply that could not be delivered is logged by a fixed reason, never by 
   expect(deliveryFailureCode('not even an error')).toBe('internal_error');
 });
 
-test('a display name that spells out the company’s address does not make its sender the company', async () => {
+test('an encoded spoofing display name round-trips as only the attacker after safe quoting', async () => {
   // The name decodes to `Acme" <support@acme.test> "`; the address is x@evil.test.
-  const name = Buffer.from('Acme" <support@acme.test> "').toString('base64');
+  const displayName = 'Acme" <support@acme.test> "';
+  const name = Buffer.from(displayName).toString('base64');
+  const fromHeader = `From: =?UTF-8?B?${name}?= <x@evil.test>`;
   const parsed = await simpleParser(
-    `From: =?UTF-8?B?${name}?= <x@evil.test>\r\nMessage-ID: <r@evil.test>\r\nDate: Fri, 18 Sep 2026 11:00:00 +0000\r\nSubject: Re: Refund\r\n\r\nPaid.`,
+    `${fromHeader}\r\nMessage-ID: <r@evil.test>\r\nDate: Fri, 18 Sep 2026 11:00:00 +0000\r\nSubject: Re: Refund\r\n\r\nPaid.`,
   );
+  expect(parsed.headerLines.filter((header) => header.key === 'from')).toEqual([
+    { key: 'from', line: fromHeader },
+  ]);
+  expect(parsed.from?.value).toEqual([{ address: 'x@evil.test', name: displayName }]);
   const message = toMailMessage(1, parsed);
   expect(message.from_addresses).toEqual(['x@evil.test']);
   const registry = new ConnectorRegistry();
@@ -134,12 +141,37 @@ test('a display name that spells out the company’s address does not make its s
     spaceId: SPACE,
   }).recent(50);
   expect(read?.messageId).toBe('<r@evil.test>');
-  if (!read) return;
+  if (!read) throw new Error('Expected the spoofing message to be read');
   const since = '2026-09-18T09:00:00.000Z';
+  expect(read.fromAddresses).toEqual(['x@evil.test']);
   expect(isReplyFrom({ domain: 'acme.test', since }, read)).toBe(false);
+  expect(isReplyFrom({ domain: 'evil.test', since }, read)).toBe(true);
   expect(replyPayload(read).sender_domain).toBe('evil.test');
-  // Reading the rendered header alone, a part that holds two addresses is nobody.
-  expect(senderDomain(read.from)).toBeNull();
+  expect(replyPayload(read).sender).toBe('x@evil.test');
+  // Escaping the display name must preserve the actual sender on either read path.
+  expect(read.from).toBe('"Acme\\" <support@acme.test> \\"" <x@evil.test>');
+  expect(fromAddresses(read.from)).toEqual(['x@evil.test']);
+  expect(senderDomain(read.from)).toBe('evil.test');
+  const roundTrip = await simpleParser(`From: ${read.from}\r\n\r\n`);
+  expect(roundTrip.from?.value).toEqual([{ address: 'x@evil.test', name: displayName }]);
+  expect(toMailMessage(2, roundTrip).from_addresses).toEqual(['x@evil.test']);
+});
+
+test('an unescaped display header containing two angle addresses is rejected', () => {
+  const malformed = '"Acme" <support@acme.test> "" <x@evil.test>';
+  expect(fromAddresses(malformed)).toEqual([]);
+  expect(senderDomain(malformed)).toBeNull();
+  const message = {
+    messageId: '<malformed@evil.test>',
+    from: malformed,
+    subject: 'Re: Refund',
+    receivedAt: '2026-09-18T11:00:00.000Z',
+  };
+  const since = '2026-09-18T09:00:00.000Z';
+  expect(isReplyFrom({ domain: 'acme.test', since }, message)).toBe(false);
+  expect(isReplyFrom({ domain: 'evil.test', since }, message)).toBe(false);
+  expect(replyPayload(message).sender_domain).toBeNull();
+  expect(replyPayload(message).sender).toBeNull();
 });
 
 test('a company with a name outside ASCII is the same company in either spelling', () => {

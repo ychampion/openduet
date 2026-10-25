@@ -5,11 +5,12 @@
  * work through the device connector. The companion's tools run for real on a
  * temporary folder; nothing listens on the "computer".
  */
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  action as actionSchema,
   type CapabilityClaims,
   DEVICE_LIMITS,
   type DeviceView,
@@ -30,6 +31,7 @@ import { BrokerService, DEVICE_SCREEN_WITHHELD } from '../../src/broker/service.
 import { ConnectorFactory, useConnectorFactory } from '../../src/connectors/configured.ts';
 import { ConnectorRegistry } from '../../src/connectors/registry.ts';
 import { sandboxExecManifest } from '../../src/connectors/sandbox-exec.ts';
+import { createDeviceConnector } from '../../src/devices/connector.ts';
 import { sharedDeviceHub } from '../../src/devices/hub.ts';
 import { PUBLIC_ONLY_NOTE, routedDescription, SIGNED_IN_NOTE } from '../../src/devices/routing.ts';
 import {
@@ -1172,40 +1174,188 @@ withDb('what waited for the computer, when the person stops or time runs out', (
     expect(log.some((line) => line.includes('local network'))).toBe(true);
   }, 60_000);
 
+  test.each([
+    ['execute', 'settings'],
+    ['execute', 'companion'],
+    ['verify', 'settings'],
+    ['verify', 'companion'],
+  ] as const)(
+    'a stale %s permission read cannot bypass a %s change',
+    async (operation, source) => {
+      const s = need();
+      const { config } = await s.computer();
+      const connectionId = await connectionOf(config.device_id);
+      const claims = await s.job(['device.status', 'device.list_files']);
+      let observed!: () => void;
+      let release!: () => void;
+      const snapshotRead = new Promise<void>((resolve) => {
+        observed = resolve;
+      });
+      const resumeRead = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let held = false;
+      const sql = new Proxy(s.sql, {
+        async apply(target, receiver, args) {
+          const rows = await Reflect.apply(target, receiver, args);
+          // Hold a real committed snapshot, not an invented permission response.
+          if (!held && String(args[0]?.[0]).startsWith('select d.id, d.name, d.platform')) {
+            held = true;
+            observed();
+            await resumeRead;
+          }
+          return rows;
+        },
+      });
+      const existing = registry.get(connectionId);
+      if (existing) await registry.remove(connectionId, existing);
+      const connector = createDeviceConnector({
+        deviceId: config.device_id,
+        connectionId,
+        name: 'Test laptop',
+        sql,
+        workRoot: s.workRoot,
+      });
+      registry.register(connectionId, connector);
+      sharedDeviceHub.touch(config.device_id);
+      const actionId = recordId('act');
+      const action = actionSchema.parse({
+        id: actionId,
+        job_id: claims.job_id,
+        attempt_id: claims.attempt_id,
+        connection_id: connectionId,
+        kind: 'device.write_file',
+        effect_class: 'write_external',
+        canonical_payload: {
+          path: 'Shared/result.txt',
+          content: 'Prepared before the permission change.',
+        },
+        payload_hash: '0'.repeat(64),
+        status: 'unknown',
+        authorization_ref: null,
+        budget_reservation: null,
+        idempotency_key: actionId,
+        dispatched_at: null,
+        receipt: null,
+        resolved_at: null,
+        reconciliation: null,
+        created_at: new Date().toISOString(),
+      });
+      const verify = connector.verify;
+      if (!verify) throw new Error('Device connector must support verification.');
+      const waiting =
+        operation === 'execute'
+          ? s.broker
+              .propose(claims, {
+                kind: 'device.list_files',
+                connection_id: connectionId,
+                payload: { path: 'Shared' },
+              })
+              .then((result) => result.status)
+          : verify(action, {
+              job_id: claims.job_id,
+              space_id: claims.space_id,
+              idempotency_key: actionId,
+              constraints: {
+                public_compartment: false,
+                allowed_domains: [],
+                deliverable: { kind: 'none' },
+              },
+            }).then((result) => result.decision);
+      try {
+        await Promise.race([
+          snapshotRead,
+          waiting.then(() => {
+            throw new Error('Device request finished before its snapshot was held.');
+          }),
+        ]);
+        const changed =
+          source === 'settings'
+            ? await s.app.request(
+                `/devices/${config.device_id}`,
+                s.as(s.cookie, 'PATCH', { capabilities: { files: false } }),
+              )
+            : await s.app.request('/device/hello', {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${config.token}`,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify({
+                  companion_version: '0.3.0',
+                  capabilities: { ...ALL, files: false },
+                  folders: config.folders,
+                }),
+              });
+        expect(changed.status).toBe(200);
+        release();
+        const collected = await sharedDeviceHub.poll(config.device_id, 100);
+        // End an unexpected delivery without running any tool on the companion.
+        sharedDeviceHub.disconnect(config.device_id, false);
+        const result = await waiting;
+        expect(collected).toEqual([]);
+        expect(result).toBe(operation === 'execute' ? 'failed' : 'undecided');
+      } finally {
+        release();
+        sharedDeviceHub.disconnect(config.device_id, false);
+        await waiting.catch(() => {});
+      }
+    },
+    60_000,
+  );
+
   test('turning a capability off withdraws what waits to be collected', async () => {
     const s = need();
     const { config, agent, log } = await s.computer();
     const connectionId = await connectionOf(config.device_id);
     const claims = await s.job(['device.status', 'device.list_files']);
-    // Online, but between polls: the request waits in the queue.
-    sharedDeviceHub.touch(config.device_id);
+    let enqueued!: () => void;
+    const queued = new Promise<void>((resolve) => {
+      enqueued = resolve;
+    });
+    const call = sharedDeviceHub.call.bind(sharedDeviceHub);
+    const observed = spyOn(sharedDeviceHub, 'call').mockImplementation((...args) => {
+      const ours = args[0] === config.device_id && args[1].tool === 'list_files';
+      // Online, but between polls, at the actual queue boundary.
+      if (ours) sharedDeviceHub.touch(config.device_id);
+      const result = call(...args);
+      if (ours) enqueued();
+      return result;
+    });
     const waiting = s.broker.propose(claims, {
       kind: 'device.list_files',
       connection_id: connectionId,
       payload: { path: 'Shared' },
     });
-    // Handed to the hub: the action is on its way to the computer.
-    for (let tries = 0; tries < 100; tries++) {
-      const [row] = await s.sql`select status from action where job_id = ${claims.job_id}`;
-      if (row?.status === 'dispatched') break;
-      await Bun.sleep(50);
+    try {
+      // Database dispatch precedes hub enqueueing, so wait for the real queue.
+      await Promise.race([
+        queued,
+        waiting.then(() => {
+          throw new Error('Request finished before it was queued.');
+        }),
+      ]);
+      const changed = await s.app.request(
+        `/devices/${config.device_id}`,
+        s.as(s.cookie, 'PATCH', { capabilities: { files: false } }),
+      );
+      expect(changed.status).toBe(200);
+      const proposal = await waiting;
+      expect(proposal.status).toBe('failed');
+      // Read as stored: the attempt may no longer look at a tool that was turned off.
+      const [action] =
+        await s.sql`select reconciliation from action where id = ${proposal.action_id}`;
+      expect(JSON.stringify(action?.reconciliation)).toContain('turned off');
+      // The computer connects afterwards and is handed nothing.
+      await connected(agent, async () => {
+        await Bun.sleep(300);
+      });
+      expect(log.some((line) => line.includes('→ list_files'))).toBe(false);
+    } finally {
+      observed.mockRestore();
+      sharedDeviceHub.disconnect(config.device_id, false);
+      await waiting.catch(() => {});
     }
-    const changed = await s.app.request(
-      `/devices/${config.device_id}`,
-      s.as(s.cookie, 'PATCH', { capabilities: { files: false } }),
-    );
-    expect(changed.status).toBe(200);
-    const proposal = await waiting;
-    expect(proposal.status).toBe('failed');
-    // Read as stored: the attempt may no longer look at a tool that was turned off.
-    const [action] =
-      await s.sql`select reconciliation from action where id = ${proposal.action_id}`;
-    expect(JSON.stringify(action?.reconciliation)).toContain('turned off');
-    // The computer connects afterwards and is handed nothing.
-    await connected(agent, async () => {
-      await Bun.sleep(300);
-    });
-    expect(log.some((line) => line.includes('→ list_files'))).toBe(false);
   }, 60_000);
 });
 

@@ -86,7 +86,7 @@
       "step": "say",
       "name": "noise-reminder",
       "event_time": "2026-07-08T07:07:00Z",
-      "text": "Remind me ten minutes ahead.",
+      "text": "I prefer reminders ten minutes before events.",
       "claim": {
         "key": "pref.calendar.reminder",
         "content": "ten minutes",

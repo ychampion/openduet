@@ -995,7 +995,7 @@ docker compose -f deploy/docker-compose.yml ps
 ```
 
 Then open **http://localhost:3101** on the Windows machine and continue with the
-README's [Run it yourself](../README.md#run-it-yourself).
+README's [Get started](../README.md#get-started).
 
 `bun run doctor --docker` names anything on the list above that is missing:
 Docker Desktop not running (nothing answers on its named pipe,
@@ -2046,12 +2046,20 @@ compatibility-check limit separate from your normal reply setting.
 The owner can also connect a model from the web app, in Settings › Models, or
 in the first-run step that appears while no working model is configured. Pick a
 provider, paste its API key (and, for `openai-compatible`, the endpoint's
-address), test the connection, choose a model from the provider's list or type
-its identifier, and use it. The test makes one small call, the provider's model
-list, and says plainly when the key is refused, the address answers 404, or the
-provider does not answer in time. Only the setup owner, or an account they made
-an admin, can change a key or the model; every other account sees which model
-is active. The secondary model stays the setup owner's own.
+address), and choose **Check credentials and list models**. That check validates
+credentials and lists models; it does not prove inference or tool use. Choose a
+listed model or enter its exact ID under Advanced, then choose **Connect and
+check**. The compatibility check reports **Credentials accepted**, **Model
+responded** and **Tool use verified** separately. It uses the exact selected model
+through Hermes, including an isolated read-only note tool, with up to three
+requests, 1,536 output tokens and a 45-second runtime limit. Provider billing can
+apply. A failed stage names the problem; no other model is silently selected.
+After success, a saved first request continues automatically. See the
+[first-task guide](GETTING_STARTED.md#3-connect-and-verify-the-model).
+
+Only the setup owner, or an account they made an admin, can change a key or the
+model; every other account sees which model is active. The secondary model
+stays the setup owner's own.
 
 A key entered this way is sealed with `OPENDUET_MASTER_KEY` before it is stored,
 so the app refuses to store one while that key is unset. No answer ever carries

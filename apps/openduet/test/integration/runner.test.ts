@@ -12,6 +12,7 @@ import {
   type RuntimeEvent,
 } from '@openduet/contracts';
 import { eq } from 'drizzle-orm';
+import type { WorkHandler, WorkOptions } from 'pg-boss';
 import { ServiceError } from '../../src/api/errors.ts';
 import { action, artifact, attempt, connection, event, space } from '../../src/db/schema.ts';
 import { loadEnv } from '../../src/env.ts';
@@ -1051,6 +1052,108 @@ withDb('attempt runner against Postgres and pg-boss', () => {
     const scheduled =
       await handle.sql`select name from pgboss.schedule where name = ${QUEUES.recoveryScan}`;
     expect(scheduled).toHaveLength(1);
+  });
+
+  test('shutdown drains an admitted recovery callback before its database work can outlive the runner', async () => {
+    const { handle, queue } = fixture();
+    const worker = runner();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const finished = deferred<void>();
+    const order: string[] = [];
+    let callbackEntered = false;
+    let stopping: Promise<void> | undefined;
+    await worker.start();
+    await queue.boss.unschedule(QUEUES.recoveryScan);
+    worker.afterRecovery = async () => {
+      callbackEntered = true;
+      order.push('recovery entered');
+      entered.resolve();
+      await release.promise;
+      try {
+        await handle.db
+          .update(space)
+          .set({ name: 'Recovery drained' })
+          .where(eq(space.id, spaceId));
+        order.push('recovery finished');
+      } finally {
+        finished.resolve();
+      }
+    };
+    try {
+      await queue.boss.send(QUEUES.recoveryScan, {});
+      await entered.promise;
+      stopping = worker.stop().then(() => {
+        order.push('stop returned');
+      });
+      // A turn through the event loop drains the stop path's ready promises, without a timing guess.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(order).toEqual(['recovery entered']);
+      release.resolve();
+      await stopping;
+      expect(order).toEqual(['recovery entered', 'recovery finished', 'stop returned']);
+      const [updated] = await handle.db.select().from(space).where(eq(space.id, spaceId));
+      expect(updated?.name).toBe('Recovery drained');
+    } finally {
+      release.resolve();
+      if (callbackEntered) await finished.promise;
+      await stopping;
+      worker.afterRecovery = undefined;
+    }
+  });
+
+  test('a real recovery callback fetched before shutdown does no recovery when delivered after it', async () => {
+    const { handle, queue } = fixture();
+    const worker = runner();
+    const fetched = deferred<void>();
+    const deliver = deferred<void>();
+    const delivered = deferred<void>();
+    const work = queue.boss.work;
+    let callbackFetched = false;
+    let recoveries = 0;
+    queue.boss.work = ((name: string, options: WorkOptions, handler: WorkHandler<unknown>) => {
+      const delayed: WorkHandler<unknown> = async (jobs) => {
+        callbackFetched = true;
+        fetched.resolve();
+        await deliver.promise;
+        try {
+          return await handler(jobs);
+        } finally {
+          delivered.resolve();
+        }
+      };
+      return Reflect.apply(work, queue.boss, [
+        name,
+        options,
+        name === QUEUES.recoveryScan ? delayed : handler,
+      ]) as Promise<string>;
+    }) as typeof work;
+    try {
+      try {
+        await worker.start();
+      } finally {
+        queue.boss.work = work;
+      }
+      await queue.boss.unschedule(QUEUES.recoveryScan);
+      worker.afterRecovery = async () => {
+        recoveries++;
+        await handle.db.update(space).set({ name: 'Late recovery' }).where(eq(space.id, spaceId));
+      };
+      await queue.boss.send(QUEUES.recoveryScan, {});
+      await fetched.promise;
+      await worker.stop();
+      expect(recoveries).toBe(0);
+      deliver.resolve();
+      await delivered.promise;
+      expect(recoveries).toBe(0);
+      const [unchanged] = await handle.db.select().from(space).where(eq(space.id, spaceId));
+      expect(unchanged?.name).toBe('Personal');
+    } finally {
+      queue.boss.work = work;
+      deliver.resolve();
+      if (callbackFetched) await delivered.promise;
+      worker.afterRecovery = undefined;
+    }
   });
 
   test('bootstrap starts migrated durable dependencies and the configured stub worker', async () => {

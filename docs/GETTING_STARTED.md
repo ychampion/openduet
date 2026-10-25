@@ -71,8 +71,6 @@ Press Send. If a model is missing or unchecked, your exact text and uploaded
 attachment references are kept while setup opens. Configure the provider and
 selected model, then review the three separate check stages:
 
-![A saved first request waiting for model setup in the scripted Sample day](media/sample-day/first-handoff.png)
-
 | Stage | What it proves |
 | --- | --- |
 | Credentials accepted | The provider accepted the configured credentials. Listing models alone proves no inference capability. |
@@ -84,7 +82,7 @@ of runtime. Provider billing can apply. It has no access to your actual accounts
 IDs and custom endpoints are under Advanced. Changing relevant model configuration
 invalidates earlier readiness. A failed check shows its stage and reason; fix
 credentials, billing, endpoint, model ID or tool compatibility before retrying.
-There is no automatic fallback to another model or the practice fixture.
+No other model is silently selected.
 
 After a successful check, the saved request continues once. Refreshes or retries
 reuse its submission key. Do not retype it into another task to recover a lost
@@ -97,20 +95,51 @@ system. Other autonomy settings can permit actions under existing policy.
 
 Your task and its useful output appear in **Chat**. Open the result to see the
 source context and full draft. A draft has not been sent. Correct it with
-**Reply to this result**, for example “Under 120 words, with one clear ask.”
+**Reply to this result**. Make an ongoing preference explicit, for example:
+
+```text
+Correction for all future customer follow-ups: use one short paragraph,
+under 60 words, and sign off "Thanks, Sam" instead of "Regards, Sam".
+```
+
+Use your own name and preferred style. With automatic capture enabled and a
+memory model configured, OpenDuet learns lasting preferences from your own
+words. Corrections replace the earlier value. Capture runs asynchronously and
+depends on the model and your privacy and spending settings; review the saved
+detail in **Settings → Memory** before relying on it for another task.
+
+**Learn from my chats** controls automatic capture. Review, edit or forget saved
+details in **Settings → Memory**. Start a message with **off the record** to
+exclude it from learning. Then try a separate, relevant task without repeating
+the style and inspect the result.
 
 Use **Remember this preference** to review and explicitly save the exact style
 instruction. Use **Save these steps** for a reusable personal procedure. Both
-have review fields; neither starts a routine. Inspect or forget memory in
-**Settings → Memory**, and manage procedures in **Explore → Skills**.
+have review fields; neither starts a routine. Manage procedures in
+**Explore → Skills**.
 
-![Prepared customer draft in the labeled Sample day](media/sample-day/result-desktop.png)
+The captures below show Anthropic Opus 5.5 using supplied customer notes. It
+learned the correction automatically, used it in a separate task, and prepared
+the shown result on a schedule with the browser and frontend server stopped.
+No mailbox was connected and nothing was sent. The same workflow also ran with
+a Fireworks model; see the [live execution record](LIVE_MODEL_VERIFICATION.md)
+for the requests, answers and timing.
+
+![A completed Opus follow-up using the corrected paragraph and sign-off](media/live-assistant/opus-result-desktop.png)
+
+![The automatically learned correction in Settings → Memory](media/live-assistant/opus-memory-desktop.png)
+
+**[Watch the saved preference and completed result](media/live-assistant/opus-learning-and-background.mp4)**.
+The recording shows reviewing them after returning to the app; the execution
+record documents when the background run completed.
 
 ## 5. Delegate a future responsibility explicitly
 
 For report-only scheduled work, choose **Run this automatically** after a result
-and review the instruction and schedule. For a daily brief, use the dedicated
-brief settings so there is one actual daily schedule.
+and review the instruction, source scope, time and time zone. Return to **Work**
+for the result and questions that need you. Manage the schedule or pause it in
+**Work → Recurring**. For a daily brief, use the dedicated brief settings so
+there is one actual daily schedule.
 
 For a customer follow-up, connect a native Gmail or Microsoft mailbox in
 **Settings → Connections**. Operator OAuth/app setup can be required; see
@@ -128,6 +157,20 @@ Your host must stay on. Closing a browser does not stop its server, but turning
 off the host does. Budgets, failed checks and disconnected accounts are shown
 rather than treated as successful work. See the [complete behavior guide](PERSONAL_ASSISTANT.md).
 
+## Plan the next useful step
+
+With suggestions enabled, the server checks saved source state every minute
+for upcoming watched meetings, unresolved source signals and stalled personal
+tasks. Chat shows up to three suggestions with a reason and source.
+
+Choose **Plan together** to gather the current context into an editable request
+with an attached source note, then press Send when ready. **Tomorrow** snoozes
+that suggestion for 24 hours; **Not useful** dismisses it. **Pause suggestions**
+stops noticing while already delegated tasks, routines and watches keep their
+own controls. Suggestions gather saved context; scheduled jobs perform the
+model work. See [always-on collaboration](ALWAYS_ON.md) for the source conditions
+and delivery settings.
+
 ## Add a browser or phone access
 
 Once your account exists, enable the browser worker from Bash:
@@ -135,6 +178,11 @@ Once your account exists, enable the browser worker from Bash:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | OPENDUET_BROWSER=1 bash
 ```
+
+For a tagged installation, keep the same tag in the download URL,
+`OPENDUET_REF` and `OPENDUET_IMAGE_TAG` when adding the worker or updating.
+Use the [matching release commands](releases/v0.3.0.md#optional-browser-worker)
+for v0.3.0. The command above tracks `main` deployment files.
 
 See [browser-worker.md](browser-worker.md) for Windows and source-install
 alternatives. Browser access and a sandbox computer are separate capabilities.
@@ -144,6 +192,29 @@ Then open your server’s HTTPS address on the phone and use **Add to Home Scree
 or **Install app**. `localhost` on your phone means the phone itself, not your
 server. PWA installation and push depend on browser support and a secure
 origin. There are no native iOS or Android binaries in this release.
+
+## Before updating an existing installation
+
+Read the target release notes and make a backup first. The installer retains
+local settings and volumes when run again; it does not create a backup.
+
+The operator CLI needs Git and Bun 1.3.13 on the host. An installation made by
+the one-line installer has no source checkout, so put the CLI in a separate
+directory and point it at the existing deployment. For a published v0.3.0:
+
+```sh
+git clone --branch v0.3.0 --depth 1 https://github.com/ychampion/openduet.git ~/openduet-tools
+cd ~/openduet-tools
+bun install --frozen-lockfile
+bun run openduet --deploy-dir ~/openduet/deploy backup --estimate
+bun run openduet --deploy-dir ~/openduet/deploy backup
+```
+
+Use your installation's actual `deploy` directory if you chose another location.
+Keep the master key separately as described in
+[backup and restore](DEPLOYMENT.md#backup-and-restore). Verify the backup and read
+[upgrading and rollback](UPGRADING.md) before re-running the installer with the
+target release in its URL, `OPENDUET_REF` and `OPENDUET_IMAGE_TAG`.
 
 ## When something does not work
 

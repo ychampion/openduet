@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.0
+
+- Fence in-flight computer permission reads when Settings or the companion
+  changes access, and require current file permissions during write verification.
+- Synchronize queued-request regression coverage with the actual device queue;
+  cover stale permission reads against real database snapshots and HTTP changes.
+- Drain admitted recovery scans during shutdown and refuse callbacks delivered
+  after stopping, so recovery cannot keep using a closed database.
+- Refresh pinned validation, mail, MCP, Hono, YAML, frontend build and Cloudflare
+  tooling dependencies to address security advisories, including the browser
+  image's independent Zod pin.
+- Pin seven transitive security fixes and run dependency audits at every
+  advisory severity in CI.
+- Run the full suite in sequential native Bun shards with one fresh process
+  per file; synchronize acknowledgement checks
+  with committed events instead of fixed pauses.
+- Make local Hermes proof launchers honor configured engine and Python paths,
+  with the appropriate virtual-environment layout on Unix and Windows.
+- Run actual-engine capability, identity, repair, discovery and execution proofs
+  in CI; check upgrade lock release in its own database and distinguish lasting
+  memory from one-time requests in conformance fixtures.
+- Learn lasting preferences automatically from corrections, reuse the latest
+  value across tasks, and retain it across backend restarts.
+- Run reviewed recurring work on the server while the browser is closed;
+  offer source-backed suggestions and an editable **Plan together** request.
+- Verify the selected model's credentials, inference and read-only tool use
+  before continuing the saved first task.
+- Carry bounded output allowances through runtime supervisors, the model
+  gateway and native Anthropic auxiliary calls without bypassing attempt budgets.
+- Ground writing in supplied evidence, omit unsupported commitments and
+  attachments, and follow the latest correction.
+- Refresh installation and first-task guidance, real Opus and Fireworks
+  execution evidence, screenshots, recordings and launch materials.
+- Align package, service, device, mock and OpenAPI versions at 0.3.0.
+
+See the [release notes](docs/releases/v0.3.0.md),
+[live execution record](docs/LIVE_MODEL_VERIFICATION.md) and
+[release readiness](docs/RELEASE_READINESS.md). Earlier development entries
+are retained below.
+
 ## Always-on collaboration
 
 - Server-side noticing runs every minute without an open browser, with persisted heartbeat and personal-space suggestions.

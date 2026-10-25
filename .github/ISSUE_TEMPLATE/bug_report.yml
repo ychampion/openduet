@@ -1,5 +1,5 @@
 name: Bug report
-description: Something behaves differently from what the docs or tests describe.
+description: Get help with installation or report unexpected behavior.
 labels: [bug]
 body:
   - type: markdown
@@ -17,24 +17,25 @@ body:
     id: reproduce
     attributes:
       label: Steps to reproduce
-      description: The shortest sequence that shows it. A failing test or command is ideal.
+      description: The shortest sequence that shows it, including the screen or command you used.
       placeholder: |
-        1. bun run ...
-        2. ...
+        1. Installed with the one-line installer on ...
+        2. Opened ...
+        3. Expected ... but saw ...
     validations:
       required: true
   - type: input
     id: revision
     attributes:
-      label: Revision
-      description: The commit you ran, from `git rev-parse --short HEAD`.
+      label: Version or revision
+      description: The release or image tag you installed (for example v0.3.0 or main), or the source commit from `git rev-parse --short HEAD`.
     validations:
       required: true
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: Operating system, Bun version, and how Postgres was provided (embedded or `DATABASE_URL`). Paste the output of `bun run doctor` if it is relevant.
+      description: Installation method, operating system, Docker/Compose versions, and browser. For model issues, include provider and model name. For source development, include Bun version and relevant `bun run doctor` output. Do not paste API keys, setup links, passwords or personal content.
   - type: textarea
     id: logs
     attributes:

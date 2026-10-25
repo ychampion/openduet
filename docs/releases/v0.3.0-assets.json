@@ -1,0 +1,58 @@
+{
+  "release": "v0.3.0",
+  "description": "Original OpenDuet mark and actual Opus workflow captures; see docs/media/live-assistant/README.md for scope.",
+  "assets": [
+    {
+      "name": "openduet-mark.svg",
+      "source": "apps/web/public/openduet-mark.svg",
+      "bytes": 300,
+      "sha256": "7caf6367de91477e2e57ae3d4781d360fc77bb21edb475bf540a9ff8f63749be"
+    },
+    {
+      "name": "openduet-opus-desktop.png",
+      "source": "docs/media/live-assistant/opus-result-desktop.png",
+      "bytes": 174014,
+      "sha256": "7afd7e5a5c2b7dae5fbb0f96336d9acf543e5f84ba2cec2032609ad46c5fa977",
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "name": "openduet-opus-dark.png",
+      "source": "docs/media/live-assistant/opus-result-dark.png",
+      "bytes": 161138,
+      "sha256": "aaaa57071623938a4258f6279c232d5aede6aef06a9bea47b99389db05dcaea5",
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "name": "openduet-opus-phone.png",
+      "source": "docs/media/live-assistant/opus-result-phone.png",
+      "bytes": 78542,
+      "sha256": "9ee91e809a6791e4c637a41b9d627ca9162138c61b4c3d414cffd46b8993413d",
+      "width": 390,
+      "height": 844
+    },
+    {
+      "name": "openduet-opus-memory.png",
+      "source": "docs/media/live-assistant/opus-memory-desktop.png",
+      "bytes": 77859,
+      "sha256": "8a4ca7e520d3b62b05a1e5ffa5288a383a09bf2745e3bbdab15684f2fa17687d",
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "name": "openduet-opus-recurring.png",
+      "source": "docs/media/live-assistant/opus-recurring-desktop.png",
+      "bytes": 122779,
+      "sha256": "448d8f3e5e7db9f26f940608f2cf156b95c0724f274eaaaf9fb0284445e6ff8f",
+      "width": 1440,
+      "height": 1000
+    },
+    {
+      "name": "openduet-opus-demo.mp4",
+      "source": "docs/media/live-assistant/opus-learning-and-background.mp4",
+      "bytes": 578853,
+      "sha256": "493995ea6ab52a90054c43dfe2617e3071df268dace566e46046452c74c91e7a"
+    }
+  ]
+}

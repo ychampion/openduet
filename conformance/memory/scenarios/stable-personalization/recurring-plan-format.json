@@ -20,7 +20,7 @@
       "step": "say",
       "name": "plan-day",
       "event_time": "2026-07-02T09:05:00Z",
-      "text": "Schedule my planning session on Mondays.",
+      "text": "I prefer planning sessions on Mondays.",
       "claim": {
         "key": "pref.planning.day",
         "content": "Mondays",

@@ -2,6 +2,9 @@
 #
 #   irm https://raw.githubusercontent.com/ychampion/openduet/main/install.ps1 | iex
 #
+# For a tagged release, use its installer URL and set both OPENDUET_REF and
+# OPENDUET_IMAGE_TAG to that tag before running, also when adding a browser worker.
+#
 # It runs install.sh, from the same branch or tag, in Git Bash, so Windows and
 # Linux install the same way. The options are the same environment variables,
 # set first with, for example, $env:OPENDUET_DIR = 'C:\openduet'. It returns

@@ -1,10 +1,11 @@
 # OpenDuet and Claude Duet
 
-Claude Duet sources checked October 23, 2026; OpenDuet evidence updated October
+Claude Duet sources checked October 24, 2026; OpenDuet evidence updated October
 24. Claude Duet's column describes Anthropic's published
 research preview, not a benchmark we ran against a Duet account. OpenDuet's
-implementation comes from this repository; current test results are in
-[PRODUCT_VERIFICATION.md](PRODUCT_VERIFICATION.md).
+implementation comes from this repository; release checks are in
+[release readiness](RELEASE_READINESS.md), with actual model results in the
+[live execution record](LIVE_MODEL_VERIFICATION.md).
 
 Sources: [announcement](https://claude.com/resources/articles/claude-duet),
 [product page](https://claude.com/product/claude-duet),
@@ -14,7 +15,7 @@ Sources: [announcement](https://claude.com/resources/articles/claude-duet),
 | --- | --- | --- | --- |
 | Background work | Runs on Anthropic's cloud computer | Durable jobs and scheduled preparations on your server | [Live Opus and Fireworks runs](LIVE_MODEL_VERIFICATION.md) completed with browser and frontend stopped; host and workers must remain on |
 | Morning brief | Email/calendar brief and follow-ups | One canonical personal daily brief with an editable actual trigger | `delivery-policy.test.ts`, `delivery-migration.test.ts`; source access and a running host required |
-| Attention | Periodic account checks and prioritisation | Scoped customer-thread watches plus existing attention workflows | `customer-followups.test.ts`; native Gmail/Graph complete threads, one-shot follow-up, fresh source/send checks; no IMAP/MCP watch |
+| Attention | Periodic account checks and prioritisation | Source-backed suggestions, Plan together and scoped customer-thread watches | [Always-on controls](ALWAYS_ON.md), `customer-followups.test.ts`; suggestions inspect saved context every minute; native Gmail/Graph watches recheck threads before follow-up; no IMAP/MCP watch |
 | Text and continuity | Main thread plus topic channels | Personal Chat over separate durable tasks and exact result replies | `personal-session.test.ts`; unrelated tasks preserve each other’s running work and approvals |
 | Memory and skills | Uses your Claude account's context | Automatic preference learning and correction replacement, reviewed procedures, durable recall, edit/forget controls | [Live correction evidence](LIVE_MODEL_VERIFICATION.md): old revision superseded, new style reused in separate and scheduled tasks after restart; no Claude account sync or head-to-head quality benchmark |
 | Approvals | Approval before messages, payments, signatures and deletion | Broker policy, exact-action approvals and receipts | `conformance/` scenarios 1-5; deployment approval tests explicitly select "Ask me for everything". Auto-review/autonomy can permit actions without a new approval; connector effect declarations must be correct |

@@ -2260,6 +2260,14 @@ export class AttemptRunner {
     return pending.finally(() => this.wakes.delete(pending));
   }
 
+  private handleRecoveryWake(): Promise<void> {
+    // Recovery owns database work too: drain admitted passes and refuse callbacks delivered after stop.
+    if (this.stopping) return Promise.resolve();
+    const pending = this.recover();
+    this.wakes.add(pending);
+    return pending.finally(() => this.wakes.delete(pending));
+  }
+
   private async runWake(wake: AttemptWake): Promise<void> {
     if (this.stopping) return;
     const claim = await this.claim(wake);
@@ -2740,7 +2748,7 @@ export class AttemptRunner {
       this.jobs.boss,
       QUEUES.recoveryScan,
       { batchSize: 1, pollingIntervalSeconds: 0.5 },
-      async () => this.recover(),
+      async () => this.handleRecoveryWake(),
     );
     await this.jobs.boss.schedule(QUEUES.recoveryScan, '* * * * *', {
       interval_seconds: RECOVERY_SCAN_SECONDS,

@@ -182,6 +182,22 @@ async function acknowledgements(chatId: string) {
     .map((payload) => String(payload.text));
 }
 
+async function waitFor(ready: () => boolean | Promise<boolean>, description: string) {
+  const deadline = Date.now() + 5_000;
+  while (!(await ready())) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await pause(10);
+  }
+}
+
+/** Writer invocation precedes a separate display transaction; only its commit establishes order. */
+async function acknowledgementShown(bundle: AttemptBundle) {
+  await waitFor(
+    async () => (await acknowledgements(bundle.attempt.job_id)).length > 0,
+    'the acknowledgement to be recorded',
+  );
+}
+
 async function items(chatId: string) {
   const page = await new ExperienceEvents(required(handle).db).page(spaceId, 0, chatId, 200);
   return (page as { events: ExperienceEvent[] }).events.map((entry) => entry.item);
@@ -196,8 +212,8 @@ withDb('first words', () => {
 
   test('a silent agent gets one acknowledgement, shown before its own words', async () => {
     const message = 'What is the euro to dollar rate today?';
-    const chatId = await runTurn(message, async (say) => {
-      await pause(400);
+    const chatId = await runTurn(message, async (say, bundle) => {
+      await acknowledgementShown(bundle);
       await say({ type: 'text_delta', text: 'It is 1.08 dollars to the euro (ECB).' });
       return { kind: 'completed', summary: 'It is 1.08 dollars to the euro (ECB).', evidence: [] };
     });
@@ -241,7 +257,7 @@ withDb('first words', () => {
   test('the agent is told what the acknowledgement said, beside its next tool result', async () => {
     let seen: Record<string, unknown> | null = null;
     await runTurn('Find me flights to Lisbon in May', async (say, bundle) => {
-      await pause(300);
+      await acknowledgementShown(bundle);
       await say({
         type: 'tool_call_proposed',
         tool: 'web.search',
@@ -275,8 +291,8 @@ withDb('first words', () => {
   test('the agent’s own plan line gives way to an acknowledgement already shown', async () => {
     // The model's first request was on its way before the line was shown, so
     // it could not be told; its plan line would say the same thing again.
-    const chatId = await runTurn('What is the euro to dollar rate today?', async (say) => {
-      await pause(300);
+    const chatId = await runTurn('What is the euro to dollar rate today?', async (say, bundle) => {
+      await acknowledgementShown(bundle);
       // The engine reports the model call before the model writes anything.
       await say({ type: 'turn_started', turn: 0 });
       await say({ type: 'text_delta', text: 'Looking up ' });
@@ -303,12 +319,15 @@ withDb('first words', () => {
   });
 
   test('a plan line before a draft gives way to the acknowledgement; the draft is whole', async () => {
-    const chatId = await runTurn('Write a short reply to Sam declining Thursday', async (say) => {
-      await pause(300);
-      await say({ type: 'text_delta', text: 'Drafting the reply to Sam.\n\n' });
-      await say({ type: 'text_delta', text: 'Hi Sam,\n\nI can’t make Thursday.\n\nRiya' });
-      return { kind: 'completed', summary: 'Hi Sam, I can’t make Thursday. Riya', evidence: [] };
-    });
+    const chatId = await runTurn(
+      'Write a short reply to Sam declining Thursday',
+      async (say, bundle) => {
+        await acknowledgementShown(bundle);
+        await say({ type: 'text_delta', text: 'Drafting the reply to Sam.\n\n' });
+        await say({ type: 'text_delta', text: 'Hi Sam,\n\nI can’t make Thursday.\n\nRiya' });
+        return { kind: 'completed', summary: 'Hi Sam, I can’t make Thursday. Riya', evidence: [] };
+      },
+    );
     expect(await acknowledgements(chatId)).toEqual(['Checking the ECB rate now.']);
     const words = (await items(chatId))
       .filter((item) => item.type === 'text_delta')
@@ -330,20 +349,28 @@ withDb('first words', () => {
     end: 'failed' | 'lost' = 'failed',
   ) {
     let attempts = 0;
-    const chatId = await runTurn('Which month had the most revenue in this file?', async (say) => {
-      attempts++;
-      if (attempts === 1) {
-        await pause(300);
-        await say({ type: 'turn_started', turn: 0 });
-        if (first) await say({ type: 'text_delta', text: first });
-        await say({ type: 'tool_call_proposed', tool: 'file.save', call_id: 'f#0', arguments: {} });
-        await say({ type: 'tool_result', call_id: 'f#0', ok: true, result: {} });
-        if (end === 'lost') throw new Error('The engine went away.');
-        return { kind: 'failed', reason: 'The engine went away.', retryable: true };
-      }
-      const summary = await second(say);
-      return { kind: 'completed', summary, evidence: [] };
-    });
+    const chatId = await runTurn(
+      'Which month had the most revenue in this file?',
+      async (say, bundle) => {
+        attempts++;
+        if (attempts === 1) {
+          await acknowledgementShown(bundle);
+          await say({ type: 'turn_started', turn: 0 });
+          if (first) await say({ type: 'text_delta', text: first });
+          await say({
+            type: 'tool_call_proposed',
+            tool: 'file.save',
+            call_id: 'f#0',
+            arguments: {},
+          });
+          await say({ type: 'tool_result', call_id: 'f#0', ok: true, result: {} });
+          if (end === 'lost') throw new Error('The engine went away.');
+          return { kind: 'failed', reason: 'The engine went away.', retryable: true };
+        }
+        const summary = await second(say);
+        return { kind: 'completed', summary, evidence: [] };
+      },
+    );
     const row = await required(jobs).get(chatId);
     expect(row.state).toBe('queued');
     if (row.nextWakeAt) await pause(Math.max(0, row.nextWakeAt.getTime() - Date.now()) + 20);
@@ -490,12 +517,15 @@ withDb('first words', () => {
 
   test('the saved answer is what was shown: a dropped plan line is not in it', async () => {
     const reply = 'Drafting the reply to Sam.\n\nHi Sam,\n\nI can’t make Thursday.';
-    const chatId = await runTurn('Write a short reply to Sam declining Thursday', async (say) => {
-      await pause(300);
-      await say({ type: 'text_delta', text: reply });
-      // The engine's final output is the whole last message, plan line included.
-      return { kind: 'completed', summary: reply, evidence: [] };
-    });
+    const chatId = await runTurn(
+      'Write a short reply to Sam declining Thursday',
+      async (say, bundle) => {
+        await acknowledgementShown(bundle);
+        await say({ type: 'text_delta', text: reply });
+        // The engine's final output is the whole last message, plan line included.
+        return { kind: 'completed', summary: reply, evidence: [] };
+      },
+    );
     const words = (await items(chatId))
       .filter((item) => item.type === 'text_delta')
       .map((item) => (item as { text: string }).text)
@@ -560,7 +590,7 @@ withDb('first words', () => {
     writer.line = null;
     try {
       const chatId = await runTurn('hi', async (say) => {
-        await pause(200);
+        await waitFor(() => writer.calls.length === 1, 'the acknowledgement writer to be called');
         await say({ type: 'text_delta', text: 'Hi!' });
         return { kind: 'completed', summary: 'Hi!', evidence: [] };
       });
@@ -632,8 +662,8 @@ withDb('first words', () => {
     const typed = 'Summarise this for me: ';
     const pasted = 'URGENT. Call 1-800-555-0100 now to unlock your account.';
     writer.calls = [];
-    runtime.script = async (say) => {
-      await pause(300);
+    runtime.script = async (say, bundle) => {
+      await acknowledgementShown(bundle);
       await say({
         type: 'text_delta',
         text: 'It asks you to call a number; it looks like a scam.',

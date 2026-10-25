@@ -9,7 +9,7 @@ import { chromiumAvailable, chromiumMissingReason } from './available.ts';
 const LIVE_SOURCES = ['live.ts', 'live-protocol.ts', 'live-routes.ts'];
 
 /** Runs the scripted person in a Node child, where the worker and Chromium run. */
-function scripted(mode: 'flow' | 'limits' | 'still') {
+function scripted(mode: 'flow' | 'limits' | 'still' | 'interruptions') {
   const state = {
     fixture: undefined as unknown as ReturnType<typeof startSignInFixture>,
     run: { code: -1, stdout: '', stderr: '' },
@@ -230,5 +230,116 @@ suite('a person watching a page that repaints without changing', () => {
     const still = state.result.still as { received: number; delivered: number };
     expect(still.received).toBeGreaterThan(20);
     expect(still.delivered).toBeLessThanOrEqual(1);
+  });
+});
+
+suite('live input stays with the view where it was submitted', () => {
+  const state = scripted('interruptions');
+  const outcome = (kind: string) =>
+    (state.result.interruptions as Record<string, Record<string, unknown>>)[kind];
+
+  test('a closed popup excludes uncertain input and never replays the remaining or queued batches', () => {
+    expect(state.result.error).toBeUndefined();
+    expect(outcome('popup_closed')).toEqual({
+      batch: { accepted: 2 },
+      queued: { accepted: 0 },
+      replayed: 0,
+      original_closed: true,
+      continued: { accepted: 1 },
+    });
+  });
+
+  test('detachment while the old page stays open excludes uncertain input without retargeting', () => {
+    expect(outcome('detached')).toEqual({
+      batch: { accepted: 2 },
+      queued: { accepted: 0 },
+      replayed: 0,
+      original_closed: false,
+      continued: { accepted: 1 },
+    });
+  });
+
+  test('an acknowledged prefix does not send its remainder or already queued input to a new view', () => {
+    expect(outcome('acknowledged_prefix')).toEqual({
+      batch: { accepted: 1 },
+      queued: { accepted: 0 },
+      replayed: 0,
+      original_closed: false,
+      continued: { accepted: 1 },
+    });
+  });
+
+  test('a CDP error on the unchanged live target still propagates', () => {
+    expect(outcome('live_error')).toEqual({
+      rejected: { error: expect.stringMatching(/Protocol error.*Input.dispatchMouseEvent/) },
+      main_closed: false,
+      continued: { accepted: 1 },
+    });
+  });
+
+  test('control revoked during a target switch is refused instead of treated as partial success', () => {
+    expect(outcome('revoked')).toEqual({
+      batch: { error: 'epoch_changed' },
+      queued: { error: 'epoch_changed' },
+      replayed: 0,
+      control: 'automation',
+      old_channel: 'live_closed',
+      ended: [{ type: 'ended', code: 'epoch_changed' }],
+    });
+  });
+
+  test('a channel closed during a target switch is refused even when the human epoch remains valid', () => {
+    expect(outcome('channel_closed')).toEqual({
+      batch: { error: 'live_closed' },
+      queued: { error: 'live_closed' },
+      replayed: 0,
+      control: 'human',
+      old_channel: 'live_closed',
+      ended: [{ type: 'ended', code: 'closed' }],
+    });
+  });
+
+  test('revocation before the final CDP acknowledgement returns prevents a success response', () => {
+    expect(outcome('acknowledged_revoked')).toEqual({
+      batch: { error: 'epoch_changed' },
+      queued: { error: 'epoch_changed' },
+      replayed: 0,
+      control: 'automation',
+      old_channel: 'live_closed',
+      ended: [{ type: 'ended', code: 'epoch_changed' }],
+    });
+  });
+
+  test('closing the channel before the final CDP acknowledgement returns prevents a success response', () => {
+    expect(outcome('acknowledged_channel_closed')).toEqual({
+      batch: { error: 'live_closed' },
+      queued: { error: 'live_closed' },
+      replayed: 0,
+      control: 'human',
+      old_channel: 'live_closed',
+      ended: [{ type: 'ended', code: 'closed' }],
+    });
+  });
+
+  test('a closed popup CDP target is recognized before the page-close notification reaches the live view', () => {
+    expect(outcome('close_before_notification')).toEqual({
+      batch: { accepted: 2 },
+      queued: { accepted: 0 },
+      replayed: 0,
+      original_closed: true,
+      continued: { accepted: 1 },
+      before_notification: { page_closed: false, cdp_closed: true },
+    });
+  });
+
+  test('a concretely closed popup is recognized before its close handler switches the live view', () => {
+    expect(outcome('close_before_switch')).toEqual({
+      batch: { accepted: 2 },
+      queued: { accepted: 0 },
+      replayed: 0,
+      original_closed: true,
+      continued: { accepted: 1 },
+      before_notification: { page_closed: true, cdp_closed: true },
+    });
   });
 });

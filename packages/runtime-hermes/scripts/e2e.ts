@@ -31,8 +31,11 @@ import { brokerParkedActions, HermesRuntimeAdapter } from '../src/adapter.ts';
 import { renderEngineConfig } from '../src/engine-config.ts';
 
 export const ROOT = join(import.meta.dir, '..', '..', '..');
-const HERMES_SRC = join(ROOT, '.hermes-src');
-const PYTHON = join(ROOT, '.hermes-venv', 'Scripts', 'python.exe');
+export const HERMES_SRC =
+  process.env.OPENDUET_HERMES_ROOT ?? process.env.OPENDUET_HERMES_SRC ?? join(ROOT, '.hermes-src');
+export const PYTHON =
+  process.env.OPENDUET_HERMES_PYTHON ??
+  join(ROOT, '.hermes-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const CAPABILITY_KEY = 'e2e-capability-key-e2e-capability-key';
 const APPROVAL_KEY = 'e2e-approval-key-e2e-approval-key-xx';
 export const API_KEY = 'e2e-api-server-key-0123456789abcdef';

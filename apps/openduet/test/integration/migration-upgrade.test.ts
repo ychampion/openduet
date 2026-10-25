@@ -86,7 +86,15 @@ databaseTest(
   async () => {
     const fixture = await createPostgresFixture({ migrationsFolder: await releasedFolder() });
     if (!fixture) throw new Error('Postgres fixture unavailable');
+    if (!server) throw new Error('Postgres server unavailable');
+    const otherDatabase = openDatabase(server.url, 1);
     try {
+      // Other suites migrate separate databases on this same server. Their
+      // database-scoped locks must not be mistaken for this boot's leaked lock.
+      await otherDatabase.sql`select pg_advisory_lock(31003102)`;
+      const [otherLock] = await otherDatabase.sql`select count(*)::int as held from pg_locks
+        where locktype = 'advisory' and objid = 31003102 and pid = pg_backend_pid()`;
+      expect(otherLock?.held).toBe(1);
       expect(await recorded(fixture.sql)).toHaveLength(released.entries.length);
       // A row written by the old release has to be there after the upgrade.
       await fixture.sql`insert into space (id, name, git_path)
@@ -106,9 +114,11 @@ databaseTest(
       expect(kept.map((row) => row.name)).toEqual(['Kept across the upgrade']);
       // The lock is session-level; a boot that kept it would block the next one.
       const [lock] = await fixture.sql`select count(*)::int as held from pg_locks
-        where locktype = 'advisory' and objid = 31003102`;
+        where locktype = 'advisory' and objid = 31003102
+          and database = (select oid from pg_database where datname = current_database())`;
       expect(lock?.held).toBe(0);
     } finally {
+      await otherDatabase.close();
       await fixture.close();
     }
   },

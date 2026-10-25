@@ -68,6 +68,12 @@ A `claim` in a scenario supplies what the fake extractor proposes; it measures
 the memory protocol, not extraction quality. Exact source-span rejection is
 challenged by `no-nearby-message-citation`.
 
+The continuing-work scenario resumes the killed extraction inside `kill_at`,
+then ingests the new budget constraint. It checks extraction recovery,
+idempotency and subsequent recall of the current constraint and earlier date.
+The inputs distinguish a fact explicitly asked to be remembered and standing
+preferences from one-time requests to book, schedule or send something.
+
 ## Metrics and counterfactual
 
 The runner writes `conformance/memory/report.json` and prints per-family rows.

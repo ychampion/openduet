@@ -5,3 +5,5 @@ maxConcurrency = 2
 # `timeout` key from this file, and a setting that is silently ignored is worse
 # than none. Run the suite with `bun run test`, or pass `--timeout=30000` when
 # invoking `bun test` directly.
+# The full-suite runner uses native discovery and sequential native shards,
+# with a fresh process for each file.

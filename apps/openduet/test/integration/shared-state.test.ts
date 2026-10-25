@@ -21,6 +21,7 @@ import { startSandboxes } from '../../src/sandbox/wiring.ts';
 import { resetTestRows, testDatabase } from '../helpers/database.ts';
 
 const handle = await testDatabase();
+const separateDatabase = handle ? await testDatabase() : null;
 const describeWithDb = handle ? describe : describe.skip;
 const masterKey = randomBytes(32).toString('hex');
 const password = 'my-test-password';
@@ -33,6 +34,19 @@ const pools = () => {
   other ??= openDatabase(handle.url);
   return [handle, other] as const;
 };
+
+/** Another suite's leases share the server, but belong to a different database. */
+function separateLease() {
+  if (!separateDatabase) throw new Error('The separate Postgres database is unavailable');
+  const sql = leaseConnection(separateDatabase.url, 'another-database');
+  return {
+    sql,
+    lease: new Leases(
+      () => sql,
+      () => {},
+    ),
+  };
+}
 
 let issuer: FakeIssuer | undefined;
 
@@ -78,6 +92,7 @@ describeWithDb('two service instances on one database', () => {
 
   afterAll(async () => {
     await other?.close();
+    await separateDatabase?.close();
     await handle?.close();
   });
 
@@ -187,6 +202,7 @@ describeWithDb('two service instances on one database', () => {
 
   test('only one instance runs the sandbox sweep at a time, and another takes over when its lease lapses', async () => {
     const [one, two] = pools();
+    const separate = separateLease();
     const sweeps = [0, 0];
     const leases = [
       new Leases(
@@ -213,6 +229,12 @@ describeWithDb('two service instances on one database', () => {
       }),
     );
     try {
+      expect(await separate.lease.leads('sandbox')).toBe(true);
+      const [outside] = await separate.sql<{ pid: number; database: string }[]>`
+        select pg_backend_pid() as pid, current_database() as database`;
+      const [inside] = await one.sql<{ database: string }[]>`
+        select current_database() as database`;
+      expect(outside?.database).not.toBe(inside?.database);
       wirings.forEach((wiring, index) => {
         const lease = leases[index];
         if (lease)
@@ -226,9 +248,12 @@ describeWithDb('two service instances on one database', () => {
       const follower = 1 - leader;
       expect(sweeps[leader]).toBeGreaterThan(3);
       expect(sweeps[follower]).toBe(0);
-      // The leader's connection ends without a word, as when its process dies.
-      const [held] = await one.sql<{ pid: number }[]>`select pid from pg_locks
-        where locktype = 'advisory' and granted and classid = ${LEASE_SPACE} and objsubid = 2`;
+      // End this database's leader, without touching another suite's lease on the same server.
+      const heldLocks = await one.sql<{ pid: number }[]>`select pid from pg_locks
+        where locktype = 'advisory' and granted and classid = ${LEASE_SPACE} and objsubid = 2
+          and database = (select oid from pg_database where datname = current_database())`;
+      expect(heldLocks).toHaveLength(1);
+      const [held] = heldLocks;
       expect(held).toBeDefined();
       await one.sql`select pg_terminate_backend(${held?.pid ?? 0})`;
       const before = sweeps[follower] ?? 0;
@@ -241,14 +266,21 @@ describeWithDb('two service instances on one database', () => {
       // and the signal its work runs under has ended.
       expect(leases[leader]?.signal('sandbox').aborted).toBe(true);
       expect(leases[follower]?.signal('sandbox').aborted).toBe(false);
+      // Killing this database's leader must leave the other suite's session and lease intact.
+      const [untouched] = await separate.sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      expect(untouched?.pid).toBe(outside?.pid);
+      expect(await separate.lease.leads('sandbox')).toBe(true);
+      expect(separate.lease.signal('sandbox').aborted).toBe(false);
     } finally {
       for (const wiring of wirings) wiring.stop();
       await Promise.all(leases.map((lease) => lease.close()));
+      await separate.lease.close();
     }
   });
 
   test('a lease let go on shutdown passes to another instance at once', async () => {
     const [one] = pools();
+    const separate = separateLease();
     const first = new Leases(
       () => leaseConnection(one.url, 'test'),
       () => {},
@@ -258,6 +290,7 @@ describeWithDb('two service instances on one database', () => {
       () => {},
     );
     try {
+      expect(await separate.lease.leads('sandbox')).toBe(true);
       expect(await first.leads('learning-drain')).toBe(true);
       expect(await second.leads('learning-drain')).toBe(false);
       // Different work has its own lease.
@@ -266,12 +299,14 @@ describeWithDb('two service instances on one database', () => {
       expect(await second.leads('learning-drain')).toBe(true);
       // The connection the first held went back to its pool without any lease.
       const locks = await one.sql<{ pid: number }[]>`select pid from pg_locks
-        where locktype = 'advisory' and granted and classid = ${LEASE_SPACE} and objsubid = 2`;
+        where locktype = 'advisory' and granted and classid = ${LEASE_SPACE} and objsubid = 2
+          and database = (select oid from pg_database where datname = current_database())`;
       expect(new Set(locks.map((lock) => lock.pid)).size).toBe(1);
       expect(locks).toHaveLength(2);
     } finally {
       await first.close();
       await second.close();
+      await separate.lease.close();
     }
   });
 

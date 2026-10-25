@@ -283,7 +283,7 @@ import { mountBrowserLive } from './workers/browser/live-service.ts';
 import { type BrowserSessionService, mountBrowserSessions } from './workers/browser/routes.ts';
 import { mountBrowserSites } from './workers/browser/sites.ts';
 
-export const VERSION = '0.2.1';
+export const VERSION = '0.3.0';
 
 /** What the test connector grants every attempt when it is enabled. */
 const TEST_CONNECTOR_SCOPES = ['test.send', 'test.read'];

@@ -20,18 +20,17 @@ Hermes Agent
 https://github.com/NousResearch/hermes-agent
 Release: v2026.9.7
 
-Melete's runtime image installs Hermes from the release above at build time.
+OpenDuet's runtime image installs Hermes from the release above at build time.
 Hermes is not vendored into this repository.
 
-Melete modifies the installed Hermes source at that point. The runtime image,
-and the process supervisor used for local development, apply Melete's lifecycle
-observer bridge (packages/runtime-hermes/patches/observer_bridge.py) to the
-installed tree. It adds a compaction dispatch and binds Melete's plugin
-observations to the current HTTP run queue, puts the model's reasoning on
-the run's event stream, and keeps a screenshot's picture for the next run of
-a session; it changes no upstream decision, and
-it refuses to apply unless the three source sections it edits match the reviewed
-release. See packages/runtime-hermes/README.md.
+The runtime image and the process supervisor used for local development adapt
+the installed Hermes sources through the inherited lifecycle observer bridge,
+extended for OpenDuet (packages/runtime-hermes/patches/observer_bridge.py).
+The reviewed seams cover run observations, reasoning and media continuity,
+brokered tool behavior, and configured output ceilings for agents and auxiliary
+compaction. They refuse to apply unless the source hashes match the audited
+release. OpenDuet's broker remains responsible for authorization and budgets.
+See packages/runtime-hermes/README.md for the current twelve-source audit.
 
 Hermes is distributed under the MIT License, reproduced below.
 
