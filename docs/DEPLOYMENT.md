@@ -1108,9 +1108,11 @@ docker compose -f deploy/docker-compose.yml up -d --force-recreate web
 server rejects foreign Origins before proxying to its fixed upstream
 `http://openduet:8787`; it does not use request forwarding headers to select an
 upstream or relax the origin check. Session cookies are `Secure` in production,
-which browsers honour over HTTPS and on localhost, so reach a remote
-installation through the SSH tunnel or a TLS proxy rather than over plain HTTP
-to its address.
+which browsers honour over HTTPS. Chrome and Edge also accept them on HTTP
+localhost, so those browsers can use the local address or the SSH tunnel.
+Safari requires HTTPS even on localhost: use a TLS proxy or
+[Tailscale HTTPS](#tailscale) for Safari. Plain HTTP to a remote host's address
+does not support sign-in.
 
 ### Rooms
 
