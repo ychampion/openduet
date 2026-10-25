@@ -104,8 +104,9 @@ export class InstanceRegistry {
         const again = await this.fresh();
         if (again && (again.nonce !== fresh.nonce || again.beat > fresh.beat)) throw refuse();
       }
-      // Taken over only from the run it waited out; of two waiting, one wins.
-      if (!(await this.claim(fresh?.nonce))) throw refuse();
+      // The heartbeat can commit after fresh() reads it. Compare it again in the
+      // takeover statement so that renewal cannot be overwritten by this claim.
+      if (!(await this.claim(fresh))) throw refuse();
     }
     this.timer ??= setInterval(() => {
       void this.beat().catch(() => this.say('instance heartbeat failed'));
@@ -125,7 +126,7 @@ export class InstanceRegistry {
    * Writes this process's row when the name is free: no row, a row of this
    * process, a stopped heartbeat, or the row of the run `replacing` names.
    */
-  private async claim(replacing?: string): Promise<boolean> {
+  private async claim(replacing?: { nonce: string; beat: string }): Promise<boolean> {
     const host = this.options.host ?? hostname();
     const staleSeconds = (this.options.staleAfterMs ?? STALE_AFTER_MS) / 1000;
     const rows = await this.sql`
@@ -134,7 +135,8 @@ export class InstanceRegistry {
         heartbeat_at = now(), started_at = now()
       where ops_instance.nonce = excluded.nonce
         or ops_instance.heartbeat_at <= now() - make_interval(secs => ${staleSeconds})
-        or ops_instance.nonce = ${replacing ?? null}
+        or (ops_instance.nonce = ${replacing?.nonce ?? null}
+          and ops_instance.heartbeat_at = ${replacing?.beat ?? null}::timestamptz)
       returning id`;
     return rows.length > 0;
   }
