@@ -346,6 +346,43 @@ describeWithDb('two service instances on one database', () => {
     }
   });
 
+  test('a heartbeat arriving after the takeover check keeps the running instance its name', async () => {
+    const [one, two] = pools();
+    const first = new InstanceRegistry(one.sql, 'claim-race', {
+      host: 'a',
+      heartbeatMs: 10_000,
+    });
+    let claims = 0;
+    const racing = new Proxy(two.sql, {
+      apply(target, self, args: unknown[]) {
+        const query = args[0];
+        if (
+          Array.isArray(query) &&
+          query.join('').includes('insert into ops_instance') &&
+          ++claims === 2
+        ) {
+          // The owner's pending heartbeat commits after the check, before the takeover.
+          return (async () => {
+            await one.sql`update ops_instance set heartbeat_at = now() where id = 'claim-race'`;
+            return Reflect.apply(target, self, args);
+          })();
+        }
+        return Reflect.apply(target, self, args);
+      },
+    });
+    const second = new InstanceRegistry(racing, 'claim-race', { host: 'b', heartbeatMs: 20 });
+    await first.start();
+    try {
+      await expect(second.start()).rejects.toThrow('Another running OpenDuet service instance');
+      expect(claims).toBe(2);
+      const [row] = await one.sql`select host from ops_instance where id = 'claim-race'`;
+      expect(row?.host).toBe('a');
+    } finally {
+      await first.stop();
+      await second.stop();
+    }
+  });
+
   test('each instance sees the others while their heartbeat is fresh', async () => {
     const [one, two] = pools();
     const first = new InstanceRegistry(one.sql, 'first', { host: 'a' });
