@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Fix installer reruns on Windows when Docker Compose and Git Bash name the same installation directory differently. Existing configuration and data stay in place; another installation remains protected.
+- Make service-instance takeover compare the observed nonce and exact heartbeat atomically, so a concurrent heartbeat cannot be overwritten.
+- Clarify that OpenDuet runs on one host and is accessed through the web app on other devices. Document HTTPS for Safari sign-in and the published x86-64 images.
+- Pin the README and first-task installation commands to matching v0.3.1 deployment files and images.
+- Align package, service, device, mock and OpenAPI versions at 0.3.1.
+
+See the [release notes](docs/releases/v0.3.1.md).
+
 ## 0.3.0
 
 - Fence in-flight computer permission reads when Settings or the companion

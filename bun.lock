@@ -16,7 +16,7 @@
     },
     "apps/mock-api": {
       "name": "@openduet/mock-api",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "hono": "4.13.13",
@@ -26,7 +26,7 @@
     },
     "apps/openduet": {
       "name": "@openduet/service",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "@openduet/knowledge": "workspace:*",
@@ -66,14 +66,14 @@
     },
     "apps/tryit": {
       "name": "@openduet/tryit",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "devDependencies": {
         "wrangler": "4.152.0",
       },
     },
     "apps/web": {
       "name": "@openduet/web",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@elevenlabs/client": "1.28.0",
         "@fontsource-variable/dm-sans": "5.3.0",
@@ -93,7 +93,7 @@
     },
     "conformance": {
       "name": "@openduet/conformance",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "@openduet/skills": "workspace:*",
@@ -115,7 +115,7 @@
     },
     "packages/cli": {
       "name": "@openduet/cli",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "yaml": "2.8.3",
         "zod": "4.6.7",
@@ -123,7 +123,7 @@
     },
     "packages/client": {
       "name": "@openduet/client",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "openapi-fetch": "0.17.0",
       },
@@ -134,7 +134,7 @@
     },
     "packages/contracts": {
       "name": "@openduet/contracts",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "re2js": "2.8.6",
         "zod": "4.6.7",
@@ -143,14 +143,14 @@
     },
     "packages/device": {
       "name": "openduet-device",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "bin": {
         "openduet-device": "./src/cli.ts",
       },
     },
     "packages/knowledge": {
       "name": "@openduet/knowledge",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "gray-matter": "4.0.3",
@@ -159,7 +159,7 @@
     },
     "packages/runtime-hermes": {
       "name": "@openduet/runtime-hermes",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "@openduet/skills": "workspace:*",
@@ -168,7 +168,7 @@
     },
     "packages/skills": {
       "name": "@openduet/skills",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@openduet/contracts": "workspace:*",
         "gray-matter": "4.0.3",

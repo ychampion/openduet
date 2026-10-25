@@ -95,7 +95,7 @@ import { mountMockSignIns } from './sign-ins.ts';
 import { MockConflict, newId, type Store } from './store.ts';
 import { mountVoiceMock } from './voice.ts';
 
-export const MOCK_VERSION = '0.3.0';
+export const MOCK_VERSION = '0.3.1';
 
 /** A budget a scripted job can never exceed, so nothing fails for the wrong reason. */
 export const DEFAULT_BUDGET: JobBudget = {

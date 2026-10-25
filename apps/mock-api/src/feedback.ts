@@ -46,7 +46,7 @@ export function mountFeedbackMock(app: Hono, deps: AppDeps, reporter: () => stri
     message:
       'The plan I added this morning is missing from Plans after a reload.\nIt was there before I refreshed.',
     route: '#/plans',
-    app_version: '0.3.0',
+    app_version: '0.3.1',
     context: {
       route: '#/plans',
       user_agent:
@@ -76,7 +76,7 @@ export function mountFeedbackMock(app: Hono, deps: AppDeps, reporter: () => stri
     status: 'fixed',
     message: 'The Send button stayed grey after I pasted a message.',
     route: '#/chat/new',
-    app_version: '0.3.0',
+    app_version: '0.3.1',
     context: { route: '#/chat/new', viewport: { width: 390, height: 844, pixel_ratio: 3 } },
     reporter: { principal_id: null, email: 'jamie.davis@fastmail.example' },
     note: 'The composer now reads pasted text.',
@@ -112,7 +112,7 @@ export function mountFeedbackMock(app: Hono, deps: AppDeps, reporter: () => stri
       message,
       summary: summarize(message),
       route: cleaned.route ?? null,
-      app_version: '0.3.0',
+      app_version: '0.3.1',
       context: cleaned,
       reporter: { principal_id: null, email: reporter() },
       note: null,

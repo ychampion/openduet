@@ -284,7 +284,7 @@ export const DEFAULT_SEARCH_RESULTS = 6;
 
 export const webManifest: ConnectorManifest = {
   name: 'web',
-  version: '0.3.0',
+  version: '0.3.1',
   provider: 'web',
   description:
     'Search the web and read public web pages: GET or HEAD only, public addresses only, no sign-in, cookies or forms.',

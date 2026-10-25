@@ -34,13 +34,15 @@ if Docker is missing.
 Linux / Intel Mac, in Bash:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ychampion/openduet/v0.3.1/install.sh | OPENDUET_REF=v0.3.1 OPENDUET_IMAGE_TAG=v0.3.1 bash
 ```
 
 Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/ychampion/openduet/main/install.ps1 | iex
+$env:OPENDUET_REF = 'v0.3.1'
+$env:OPENDUET_IMAGE_TAG = 'v0.3.1'
+irm https://raw.githubusercontent.com/ychampion/openduet/v0.3.1/install.ps1 | iex
 ```
 
 The installer creates `~/openduet` and local configuration, pulls the images
